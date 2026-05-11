@@ -161,6 +161,7 @@ impl DerefMut for Tokenizer {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    System,
     User,
     Assistant,
 }
@@ -231,7 +232,7 @@ where
 {
     // pub conversations: &'a [Conversation<R, T>],
     pub conversations: I,
-    // pub tools: Option<Box<dyn FnOnce()>>, // TODO
+    pub tools: Option<&'a [serde_json::Value]>,
     pub documents: Option<&'a [Document]>,
     pub model_id: &'a str,
     pub chat_template_id: Option<&'a str>,
@@ -439,7 +440,7 @@ where
 {
     let ApplyChatTemplateArgs {
         conversations,
-        // tools,
+        tools,
         documents,
         model_id,
         chat_template_id,
@@ -462,13 +463,12 @@ where
         },
     };
 
-    // TODO: handle tool
-
     // TODO: allow return_generation_indices
 
     render_jinja_tempalte(
         template,
         conversations,
+        tools,
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
@@ -479,6 +479,7 @@ where
 fn render_jinja_tempalte<'a, R, T>(
     template: Template,
     conversations: impl IntoIterator<Item = Chat<'a, R, T>>,
+    tools: Option<&'a [serde_json::Value]>,
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
@@ -495,6 +496,7 @@ where
     for chat in conversations {
         let mut rendered_chat = template.render(context! {
             messages => chat,
+            tools => tools,
             documents => documents,
             add_generation_prompt => add_generation_prompt,
         })?;
@@ -568,6 +570,7 @@ mod tests {
         }];
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,
@@ -604,6 +607,7 @@ mod tests {
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,
@@ -638,6 +642,7 @@ mod tests {
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,

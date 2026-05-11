@@ -1,11 +1,15 @@
 use std::path::Path;
 
+use mlx_lm_utils::tokenizer::{
+    load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat,
+    Tokenizer as ChatTokenizer,
+};
 use mlx_rs::{
     error::Exception,
     ops::indexing::{IndexOp, NewAxis},
     Array,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 use crate::{cache::ConcatKeyValueCache, error::Error};
@@ -106,7 +110,9 @@ impl Iterator for Generate<'_> {
 
 pub struct LoadedModel {
     model: Model,
-    tokenizer: Tokenizer,
+    tokenizer: ChatTokenizer,
+    chat_template: Option<String>,
+    model_id: String,
     eos_token_ids: Vec<u32>,
 }
 
@@ -115,7 +121,8 @@ impl LoadedModel {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
         let kind = ModelKind::from_model_type(&metadata.model_type)?;
-        let tokenizer = load_tokenizer(model_dir)?;
+        let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
+        let chat_template = load_chat_template(model_dir)?;
         let model = match kind {
             ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir)?),
             ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir)?),
@@ -128,12 +135,48 @@ impl LoadedModel {
         Ok(Self {
             model,
             tokenizer,
+            chat_template,
+            model_id: metadata.model_type,
             eos_token_ids,
         })
     }
 
     pub fn model_type(&self) -> &str {
         self.model.model_type()
+    }
+
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
+    pub fn apply_chat_template<'a, I, R, T>(
+        &'a mut self,
+        conversations: I,
+        tools: Option<&'a [serde_json::Value]>,
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>, Error>
+    where
+        I: IntoIterator<Item = Chat<'a, R, T>>,
+        R: Serialize + 'a,
+        T: Serialize + ToString + 'a,
+    {
+        let Some(template) = self.chat_template.clone() else {
+            return Ok(None);
+        };
+
+        let rendered = self.tokenizer.apply_chat_template(
+            template,
+            ApplyChatTemplateArgs {
+                conversations,
+                tools,
+                documents: None,
+                model_id: &self.model_id,
+                chat_template_id: None,
+                add_generation_prompt: Some(add_generation_prompt),
+                continue_final_message: None,
+            },
+        )?;
+        Ok(rendered.into_iter().next())
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
@@ -197,4 +240,12 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
+}
+
+fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    Ok(load_model_chat_template_from_file(config_path)?)
 }
