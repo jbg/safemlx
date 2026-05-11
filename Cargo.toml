@@ -18,6 +18,7 @@ rust-version = "1.85.0"
 
 [workspace.dependencies]
 mlx-rs = { version = "0.25.3" }
+mlx-macros = "0.25.3"
 mlx-lm = { version = "0.0.1", path = "mlx-lm" }
 mlx-lm-utils = { version = "0.0.1", path = "mlx-lm-utils" }
 thiserror = "2"

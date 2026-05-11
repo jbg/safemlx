@@ -247,7 +247,6 @@ where
         values,
         scale,
         mask.map(ScaledDotProductAttentionMask::Array),
-        None,
     )
 }
 
