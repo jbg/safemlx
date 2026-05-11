@@ -159,6 +159,10 @@ impl LoadedModel {
             .map_err(Into::into)
     }
 
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
     pub fn is_eos_token(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
     }
