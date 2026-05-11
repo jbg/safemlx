@@ -73,7 +73,7 @@ use std::{
     str::FromStr,
 };
 
-use minijinja::{context, Environment, Template};
+use minijinja::{context, Environment, Template, Value as JinjaValue};
 use serde::Serialize;
 use tokenizers::Encoding;
 
@@ -120,7 +120,7 @@ impl Tokenizer {
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
         R: Serialize + 'a,
-        T: Serialize + ToString + 'a,
+        T: Serialize + 'a,
     {
         apply_chat_template(&mut self.env, model_template, args)
     }
@@ -133,7 +133,7 @@ impl Tokenizer {
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
         R: Serialize + 'a,
-        T: Serialize + ToString + 'a,
+        T: Serialize + 'a,
     {
         let Self { inner, env } = self;
 
@@ -141,6 +141,27 @@ impl Tokenizer {
         inner
             .encode_batch(rendered_chats, false)
             .map_err(Into::into)
+    }
+
+    pub fn apply_chat_template_json<'a, I>(
+        &mut self,
+        model_template: String,
+        conversations: I,
+        tools: Option<&'a [serde_json::Value]>,
+        model_id: &'a str,
+        add_generation_prompt: bool,
+    ) -> Result<Vec<String>, Error>
+    where
+        I: IntoIterator<Item = Vec<serde_json::Value>>,
+    {
+        apply_chat_template_json(
+            &mut self.env,
+            model_template,
+            conversations,
+            tools,
+            model_id,
+            add_generation_prompt,
+        )
     }
 }
 
@@ -223,12 +244,16 @@ pub enum Truncation {
     MaxLength(usize),
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct JsonConversation(pub Vec<serde_json::Value>);
+
 #[derive(Default)]
 pub struct ApplyChatTemplateArgs<'a, I, R = Role, T = String>
 where
     I: IntoIterator<Item = Chat<'a, R, T>>,
     R: Serialize + 'a,
-    T: Serialize + ToString + 'a,
+    T: Serialize + 'a,
 {
     // pub conversations: &'a [Conversation<R, T>],
     pub conversations: I,
@@ -428,6 +453,39 @@ pub fn load_model_chat_template_from_file(
 
 //     return rendered, all_generation_indices
 
+pub fn apply_chat_template_json<'a, I>(
+    env: &mut Environment<'static>,
+    model_template: String,
+    conversations: I,
+    tools: Option<&'a [serde_json::Value]>,
+    model_id: &'a str,
+    add_generation_prompt: bool,
+) -> Result<Vec<String>, Error>
+where
+    I: IntoIterator<Item = Vec<serde_json::Value>>,
+{
+    let conversations = conversations.into_iter().map(|conversation| {
+        Chat::Owned(vec![Conversation {
+            role: serde_json::Value::Null,
+            content: JsonConversation(conversation),
+        }])
+    });
+
+    apply_chat_template(
+        env,
+        model_template,
+        ApplyChatTemplateArgs {
+            conversations,
+            tools,
+            documents: None,
+            model_id,
+            chat_template_id: None,
+            add_generation_prompt: Some(add_generation_prompt),
+            continue_final_message: None,
+        },
+    )
+}
+
 pub fn apply_chat_template<'a, I, R, T>(
     env: &mut Environment<'static>,
     model_template: String,
@@ -436,7 +494,7 @@ pub fn apply_chat_template<'a, I, R, T>(
 where
     I: IntoIterator<Item = Chat<'a, R, T>>,
     R: Serialize + 'a,
-    T: Serialize + ToString + 'a,
+    T: Serialize + 'a,
 {
     let ApplyChatTemplateArgs {
         conversations,
@@ -486,7 +544,7 @@ fn render_jinja_tempalte<'a, R, T>(
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
-    T: Serialize + ToString + 'a,
+    T: Serialize + 'a,
 {
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
     let continue_final_message = continue_final_message.unwrap_or(false);
@@ -494,19 +552,47 @@ where
     // TODO: what does checking for "messages" key do in the python code?
     let mut rendered = Vec::new();
     for chat in conversations {
+        let messages = if chat.len() == 1 {
+            serde_json::to_value(&chat[0].content)
+                .ok()
+                .and_then(|value| match value {
+                    serde_json::Value::Array(messages)
+                        if serde_json::to_value(&chat[0].role).ok()
+                            == Some(serde_json::Value::Null) =>
+                    {
+                        Some(JinjaValue::from_serialize(messages))
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        }
+        .unwrap_or_else(|| JinjaValue::from_serialize(&chat));
+
         let mut rendered_chat = template.render(context! {
-            messages => chat,
+            messages => messages,
             tools => tools,
             documents => documents,
             add_generation_prompt => add_generation_prompt,
         })?;
 
         if continue_final_message {
-            let Some(final_message) = chat.last().map(|chat| &chat.content) else {
+            let Some(final_message) = chat
+                .last()
+                .and_then(|chat| serde_json::to_value(&chat.content).ok())
+                .and_then(|value| match value {
+                    serde_json::Value::String(text) => Some(text),
+                    other => other
+                        .get("text")
+                        .or_else(|| other.get("content"))
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                })
+            else {
                 continue;
             };
 
-            let final_message_str = final_message.to_string();
+            let final_message_str = final_message;
 
             if !rendered_chat.contains(final_message_str.trim()) {
                 return Err(Error::FinalMsgNotInChat);

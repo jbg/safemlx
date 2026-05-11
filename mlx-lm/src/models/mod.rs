@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use mlx_lm_utils::tokenizer::{
-    load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat,
-    Tokenizer as ChatTokenizer,
+    load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
 };
 use mlx_rs::{
     error::Exception,
@@ -76,18 +75,12 @@ impl Model {
         prompt_tokens: &'a Array,
     ) -> Generate<'a> {
         match self {
-            Self::Llama(model) => Generate::Llama(llama::Generate::new(
-                model,
-                cache,
-                temp,
-                prompt_tokens,
-            )),
-            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::new(
-                model,
-                cache,
-                temp,
-                prompt_tokens,
-            )),
+            Self::Llama(model) => {
+                Generate::Llama(llama::Generate::new(model, cache, temp, prompt_tokens))
+            }
+            Self::Qwen3(model) => {
+                Generate::Qwen3(qwen3::Generate::new(model, cache, temp, prompt_tokens))
+            }
         }
     }
 }
@@ -158,7 +151,7 @@ impl LoadedModel {
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
         R: Serialize + 'a,
-        T: Serialize + ToString + 'a,
+        T: Serialize + 'a,
     {
         let Some(template) = self.chat_template.clone() else {
             return Ok(None);
@@ -179,6 +172,26 @@ impl LoadedModel {
         Ok(rendered.into_iter().next())
     }
 
+    pub fn apply_chat_template_json(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>, Error> {
+        let Some(template) = self.chat_template.clone() else {
+            return Ok(None);
+        };
+
+        let rendered = self.tokenizer.apply_chat_template_json(
+            template,
+            conversations,
+            tools,
+            &self.model_id,
+            add_generation_prompt,
+        )?;
+        Ok(rendered.into_iter().next())
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
         Ok(self
             .tokenizer
@@ -187,11 +200,7 @@ impl LoadedModel {
             .to_vec())
     }
 
-    pub fn encode_to_array(
-        &self,
-        text: &str,
-        add_special_tokens: bool,
-    ) -> Result<Array, Error> {
+    pub fn encode_to_array(&self, text: &str, add_special_tokens: bool) -> Result<Array, Error> {
         let ids = self.encode(text, add_special_tokens)?;
         Ok(Array::from(ids.as_slice()).index(NewAxis))
     }
