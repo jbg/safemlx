@@ -13,11 +13,21 @@ use tokenizers::Tokenizer;
 
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
+pub mod gemma4;
 pub mod llama;
 pub mod qwen3;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelMetadata {
+    model_type: String,
+    #[serde(default)]
+    eos_token_id: Option<TokenIdOrIds>,
+    #[serde(default)]
+    text_config: Option<TextModelMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TextModelMetadata {
     model_type: String,
     #[serde(default)]
     eos_token_id: Option<TokenIdOrIds>,
@@ -41,6 +51,7 @@ impl TokenIdOrIds {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ModelKind {
+    Gemma4,
     Llama,
     Qwen3,
 }
@@ -48,6 +59,7 @@ pub enum ModelKind {
 impl ModelKind {
     fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
+            "gemma4" | "gemma4_text" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "qwen3" => Ok(Self::Qwen3),
             other => Err(Error::UnsupportedModelType(other.to_string())),
@@ -56,6 +68,7 @@ impl ModelKind {
 }
 
 pub enum Model {
+    Gemma4(gemma4::Model),
     Llama(llama::Model),
     Qwen3(qwen3::Model),
 }
@@ -63,6 +76,7 @@ pub enum Model {
 impl Model {
     pub fn model_type(&self) -> &str {
         match self {
+            Self::Gemma4(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
         }
@@ -75,6 +89,9 @@ impl Model {
         prompt_tokens: &'a Array,
     ) -> Generate<'a> {
         match self {
+            Self::Gemma4(model) => {
+                Generate::Gemma4(gemma4::Generate::new(model, cache, temp, prompt_tokens))
+            }
             Self::Llama(model) => {
                 Generate::Llama(llama::Generate::new(model, cache, temp, prompt_tokens))
             }
@@ -86,6 +103,7 @@ impl Model {
 }
 
 pub enum Generate<'a> {
+    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
     Llama(llama::Generate<'a, ConcatKeyValueCache>),
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
 }
@@ -95,6 +113,7 @@ impl Iterator for Generate<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            Self::Gemma4(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::Qwen3(generate) => generate.next(),
         }
@@ -113,15 +132,30 @@ impl LoadedModel {
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
-        let kind = ModelKind::from_model_type(&metadata.model_type)?;
+        let model_type = if ModelKind::from_model_type(&metadata.model_type).is_ok() {
+            metadata.model_type.clone()
+        } else {
+            metadata
+                .text_config
+                .as_ref()
+                .map(|text_config| text_config.model_type.clone())
+                .unwrap_or_else(|| metadata.model_type.clone())
+        };
+        let kind = ModelKind::from_model_type(&model_type)?;
         let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
         let model = match kind {
+            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(model_dir)?),
             ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir)?),
             ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir)?),
         };
         let eos_token_ids = metadata
             .eos_token_id
+            .or_else(|| {
+                metadata
+                    .text_config
+                    .and_then(|text_config| text_config.eos_token_id)
+            })
             .map(TokenIdOrIds::into_vec)
             .unwrap_or_default();
 
@@ -129,7 +163,7 @@ impl LoadedModel {
             model,
             tokenizer,
             chat_template,
-            model_id: metadata.model_type,
+            model_id: model_type,
             eos_token_ids,
         })
     }
@@ -232,6 +266,7 @@ impl LoadedModel {
 pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(model_dir)?)),
         ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir)?)),
         ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir)?)),
     }
@@ -240,6 +275,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let model_dir = model_dir.as_ref();
     match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+        ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
     }
