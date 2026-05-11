@@ -2,6 +2,9 @@ use mlx_rs::error::Exception;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("unsupported model type: {0}")]
+    UnsupportedModelType(String),
+
     #[error(transparent)]
     Exception(#[from] Exception),
 

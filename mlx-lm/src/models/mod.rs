@@ -1,2 +1,196 @@
+use std::path::Path;
+
+use mlx_rs::{
+    error::Exception,
+    ops::indexing::{IndexOp, NewAxis},
+    Array,
+};
+use serde::Deserialize;
+use tokenizers::Tokenizer;
+
+use crate::{cache::ConcatKeyValueCache, error::Error};
+
 pub mod llama;
 pub mod qwen3;
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelMetadata {
+    model_type: String,
+    #[serde(default)]
+    eos_token_id: Option<TokenIdOrIds>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TokenIdOrIds {
+    Single(u32),
+    Multiple(Vec<u32>),
+}
+
+impl TokenIdOrIds {
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            Self::Single(id) => vec![id],
+            Self::Multiple(ids) => ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ModelKind {
+    Llama,
+    Qwen3,
+}
+
+impl ModelKind {
+    fn from_model_type(model_type: &str) -> Result<Self, Error> {
+        match model_type {
+            "llama" => Ok(Self::Llama),
+            "qwen3" => Ok(Self::Qwen3),
+            other => Err(Error::UnsupportedModelType(other.to_string())),
+        }
+    }
+}
+
+pub enum Model {
+    Llama(llama::Model),
+    Qwen3(qwen3::Model),
+}
+
+impl Model {
+    pub fn model_type(&self) -> &str {
+        match self {
+            Self::Llama(model) => model.model_type(),
+            Self::Qwen3(model) => model.model_type(),
+        }
+    }
+
+    pub fn generate<'a>(
+        &'a mut self,
+        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
+        temp: f32,
+        prompt_tokens: &'a Array,
+    ) -> Generate<'a> {
+        match self {
+            Self::Llama(model) => Generate::Llama(llama::Generate::new(
+                model,
+                cache,
+                temp,
+                prompt_tokens,
+            )),
+            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::new(
+                model,
+                cache,
+                temp,
+                prompt_tokens,
+            )),
+        }
+    }
+}
+
+pub enum Generate<'a> {
+    Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+}
+
+impl Iterator for Generate<'_> {
+    type Item = Result<Array, Exception>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Llama(generate) => generate.next(),
+            Self::Qwen3(generate) => generate.next(),
+        }
+    }
+}
+
+pub struct LoadedModel {
+    model: Model,
+    tokenizer: Tokenizer,
+    eos_token_ids: Vec<u32>,
+}
+
+impl LoadedModel {
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let model_dir = model_dir.as_ref();
+        let metadata = read_model_metadata(model_dir)?;
+        let kind = ModelKind::from_model_type(&metadata.model_type)?;
+        let tokenizer = load_tokenizer(model_dir)?;
+        let model = match kind {
+            ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir)?),
+            ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir)?),
+        };
+        let eos_token_ids = metadata
+            .eos_token_id
+            .map(TokenIdOrIds::into_vec)
+            .unwrap_or_default();
+
+        Ok(Self {
+            model,
+            tokenizer,
+            eos_token_ids,
+        })
+    }
+
+    pub fn model_type(&self) -> &str {
+        self.model.model_type()
+    }
+
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
+        Ok(self
+            .tokenizer
+            .encode(text, add_special_tokens)?
+            .get_ids()
+            .to_vec())
+    }
+
+    pub fn encode_to_array(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Array, Error> {
+        let ids = self.encode(text, add_special_tokens)?;
+        Ok(Array::from(ids.as_slice()).index(NewAxis))
+    }
+
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+        self.tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(Into::into)
+    }
+
+    pub fn is_eos_token(&self, id: u32) -> bool {
+        self.eos_token_ids.contains(&id)
+    }
+
+    pub fn generate<'a>(
+        &'a mut self,
+        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
+        temp: f32,
+        prompt_tokens: &'a Array,
+    ) -> Generate<'a> {
+        self.model.generate(cache, temp, prompt_tokens)
+    }
+}
+
+pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+    match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir)?)),
+        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir)?)),
+    }
+}
+
+pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
+    let model_dir = model_dir.as_ref();
+    match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+        ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
+        ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
+    }
+}
+
+fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
+    let config_path = model_dir.join("config.json");
+    let file = std::fs::File::open(config_path)?;
+    Ok(serde_json::from_reader(file)?)
+}
