@@ -1,0 +1,31 @@
+[workspace]
+members = ["mlx-lm", "mlx-lm-utils"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = [
+    "Minghua Wu <michael.wu1107@gmail.com>",
+    "David Chavez <david@dcvz.io>",
+]
+repository = "https://github.com/jh-block/mlx-lm"
+keywords = ["mlx", "deep-learning", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+documentation = "https://oxideai.github.io/mlx-rs/mlx_rs/"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+mlx-rs = { version = "0.25.3" }
+mlx-lm = { version = "0.0.1", path = "mlx-lm" }
+mlx-lm-utils = { version = "0.0.1", path = "mlx-lm-utils" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.22"
+minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+clap = { version = "4", features = ["derive"] }
+idna_adapter = "1.2"
+anyhow = "1"
