@@ -172,6 +172,10 @@ impl LoadedModel {
         self.model.model_type()
     }
 
+    pub fn model_id_for_template(&self) -> &str {
+        &self.model_id
+    }
+
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
     }
@@ -289,8 +293,26 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
 
 fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
     let config_path = model_dir.join("tokenizer_config.json");
-    if !config_path.exists() {
-        return Ok(None);
+    if config_path.exists() {
+        if let Some(template) = load_model_chat_template_from_file(config_path)? {
+            return Ok(Some(template));
+        }
     }
-    Ok(load_model_chat_template_from_file(config_path)?)
+
+    let metadata = read_model_metadata(model_dir)?;
+    if metadata.model_type == "gemma4"
+        || metadata
+            .text_config
+            .as_ref()
+            .is_some_and(|text_config| text_config.model_type == "gemma4_text")
+    {
+        return Ok(Some(GEMMA4_TEXT_TEMPLATE.to_string()));
+    }
+
+    Ok(None)
 }
+
+const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set role = 'model' if message['role'] == 'assistant' else message['role'] %}<|turn>{{ role }}
+{% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'text' %}{{ content['text'] }}{% elif content['type'] == 'image' %}<|image>{% elif content['type'] == 'audio' %}<|audio>{% endif %}{% endfor %}{% endif %}<turn|>
+{% endfor %}{% if add_generation_prompt %}<|turn>model
+{% endif %}"#;

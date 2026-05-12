@@ -6,7 +6,7 @@ use mlx_rs::{
     error::Exception,
     module::Module,
     nn,
-    ops::{arange, which},
+    ops::{arange, concatenate_axis, which, zeros},
     Array,
 };
 use serde::Deserialize;
@@ -162,12 +162,87 @@ where
     fn training_mode(&mut self, _mode: bool) {}
 }
 
+/// Proportional RoPE used by Gemma 4 full-attention layers.
+///
+/// Unlike partial RoPE, proportional RoPE keeps `dimensions == head_dim` and fills
+/// non-rotary dimensions with zero frequencies. Passing zero frequencies to MLX's
+/// RoPE implementation leaves those dimensions unchanged while preserving the
+/// full head shape expected by Gemma 4.
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct ProportionalRope {
+    pub dimensions: i32,
+    pub traditional: bool,
+    pub scale: f32,
+    pub freqs: Array,
+}
+
+impl ProportionalRope {
+    pub fn new(
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        factor: f32,
+        proportion: f32,
+    ) -> Result<Self, Exception> {
+        let half_dims = dims / 2;
+        let rope_angles = ((proportion * dims as f32) / 2.0).floor() as i32;
+        let rotated_freqs = if rope_angles > 0 {
+            let indices = arange::<_, f32>(None, rope_angles, None)?;
+            let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32))?;
+            Array::from_f32(base)
+                .power(&exponents)?
+                .divide(Array::from_f32(factor))?
+        } else {
+            zeros::<f32>(&[0])?
+        };
+        let nope_angles = half_dims - rope_angles;
+        let freqs = if nope_angles > 0 {
+            concatenate_axis(&[rotated_freqs, zeros::<f32>(&[nope_angles])?], 0)?
+        } else {
+            rotated_freqs
+        };
+        Ok(Self {
+            dimensions: dims,
+            traditional,
+            scale: 1.0,
+            freqs,
+        })
+    }
+}
+
+impl<'a, Input> Module<Input> for ProportionalRope
+where
+    Input: Into<nn::RopeInput<'a>>,
+{
+    type Error = Exception;
+    type Output = Array;
+
+    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+        let nn::RopeInput { x, offset } = input.into();
+        let shape = x.shape();
+        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
+        let x = mlx_rs::fast::rope(
+            x,
+            self.dimensions,
+            self.traditional,
+            None::<f32>,
+            self.scale,
+            offset,
+            &self.freqs,
+        )?;
+        x.reshape(shape)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
 /// Enum wrapping different RoPE variants so that `initialize_rope` can return
 /// either a standard RoPE or a Llama3 RoPE.
 #[derive(Debug, Clone)]
 pub enum RopeVariant {
     Default(nn::Rope),
     Llama3(Llama3Rope),
+    Proportional(ProportionalRope),
 }
 
 // TODO: support derive ModuleParameters for enum
@@ -176,6 +251,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.num_parameters(),
             RopeVariant::Llama3(rope) => rope.num_parameters(),
+            RopeVariant::Proportional(rope) => rope.num_parameters(),
         }
     }
 
@@ -183,6 +259,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.freeze_parameters(_recursive),
+            RopeVariant::Proportional(rope) => rope.freeze_parameters(_recursive),
         }
     }
 
@@ -190,6 +267,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.unfreeze_parameters(_recursive),
+            RopeVariant::Proportional(rope) => rope.unfreeze_parameters(_recursive),
         }
     }
 
@@ -197,6 +275,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.parameters(),
             RopeVariant::Llama3(rope) => rope.parameters(),
+            RopeVariant::Proportional(rope) => rope.parameters(),
         }
     }
 
@@ -204,6 +283,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.parameters_mut(),
             RopeVariant::Llama3(rope) => rope.parameters_mut(),
+            RopeVariant::Proportional(rope) => rope.parameters_mut(),
         }
     }
 
@@ -211,6 +291,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.trainable_parameters(),
             RopeVariant::Llama3(rope) => rope.trainable_parameters(),
+            RopeVariant::Proportional(rope) => rope.trainable_parameters(),
         }
     }
 
@@ -218,6 +299,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.all_frozen(),
             RopeVariant::Llama3(rope) => rope.all_frozen(),
+            RopeVariant::Proportional(rope) => rope.all_frozen(),
         }
     }
 
@@ -225,6 +307,7 @@ impl mlx_rs::module::ModuleParameters for RopeVariant {
         match self {
             RopeVariant::Default(rope) => rope.any_frozen(),
             RopeVariant::Llama3(rope) => rope.any_frozen(),
+            RopeVariant::Proportional(rope) => rope.any_frozen(),
         }
     }
 }
@@ -240,6 +323,7 @@ where
         match self {
             RopeVariant::Default(rope) => rope.forward(input),
             RopeVariant::Llama3(rope) => rope.forward(input),
+            RopeVariant::Proportional(rope) => rope.forward(input),
         }
     }
 
@@ -250,6 +334,9 @@ where
             }
             RopeVariant::Llama3(rope) => {
                 <Llama3Rope as Module<nn::RopeInput>>::training_mode(rope, mode)
+            }
+            RopeVariant::Proportional(rope) => {
+                <ProportionalRope as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
         }
     }
@@ -308,6 +395,27 @@ pub fn initialize_rope(
             high_freq_factor,
         )?;
         return Ok(RopeVariant::Llama3(rope));
+    } else if rope_type == FloatOrStr::Str("proportional") {
+        let config = scaling_config
+            .as_ref()
+            .ok_or_else(|| Exception::custom("scaling_config is required for proportional RoPE"))?;
+        let factor = config
+            .get("factor")
+            .map(|_| get_numeric_from_config(config, "factor"))
+            .transpose()?
+            .unwrap_or(1.0);
+        let proportion = config
+            .get("partial_rotary_factor")
+            .map(|_| get_numeric_from_config(config, "partial_rotary_factor"))
+            .transpose()?
+            .unwrap_or(1.0);
+        return Ok(RopeVariant::Proportional(ProportionalRope::new(
+            dims,
+            traditional,
+            base,
+            factor,
+            proportion,
+        )?));
     } else if rope_type == FloatOrStr::Str("yarn") {
         todo!()
     } else if rope_type == FloatOrStr::Str("longrope") {

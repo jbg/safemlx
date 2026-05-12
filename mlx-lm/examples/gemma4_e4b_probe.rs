@@ -15,6 +15,10 @@ fn main() -> anyhow::Result<()> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "what is goose?".to_string());
+    let temp = args
+        .get(2)
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.0);
 
     print_config_summary(&model_dir)?;
 
@@ -31,7 +35,7 @@ fn main() -> anyhow::Result<()> {
 
     let rendered = model
         .apply_chat_template_json(
-            vec![vec![serde_json::json!({"role":"user","content":prompt})]],
+            vec![vec![gemma4_message(&prompt, model.model_id_for_template())]],
             None,
             true,
         )?
@@ -41,15 +45,18 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "what is goose?".to_string())
         });
     println!("\n=== prompt ===\n{rendered}\n");
+    println!("temperature: {temp}");
 
     let ids = model.encode(&rendered, false)?;
     let tokens = mlx_rs::Array::from(ids.as_slice()).index(NewAxis);
     let eos = model.eos_token_ids().to_vec();
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+    print_first_token_distribution(&mut model, &mut cache, &tokens)?;
+    cache.clear();
     let mut output_ids = Vec::new();
 
     {
-        let mut generator = model.generate(&mut cache, 0.0, &tokens);
+        let mut generator = model.generate(&mut cache, temp, &tokens);
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
@@ -65,6 +72,35 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== output ids ===\n{output_ids:?}\n");
     println!("=== output ===\n{}", model.decode(&output_ids, false)?);
+    Ok(())
+}
+
+fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
+    if model_type == "gemma4" || model_type == "gemma4_text" {
+        serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": prompt, "content": prompt}],
+        })
+    } else {
+        serde_json::json!({"role": "user", "content": prompt})
+    }
+}
+
+fn print_first_token_distribution(
+    model: &mut LoadedModel,
+    cache: &mut Vec<Option<ConcatKeyValueCache>>,
+    tokens: &mlx_rs::Array,
+) -> anyhow::Result<()> {
+    let mut generator = model.generate(cache, 0.0, tokens);
+    let Some(first) = generator.next() else {
+        return Ok(());
+    };
+    let first_id = first?.item::<u32>();
+    drop(generator);
+    println!(
+        "first greedy id: {first_id} {:?}",
+        model.decode(&[first_id], false)?
+    );
     Ok(())
 }
 

@@ -81,6 +81,16 @@ impl StrictLoadConfig {
             if let Some(inner_key) = candidate.strip_suffix(".weight") {
                 expanded.push(format!("{inner_key}.inner.weight"));
             }
+            if let Some(rest) = candidate.strip_prefix("model.language_model.embed_tokens.") {
+                expanded.push(format!("model.language_model.embed_tokens.inner.{rest}"));
+            }
+            if let Some(rest) =
+                candidate.strip_prefix("model.language_model.embed_tokens_per_layer.")
+            {
+                expanded.push(format!(
+                    "model.language_model.embed_tokens_per_layer.inner.{rest}"
+                ));
+            }
         }
 
         let mut seen = HashSet::new();
@@ -95,6 +105,7 @@ impl StrictLoadConfig {
 pub struct StrictLoadReport {
     loaded: HashSet<String>,
     unused: Vec<String>,
+    shape_mismatches: Vec<String>,
 }
 
 impl StrictLoadReport {
@@ -104,6 +115,18 @@ impl StrictLoadReport {
 
     fn record_unused(&mut self, key: String) {
         self.unused.push(key);
+    }
+
+    fn record_shape_mismatch(
+        &mut self,
+        weight_key: String,
+        param_key: String,
+        expected_shape: Vec<i32>,
+        actual_shape: Vec<i32>,
+    ) {
+        self.shape_mismatches.push(format!(
+            "{weight_key} -> {param_key}: expected {expected_shape:?}, got {actual_shape:?}"
+        ));
     }
 
     pub fn finish<M: ModuleParameters>(
@@ -125,6 +148,7 @@ impl StrictLoadReport {
             .into_iter()
             .filter(|key| !config.is_unused_allowed(key))
             .collect::<Vec<_>>();
+        unused.extend(self.shape_mismatches);
 
         missing.sort();
         unused.sort();
@@ -158,8 +182,14 @@ pub fn load_safetensors_strict<M: ModuleParametersExt>(
 
         if let Some(candidate) = matched {
             if let Some(param) = params.get_mut(candidate.as_str()) {
-                **param = value;
-                report.record_loaded(candidate);
+                let expected_shape = param.shape().to_vec();
+                let actual_shape = value.shape().to_vec();
+                if expected_shape == actual_shape {
+                    **param = value;
+                    report.record_loaded(candidate);
+                } else {
+                    report.record_shape_mismatch(key, candidate, expected_shape, actual_shape);
+                }
             }
         } else {
             report.record_unused(key);
