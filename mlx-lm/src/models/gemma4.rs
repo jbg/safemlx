@@ -61,6 +61,14 @@ pub struct ModelArgs {
     #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
     #[serde(default)]
+    pub enable_moe_block: bool,
+    #[serde(default)]
+    pub num_experts: Option<i32>,
+    #[serde(default)]
+    pub top_k_experts: Option<i32>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<i32>,
+    #[serde(default)]
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     #[serde(default)]
     pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
@@ -668,6 +676,11 @@ pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, E
 pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
+    if config.text_config.enable_moe_block {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 MoE models are not supported yet".to_string(),
+        ));
+    }
     config.text_config.model_type = "gemma4".to_string();
     config.text_config.tie_word_embeddings = config.tie_word_embeddings;
     Ok(config.text_config)

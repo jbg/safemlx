@@ -5,6 +5,9 @@ pub enum Error {
     #[error("unsupported model type: {0}")]
     UnsupportedModelType(String),
 
+    #[error("unsupported model architecture: {0}")]
+    UnsupportedArchitecture(String),
+
     #[error(transparent)]
     Exception(#[from] Exception),
 
