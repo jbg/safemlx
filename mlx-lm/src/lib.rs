@@ -4,6 +4,7 @@ pub mod error;
 pub mod models;
 pub mod sampler;
 pub mod utils;
+pub mod weights;
 
 use mlx_rs::Array;
 

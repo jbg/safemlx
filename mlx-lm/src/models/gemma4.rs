@@ -9,7 +9,7 @@ use mlx_rs::{
     categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, Param},
     nn,
     ops::{
         indexing::{IndexOp, NewAxis},
@@ -29,6 +29,7 @@ use crate::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
+    weights::{load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -697,17 +698,33 @@ pub fn load_gemma4_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_args = get_gemma4_model_args(model_dir)?;
     let mut model = Model::new(model_args)?;
     let weights_index = model_dir.join("model.safetensors.index.json");
+    let config = StrictLoadConfig::default()
+        .rewrite_prefix("language_model.model.", "model.language_model.")
+        .rewrite_prefix("model.language_model.", "model.language_model.")
+        .allow_unused_prefix("audio_tower.")
+        .allow_unused_prefix("embed_audio.")
+        .allow_unused_prefix("embed_vision.")
+        .allow_unused_prefix("multi_modal_projector.")
+        .allow_unused_prefix("vision_tower.")
+        .allow_missing_suffix(".bias");
+    let mut report = StrictLoadReport::default();
     if weights_index.exists() {
         let json = std::fs::read_to_string(weights_index)?;
         let weight_map: WeightMap = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
         for weight_file in weight_files {
             let weights_filename = model_dir.join(weight_file);
-            model.load_safetensors(weights_filename)?;
+            load_safetensors_strict(&mut model, weights_filename, &config, &mut report)?;
         }
     } else {
-        model.load_safetensors(model_dir.join("model.safetensors"))?;
+        load_safetensors_strict(
+            &mut model,
+            model_dir.join("model.safetensors"),
+            &config,
+            &mut report,
+        )?;
     }
+    report.finish(&model, &config)?;
     Ok(model)
 }
 
