@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::KeyValueCache,
+    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     utils::{
         create_causal_mask,
@@ -148,7 +148,7 @@ impl ModelArgs {
         args
     }
 
-    fn layer_type(&self, index: usize) -> LayerType {
+    pub(crate) fn layer_type(&self, index: usize) -> LayerType {
         self.layer_types
             .get(index)
             .copied()
@@ -361,6 +361,13 @@ pub struct AttentionInput<'a, C> {
     pub position_offset: i32,
     pub per_layer_input: Option<&'a Array>,
     pub shared_kv: Option<&'a mut HashMap<LayerType, (Array, Array)>>,
+    pub disable_generated_mask: bool,
+}
+
+pub struct Gemma4TextOutput {
+    pub hidden: Array,
+    pub pre_norm_hidden: Array,
+    pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
 impl<C> Module<AttentionInput<'_, C>> for Attention
@@ -431,7 +438,11 @@ where
             (keys, values)
         };
 
-        let attention_cache = if self.is_kv_shared_layer { None } else { cache };
+        let attention_cache = if self.is_kv_shared_layer || shared_kv.is_some() {
+            None
+        } else {
+            cache
+        };
         let output = crate::utils::scaled_dot_product_attention(
             queries,
             keys,
@@ -731,8 +742,11 @@ where
             position_offset,
             per_layer_input,
             shared_kv,
+            disable_generated_mask,
         } = input;
-        let generated_mask = if self.layer_type == LayerType::SlidingAttention {
+        let generated_mask = if disable_generated_mask {
+            None
+        } else if self.layer_type == LayerType::SlidingAttention {
             if x.shape()[1] > 1 || self.sliding_window.is_some() {
                 Some(create_causal_mask(
                     x.shape()[1],
@@ -753,6 +767,7 @@ where
             position_offset,
             per_layer_input: None,
             shared_kv,
+            disable_generated_mask,
         };
         let r = self.self_attn.forward(self_attn_input)?;
         let r = self.post_attention_layernorm.forward(&r)?;
@@ -929,14 +944,14 @@ pub struct ModelInput<'a, C> {
     pub cache: &'a mut Vec<Option<C>>,
 }
 
-impl<C> Module<ModelInput<'_, C>> for Gemma4TextModel
-where
-    C: KeyValueCache + Default,
-{
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
+impl Gemma4TextModel {
+    pub fn forward_with_state<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> Result<Gemma4TextOutput, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
         let ModelInput {
             inputs,
             mask,
@@ -956,7 +971,12 @@ where
         let mut shared_kv = HashMap::new();
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
-            None if h.shape()[1] > 1 => Some(create_causal_mask(h.shape()[1], None, None, None)?),
+            None if h.shape()[1] > 1 => Some(create_causal_mask(
+                h.shape()[1],
+                Some(position_offset),
+                None,
+                None,
+            )?),
             None => None,
         };
 
@@ -974,10 +994,29 @@ where
                 position_offset,
                 per_layer_input: layer_ple.as_ref(),
                 shared_kv: Some(&mut shared_kv),
+                disable_generated_mask: false,
             };
             h = layer.forward(layer_input)?;
         }
-        self.norm.forward(&h)
+        let pre_norm_hidden = h.clone();
+        let hidden = self.norm.forward(&h)?;
+        Ok(Gemma4TextOutput {
+            hidden,
+            pre_norm_hidden,
+            shared_kv_states: shared_kv,
+        })
+    }
+}
+
+impl<C> Module<ModelInput<'_, C>> for Gemma4TextModel
+where
+    C: KeyValueCache + Default,
+{
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
+        Ok(self.forward_with_state(input)?.hidden)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1140,6 +1179,55 @@ pub fn load_gemma4_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     }
     report.finish(&model, &config)?;
     Ok(model)
+}
+
+impl Model {
+    pub fn forward_with_state(
+        &mut self,
+        input: ModelInput<'_, ConcatKeyValueCache>,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        let text_output = self.model.language_model.forward_with_state(input)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&text_output.hidden)?,
+            None => self
+                .model
+                .language_model
+                .embed_tokens
+                .as_linear(&text_output.hidden)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            logits = tanh(&(logits.divide(Array::from_f32(softcap))?))?
+                .multiply(Array::from_f32(softcap))?;
+        }
+        Ok(Gemma4StepOutput {
+            logits,
+            hidden: text_output.pre_norm_hidden,
+            shared_kv_states: text_output.shared_kv_states,
+        })
+    }
+
+    pub fn rollback_speculative_cache(
+        &mut self,
+        cache: &mut [Option<ConcatKeyValueCache>],
+        accepted: usize,
+        block_size: usize,
+    ) -> Result<(), Exception> {
+        let rejected = block_size.saturating_sub(accepted + 1) as i32;
+        if rejected == 0 {
+            return Ok(());
+        }
+        for cache in cache.iter_mut().flatten() {
+            let new_len = cache.offset().saturating_sub(rejected);
+            cache.truncate(new_len)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct Gemma4StepOutput {
+    pub logits: Array,
+    pub hidden: Array,
+    pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
 pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {

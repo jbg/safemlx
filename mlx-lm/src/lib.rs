@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod error;
+pub mod gemma4_mtp;
 // pub mod generate;
 pub mod models;
 pub mod sampler;

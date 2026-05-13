@@ -11,6 +11,7 @@ use crate::error::Error;
 pub struct StrictLoadConfig {
     allowed_unused_prefixes: Vec<String>,
     allowed_missing_suffixes: Vec<String>,
+    allowed_missing_contains: Vec<String>,
     key_prefixes_to_strip: Vec<String>,
     key_prefix_rewrites: Vec<(String, String)>,
 }
@@ -20,6 +21,7 @@ impl Default for StrictLoadConfig {
         Self {
             allowed_unused_prefixes: Vec::new(),
             allowed_missing_suffixes: Vec::new(),
+            allowed_missing_contains: Vec::new(),
             key_prefixes_to_strip: Vec::new(),
             key_prefix_rewrites: Vec::new(),
         }
@@ -34,6 +36,11 @@ impl StrictLoadConfig {
 
     pub fn allow_missing_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.allowed_missing_suffixes.push(suffix.into());
+        self
+    }
+
+    pub fn allow_missing_contains(mut self, needle: impl Into<String>) -> Self {
+        self.allowed_missing_contains.push(needle.into());
         self
     }
 
@@ -57,6 +64,10 @@ impl StrictLoadConfig {
         self.allowed_missing_suffixes
             .iter()
             .any(|suffix| key.ends_with(suffix))
+            || self
+                .allowed_missing_contains
+                .iter()
+                .any(|needle| key.contains(needle))
     }
 
     fn candidates(&self, key: &str) -> Vec<String> {

@@ -14,6 +14,7 @@ use tokenizers::Tokenizer;
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
 pub mod gemma4;
+pub mod gemma4_assistant;
 pub mod llama;
 pub mod qwen3;
 
@@ -264,6 +265,10 @@ impl LoadedModel {
         prompt_tokens: &'a Array,
     ) -> Generate<'a> {
         self.model.generate(cache, temp, prompt_tokens)
+    }
+
+    pub fn model_mut(&mut self) -> &mut Model {
+        &mut self.model
     }
 }
 

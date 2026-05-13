@@ -1,4 +1,8 @@
-use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
+use mlx_rs::{
+    error::Exception,
+    ops::{concatenate_axis, indexing::IndexOp},
+    Array,
+};
 
 // TODO: somehow move quantized methods to a separate trait?
 pub trait KeyValueCache {
@@ -67,6 +71,17 @@ pub struct ConcatKeyValueCache {
 impl ConcatKeyValueCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn truncate(&mut self, len: i32) -> Result<(), Exception> {
+        if let Some(keys) = self.keys.take() {
+            self.keys = Some(keys.index((.., .., ..len, ..)));
+        }
+        if let Some(values) = self.values.take() {
+            self.values = Some(values.index((.., .., ..len, ..)));
+        }
+        self.offset = len;
+        Ok(())
     }
 }
 
