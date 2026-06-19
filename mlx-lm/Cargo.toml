@@ -1,20 +1,21 @@
 [package]
-name = "mlx-lm"
-version = "0.0.1"
+name = "goose-mlx-lm"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
-documentation.workspace = true
-description = "Rust implementation of mlx-lm"
+rust-version.workspace = true
+description = "Goose-maintained Rust MLX language model runtime"
+readme = "README.md"
 
 [dependencies]
 # Local dependencies
 mlx-rs.workspace = true
 mlx-macros.workspace = true
-mlx-lm-utils.workspace = true
+goose-mlx-lm-utils.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }

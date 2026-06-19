@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use mlx_lm_utils::tokenizer::Tokenizer;
+use goose_mlx_lm_utils::tokenizer::Tokenizer;
 use mlx_rs::{error::Exception, module::Module, Array};
 
 use crate::{

@@ -43,7 +43,7 @@ pub enum Error {
     LoadWeights(#[from] mlx_rs::error::IoError),
 
     #[error(transparent)]
-    Template(#[from] mlx_lm_utils::error::Error),
+    Template(#[from] goose_mlx_lm_utils::error::Error),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),

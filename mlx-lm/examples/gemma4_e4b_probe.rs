@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use mlx_lm::{cache::ConcatKeyValueCache, error::Error, models::LoadedModel};
+use goose_mlx_lm::{cache::ConcatKeyValueCache, error::Error, models::LoadedModel};
 use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use serde_json::Value;
 
@@ -10,7 +10,9 @@ fn main() -> anyhow::Result<()> {
         .first()
         .map(PathBuf::from)
         .or_else(default_e4b_snapshot)
-        .expect("usage: cargo run -p mlx-lm --example gemma4_e4b_probe -- <model-dir> [prompt]");
+        .expect(
+            "usage: cargo run -p goose-mlx-lm --example gemma4_e4b_probe -- <model-dir> [prompt]",
+        );
     let prompt = args
         .get(1)
         .cloned()

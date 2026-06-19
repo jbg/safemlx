@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mlx_lm_utils::tokenizer::{
+use goose_mlx_lm_utils::tokenizer::{
     load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
 };
 use mlx_rs::{

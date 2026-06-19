@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Instant};
 
-use mlx_lm::{
+use goose_mlx_lm::{
     gemma4_mtp::generate_gemma4_mtp,
     models::{
         gemma4::load_gemma4_model, gemma4_assistant::load_gemma4_assistant_model, LoadedModel,
