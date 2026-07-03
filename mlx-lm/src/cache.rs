@@ -83,6 +83,10 @@ impl ConcatKeyValueCache {
         self.offset = len;
         Ok(())
     }
+
+    pub fn arrays(&self) -> impl Iterator<Item = &Array> {
+        self.keys.iter().chain(self.values.iter())
+    }
 }
 
 impl KeyValueCache for ConcatKeyValueCache {

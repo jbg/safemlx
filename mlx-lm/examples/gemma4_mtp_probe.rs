@@ -87,12 +87,12 @@ fn run_greedy(
     let mut loaded = LoadedModel::load(target_dir)?;
     let prompt_tokens = loaded.encode_to_array(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
-    let mut cache = Vec::new();
+    let mut cache = loaded.new_cache();
     let mut ids = Vec::new();
     let start = Instant::now();
     {
         let generator = loaded
-            .generate(&mut cache, 0.0, &prompt_tokens)
+            .generate_with_cache(&mut cache, 0.0, &prompt_tokens)
             .take(max_tokens);
         for token in generator {
             let token = token?;

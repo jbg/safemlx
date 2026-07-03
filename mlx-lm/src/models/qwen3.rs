@@ -11,7 +11,10 @@ use mlx_rs::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
     nn,
-    ops::indexing::{IndexOp, NewAxis},
+    ops::{
+        indexing::{IndexOp, NewAxis},
+        sigmoid,
+    },
     quantization::MaybeQuantized,
     Array,
 };
@@ -44,6 +47,10 @@ pub struct ModelArgs {
     pub head_dim: i32,
     pub tie_word_embeddings: bool,
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+}
+
+fn silu(x: Array) -> Result<Array, Exception> {
+    x.multiply(sigmoid(&x)?)
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -243,7 +250,7 @@ impl Module<&Array> for Mlp {
 
     fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
         let down_proj_input =
-            nn::silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
+            silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
         self.down_proj.forward(&down_proj_input)
     }
 

@@ -17,6 +17,7 @@ pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod llama;
 pub mod qwen3;
+pub mod qwen3_5_moe;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelMetadata {
@@ -55,6 +56,7 @@ pub enum ModelKind {
     Gemma4,
     Llama,
     Qwen3,
+    Qwen35Moe,
 }
 
 impl ModelKind {
@@ -63,6 +65,7 @@ impl ModelKind {
             "gemma4" | "gemma4_text" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "qwen3" => Ok(Self::Qwen3),
+            "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
         }
     }
@@ -72,6 +75,7 @@ pub enum Model {
     Gemma4(gemma4::Model),
     Llama(llama::Model),
     Qwen3(qwen3::Model),
+    Qwen35Moe(qwen3_5_moe::Model),
 }
 
 impl Model {
@@ -80,6 +84,7 @@ impl Model {
             Self::Gemma4(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
+            Self::Qwen35Moe(model) => model.model_type(),
         }
     }
 
@@ -99,6 +104,39 @@ impl Model {
             Self::Qwen3(model) => {
                 Generate::Qwen3(qwen3::Generate::new(model, cache, temp, prompt_tokens))
             }
+            Self::Qwen35Moe(_) => {
+                panic!("qwen3_5_moe requires ModelCache; use generate_with_cache")
+            }
+        }
+    }
+
+    pub fn new_cache(&self) -> ModelCache {
+        match self {
+            Self::Gemma4(_) | Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
+            Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
+        }
+    }
+
+    pub fn generate_with_cache<'a>(
+        &'a mut self,
+        cache: &'a mut ModelCache,
+        temp: f32,
+        prompt_tokens: &'a Array,
+    ) -> ModelGenerate<'a> {
+        match (self, cache) {
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Gemma4(gemma4::Generate::new(model, cache, temp, prompt_tokens))
+            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Llama(llama::Generate::new(model, cache, temp, prompt_tokens))
+            }
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Qwen3(qwen3::Generate::new(model, cache, temp, prompt_tokens))
+            }
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => ModelGenerate::Qwen35Moe(
+                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens),
+            ),
+            _ => panic!("model cache type does not match model kind"),
         }
     }
 }
@@ -121,6 +159,31 @@ impl Iterator for Generate<'_> {
     }
 }
 
+pub enum ModelCache {
+    KeyValue(Vec<Option<ConcatKeyValueCache>>),
+    Qwen35Moe(qwen3_5_moe::Cache),
+}
+
+pub enum ModelGenerate<'a> {
+    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
+    Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+    Qwen35Moe(qwen3_5_moe::Generate<'a>),
+}
+
+impl Iterator for ModelGenerate<'_> {
+    type Item = Result<Array, Exception>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Gemma4(generate) => generate.next(),
+            Self::Llama(generate) => generate.next(),
+            Self::Qwen3(generate) => generate.next(),
+            Self::Qwen35Moe(generate) => generate.next(),
+        }
+    }
+}
+
 pub struct LoadedModel {
     model: Model,
     tokenizer: ChatTokenizer,
@@ -133,15 +196,7 @@ impl LoadedModel {
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
-        let model_type = if ModelKind::from_model_type(&metadata.model_type).is_ok() {
-            metadata.model_type.clone()
-        } else {
-            metadata
-                .text_config
-                .as_ref()
-                .map(|text_config| text_config.model_type.clone())
-                .unwrap_or_else(|| metadata.model_type.clone())
-        };
+        let model_type = effective_model_type(&metadata);
         let kind = ModelKind::from_model_type(&model_type)?;
         let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
@@ -149,6 +204,9 @@ impl LoadedModel {
             ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(model_dir)?),
             ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir)?),
             ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir)?),
+            ModelKind::Qwen35Moe => {
+                Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(model_dir)?)
+            }
         };
         let eos_token_ids = metadata
             .eos_token_id
@@ -267,6 +325,19 @@ impl LoadedModel {
         self.model.generate(cache, temp, prompt_tokens)
     }
 
+    pub fn new_cache(&self) -> ModelCache {
+        self.model.new_cache()
+    }
+
+    pub fn generate_with_cache<'a>(
+        &'a mut self,
+        cache: &'a mut ModelCache,
+        temp: f32,
+        prompt_tokens: &'a Array,
+    ) -> ModelGenerate<'a> {
+        self.model.generate_with_cache(cache, temp, prompt_tokens)
+    }
+
     pub fn model_mut(&mut self) -> &mut Model {
         &mut self.model
     }
@@ -274,19 +345,25 @@ impl LoadedModel {
 
 pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+    let metadata = read_model_metadata(model_dir)?;
+    match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(model_dir)?)),
         ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir)?)),
         ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir)?)),
+        ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
+            model_dir,
+        )?)),
     }
 }
 
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let model_dir = model_dir.as_ref();
-    match ModelKind::from_model_type(&read_model_metadata(model_dir)?.model_type)? {
+    let metadata = read_model_metadata(model_dir)?;
+    match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
+        ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
     }
 }
 
@@ -294,6 +371,18 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
+}
+
+fn effective_model_type(metadata: &ModelMetadata) -> String {
+    if ModelKind::from_model_type(&metadata.model_type).is_ok() {
+        metadata.model_type.clone()
+    } else {
+        metadata
+            .text_config
+            .as_ref()
+            .map(|text_config| text_config.model_type.clone())
+            .unwrap_or_else(|| metadata.model_type.clone())
+    }
 }
 
 fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
@@ -321,3 +410,50 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 {% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'text' %}{{ content['text'] }}{% elif content['type'] == 'image' %}<|image>{% elif content['type'] == 'audio' %}<|audio>{% endif %}{% endfor %}{% endif %}<turn|>
 {% endfor %}{% if add_generation_prompt %}<|turn>model
 {% endif %}"#;
+
+#[cfg(test)]
+mod tests {
+    use super::load_tokenizer;
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
+
+    static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_model_dir(config: &str) -> std::path::PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "model_metadata_test_{}_{}_{}",
+            std::process::id(),
+            id,
+            counter
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.json"), config).unwrap();
+        Tokenizer::new(WordLevel::default())
+            .save(dir.join("tokenizer.json"), false)
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_tokenizer_accepts_top_level_qwen3_5_moe_metadata() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_5_moe",
+              "text_config": {
+                "model_type": "qwen3_5_moe_text"
+              }
+            }"#,
+        );
+        let tokenizer = load_tokenizer(&dir).unwrap();
+        assert_eq!(tokenizer.get_vocab_size(false), 0);
+    }
+}

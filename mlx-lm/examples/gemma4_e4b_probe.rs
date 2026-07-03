@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use goose_mlx_lm::{cache::ConcatKeyValueCache, error::Error, models::LoadedModel};
+use goose_mlx_lm::{
+    error::Error,
+    models::{LoadedModel, ModelCache},
+};
 use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use serde_json::Value;
 
@@ -52,13 +55,13 @@ fn main() -> anyhow::Result<()> {
     let ids = model.encode(&rendered, false)?;
     let tokens = mlx_rs::Array::from(ids.as_slice()).index(NewAxis);
     let eos = model.eos_token_ids().to_vec();
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+    let mut cache = model.new_cache();
     print_first_token_distribution(&mut model, &mut cache, &tokens)?;
-    cache.clear();
+    cache = model.new_cache();
     let mut output_ids = Vec::new();
 
     {
-        let mut generator = model.generate(&mut cache, temp, &tokens);
+        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens);
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
@@ -90,10 +93,10 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 
 fn print_first_token_distribution(
     model: &mut LoadedModel,
-    cache: &mut Vec<Option<ConcatKeyValueCache>>,
+    cache: &mut ModelCache,
     tokens: &mlx_rs::Array,
 ) -> anyhow::Result<()> {
-    let mut generator = model.generate(cache, 0.0, tokens);
+    let mut generator = model.generate_with_cache(cache, 0.0, tokens);
     let Some(first) = generator.next() else {
         return Ok(());
     };
