@@ -184,6 +184,207 @@ impl Drop for MetalKernel {
     }
 }
 
+/// Result returned by stateful recurrent kernels.
+///
+/// The first value is the emitted sequence, including the single-token
+/// sequence produced by decode kernels. The second value is the state that
+/// should be carried into the next recurrent call.
+#[derive(Debug)]
+pub struct StatefulKernelOutput {
+    /// Emitted output sequence.
+    pub output_sequence: Array,
+
+    /// Updated recurrent state.
+    pub new_state: Array,
+}
+
+impl StatefulKernelOutput {
+    /// Create a stateful kernel output from its two arrays.
+    pub fn new(output_sequence: Array, new_state: Array) -> Self {
+        Self {
+            output_sequence,
+            new_state,
+        }
+    }
+
+    /// Split into `(output_sequence, new_state)`.
+    pub fn into_tuple(self) -> (Array, Array) {
+        (self.output_sequence, self.new_state)
+    }
+}
+
+/// A custom Metal kernel that returns `(output_sequence, new_state)`.
+///
+/// This is a light wrapper around [`MetalKernel`] for recurrent/stateful
+/// kernels where callers want the API to reflect state threading rather than
+/// manually indexing a `Vec<Array>`.
+pub struct StatefulMetalKernel {
+    kernel: MetalKernel,
+}
+
+impl fmt::Debug for StatefulMetalKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StatefulMetalKernel")
+            .field("kernel", &self.kernel)
+            .finish()
+    }
+}
+
+impl StatefulMetalKernel {
+    /// Create a stateful custom Metal kernel.
+    ///
+    /// `output_names` should name exactly two outputs in this order:
+    /// output sequence, then new recurrent state.
+    pub fn new<Name, Inputs, InputName, Source, Header>(
+        name: Name,
+        input_names: Inputs,
+        output_names: [&str; 2],
+        source: Source,
+        header: Header,
+        ensure_row_contiguous: bool,
+        atomic_outputs: bool,
+    ) -> Result<Self>
+    where
+        Name: Into<String>,
+        Inputs: IntoIterator<Item = InputName>,
+        InputName: Into<String>,
+        Source: Into<String>,
+        Header: Into<String>,
+    {
+        Ok(Self {
+            kernel: MetalKernel::new(
+                name,
+                input_names,
+                output_names,
+                source,
+                header,
+                ensure_row_contiguous,
+                atomic_outputs,
+            )?,
+        })
+    }
+
+    /// Apply the kernel on the default stream.
+    pub fn apply<I, A>(&self, inputs: I, config: &MetalKernelConfig) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        self.apply_device(inputs, config, StreamOrDevice::default())
+    }
+
+    /// Apply the kernel on `stream`.
+    pub fn apply_device<I, A>(
+        &self,
+        inputs: I,
+        config: &MetalKernelConfig,
+        stream: impl AsRef<Stream>,
+    ) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        if config.output_count() != 2 {
+            return Err(Exception::custom(format!(
+                "stateful kernel config declares {} outputs, expected 2",
+                config.output_count()
+            )));
+        }
+
+        let mut outputs = self.kernel.apply_device(inputs, config, stream)?;
+        match outputs.len() {
+            2 => {
+                let new_state = outputs.remove(1);
+                let output_sequence = outputs.remove(0);
+                Ok(StatefulKernelOutput::new(output_sequence, new_state))
+            }
+            n => Err(Exception::custom(format!(
+                "stateful kernel returned {n} outputs, expected 2"
+            ))),
+        }
+    }
+}
+
+/// Paired recurrent scan kernels for prefill and decode.
+///
+/// The decode kernel handles a single recurrent step and the prefill kernel
+/// scans a full sequence while carrying state internally inside the custom
+/// kernel. Both kernels return [`StatefulKernelOutput`].
+pub struct RecurrentScanKernel {
+    decode: StatefulMetalKernel,
+    prefill: StatefulMetalKernel,
+}
+
+impl fmt::Debug for RecurrentScanKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecurrentScanKernel")
+            .field("decode", &self.decode)
+            .field("prefill", &self.prefill)
+            .finish()
+    }
+}
+
+impl RecurrentScanKernel {
+    /// Create a recurrent scan kernel pair from decode and prefill kernels.
+    pub fn new(decode: StatefulMetalKernel, prefill: StatefulMetalKernel) -> Self {
+        Self { decode, prefill }
+    }
+
+    /// Apply the single-token decode kernel on the default stream.
+    pub fn decode<I, A>(
+        &self,
+        inputs: I,
+        config: &MetalKernelConfig,
+    ) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        self.decode_device(inputs, config, StreamOrDevice::default())
+    }
+
+    /// Apply the single-token decode kernel on `stream`.
+    pub fn decode_device<I, A>(
+        &self,
+        inputs: I,
+        config: &MetalKernelConfig,
+        stream: impl AsRef<Stream>,
+    ) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        self.decode.apply_device(inputs, config, stream)
+    }
+
+    /// Apply the full-sequence prefill kernel on the default stream.
+    pub fn prefill<I, A>(
+        &self,
+        inputs: I,
+        config: &MetalKernelConfig,
+    ) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        self.prefill_device(inputs, config, StreamOrDevice::default())
+    }
+
+    /// Apply the full-sequence prefill kernel on `stream`.
+    pub fn prefill_device<I, A>(
+        &self,
+        inputs: I,
+        config: &MetalKernelConfig,
+        stream: impl AsRef<Stream>,
+    ) -> Result<StatefulKernelOutput>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        self.prefill.apply_device(inputs, config, stream)
+    }
+}
+
 /// Output declaration for a custom Metal kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalKernelOutput {
@@ -829,6 +1030,76 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(outputs[1].as_slice::<f32>(), &[2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn test_stateful_and_recurrent_metal_kernels() {
+        let state = Array::from_slice(&[10.0f32, 20.0], &[2]);
+        let token = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        let sequence = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+
+        let decode = StatefulMetalKernel::new(
+            "stateful_decode_test",
+            ["state", "token"],
+            ["out", "state_out"],
+            concat!(
+                "uint elem = thread_position_in_grid.x;",
+                "float updated = float(state[elem]) + float(token[elem]);",
+                "out[elem] = updated;",
+                "state_out[elem] = updated;"
+            ),
+            "",
+            true,
+            false,
+        )
+        .unwrap();
+        let prefill = StatefulMetalKernel::new(
+            "stateful_prefill_test",
+            ["state", "sequence"],
+            ["out", "state_out"],
+            concat!(
+                "uint elem = thread_position_in_grid.x;",
+                "float acc = float(state[elem]);",
+                "for (uint t = 0; t < L; ++t) {",
+                "  acc += float(sequence[t * D + elem]);",
+                "  out[t * D + elem] = acc;",
+                "}",
+                "state_out[elem] = acc;"
+            ),
+            "",
+            true,
+            false,
+        )
+        .unwrap();
+        let recurrent = RecurrentScanKernel::new(decode, prefill);
+
+        let decode_config = MetalKernelConfig::new()
+            .with_grid([2, 1, 1])
+            .with_thread_group([32, 1, 1])
+            .with_output_arg([2], Dtype::Float32)
+            .with_output_arg([2], Dtype::Float32);
+        let decode = recurrent
+            .decode_device([&state, &token], &decode_config, StreamOrDevice::gpu())
+            .unwrap();
+        assert_eq!(decode.output_sequence.as_slice::<f32>(), &[11.0, 22.0]);
+        assert_eq!(decode.new_state.as_slice::<f32>(), &[11.0, 22.0]);
+
+        let prefill_config = MetalKernelConfig::new()
+            .with_template_arg_int("L", 3)
+            .with_template_arg_int("D", 2)
+            .with_grid([2, 1, 1])
+            .with_thread_group([32, 1, 1])
+            .with_output_arg([3, 2], Dtype::Float32)
+            .with_output_arg([2], Dtype::Float32);
+        let prefill = recurrent
+            .prefill_device([&state, &sequence], &prefill_config, StreamOrDevice::gpu())
+            .unwrap();
+        assert_eq!(
+            prefill.output_sequence.as_slice::<f32>(),
+            &[11.0, 22.0, 14.0, 26.0, 19.0, 32.0]
+        );
+        assert_eq!(prefill.new_state.as_slice::<f32>(), &[19.0, 32.0]);
     }
 
     #[test]

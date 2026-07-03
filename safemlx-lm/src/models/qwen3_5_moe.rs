@@ -10,7 +10,7 @@ use safemlx::{
     builder::Builder,
     categorical,
     error::Exception,
-    fast::{MetalKernel, MetalKernelConfig},
+    fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
@@ -64,7 +64,7 @@ fn silu(x: Array) -> Result<Array, Exception> {
 }
 
 thread_local! {
-    static RECURRENT_DECODE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static RECURRENT_DELTA_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
 }
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
@@ -785,15 +785,78 @@ impl LinearAttention {
         x.multiply(safemlx::ops::rsqrt(denom)?)
     }
 
-    fn recurrent_state_read(state: &Array, vector: &Array) -> Result<Array, Exception> {
-        let vector = vector.index((.., .., NewAxis, ..));
-        Ok(matmul(&vector, state)?.index((.., .., 0, ..)))
-    }
-
-    fn recurrent_state_update(key: &Array, delta: &Array) -> Result<Array, Exception> {
-        let key = key.index((.., .., .., NewAxis));
-        let delta = delta.index((.., .., NewAxis, ..));
-        matmul(&key, &delta)
+    fn recurrent_delta_kernels() -> Result<RecurrentScanKernel, Exception> {
+        Ok(RecurrentScanKernel::new(
+            StatefulMetalKernel::new(
+                "qwen35_moe_recurrent_decode",
+                ["state", "query", "key", "value", "g", "beta"],
+                ["out", "state_out"],
+                concat!(
+                    "uint elem = thread_position_in_grid.x;",
+                    "uint vd = elem % VD;",
+                    "uint group = elem / VD;",
+                    "uint state_base = group * KD * VD;",
+                    "uint vec_base = group * KD;",
+                    "uint value_base = group * VD;",
+                    "float gate = metal::exp(g[group]);",
+                    "float kv_mem = 0.0f;",
+                    "for (uint kd = 0; kd < KD; ++kd) {",
+                    "  uint state_idx = state_base + kd * VD + vd;",
+                    "  kv_mem += float(state[state_idx]) * gate * float(key[vec_base + kd]);",
+                    "}",
+                    "float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[group]);",
+                    "float acc = 0.0f;",
+                    "for (uint kd = 0; kd < KD; ++kd) {",
+                    "  uint state_idx = state_base + kd * VD + vd;",
+                    "  float updated = float(state[state_idx]) * gate + float(key[vec_base + kd]) * delta;",
+                    "  state_out[state_idx] = updated;",
+                    "  acc += updated * float(query[vec_base + kd]);",
+                    "}",
+                    "out[value_base + vd] = acc;"
+                ),
+                "",
+                true,
+                false,
+            )?,
+            StatefulMetalKernel::new(
+                "qwen35_moe_recurrent_prefill",
+                ["state", "query", "key", "value", "g", "beta"],
+                ["out", "state_out"],
+                concat!(
+                    "uint elem = thread_position_in_grid.x;",
+                    "uint vd = elem % VD;",
+                    "uint group = elem / VD;",
+                    "uint h = group % H;",
+                    "uint b = group / H;",
+                    "uint state_base = group * KD * VD;",
+                    "for (uint t = 0; t < L; ++t) {",
+                    "  uint gh_idx = (b * L + t) * H + h;",
+                    "  uint vec_base = gh_idx * KD;",
+                    "  uint value_base = gh_idx * VD;",
+                    "  float gate = metal::exp(g[gh_idx]);",
+                    "  float kv_mem = 0.0f;",
+                    "  for (uint kd = 0; kd < KD; ++kd) {",
+                    "    uint state_idx = state_base + kd * VD + vd;",
+                    "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
+                    "    kv_mem += prev * gate * float(key[vec_base + kd]);",
+                    "  }",
+                    "  float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[gh_idx]);",
+                    "  float acc = 0.0f;",
+                    "  for (uint kd = 0; kd < KD; ++kd) {",
+                    "    uint state_idx = state_base + kd * VD + vd;",
+                    "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
+                    "    float updated = prev * gate + float(key[vec_base + kd]) * delta;",
+                    "    state_out[state_idx] = updated;",
+                    "    acc += updated * float(query[vec_base + kd]);",
+                    "  }",
+                    "  out[value_base + vd] = acc;",
+                    "}"
+                ),
+                "",
+                true,
+                false,
+            )?,
+        ))
     }
 
     fn recurrent_delta_decode_kernel(
@@ -816,56 +879,68 @@ impl LinearAttention {
         let g = g.as_dtype(Dtype::Float32)?;
         let beta = beta.as_dtype(Dtype::Float32)?;
 
-        let outputs = RECURRENT_DECODE_KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
+        let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(MetalKernel::new(
-                    "qwen35_moe_recurrent_decode",
-                    ["state", "query", "key", "value", "g", "beta"],
-                    ["state_out", "out"],
-                    concat!(
-                        "uint elem = thread_position_in_grid.x;",
-                        "uint vd = elem % VD;",
-                        "uint group = elem / VD;",
-                        "uint state_base = group * KD * VD;",
-                        "uint vec_base = group * KD;",
-                        "uint value_base = group * VD;",
-                        "float gate = metal::exp(g[group]);",
-                        "float kv_mem = 0.0f;",
-                        "for (uint kd = 0; kd < KD; ++kd) {",
-                        "  uint state_idx = state_base + kd * VD + vd;",
-                        "  kv_mem += float(state[state_idx]) * gate * float(key[vec_base + kd]);",
-                        "}",
-                        "float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[group]);",
-                        "float acc = 0.0f;",
-                        "for (uint kd = 0; kd < KD; ++kd) {",
-                        "  uint state_idx = state_base + kd * VD + vd;",
-                        "  float updated = float(state[state_idx]) * gate + float(key[vec_base + kd]) * delta;",
-                        "  state_out[state_idx] = updated;",
-                        "  acc += updated * float(query[vec_base + kd]);",
-                        "}",
-                        "out[value_base + vd] = acc;"
-                    ),
-                    "",
-                    true,
-                    false,
-                )?);
+                *cell.borrow_mut() = Some(Self::recurrent_delta_kernels()?);
             }
             let config = MetalKernelConfig::new()
                 .with_template_arg_int("KD", kd)
                 .with_template_arg_int("VD", vd)
                 .with_grid([b * h * vd, 1, 1])
                 .with_thread_group([256, 1, 1])
-                .with_output_arg([b, h, kd, vd], Dtype::Float32)
-                .with_output_arg([b, h, vd], Dtype::Float32);
+                .with_output_arg([b, 1, h, vd], Dtype::Float32)
+                .with_output_arg([b, h, kd, vd], Dtype::Float32);
             cell.borrow()
                 .as_ref()
-                .expect("recurrent decode kernel initialized")
-                .apply([&state, &query, &key, &value, &g, &beta], &config)
+                .expect("recurrent delta kernels initialized")
+                .decode([&state, &query, &key, &value, &g, &beta], &config)
         })?;
 
-        let mut outputs = outputs;
-        let out = outputs.remove(1);
-        let state = outputs.remove(0);
+        let (out, state) = output.into_tuple();
+        Ok((state, out))
+    }
+
+    fn recurrent_delta_prefill_kernel(
+        state: &Array,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        g: &Array,
+        beta: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        let shape = query.shape();
+        let b = shape[0];
+        let l = shape[1];
+        let h = shape[2];
+        let kd = shape[3];
+        let vd = value.shape()[3];
+        let state = state.as_dtype(Dtype::Float32)?;
+        let query = query.as_dtype(Dtype::Float32)?;
+        let key = key.as_dtype(Dtype::Float32)?;
+        let value = value.as_dtype(Dtype::Float32)?;
+        let g = g.as_dtype(Dtype::Float32)?;
+        let beta = beta.as_dtype(Dtype::Float32)?;
+
+        let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(Self::recurrent_delta_kernels()?);
+            }
+            let config = MetalKernelConfig::new()
+                .with_template_arg_int("L", l)
+                .with_template_arg_int("H", h)
+                .with_template_arg_int("KD", kd)
+                .with_template_arg_int("VD", vd)
+                .with_grid([b * h * vd, 1, 1])
+                .with_thread_group([256, 1, 1])
+                .with_output_arg([b, l, h, vd], Dtype::Float32)
+                .with_output_arg([b, h, kd, vd], Dtype::Float32);
+            cell.borrow()
+                .as_ref()
+                .expect("recurrent delta kernels initialized")
+                .prefill([&state, &query, &key, &value, &g, &beta], &config)
+        })?;
+
+        let (out, state) = output.into_tuple();
         Ok((state, out))
     }
 
@@ -887,7 +962,7 @@ impl LinearAttention {
         let VD = value.shape()[3];
         let scale = (KD as f32).sqrt().recip();
         let query = query.multiply(Array::from_f32(scale))?;
-        let mut state = cache
+        let state = cache
             .as_ref()
             .and_then(|cache| cache.recurrent_state.clone())
             .unwrap_or(zeros::<f32>(&[B, H, KD, VD])?);
@@ -903,29 +978,15 @@ impl LinearAttention {
             if let Some(cache) = cache {
                 cache.recurrent_state = Some(new_state);
             }
-            return Ok(out_t.index((.., NewAxis, .., ..)));
+            return Ok(out_t);
         }
 
-        let mut outs = Vec::with_capacity(L as usize);
-
-        for t in 0..L {
-            let q_t = query.index((.., t, .., ..));
-            let k_t = key.index((.., t, .., ..));
-            let v_t = value.index((.., t, .., ..));
-            let g_t = exp(g.index((.., t, ..)).index((.., .., NewAxis, NewAxis)))?;
-            let beta_t = beta.index((.., t, ..)).index((.., .., NewAxis));
-            state = state.multiply(g_t)?;
-            let kv_mem = Self::recurrent_state_read(&state, &k_t)?;
-            let delta = v_t.subtract(kv_mem)?.multiply(beta_t)?;
-            state = state.add(Self::recurrent_state_update(&k_t, &delta)?)?;
-            let out_t = Self::recurrent_state_read(&state, &q_t)?;
-            outs.push(out_t.index((.., NewAxis, .., ..)));
-        }
-
+        let (new_state, out) =
+            Self::recurrent_delta_prefill_kernel(&state, &query, &key, &value, &g, &beta)?;
         if let Some(cache) = cache {
-            cache.recurrent_state = Some(state);
+            cache.recurrent_state = Some(new_state);
         }
-        concatenate_axis(&outs, 1)
+        Ok(out)
     }
 }
 
