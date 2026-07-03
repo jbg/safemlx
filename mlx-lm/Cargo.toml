@@ -1,5 +1,5 @@
 [package]
-name = "goose-mlx-lm"
+name = "safemlx-lm"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
@@ -8,14 +8,14 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Goose-maintained Rust MLX language model runtime"
+description = "Rust MLX language model runtime used by Goose"
 readme = "README.md"
 
 [dependencies]
 # Local dependencies
 mlx-rs.workspace = true
 mlx-macros.workspace = true
-goose-mlx-lm-utils.workspace = true
+safemlx-lm-utils.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }

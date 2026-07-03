@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Instant};
 
-use goose_mlx_lm::models::{qwen3_5_moe, LoadedModel};
+use safemlx_lm::models::{qwen3_5_moe, LoadedModel};
 use mlx_rs::{ops::indexing::IndexOp, transforms::eval, Array};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;

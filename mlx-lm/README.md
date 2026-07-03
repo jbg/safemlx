@@ -1,6 +1,6 @@
-# goose-mlx-lm
+# safemlx-lm
 
-`goose-mlx-lm` is a Goose-maintained Rust runtime for MLX language models.
+`safemlx-lm` is a Rust runtime for MLX language models used by Goose.
 
 The crate is derived from the `mlx-lm` crate in
 [`oxideai/mlx-rs`](https://github.com/oxideai/mlx-rs), introduced upstream in
@@ -8,7 +8,7 @@ The crate is derived from the `mlx-lm` crate in
 commit `7c667cb7`.
 
 The original implementation and authorship belong to the `oxideai/mlx-rs`
-contributors. Goose contributors maintain this fork and its additional changes.
+contributors. This fork carries additional changes used by Goose.
 
 This fork adds model/runtime support needed by Goose, including Gemma 4 loading,
 Gemma 4 assistant drafting, expanded model dispatch, and related generation
@@ -18,7 +18,7 @@ utilities.
 
 ```toml
 [dependencies]
-goose-mlx-lm = "0.1"
+safemlx-lm = "0.1"
 ```
 
 ## License

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use goose_mlx_lm::{
+use safemlx_lm::{
     error::Error,
     models::{LoadedModel, ModelCache},
 };
@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(default_e4b_snapshot)
         .expect(
-            "usage: cargo run -p goose-mlx-lm --example gemma4_e4b_probe -- <model-dir> [prompt]",
+            "usage: cargo run -p safemlx-lm --example gemma4_e4b_probe -- <model-dir> [prompt]",
         );
     let prompt = args
         .get(1)

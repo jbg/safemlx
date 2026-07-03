@@ -1,7 +1,7 @@
-# goose-mlx-lm-utils
+# safemlx-lm-utils
 
-`goose-mlx-lm-utils` contains Goose-maintained utility code for MLX language
-model runtimes.
+`safemlx-lm-utils` contains utility code for MLX language model runtimes used by
+Goose.
 
 The crate is derived from the `mlx-lm-utils` crate in
 [`oxideai/mlx-rs`](https://github.com/oxideai/mlx-rs), introduced upstream in
@@ -9,7 +9,7 @@ The crate is derived from the `mlx-lm-utils` crate in
 commit `7c667cb7`.
 
 The original implementation and authorship belong to the `oxideai/mlx-rs`
-contributors. Goose contributors maintain this fork and its additional changes.
+contributors. This fork carries additional changes used by Goose.
 
 This fork adds chat-template support needed by Goose, including structured JSON
 messages, system roles, and tool metadata passed into Jinja templates.
@@ -18,7 +18,7 @@ messages, system roles, and tool metadata passed into Jinja templates.
 
 ```toml
 [dependencies]
-goose-mlx-lm-utils = "0.1"
+safemlx-lm-utils = "0.1"
 ```
 
 ## License
