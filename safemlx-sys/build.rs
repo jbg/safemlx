@@ -113,6 +113,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .rust_target("1.73.0".parse().expect("rust-version"))
         .header("src/mlx-c/mlx/c/mlx.h")
+        .header("src/mlx-c/mlx/c/fast.h")
         .header("src/mlx-c/mlx/c/linalg.h")
         .header("src/mlx-c/mlx/c/error.h")
         .header("src/mlx-c/mlx/c/transforms_impl.h")
