@@ -69,6 +69,9 @@ thread_local! {
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
+const RECURRENT_PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
+const RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
+const RECURRENT_PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[derive(Debug, Clone, Default)]
 pub struct PerfStats {
@@ -944,6 +947,47 @@ impl LinearAttention {
         Ok((state, out))
     }
 
+    fn recurrent_delta_prefill_scan_chunked(
+        mut state: Array,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        g: &Array,
+        beta: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        let l = query.shape()[1];
+        let chunk_tokens = if l <= RECURRENT_PREFILL_SHORT_SCAN_TOKENS {
+            RECURRENT_PREFILL_SHORT_SCAN_TOKENS
+        } else if l <= 256 {
+            RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS
+        } else {
+            RECURRENT_PREFILL_LONG_SCAN_TOKENS
+        };
+        let mut outs = Vec::with_capacity(((l + chunk_tokens - 1) / chunk_tokens) as usize);
+        let mut start = 0;
+        while start < l {
+            let end = (start + chunk_tokens).min(l);
+            let query_chunk = query.index((.., start..end, .., ..));
+            let key_chunk = key.index((.., start..end, .., ..));
+            let value_chunk = value.index((.., start..end, .., ..));
+            let g_chunk = g.index((.., start..end, ..));
+            let beta_chunk = beta.index((.., start..end, ..));
+            let (new_state, out) = Self::recurrent_delta_prefill_kernel(
+                &state,
+                &query_chunk,
+                &key_chunk,
+                &value_chunk,
+                &g_chunk,
+                &beta_chunk,
+            )?;
+            state = new_state;
+            outs.push(out);
+            start = end;
+        }
+
+        Ok((state, concatenate_axis(&outs, 1)?))
+    }
+
     #[allow(non_snake_case)]
     fn recurrent_delta_rule(
         &self,
@@ -982,7 +1026,7 @@ impl LinearAttention {
         }
 
         let (new_state, out) =
-            Self::recurrent_delta_prefill_kernel(&state, &query, &key, &value, &g, &beta)?;
+            Self::recurrent_delta_prefill_scan_chunked(state, &query, &key, &value, &g, &beta)?;
         if let Some(cache) = cache {
             cache.recurrent_state = Some(new_state);
         }
