@@ -6,9 +6,7 @@ use std::{
 };
 
 use safemlx::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
@@ -27,9 +25,12 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+pub use super::common::sample;
+
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
+    models::common::{self, project_logits_dense, silu, CausalLm, DenseSwiGluMlp},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -57,10 +58,6 @@ impl<'de> Deserialize<'de> for LayerType {
             ))),
         }
     }
-}
-
-fn silu(x: Array) -> Result<Array, Exception> {
-    x.multiply(sigmoid(&x)?)
 }
 
 thread_local! {
@@ -1117,47 +1114,7 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct Mlp {
-    #[param]
-    pub gate_proj: nn::Linear,
-    #[param]
-    pub up_proj: nn::Linear,
-    #[param]
-    pub down_proj: nn::Linear,
-}
-
-impl Mlp {
-    pub fn new(args: &ModelArgs, intermediate_size: i32) -> Result<Self, Exception> {
-        Ok(Self {
-            gate_proj: nn::LinearBuilder::new(args.hidden_size, intermediate_size)
-                .bias(false)
-                .build()?,
-            up_proj: nn::LinearBuilder::new(args.hidden_size, intermediate_size)
-                .bias(false)
-                .build()?,
-            down_proj: nn::LinearBuilder::new(intermediate_size, args.hidden_size)
-                .bias(false)
-                .build()?,
-        })
-    }
-}
-
-impl Module<&Array> for Mlp {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
-        let h = silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
-        self.down_proj.forward(&h)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.gate_proj.training_mode(mode);
-        self.up_proj.training_mode(mode);
-        self.down_proj.training_mode(mode);
-    }
-}
+pub type Mlp = DenseSwiGluMlp;
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Experts {
@@ -1324,7 +1281,11 @@ impl SparseMoeBlock {
         Ok(Self {
             gate: TopKRouter::new(args)?,
             experts: Experts::new(args)?,
-            shared_expert: Mlp::new(args, args.shared_expert_intermediate_size)?,
+            shared_expert: DenseSwiGluMlp::new(
+                args.hidden_size,
+                args.shared_expert_intermediate_size,
+                false,
+            )?,
             shared_expert_gate: nn::LinearBuilder::new(args.hidden_size, 1)
                 .bias(false)
                 .build()?,
@@ -1619,11 +1580,7 @@ impl Model {
     ) -> Result<Self, Exception> {
         let model = Qwen35MoeTextModel::new(&args)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(
-                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
-                    .bias(false)
-                    .build()?,
-            )
+            Some(common::build_lm_head(args.hidden_size, args.vocab_size)?)
         } else {
             None
         };
@@ -1665,10 +1622,8 @@ impl Model {
     }
 
     fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
-        let logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(hidden_states),
-            None => self.model.embed_tokens.as_linear(hidden_states),
-        }?;
+        let logits =
+            project_logits_dense(&mut self.lm_head, &self.model.embed_tokens, hidden_states)?;
         profile_array(PerfComponent::LmHead, &logits)?;
         Ok(logits)
     }
@@ -1788,93 +1743,51 @@ fn qwen3_5_moe_strict_load_config() -> StrictLoadConfig {
         .allow_unused_prefix("mtp.")
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
+impl CausalLm<Cache> for Model {
+    fn prefill_logits(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut Cache,
+    ) -> Result<Array, Exception> {
+        self.forward_logits(
+            ModelInput {
+                inputs: prompt_tokens,
+                mask: None,
+                cache: Some(cache),
+            },
+            true,
+        )
+    }
+
+    fn decode_logits(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut Cache,
+    ) -> Result<Array, Exception> {
+        let logits = self.forward(ModelInput {
+            inputs: input_tokens,
+            mask: None,
+            cache: Some(cache),
+        })?;
+        Ok(logits.index((.., -1, ..)))
+    }
+
+    fn adjust_prefill_logits(
+        &mut self,
+        mut logits: Array,
+        cache: &mut Cache,
+    ) -> Result<Array, Exception> {
+        // Keep the first sampled token dependent on all prefill cache state while
+        // avoiding a prompt-length vocabulary projection.
+        if let Some(dependency) = cache.prefill_state_dependency()? {
+            profile_array(PerfComponent::PrefillStateDependency, &dependency)?;
+            logits = logits.add(dependency)?;
         }
+        Ok(logits)
     }
 }
 
-pub struct Generate<'a> {
-    model: &'a mut Model,
-    cache: &'a mut Cache,
-    temp: f32,
-    state: GenerateState<'a>,
-}
-
-impl<'a> Generate<'a> {
-    pub fn new(
-        model: &'a mut Model,
-        cache: &'a mut Cache,
-        temp: f32,
-        prompt_token: &'a Array,
-    ) -> Self {
-        Self {
-            model,
-            cache,
-            temp,
-            state: GenerateState::Prefill { prompt_token },
-        }
-    }
-}
-
-pub enum GenerateState<'a> {
-    Prefill { prompt_token: &'a Array },
-    Decode { y: Array },
-}
-
-macro_rules! tri {
-    ($expr:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(e) => return Some(Err(e.into())),
-        }
-    };
-}
-
-impl Iterator for Generate<'_> {
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &self.state {
-            GenerateState::Prefill { prompt_token } => {
-                let input = ModelInput {
-                    inputs: prompt_token,
-                    mask: None,
-                    cache: Some(self.cache),
-                };
-                let mut logits = tri!(self.model.forward_logits(input, true));
-                // Keep the first sampled token dependent on all prefill cache state while
-                // avoiding a prompt-length vocabulary projection.
-                if let Some(dependency) = tri!(self.cache.prefill_state_dependency()) {
-                    tri!(profile_array(
-                        PerfComponent::PrefillStateDependency,
-                        &dependency
-                    ));
-                    logits = tri!(logits.add(dependency));
-                }
-                let y = tri!(sample(&logits, self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
-            GenerateState::Decode { y } => {
-                let inputs = y.index((.., NewAxis));
-                let input = ModelInput {
-                    inputs: &inputs,
-                    mask: None,
-                    cache: Some(self.cache),
-                };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
-        }
-    }
-}
+pub type Generate<'a> = common::Generate<'a, Model, Cache>;
 
 #[cfg(test)]
 mod tests {

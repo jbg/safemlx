@@ -4,17 +4,12 @@ use std::{
 };
 
 use safemlx::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, Param},
     nn,
-    ops::{
-        indexing::{IndexOp, NewAxis},
-        mean_axis, rsqrt, tanh,
-    },
+    ops::{indexing::IndexOp, mean_axis, rsqrt, tanh},
     quantization::{MaybeQuantized, Quantizable as _},
     Array,
 };
@@ -22,9 +17,12 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+pub use super::common::sample;
+
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
+    models::common::{self, batch_seq, finish_attention, reshape_attention_projection, CausalLm},
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -388,16 +386,12 @@ where
             ..
         } = input;
 
-        let shape = x.shape();
-        let B = shape[0];
-        let L = shape[1];
+        let (B, L) = batch_seq(x);
 
         let queries = self.q_proj.forward(x)?;
-        let mut queries = self.q_norm.forward(
-            &queries
-                .reshape(&[B, L, self.n_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?,
-        )?;
+        let mut queries =
+            self.q_norm
+                .forward(&reshape_attention_projection(queries, B, L, self.n_heads)?)?;
         let offset = position_offset;
         queries = self
             .rope
@@ -416,11 +410,9 @@ where
             } else {
                 self.v_proj.forward(x)?
             };
-            let mut keys = self.k_norm.forward(
-                &keys
-                    .reshape(&[B, L, self.n_kv_heads, -1])?
-                    .transpose_axes(&[0, 2, 1, 3])?,
-            )?;
+            let mut keys =
+                self.k_norm
+                    .forward(&reshape_attention_projection(keys, B, L, self.n_kv_heads)?)?;
             let mut values =
                 rms_norm_without_scale(&values.reshape(&[B, L, self.n_kv_heads, -1])?, 1e-6)?
                     .transpose_axes(&[0, 2, 1, 3])?;
@@ -443,16 +435,16 @@ where
         } else {
             cache
         };
-        let output = crate::utils::scaled_dot_product_attention(
+        let output = finish_attention(
             queries,
             keys,
             values,
             attention_cache,
             self.scale,
             mask,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+            B,
+            L,
+        )?;
 
         self.o_proj.forward(&output)
     }
@@ -1058,11 +1050,10 @@ impl Model {
     pub fn new(args: ModelArgs) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(MaybeQuantized::Original(
-                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
-                    .bias(false)
-                    .build()?,
-            ))
+            Some(common::build_maybe_quantized_lm_head(
+                args.hidden_size,
+                args.vocab_size,
+            )?)
         } else {
             None
         };
@@ -1230,98 +1221,45 @@ pub struct Gemma4StepOutput {
     pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
-        }
-    }
-}
-
-pub struct Generate<'a, C> {
-    model: &'a mut Model,
-    cache: &'a mut Vec<Option<C>>,
-    temp: f32,
-    state: GenerateState<'a>,
-}
-
-impl<'a, C> Generate<'a, C>
+impl<C> CausalLm<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
 {
-    pub fn new(
-        model: &'a mut Model,
-        cache: &'a mut Vec<Option<C>>,
-        temp: f32,
-        prompt_token: &'a Array,
-    ) -> Self {
-        Self {
-            model,
+    fn prefill_logits(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let prompt_len = prompt_tokens.shape()[1];
+        if prompt_len > 1 {
+            let prefix = prompt_tokens.index((.., ..prompt_len - 1));
+            self.forward(ModelInput {
+                inputs: &prefix,
+                mask: None,
+                cache,
+            })?;
+        }
+        let last = prompt_tokens.index((.., prompt_len - 1..));
+        let logits = self.forward(ModelInput {
+            inputs: &last,
+            mask: None,
             cache,
-            temp,
-            state: GenerateState::Prefill { prompt_token },
-        }
+        })?;
+        Ok(logits.index((.., -1, ..)))
+    }
+
+    fn decode_logits(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let logits = self.forward(ModelInput {
+            inputs: input_tokens,
+            mask: None,
+            cache,
+        })?;
+        Ok(logits.index((.., -1, ..)))
     }
 }
 
-pub enum GenerateState<'a> {
-    Prefill { prompt_token: &'a Array },
-    Decode { y: Array },
-}
-
-macro_rules! tri {
-    ($expr:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(e) => return Some(Err(e.into())),
-        }
-    };
-}
-
-impl<'a, C> Iterator for Generate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &self.state {
-            GenerateState::Prefill { prompt_token } => {
-                let prompt_len = prompt_token.shape()[1];
-                if prompt_len > 1 {
-                    let prefix = prompt_token.index((.., ..prompt_len - 1));
-                    let input = ModelInput {
-                        inputs: &prefix,
-                        mask: None,
-                        cache: self.cache,
-                    };
-                    tri!(self.model.forward(input));
-                }
-                let last = prompt_token.index((.., prompt_len - 1..));
-                let input = ModelInput {
-                    inputs: &last,
-                    mask: None,
-                    cache: self.cache,
-                };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
-            GenerateState::Decode { y } => {
-                let inputs = y.index((.., NewAxis));
-                let input = ModelInput {
-                    inputs: &inputs,
-                    mask: None,
-                    cache: self.cache,
-                };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
-        }
-    }
-}
+pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;

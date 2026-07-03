@@ -13,6 +13,7 @@ use tokenizers::Tokenizer;
 
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
+pub mod common;
 pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod llama;
