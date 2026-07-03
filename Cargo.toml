@@ -1,22 +1,32 @@
 [workspace]
-members = ["mlx-lm", "mlx-lm-utils"]
+members = [
+    "safemlx",
+    "safemlx-sys",
+    "safemlx-macros",
+    "safemlx-internal-macros",
+    "safemlx-tests",
+    "safemlx-lm",
+    "safemlx-lm-utils",
+]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["Goose contributors"]
-repository = "https://github.com/jh-block/mlx-lm"
+repository = "https://github.com/jbg/safemlx"
 keywords = ["mlx", "deep-learning", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
 
 [workspace.dependencies]
-mlx-rs = { version = "0.25.3" }
-mlx-macros = "0.25.3"
-safemlx-lm = { version = "0.1.0", path = "mlx-lm" }
-safemlx-lm-utils = { version = "0.1.0", path = "mlx-lm-utils" }
+safemlx = { version = "0.25.3", path = "safemlx" }
+safemlx-sys = { version = "0.2.0", path = "safemlx-sys", default-features = false }
+safemlx-macros = { version = "0.25.3", path = "safemlx-macros" }
+safemlx-internal-macros = { version = "0.25.3", path = "safemlx-internal-macros" }
+safemlx-lm = { version = "0.1.0", path = "safemlx-lm" }
+safemlx-lm-utils = { version = "0.1.0", path = "safemlx-lm-utils" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,3 +36,12 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 clap = { version = "4", features = ["derive"] }
 idna_adapter = "1.2"
 anyhow = "1"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+darling = "0.21"
+proc-macro2 = "1"
+itertools = "0.14"
+bindgen = "0.72.1"
+cmake = "0.1"
+cc = "1"
+tempfile = "3"

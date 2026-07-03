@@ -3,6 +3,9 @@
 This repository contains Rust crates for running language models with Apple's
 MLX framework:
 
+- `safemlx`
+- `safemlx-sys`
+- `safemlx-tests`
 - `safemlx-lm`
 - `safemlx-lm-utils`
 
@@ -25,6 +28,8 @@ The crates use SafeMLX package names on crates.io to avoid confusion with the
 upstream `mlx-lm` packages:
 
 ```toml
+safemlx = "0.25"
+safemlx-sys = "0.2"
 safemlx-lm = "0.1"
 safemlx-lm-utils = "0.1"
 ```

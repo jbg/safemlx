@@ -1,0 +1,24 @@
+[package]
+name = "safemlx-macros"
+version = "0.25.3"
+authors = [
+    "Minghua Wu <michael.wu1107@gmail.com>",
+    "David Chavez <david@dcvz.io>",
+]
+edition.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+documentation = "https://github.com/jbg/safemlx"
+
+description = "Procedural macros for safemlx"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+darling.workspace = true
+proc-macro2.workspace = true

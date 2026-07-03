@@ -1,0 +1,12 @@
+[package]
+name = "safemlx-tests"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+safemlx-internal-macros.workspace = true
+safemlx.workspace = true
+tempfile.workspace = true
