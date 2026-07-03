@@ -15,11 +15,13 @@ use safemlx::{
     nn,
     ops::{
         argpartition_axis, broadcast_to, concatenate_axis, conv1d, exp,
-        indexing::{take_along_axis, IndexMutOp, IndexOp, NewAxis},
-        matmul, sigmoid, softmax_axis, sum_axis, zeros,
+        gather_grouped_rows, gather_route_values,
+        indexing::{take_along_axis, IndexOp, NewAxis},
+        grouped_matmul, matmul, segment_sum_by_index, sigmoid, softmax_axis, sum_axis,
+        topk_route_plan, zeros,
     },
     transforms::eval,
-    Array, Dtype,
+    Array,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -63,7 +65,6 @@ fn silu(x: Array) -> Result<Array, Exception> {
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
-const ROUTED_EXPERT_MAJOR_THRESHOLD: i32 = 65;
 
 #[derive(Debug, Clone, Default)]
 pub struct PerfStats {
@@ -1077,60 +1078,19 @@ impl Experts {
         top_k_weights: &Array,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
-        if num_tokens < ROUTED_EXPERT_MAJOR_THRESHOLD {
-            let top_k = top_k_index.shape()[1];
-            let top_k_index_i32 = top_k_index.as_dtype(Dtype::Int32)?;
-            let route_indices = top_k_index_i32.as_slice::<i32>();
-            let mut assignments = vec![Vec::<(i32, i32)>::new(); self.num_experts as usize];
-            for token in 0..num_tokens {
-                for slot in 0..top_k {
-                    let expert = route_indices[(token * top_k + slot) as usize];
-                    assignments[expert as usize].push((token, slot));
-                }
-            }
+        let plan = topk_route_plan(top_k_index, self.num_experts)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan)?;
+        let gate_up_weights = self.gate_up_proj.as_ref().swap_axes(-1, -2)?;
+        let gate_up = grouped_matmul(&hidden, &gate_up_weights, &plan.sorted_group_ids, true)?;
+        let gate = gate_up.index((.., ..self.intermediate_dim));
+        let up = gate_up.index((.., self.intermediate_dim..));
+        let current = silu(gate)?.multiply(up)?;
 
-            let mut output: Option<Array> = None;
-            for (expert, assignments) in assignments.iter().enumerate() {
-                if assignments.is_empty() {
-                    continue;
-                }
-                let token_indices = assignments
-                    .iter()
-                    .map(|(token, _)| *token)
-                    .collect::<Vec<_>>();
-                let slot_indices = assignments
-                    .iter()
-                    .map(|(_, slot)| *slot)
-                    .collect::<Vec<_>>();
-                let token_indices = Array::from_slice(&token_indices, &[assignments.len() as i32]);
-                let slot_indices = Array::from_slice(&slot_indices, &[assignments.len() as i32]);
-
-                let hidden = hidden_states.index(token_indices.clone());
-                let gate_up_weight = self.gate_up_proj.as_ref().index(expert as i32);
-                let gate_up = matmul(&hidden, gate_up_weight.t())?;
-                let gate = gate_up.index((.., ..self.intermediate_dim));
-                let up = gate_up.index((.., self.intermediate_dim..));
-                let current = silu(gate)?.multiply(up)?;
-
-                let down_weight = self.down_proj.as_ref().index(expert as i32);
-                let current = matmul(&current, down_weight.t())?;
-                let weights = top_k_weights
-                    .index((token_indices.clone(), slot_indices))
-                    .index((.., NewAxis));
-                let weighted = current.multiply(weights)?;
-
-                let mut scattered = zeros::<f32>(&[num_tokens, self.hidden_dim])?;
-                scattered.index_mut(token_indices, weighted);
-                output = Some(match output {
-                    Some(acc) => acc.add(scattered)?,
-                    None => scattered,
-                });
-            }
-
-            return output.ok_or_else(|| Exception::custom("MoE chunk has no routed experts"));
-        }
-
-        self.forward(hidden_states, top_k_index, top_k_weights)
+        let down_weights = self.down_proj.as_ref().swap_axes(-1, -2)?;
+        let current = grouped_matmul(&current, &down_weights, &plan.sorted_group_ids, true)?;
+        let weights = gather_route_values(top_k_weights, &plan)?.index((.., NewAxis));
+        let weighted = current.multiply(weights)?;
+        segment_sum_by_index(weighted, &plan.token_indices, num_tokens)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
