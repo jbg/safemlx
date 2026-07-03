@@ -100,7 +100,11 @@ use std::{borrow::Cow, ops::Bound, rc::Rc};
 
 use safemlx_internal_macros::{default_device, generate_macro};
 
-use crate::{error::Result, utils::guard::Guarded, Array, Stream, StreamOrDevice};
+use crate::{
+    error::Result,
+    utils::{guard::Guarded, VectorArray},
+    Array, Stream, StreamOrDevice,
+};
 
 pub(crate) mod index_impl;
 pub(crate) mod indexmut_impl;
@@ -497,6 +501,101 @@ impl Array {
             }),
         }
     }
+
+    /// Scatter updates to the array at the given indices along one axis.
+    ///
+    /// `indices` identifies destination positions along `axis`. `updates` is broadcast according
+    /// to MLX scatter rules before being written into a copy of `self`.
+    #[default_device]
+    pub fn scatter_device(
+        &self,
+        indices: impl AsRef<Array>,
+        updates: impl AsRef<Array>,
+        axis: i32,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        scatter_single_device(self, indices, updates, axis, stream)
+    }
+
+    /// Add updates to the array at the given indices along one axis.
+    ///
+    /// Duplicate indices accumulate into the output. The output dtype is the dtype of `self`, and
+    /// `updates` follows MLX scatter-add casting and broadcasting rules. For arrays with rank
+    /// greater than one, `indices` must also have that rank; add singleton dimensions where the
+    /// same indices should broadcast across the remaining dimensions.
+    #[default_device]
+    pub fn scatter_add_device(
+        &self,
+        indices: impl AsRef<Array>,
+        updates: impl AsRef<Array>,
+        axis: i32,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_scatter_add_axis(
+                res,
+                self.as_ptr(),
+                indices.as_ref().as_ptr(),
+                updates.as_ref().as_ptr(),
+                axis,
+                stream.as_ref().as_ptr(),
+            )
+        })
+    }
+
+    /// Scatter updates to the array using index arrays and matching axes.
+    ///
+    /// This is the N-D form of [`Array::scatter`]. `indices` and `axes` must have the same length.
+    /// For point updates, append singleton slice dimensions to `updates`, e.g. shape `[N, 1, 1]`
+    /// for `N` coordinates into a 2-D array.
+    #[default_device]
+    pub fn scatter_nd_device(
+        &self,
+        indices: &[impl AsRef<Array>],
+        updates: impl AsRef<Array>,
+        axes: &[i32],
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        let indices = VectorArray::try_from_iter(indices.iter())?;
+        Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_scatter(
+                res,
+                self.as_ptr(),
+                indices.as_ptr(),
+                updates.as_ref().as_ptr(),
+                axes.as_ptr(),
+                axes.len(),
+                stream.as_ref().as_ptr(),
+            )
+        })
+    }
+
+    /// Add updates to the array using index arrays and matching axes.
+    ///
+    /// This is the N-D form of [`Array::scatter_add`]. Duplicate destination indices accumulate
+    /// into the output. For point updates, append singleton slice dimensions to `updates`, e.g.
+    /// shape `[N, 1, 1]` for `N` coordinates into a 2-D array.
+    #[default_device]
+    pub fn scatter_add_nd_device(
+        &self,
+        indices: &[impl AsRef<Array>],
+        updates: impl AsRef<Array>,
+        axes: &[i32],
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        let indices = VectorArray::try_from_iter(indices.iter())?;
+        Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_scatter_add(
+                res,
+                self.as_ptr(),
+                indices.as_ptr(),
+                updates.as_ref().as_ptr(),
+                axes.as_ptr(),
+                axes.len(),
+                stream.as_ref().as_ptr(),
+            )
+        })
+    }
 }
 
 /// Indices of the maximum values along the axis.
@@ -633,6 +732,60 @@ pub fn put_along_axis_device(
 ) -> Result<Array> {
     a.as_ref()
         .put_along_axis_device(indices, values, axis, stream)
+}
+
+/// See [`Array::scatter`].
+#[generate_macro(customize(root = "$crate::ops::indexing"))]
+#[default_device]
+pub fn scatter_device(
+    a: impl AsRef<Array>,
+    indices: impl AsRef<Array>,
+    updates: impl AsRef<Array>,
+    axis: i32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    a.as_ref().scatter_device(indices, updates, axis, stream)
+}
+
+/// See [`Array::scatter_add`].
+#[generate_macro(customize(root = "$crate::ops::indexing"))]
+#[default_device]
+pub fn scatter_add_device(
+    a: impl AsRef<Array>,
+    indices: impl AsRef<Array>,
+    updates: impl AsRef<Array>,
+    axis: i32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    a.as_ref()
+        .scatter_add_device(indices, updates, axis, stream)
+}
+
+/// See [`Array::scatter_nd`].
+#[generate_macro(customize(root = "$crate::ops::indexing"))]
+#[default_device]
+pub fn scatter_nd_device(
+    a: impl AsRef<Array>,
+    indices: &[impl AsRef<Array>],
+    updates: impl AsRef<Array>,
+    axes: &[i32],
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    a.as_ref().scatter_nd_device(indices, updates, axes, stream)
+}
+
+/// See [`Array::scatter_add_nd`].
+#[generate_macro(customize(root = "$crate::ops::indexing"))]
+#[default_device]
+pub fn scatter_add_nd_device(
+    a: impl AsRef<Array>,
+    indices: &[impl AsRef<Array>],
+    updates: impl AsRef<Array>,
+    axes: &[i32],
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    a.as_ref()
+        .scatter_add_nd_device(indices, updates, axes, stream)
 }
 
 /// See [`Array::take`]
@@ -977,6 +1130,48 @@ mod tests {
         let updates = Array::ones::<f32>(&[3, 1]).unwrap();
         let out = scatter_add_single(&input, &indices, &updates, 0).unwrap();
         let expected = array!([3.0f32, 1.0, 1.0, 2.0]);
+        assert!(out
+            .all_close(&expected, 1e-5, 1e-5, None)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn test_scatter_add_axis() {
+        let input = Array::ones::<f32>(&[4]).unwrap();
+        let indices = Array::from_slice(&[0u32, 0, 3], &[3]);
+        let updates = Array::ones::<f32>(&[3]).unwrap();
+        let out = scatter_add(&input, &indices, &updates, 0).unwrap();
+        let expected = array!([3.0f32, 1.0, 1.0, 2.0]);
+        assert!(out
+            .all_close(&expected, 1e-5, 1e-5, None)
+            .unwrap()
+            .item::<bool>());
+        assert_eq!(out.dtype(), input.dtype());
+    }
+
+    #[test]
+    fn test_scatter_nd() {
+        let input = Array::zeros::<f32>(&[2, 3]).unwrap();
+        let rows = Array::from_slice(&[0u32, 1, 1], &[3]);
+        let cols = Array::from_slice(&[2u32, 0, 2], &[3]);
+        let updates = reshape(array!([4.0f32, 5.0, 6.0]), &[3, 1, 1]).unwrap();
+        let out = scatter_nd(&input, &[&rows, &cols], &updates, &[0, 1]).unwrap();
+        let expected = array!([[0.0f32, 0.0, 4.0], [5.0, 0.0, 6.0]]);
+        assert!(out
+            .all_close(&expected, 1e-5, 1e-5, None)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn test_scatter_add_nd() {
+        let input = Array::zeros::<f32>(&[2, 3]).unwrap();
+        let rows = Array::from_slice(&[0u32, 1, 1, 1], &[4]);
+        let cols = Array::from_slice(&[2u32, 0, 2, 2], &[4]);
+        let updates = reshape(array!([4.0f32, 5.0, 6.0, 7.0]), &[4, 1, 1]).unwrap();
+        let out = scatter_add_nd(&input, &[&rows, &cols], &updates, &[0, 1]).unwrap();
+        let expected = array!([[0.0f32, 0.0, 4.0], [5.0, 0.0, 13.0]]);
         assert!(out
             .all_close(&expected, 1e-5, 1e-5, None)
             .unwrap()

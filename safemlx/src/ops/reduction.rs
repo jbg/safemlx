@@ -1,9 +1,23 @@
+use std::borrow::Cow;
+
 use crate::array::Array;
-use crate::error::Result;
+use crate::error::{Exception, Result};
 use crate::utils::axes_or_default_to_all;
 use crate::utils::guard::Guarded;
 use crate::Stream;
 use safemlx_internal_macros::{default_device, generate_macro};
+
+use super::{factory::zeros_dtype_device, indexing::scatter_add_device};
+
+fn resolve_axis(axis: i32, ndim: usize) -> Result<usize> {
+    let resolved = if axis < 0 { axis + ndim as i32 } else { axis };
+    if resolved < 0 || resolved as usize >= ndim {
+        return Err(Exception::custom(format!(
+            "axis {axis} is out of bounds for array with {ndim} dimensions"
+        )));
+    }
+    Ok(resolved as usize)
+}
 
 impl Array {
     /// An `and` reduction over the given axes returning an error if the axes are invalid.
@@ -289,6 +303,34 @@ impl Array {
                 stream.as_ref().as_ptr(),
             )
         })
+    }
+
+    /// Sum values by integer segment ids along one axis.
+    ///
+    /// This creates an output with `shape[axis] == num_segments` and accumulates `self` into that
+    /// output using `segment_ids` along `axis`. Duplicate segment ids are summed. The output dtype
+    /// is the dtype of `self`.
+    #[default_device]
+    pub fn segment_sum_device(
+        &self,
+        segment_ids: impl AsRef<Array>,
+        num_segments: i32,
+        axis: i32,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        let axis = resolve_axis(axis, self.ndim())?;
+        let mut shape = self.shape().to_vec();
+        shape[axis] = num_segments;
+        let segment_ids = segment_ids.as_ref();
+        let segment_ids = if segment_ids.ndim() == 1 && self.ndim() > 1 {
+            let mut index_shape = vec![1; self.ndim()];
+            index_shape[axis] = self.dim(axis as i32);
+            Cow::Owned(segment_ids.reshape_device(&index_shape, &stream)?)
+        } else {
+            Cow::Borrowed(segment_ids)
+        };
+        let base = zeros_dtype_device(&shape, self.dtype(), &stream)?;
+        scatter_add_device(base, segment_ids.as_ref(), self, axis as i32, stream)
     }
 
     /// A `mean` reduction over the given axes returning an error if the axes are invalid.
@@ -829,6 +871,21 @@ pub fn sum_device(
     array.as_ref().sum_device(keep_dims, stream)
 }
 
+/// See [`Array::segment_sum`]
+#[generate_macro]
+#[default_device]
+pub fn segment_sum_device(
+    array: impl AsRef<Array>,
+    segment_ids: impl AsRef<Array>,
+    num_segments: i32,
+    axis: i32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    array
+        .as_ref()
+        .segment_sum_device(segment_ids, num_segments, axis, stream)
+}
+
 /// See [`Array::mean_axes`]
 #[generate_macro]
 #[default_device]
@@ -1213,6 +1270,28 @@ mod tests {
 
         let results: &[f32] = result.as_slice();
         assert_eq!(results, &[5.0, 8.0, 4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_segment_sum() {
+        let values = Array::from_slice(&[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0], &[4, 2]);
+        let segment_ids = Array::from_slice(&[0u32, 1, 0, 2], &[4]);
+        let out = segment_sum(&values, &segment_ids, 4, 0).unwrap();
+        let expected = Array::from_slice(&[4.0f32, 40.0, 2.0, 20.0, 4.0, 40.0, 0.0, 0.0], &[4, 2]);
+        assert!(out
+            .all_close(&expected, 1e-5, 1e-5, None)
+            .unwrap()
+            .item::<bool>());
+        assert_eq!(out.dtype(), values.dtype());
+
+        let values = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let segment_ids = Array::from_slice(&[0u32, 1, 0], &[3]);
+        let out = values.segment_sum(&segment_ids, 2, -1).unwrap();
+        let expected = Array::from_slice(&[4.0f32, 2.0, 10.0, 5.0], &[2, 2]);
+        assert!(out
+            .all_close(&expected, 1e-5, 1e-5, None)
+            .unwrap()
+            .item::<bool>());
     }
 
     // Tests adapted from Python test `test_ops.py/test_median`
