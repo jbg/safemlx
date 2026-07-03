@@ -1,6 +1,7 @@
 //! Operations
 
 mod arithmetic;
+mod compact;
 mod conversion;
 mod convolution;
 mod cumulative;
@@ -16,6 +17,7 @@ mod sort;
 pub mod indexing;
 
 pub use arithmetic::*;
+pub use compact::*;
 pub use conversion::*;
 pub use convolution::*;
 pub use cumulative::*;
