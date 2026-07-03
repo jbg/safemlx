@@ -179,10 +179,8 @@ pub fn routed_grouped_matmul_device(
         true,
         stream,
     )?;
-    let weights = gather_route_values_device(route_weights, &plan, stream)?.reshape_device(
-        &[projected.dim(0), 1],
-        stream,
-    )?;
+    let weights = gather_route_values_device(route_weights, &plan, stream)?
+        .reshape_device(&[projected.dim(0), 1], stream)?;
     let weighted = projected.multiply_device(&weights, stream)?;
     segment_sum_by_index_device(weighted, &plan.token_indices, hidden_states.dim(0), stream)
 }
@@ -220,11 +218,7 @@ mod tests {
 
     #[test]
     fn test_grouped_matmul_matches_gathered_reference() {
-        let inputs = reshape(
-            Array::arange::<_, f32>(0.0, 12.0, None).unwrap(),
-            &[4, 3],
-        )
-        .unwrap();
+        let inputs = reshape(Array::arange::<_, f32>(0.0, 12.0, None).unwrap(), &[4, 3]).unwrap();
         let weights = reshape(
             Array::arange::<_, f32>(0.0, 18.0, None).unwrap(),
             &[3, 3, 2],
@@ -251,11 +245,7 @@ mod tests {
 
     #[test]
     fn test_routed_grouped_matmul_matches_reference() {
-        let hidden = reshape(
-            Array::arange::<_, f32>(0.0, 12.0, None).unwrap(),
-            &[3, 4],
-        )
-        .unwrap();
+        let hidden = reshape(Array::arange::<_, f32>(0.0, 12.0, None).unwrap(), &[3, 4]).unwrap();
         let weights = reshape(
             Array::arange::<_, f32>(0.0, 40.0, None).unwrap(),
             &[5, 4, 2],
@@ -269,7 +259,12 @@ mod tests {
 
         let selected_weights = take_axis(&weights, &expert_ids, 0).unwrap();
         let current = matmul(
-            hidden.index((.., crate::ops::indexing::NewAxis, crate::ops::indexing::NewAxis, ..)),
+            hidden.index((
+                ..,
+                crate::ops::indexing::NewAxis,
+                crate::ops::indexing::NewAxis,
+                ..,
+            )),
             selected_weights,
         )
         .unwrap()
