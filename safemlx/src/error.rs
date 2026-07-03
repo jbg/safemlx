@@ -225,29 +225,32 @@ impl From<Exception> for String {
 
 thread_local! {
     static CLOSURE_ERROR: Cell<Option<Exception>> = const { Cell::new(None) };
-    static LAST_MLX_ERROR: Cell<*const c_char> = const { Cell::new(std::ptr::null()) };
-    pub(crate) static INIT_ERR_HANDLER: Once = const { Once::new() };
+    static LAST_MLX_ERROR: Cell<*mut c_char> = const { Cell::new(std::ptr::null_mut()) };
 }
+
+static INIT_ERR_HANDLER: Once = Once::new();
 
 #[no_mangle]
 extern "C" fn default_mlx_error_handler(msg: *const c_char, _data: *mut std::ffi::c_void) {
     unsafe {
         LAST_MLX_ERROR.with(|last_error| {
-            last_error.set(strdup(msg));
+            let previous = last_error.replace(strdup(msg));
+            if !previous.is_null() {
+                libc::free(previous as *mut libc::c_void);
+            }
         });
     }
 }
 
-#[no_mangle]
-extern "C" fn noop_mlx_error_handler_data_deleter(_data: *mut std::ffi::c_void) {}
-
-pub(crate) fn setup_mlx_error_handler() {
+fn setup_mlx_error_handler() {
     let handler = default_mlx_error_handler;
-    let data_ptr = LAST_MLX_ERROR.with(|last_error| last_error.as_ptr() as *mut std::ffi::c_void);
-    let dtor = noop_mlx_error_handler_data_deleter;
     unsafe {
-        safemlx_sys::mlx_set_error_handler(Some(handler), data_ptr, Some(dtor));
+        safemlx_sys::mlx_set_error_handler(Some(handler), std::ptr::null_mut(), None);
     }
+}
+
+pub(crate) fn ensure_mlx_error_handler() {
+    INIT_ERR_HANDLER.call_once(setup_mlx_error_handler);
 }
 
 pub(crate) fn set_closure_error(err: Exception) {
@@ -261,7 +264,7 @@ pub(crate) fn get_and_clear_closure_error() -> Option<Exception> {
 #[track_caller]
 pub(crate) fn get_and_clear_last_mlx_error() -> Option<RawException> {
     LAST_MLX_ERROR.with(|last_error| {
-        let last_err_ptr = last_error.replace(std::ptr::null());
+        let last_err_ptr = last_error.replace(std::ptr::null_mut());
         if last_err_ptr.is_null() {
             return None;
         }
@@ -392,7 +395,7 @@ impl From<InexactDtypeError> for Exception {
 
 #[cfg(test)]
 mod tests {
-    use crate::array;
+    use crate::{array, Array};
 
     #[test]
     fn test_exception() {
@@ -407,5 +410,32 @@ mod tests {
         assert!(error
             .what()
             .contains("Shapes (3) and (2) cannot be broadcast."))
+    }
+
+    #[test]
+    fn mlx_errors_are_thread_local() {
+        let threads = (0..8)
+            .map(|thread_index| {
+                std::thread::spawn(move || {
+                    for iteration in 0..64 {
+                        let lhs_len = 3 + thread_index;
+                        let rhs_len = lhs_len + 1 + iteration % 3;
+                        let lhs = Array::from_slice(&vec![0.0f32; lhs_len], &[lhs_len as i32]);
+                        let rhs = Array::from_slice(&vec![0.0f32; rhs_len], &[rhs_len as i32]);
+                        let error = lhs.add(&rhs).expect_err("add should fail");
+                        let expected = format!("Shapes ({lhs_len}) and ({rhs_len})");
+                        assert!(
+                            error.what().contains(&expected),
+                            "expected thread-local error containing {expected:?}, got {:?}",
+                            error.what()
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().expect("worker thread panicked");
+        }
     }
 }

@@ -57,8 +57,7 @@ impl MetalKernel {
         Source: Into<String>,
         Header: Into<String>,
     {
-        crate::error::INIT_ERR_HANDLER
-            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+        crate::error::ensure_mlx_error_handler();
 
         let name = name.into();
         let input_names: Vec<String> = input_names.into_iter().map(Into::into).collect();
@@ -580,8 +579,7 @@ struct RawMetalKernelConfig {
 
 impl RawMetalKernelConfig {
     fn try_from_config(config: &MetalKernelConfig) -> Result<Self> {
-        crate::error::INIT_ERR_HANDLER
-            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+        crate::error::ensure_mlx_error_handler();
 
         let c_config = unsafe { safemlx_sys::mlx_fast_metal_kernel_config_new() };
         if c_config.ctx.is_null() {

@@ -52,8 +52,7 @@ impl SafeTensors {
     }
 
     pub(crate) fn data(&self) -> Result<HashMap<String, Array>, Exception> {
-        crate::error::INIT_ERR_HANDLER
-            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+        crate::error::ensure_mlx_error_handler();
         let mut map = HashMap::new();
         unsafe {
             let iterator = safemlx_sys::mlx_map_string_to_array_iterator_new(self.c_data);
@@ -94,8 +93,7 @@ impl SafeTensors {
     }
 
     pub(crate) fn metadata(&self) -> Result<HashMap<String, String>, Exception> {
-        crate::error::INIT_ERR_HANDLER
-            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+        crate::error::ensure_mlx_error_handler();
 
         let mut map = HashMap::new();
         unsafe {
