@@ -204,6 +204,7 @@ impl Model {
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
         temp: f32,
         prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Generate<'a> {
         match self {
@@ -212,6 +213,7 @@ impl Model {
                 cache,
                 temp,
                 prompt_tokens,
+                prng_key,
                 stream,
             )),
             Self::Llama(model) => Generate::Llama(llama::Generate::new(
@@ -219,6 +221,7 @@ impl Model {
                 cache,
                 temp,
                 prompt_tokens,
+                prng_key,
                 stream,
             )),
             Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::new(
@@ -226,6 +229,7 @@ impl Model {
                 cache,
                 temp,
                 prompt_tokens,
+                prng_key,
                 stream,
             )),
             Self::Qwen35Moe(_) => {
@@ -246,20 +250,21 @@ impl Model {
         cache: &'a mut ModelCache,
         temp: f32,
         prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> ModelGenerate<'a> {
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::KeyValue(cache)) => ModelGenerate::Gemma4(
-                gemma4::Generate::new(model, cache, temp, prompt_tokens, stream),
+                gemma4::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
             ),
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
-                llama::Generate::new(model, cache, temp, prompt_tokens, stream),
+                llama::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
             ),
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
-                qwen3::Generate::new(model, cache, temp, prompt_tokens, stream),
+                qwen3::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
             ),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => ModelGenerate::Qwen35Moe(
-                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens, stream),
+                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
             ),
             _ => panic!("model cache type does not match model kind"),
         }
@@ -451,9 +456,11 @@ impl LoadedModel {
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
         temp: f32,
         prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Generate<'a> {
-        self.model.generate(cache, temp, prompt_tokens, stream)
+        self.model
+            .generate(cache, temp, prompt_tokens, prng_key, stream)
     }
 
     pub fn new_cache(&self) -> ModelCache {
@@ -465,10 +472,11 @@ impl LoadedModel {
         cache: &'a mut ModelCache,
         temp: f32,
         prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> ModelGenerate<'a> {
         self.model
-            .generate_with_cache(cache, temp, prompt_tokens, stream)
+            .generate_with_cache(cache, temp, prompt_tokens, prng_key, stream)
     }
 
     pub fn model_mut(&mut self) -> &mut Model {

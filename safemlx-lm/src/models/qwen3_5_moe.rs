@@ -2365,7 +2365,7 @@ mod tests {
             let mut cache = model.new_cache();
             let mut tokens = Vec::new();
             let generate =
-                super::Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens, stream);
+                super::Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens, None, stream);
             for token in generate.take(expected_tokens.len()) {
                 let token = token.unwrap();
                 eval([&token]).unwrap();

@@ -99,7 +99,7 @@ fn run_greedy(
     let start = Instant::now();
     {
         let generator = loaded
-            .generate_with_cache(&mut cache, 0.0, &prompt_tokens, stream)
+            .generate_with_cache(&mut cache, 0.0, &prompt_tokens, None, stream)
             .take(max_tokens);
         for token in generator {
             let token = token?;
@@ -141,6 +141,7 @@ fn run_mtp(
         tokenizer_holder.eos_token_ids(),
         max_tokens,
         0.0,
+        None,
         stream,
     )?;
 

@@ -114,7 +114,7 @@ fn run_case(
     let prompt_ids = model.encode(prompt, false)?;
     let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
     let mut cache = model.new_cache();
-    let mut generator = model.generate_with_cache(&mut cache, 0.0, &prompt_tokens, stream);
+    let mut generator = model.generate_with_cache(&mut cache, 0.0, &prompt_tokens, None, stream);
     let mut ids = Vec::with_capacity(decode_tokens);
 
     qwen3_5_moe::set_perf_profiling(profile_components);

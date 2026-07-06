@@ -64,9 +64,14 @@ fn main() -> anyhow::Result<()> {
     print_first_token_distribution(&mut model, &mut cache, &tokens, stream)?;
     cache = model.new_cache();
     let mut output_ids = Vec::new();
+    let prng_key = if temp == 0.0 {
+        None
+    } else {
+        Some(safemlx::random::key(0)?)
+    };
 
     {
-        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens, stream);
+        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens, prng_key, stream);
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
@@ -102,7 +107,7 @@ fn print_first_token_distribution(
     tokens: &safemlx::Array,
     stream: &Stream,
 ) -> anyhow::Result<()> {
-    let mut generator = model.generate_with_cache(cache, 0.0, tokens, stream);
+    let mut generator = model.generate_with_cache(cache, 0.0, tokens, None, stream);
     let Some(first) = generator.next() else {
         return Ok(());
     };

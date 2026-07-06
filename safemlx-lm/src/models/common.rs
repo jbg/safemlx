@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use safemlx::{
     argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::Module,
@@ -13,6 +12,7 @@ use safemlx::{
         sigmoid,
     },
     quantization::MaybeQuantized,
+    random::{self, RandomState},
     Array, Stream,
 };
 
@@ -225,12 +225,21 @@ where
         .reshape(&[batch, seq_len, -1], stream)
 }
 
-pub fn sample(logits: &Array, temp: f32, stream: &Stream) -> Result<Array, Exception> {
+pub fn sample(
+    logits: &Array,
+    temp: f32,
+    prng_state: Option<&mut RandomState>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     match temp {
         0.0 => argmax_axis!(logits, -1, stream = stream),
         _ => {
+            let prng_state = prng_state.ok_or_else(|| {
+                Exception::custom("random operations require an explicit PRNG key")
+            })?;
+            let key = prng_state.next_key(stream)?;
             let logits = logits.multiply(array!(1.0 / temp), stream)?;
-            categorical!(logits, stream = stream)
+            random::categorical(&logits, None, None, &key, stream)
         }
     }
 }
@@ -272,6 +281,7 @@ where
     model: &'a mut M,
     cache: &'a mut C,
     temp: f32,
+    prng_state: Option<RandomState>,
     stream: &'a Stream,
     state: GenerateState<'a>,
     _cache: PhantomData<C>,
@@ -286,12 +296,14 @@ where
         cache: &'a mut C,
         temp: f32,
         prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Self {
         Self {
             model,
             cache,
             temp,
+            prng_state: prng_key.map(RandomState::from_key),
             stream,
             state: GenerateState::Prefill { prompt_tokens },
             _cache: PhantomData,
@@ -322,7 +334,7 @@ where
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp, self.stream) {
+                let y = match sample(&logits, self.temp, self.prng_state.as_mut(), self.stream) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };
@@ -338,7 +350,7 @@ where
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp, self.stream) {
+                let y = match sample(&logits, self.temp, self.prng_state.as_mut(), self.stream) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };
@@ -346,5 +358,24 @@ where
                 Some(Ok(y))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample;
+    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn non_greedy_sample_requires_prng_key() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let logits = Array::from_slice(&[0.0f32, 1.0], &[1, 2]);
+
+        let error = sample(&logits, 1.0, None, ctx.stream()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("random operations require an explicit PRNG key"));
     }
 }

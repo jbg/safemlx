@@ -570,6 +570,7 @@ mod tests {
             &mut cache,
             0.0,
             &prompt_tokens,
+            None,
             stream,
         );
         for (token, ntoks) in generate.zip(0..10) {

@@ -11,6 +11,7 @@ use safemlx::{
         indexing::{put_along_axis, NewAxis, TryIndexOp},
         lt, matmul, which,
     },
+    random::RandomState,
     Array, Stream,
 };
 use serde::Deserialize;
@@ -323,11 +324,13 @@ impl Gemma4AssistantDraftModel {
         hidden: &Array,
         block_size: usize,
         temp: f32,
+        prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let mut token = Array::from_slice(&[last_bonus], &[1, 1]);
         let mut h_prev = hidden.clone();
         let mut tokens = Vec::new();
+        let mut prng_state = prng_state;
 
         for _ in 0..block_size.saturating_sub(1) {
             let token_embed = target_model
@@ -341,7 +344,7 @@ impl Gemma4AssistantDraftModel {
                 )?;
             let inputs_embeds = safemlx::ops::concatenate_axis(&[token_embed, h_prev], -1, stream)?;
             let (next_hidden, logits) = self.forward(&inputs_embeds, stream)?;
-            token = sample(&logits, temp, stream)?;
+            token = sample(&logits, temp, prng_state.as_deref_mut(), stream)?;
             tokens.push(token.clone());
             h_prev = next_hidden;
         }

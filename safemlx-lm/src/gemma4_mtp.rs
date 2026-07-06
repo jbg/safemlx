@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use safemlx::{
     ops::{concatenate_axis, indexing::TryIndexOp},
+    random::RandomState,
     transforms::eval,
     Array, Stream,
 };
@@ -42,9 +43,11 @@ pub fn generate_gemma4_mtp(
     eos_token_ids: &[u32],
     max_tokens: usize,
     temp: f32,
+    prng_key: Option<Array>,
     stream: &Stream,
 ) -> Result<(Vec<u32>, MtpStats), Error> {
     let start = Instant::now();
+    let mut prng_state = prng_key.map(RandomState::from_key);
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
     let mut generated = Vec::new();
     let mut stats = MtpStats::default();
@@ -72,7 +75,7 @@ pub fn generate_gemma4_mtp(
         stream,
     )?;
     let first_logits = first_out.logits.try_index_device((.., -1, ..), stream)?;
-    let first_token = sample(&first_logits, temp, stream)?;
+    let first_token = sample(&first_logits, temp, prng_state.as_mut(), stream)?;
     eval([&first_token])?;
     let mut bonus = first_token.item::<u32>(&stream);
     stats.target_tokens += 1;
@@ -100,7 +103,15 @@ pub fn generate_gemma4_mtp(
             .map(KeyValueCache::offset)
             .unwrap_or(0);
         assistant.set_shared_kv(shared_kv.clone(), kv_offset);
-        let draft = assistant.draft_block(target, bonus, &hidden, block, temp, stream)?;
+        let draft = assistant.draft_block(
+            target,
+            bonus,
+            &hidden,
+            block,
+            temp,
+            prng_state.as_mut(),
+            stream,
+        )?;
         eval([&draft])?;
 
         let verify_input = concatenate_axis(
@@ -116,7 +127,7 @@ pub fn generate_gemma4_mtp(
             },
             stream,
         )?;
-        let target_tokens = sample(&verify_out.logits, temp, stream)?;
+        let target_tokens = sample(&verify_out.logits, temp, prng_state.as_mut(), stream)?;
         eval([&target_tokens])?;
         stats.target_tokens += verify_input.shape()[1] as usize;
 
