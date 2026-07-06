@@ -1218,6 +1218,18 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
     Ok(config.text_config)
 }
 
+pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    let config: Gemma4Config = serde_json::from_value(config.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid Gemma 4 config: {error}"))
+    })?;
+    if config.text_config.enable_moe_block {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 MoE models are not supported yet".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeightMap {
     pub metadata: HashMap<String, Value>,

@@ -9,6 +9,7 @@ use safemlx_lm_utils::tokenizer::{
     load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{cache::ConcatKeyValueCache, error::Error};
@@ -69,6 +70,115 @@ impl ModelKind {
             "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
         }
+    }
+}
+
+/// Details for a model config that this crate can load.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SupportedModelConfig {
+    /// The runtime model implementation that will be used.
+    pub kind: ModelKind,
+    /// The top-level `model_type` from the submitted config.
+    pub model_type: String,
+    /// The resolved text model type used for dispatch.
+    pub effective_model_type: String,
+}
+
+/// Result of checking whether a submitted model config is supported.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ModelConfigSupport {
+    /// The config is supported by this crate's loader.
+    Supported(SupportedModelConfig),
+    /// The config is not supported, with a human-readable reason.
+    Unsupported { reason: String },
+}
+
+impl ModelConfigSupport {
+    /// Returns true when this config is supported.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported(_))
+    }
+
+    /// Returns the unsupported reason, if this result is unsupported.
+    pub fn unsupported_reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported(_) => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Checks a `config.json` string and reports whether it is supported.
+pub fn check_model_config_json(config_json: &str) -> ModelConfigSupport {
+    match serde_json::from_str::<Value>(config_json) {
+        Ok(config) => check_model_config(&config),
+        Err(error) => ModelConfigSupport::Unsupported {
+            reason: format!("invalid model config JSON: {error}"),
+        },
+    }
+}
+
+/// Checks a parsed model config value and reports whether it is supported.
+pub fn check_model_config(config: &Value) -> ModelConfigSupport {
+    let metadata = match serde_json::from_value::<ModelMetadata>(config.clone()) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return ModelConfigSupport::Unsupported {
+                reason: format!("invalid model config metadata: {error}"),
+            };
+        }
+    };
+
+    let effective_model_type = effective_model_type(&metadata);
+    let kind = match ModelKind::from_model_type(&effective_model_type) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return ModelConfigSupport::Unsupported {
+                reason: error.to_string(),
+            };
+        }
+    };
+
+    if let Err(error) = validate_model_config(kind, config) {
+        return ModelConfigSupport::Unsupported {
+            reason: error.to_string(),
+        };
+    }
+
+    ModelConfigSupport::Supported(SupportedModelConfig {
+        kind,
+        model_type: metadata.model_type,
+        effective_model_type,
+    })
+}
+
+/// Reads `config.json` from a model directory and reports whether it is supported.
+pub fn check_model_dir(model_dir: impl AsRef<Path>) -> ModelConfigSupport {
+    let config_path = model_dir.as_ref().join("config.json");
+    match std::fs::read_to_string(&config_path) {
+        Ok(config_json) => check_model_config_json(&config_json),
+        Err(error) => ModelConfigSupport::Unsupported {
+            reason: format!("could not read {}: {error}", config_path.display()),
+        },
+    }
+}
+
+fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
+    match kind {
+        ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
+        ModelKind::Llama => {
+            serde_json::from_value::<llama::ModelArgs>(config.clone()).map_err(|error| {
+                Error::UnsupportedArchitecture(format!("invalid llama config: {error}"))
+            })?;
+            Ok(())
+        }
+        ModelKind::Qwen3 => {
+            serde_json::from_value::<qwen3::ModelArgs>(config.clone()).map_err(|error| {
+                Error::UnsupportedArchitecture(format!("invalid qwen3 config: {error}"))
+            })?;
+            Ok(())
+        }
+        ModelKind::Qwen35Moe => qwen3_5_moe::validate_model_config_value(config),
     }
 }
 
@@ -397,7 +507,13 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
 }
 
 fn effective_model_type(metadata: &ModelMetadata) -> String {
-    if ModelKind::from_model_type(&metadata.model_type).is_ok() {
+    if matches!(metadata.model_type.as_str(), "gemma4" | "qwen3_5_moe") {
+        metadata
+            .text_config
+            .as_ref()
+            .map(|text_config| text_config.model_type.clone())
+            .unwrap_or_else(|| metadata.model_type.clone())
+    } else if ModelKind::from_model_type(&metadata.model_type).is_ok() {
         metadata.model_type.clone()
     } else {
         metadata
@@ -436,7 +552,8 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 
 #[cfg(test)]
 mod tests {
-    use super::load_tokenizer;
+    use super::{check_model_config, check_model_config_json, check_model_dir, load_tokenizer};
+    use serde_json::json;
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
@@ -478,5 +595,134 @@ mod tests {
         );
         let tokenizer = load_tokenizer(&dir).unwrap();
         assert_eq!(tokenizer.get_vocab_size(false), 0);
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_llama() {
+        let support = check_model_config(&json!({
+            "model_type": "llama",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "head_dim": 4
+        }));
+
+        assert!(support.is_supported(), "{support:?}");
+    }
+
+    #[test]
+    fn check_model_config_reports_unsupported_model_type() {
+        let support = check_model_config(&json!({
+            "model_type": "not_a_model"
+        }));
+
+        assert!(!support.is_supported());
+        assert_eq!(
+            support.unsupported_reason(),
+            Some("unsupported model type: not_a_model")
+        );
+    }
+
+    #[test]
+    fn check_model_config_json_reports_invalid_json() {
+        let support = check_model_config_json("{not json");
+
+        assert!(!support.is_supported());
+        assert!(support
+            .unsupported_reason()
+            .unwrap()
+            .starts_with("invalid model config JSON:"));
+    }
+
+    #[test]
+    fn check_model_config_reports_qwen3_5_moe_missing_text_config() {
+        let support = check_model_config(&json!({
+            "model_type": "qwen3_5_moe"
+        }));
+
+        assert!(!support.is_supported());
+        assert_eq!(
+            support.unsupported_reason(),
+            Some("unsupported model architecture: qwen3_5_moe config is missing text_config")
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_qwen3_5_moe() {
+        let support = check_model_config(&json!({
+            "model_type": "qwen3_5_moe",
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "vocab_size": 128,
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 128
+            }
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Qwen35Moe,
+                model_type: "qwen3_5_moe".to_string(),
+                effective_model_type: "qwen3_5_moe_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_gemma4_moe_unsupported() {
+        let support = check_model_config(&json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 32,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 128,
+                "head_dim": 4,
+                "enable_moe_block": true
+            }
+        }));
+
+        assert!(!support.is_supported());
+        assert_eq!(
+            support.unsupported_reason(),
+            Some("unsupported model architecture: Gemma 4 MoE models are not supported yet")
+        );
+    }
+
+    #[test]
+    fn check_model_dir_reads_config_json() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "llama",
+              "hidden_size": 8,
+              "num_hidden_layers": 1,
+              "intermediate_size": 16,
+              "num_attention_heads": 2,
+              "rms_norm_eps": 0.00001,
+              "vocab_size": 32,
+              "num_key_value_heads": 2,
+              "max_position_embeddings": 128,
+              "head_dim": 4
+            }"#,
+        );
+
+        let support = check_model_dir(&dir);
+        assert!(support.is_supported(), "{support:?}");
     }
 }

@@ -1817,6 +1817,31 @@ pub fn get_qwen3_5_moe_model_args(
     Ok((args, config.image_token_id, config.video_token_id))
 }
 
+pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    let value = config.clone();
+    let config: TopLevelConfig = serde_json::from_value(value.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid qwen3_5_moe config: {error}"))
+    })?;
+    match config.model_type.as_str() {
+        "qwen3_5_moe" => {
+            config.text_config.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "qwen3_5_moe config is missing text_config".to_string(),
+                )
+            })?;
+        }
+        "qwen3_5_moe_text" => {
+            serde_json::from_value::<ModelArgs>(value).map_err(|error| {
+                Error::UnsupportedArchitecture(format!("invalid qwen3_5_moe_text config: {error}"))
+            })?;
+        }
+        other => {
+            return Err(Error::UnsupportedModelType(other.to_string()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeightMap {
     pub metadata: HashMap<String, Value>,

@@ -7,6 +7,11 @@ pub mod sampler;
 pub mod utils;
 pub mod weights;
 
+pub use models::{
+    check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
+    SupportedModelConfig,
+};
+
 use safemlx::Array;
 
 use crate::models::qwen3;
