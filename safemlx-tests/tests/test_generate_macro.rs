@@ -1,12 +1,11 @@
 #![allow(unused_variables)]
 
 use safemlx::Stream;
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 // Test generate_macro for functions with no generic type arguments.
 #[generate_macro(customize(root = "$crate"))]
-#[default_device]
-fn foo_device(
+fn foo(
     a: i32,                                 // Mandatory argument
     b: i32,                                 // Mandatory argument
     #[optional] c: Option<i32>,             // Optional argument
@@ -18,12 +17,8 @@ fn foo_device(
 
 #[test]
 fn test_foo() {
-    assert_eq!(foo!(1, 2), 3);
-    assert_eq!(foo!(1, 2, c = Some(3)), 6);
-    assert_eq!(foo!(1, 2, d = Some(4)), 7);
-    assert_eq!(foo!(1, 2, c = Some(3), d = Some(4)), 10);
-
-    let stream = Stream::new();
+    let stream =
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 
     assert_eq!(foo!(1, 2, stream = &stream), 3);
     assert_eq!(foo!(1, 2, c = Some(3), stream = &stream), 6);
@@ -36,8 +31,7 @@ fn test_foo() {
     root = "$crate",
     default_dtype = i32,
 ))]
-#[default_device]
-fn bar_device<T: Into<i32>>(
+fn bar<T: Into<i32>>(
     a: T,                                   // Mandatory argument
     b: T,                                   // Mandatory argument
     #[optional] c: Option<T>,               // Optional argument
@@ -54,36 +48,43 @@ fn bar_device<T: Into<i32>>(
 #[test]
 fn test_bar() {
     // Without specifying dtype, the default is i32.
+    let stream =
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 
-    let result = bar!(1, 2);
+    let result = bar!(1, 2, stream = &stream);
     assert_eq!(result, 3);
 
-    let result = bar!(1, 2, c = Some(3));
+    let result = bar!(1, 2, c = Some(3), stream = &stream);
     assert_eq!(result, 6);
 
-    let result = bar!(1, 2, d = Some(4));
+    let result = bar!(1, 2, d = Some(4), stream = &stream);
     assert_eq!(result, 7);
 
-    let result = bar!(1, 2, c = Some(3), d = Some(4));
+    let result = bar!(1, 2, c = Some(3), d = Some(4), stream = &stream);
     assert_eq!(result, 10);
 
     // With dtype specified as i16.
 
-    let result = bar!(1, 2, dtype = i16);
+    let result = bar!(1, 2, dtype = i16, stream = &stream);
     assert_eq!(result, 3);
 
-    let result = bar!(1, 2, c = Some(3), dtype = i16);
+    let result = bar!(1, 2, c = Some(3), dtype = i16, stream = &stream);
     assert_eq!(result, 6);
 
-    let result = bar!(1, 2, d = Some(4), dtype = i16);
+    let result = bar!(1, 2, d = Some(4), dtype = i16, stream = &stream);
     assert_eq!(result, 7);
 
-    let result = bar!(1, 2, c = Some(3), d = Some(4), dtype = i16);
+    let result = bar!(
+        1,
+        2,
+        c = Some(3),
+        d = Some(4),
+        dtype = i16,
+        stream = &stream
+    );
     assert_eq!(result, 10);
 
     // With stream specified.
-
-    let stream = Stream::new();
 
     let result = bar!(1, 2, stream = &stream);
     assert_eq!(result, 3);
@@ -121,8 +122,7 @@ fn test_bar() {
 
 // Test named mandatory arguments.
 #[generate_macro(customize(root = "$crate"))]
-#[default_device]
-fn baz_device(
+fn baz(
     #[optional] a: Option<i32>,             // Optinal argument
     #[named] b: i32,                        // Mandatory argument
     #[optional] c: Option<i32>,             // Optional argument
@@ -133,12 +133,8 @@ fn baz_device(
 
 #[test]
 fn test_baz() {
-    assert_eq!(baz!(b = 1), 1);
-    assert_eq!(baz!(a = Some(2), b = 1), 3);
-    assert_eq!(baz!(b = 1, c = Some(3)), 4);
-    assert_eq!(baz!(a = Some(2), b = 1, c = Some(3)), 6);
-
-    let stream = Stream::new();
+    let stream =
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 
     assert_eq!(baz!(b = 1, stream = &stream), 1);
     assert_eq!(baz!(a = Some(2), b = 1, stream = &stream), 3);

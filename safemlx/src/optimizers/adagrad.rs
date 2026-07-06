@@ -68,14 +68,15 @@ impl Optimizer for AdaGrad {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let state = get_mut_or_insert_with(&mut self.state, key, || array!(0.0));
 
-        let v = state.add(square(gradient)?)?;
+        let v = state.add(square(gradient, stream)?, stream)?;
 
-        let num = self.lr.multiply(gradient)?;
-        let den = v.sqrt()?.add(&self.eps)?;
-        let new_param = parameter.subtract(num.divide(&den)?)?;
+        let num = self.lr.multiply(gradient, stream)?;
+        let den = v.sqrt(stream)?.add(&self.eps, stream)?;
+        let new_param = parameter.subtract(num.divide(&den, stream)?, stream)?;
 
         *state = v;
         *parameter = new_param;

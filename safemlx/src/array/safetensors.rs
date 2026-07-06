@@ -2,14 +2,19 @@
 //! 
 //! `F8_*` dtypes are not supported and will return an error.
 
-use std::{ffi::c_void, mem::transmute};
+use std::ffi::c_void;
 
+#[cfg(test)]
 use bytemuck::cast_slice;
 use safetensors::tensor::TensorView;
+#[cfg(test)]
+use std::mem::transmute;
 
 use crate::{error::ConversionError, Dtype};
 
 use super::Array;
+#[cfg(test)]
+use super::EvaluatedArray;
 
 impl<'data> TryFrom<TensorView<'data>> for Array {
     type Error = ConversionError;
@@ -29,94 +34,94 @@ impl<'data> TryFrom<TensorView<'data>> for Array {
     }
 }
 
-impl<'a> TryFrom<&'a Array> for TensorView<'a> {
-    type Error = ConversionError;
+#[cfg(test)]
+pub(crate) fn tensor_view_from_array<'a>(
+    value: &'a EvaluatedArray<'a>,
+) -> Result<TensorView<'a>, ConversionError> {
+    let dtype: safetensors::tensor::Dtype = value.as_array().dtype().try_into()?;
+    let shape = value.as_array().shape()
+        .iter()
+        .map(|x| *x as usize)
+        .collect::<Vec<_>>();
+    let data: &[u8] = unsafe {
+        match value.as_array().dtype() {
+            Dtype::Bool => {
+                let data = value.as_slice::<bool>();
+                cast_slice(data)
+            },
+            Dtype::Uint8 => {
+                let data = value.as_slice::<u8>();
+                cast_slice(data)
+            },
+            Dtype::Uint16 => {
+                let data = value.as_slice::<u16>();
+                cast_slice(data)
+            },
+            Dtype::Uint32 => {
+                let data = value.as_slice::<u32>();
+                cast_slice(data)
+            },
+            Dtype::Uint64 => {
+                let data = value.as_slice::<u64>();
+                cast_slice(data)
+            },
+            Dtype::Int8 => {
+                let data = value.as_slice::<i8>();
+                cast_slice(data)
+            },
+            Dtype::Int16 => {
+                let data = value.as_slice::<i16>();
+                cast_slice(data)
+            },
+            Dtype::Int32 => {
+                let data = value.as_slice::<i32>();
+                cast_slice(data)
+            },
+            Dtype::Int64 => {
+                let data = value.as_slice::<i64>();
+                cast_slice(data)
+            },
+            Dtype::Float16 => {
+                let data = value.as_slice::<half::f16>();
+                let bits: &[u16] = transmute(data);
+                cast_slice(bits)
+            },
+            Dtype::Float32 => {
+                let data = value.as_slice::<f32>();
+                cast_slice(data)
+            },
+            Dtype::Float64 => {
+                let data = value.as_slice::<f64>();
+                cast_slice(data)
+            },
+            Dtype::Bfloat16 => {
+                let data = value.as_slice::<half::bf16>();
+                let bits: &[u16] = transmute(data);
+                cast_slice(bits)
+            },
+            Dtype::Complex64 => return Err(ConversionError::MlxDtype(Dtype::Complex64)),
+        }
+    };
 
-    fn try_from(value: &'a Array) -> Result<Self, Self::Error> {
-        let dtype: safetensors::tensor::Dtype = value.dtype().try_into()?;
-        let shape = value.shape()
-            .iter()
-            .map(|x| *x as usize)
-            .collect::<Vec<_>>();
-        let data: &[u8] = unsafe {
-            match value.dtype() {
-                Dtype::Bool => {
-                    let data = value.as_slice::<bool>();
-                    cast_slice(data)
-                },
-                Dtype::Uint8 => {
-                    let data = value.as_slice::<u8>();
-                    cast_slice(data)
-                },
-                Dtype::Uint16 => {
-                    let data = value.as_slice::<u16>();
-                    cast_slice(data)
-                },
-                Dtype::Uint32 => {
-                    let data = value.as_slice::<u32>();
-                    cast_slice(data)
-                },
-                Dtype::Uint64 => {
-                    let data = value.as_slice::<u64>();
-                    cast_slice(data)
-                },
-                Dtype::Int8 => {
-                    let data = value.as_slice::<i8>();
-                    cast_slice(data)
-                },
-                Dtype::Int16 => {
-                    let data = value.as_slice::<i16>();
-                    cast_slice(data)
-                },
-                Dtype::Int32 => {
-                    let data = value.as_slice::<i32>();
-                    cast_slice(data)
-                },
-                Dtype::Int64 => {
-                    let data = value.as_slice::<i64>();
-                    cast_slice(data)
-                },
-                Dtype::Float16 => {
-                    let data = value.as_slice::<half::f16>();
-                    let bits: &[u16] = transmute(data);
-                    cast_slice(bits)
-                },
-                Dtype::Float32 => {
-                    let data = value.as_slice::<f32>();
-                    cast_slice(data)
-                },
-                Dtype::Float64 => {
-                    let data = value.as_slice::<f64>();
-                    cast_slice(data)
-                },
-                Dtype::Bfloat16 => {
-                    let data = value.as_slice::<half::bf16>();
-                    let bits: &[u16] = transmute(data);
-                    cast_slice(bits)
-                },
-                Dtype::Complex64 => return Err(ConversionError::MlxDtype(Dtype::Complex64)),
-            }
-        };
-
-        TensorView::new(dtype, shape, data)
-            .map_err(Into::into)
-    }
+    TensorView::new(dtype, shape, data)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
-    use safetensors::tensor::TensorView;
-
     use crate::{array, complex64, Array};
 
     // Helper macro to test conversion between Array and TensorView
     macro_rules! assert_conversion {
         ($arr:expr, $dtype:expr) => {
-            let arr = $arr.as_dtype($dtype).unwrap();
-            let tensor = TensorView::try_from(&arr).unwrap();
+            let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+            let arr = $arr.as_dtype($dtype, &stream).unwrap();
+            let arr = arr.evaluated().unwrap();
+            let tensor = super::tensor_view_from_array(&arr).unwrap();
             let arr2 = Array::try_from(tensor).unwrap();
+            let arr2 = arr2.evaluated().unwrap();
 
-            assert_eq!(arr, arr2);
+            assert!(arr.equal_values(&arr2));
         };
     }
 
@@ -194,8 +199,12 @@ mod tests {
 
     #[test]
     fn test_conversion_complex64() {
-        let arr = array!([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).as_type::<complex64>().unwrap();
-        let tensor = TensorView::try_from(&arr);
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let arr = array!([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            .as_type::<complex64>(&stream)
+            .unwrap();
+        let arr = arr.evaluated().unwrap();
+        let tensor = super::tensor_view_from_array(&arr);
         assert!(tensor.is_err());
     }
 }

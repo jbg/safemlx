@@ -26,11 +26,11 @@ impl Module<&Array> for Sequential {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut x = Cow::Borrowed(x);
 
         for layer in &mut self.layers {
-            x = Cow::Owned(layer.forward(x.as_ref())?);
+            x = Cow::Owned(layer.forward(x.as_ref(), stream)?);
         }
 
         match x {
@@ -97,6 +97,7 @@ mod tests {
 
     #[test]
     fn test_sequential_linear_param_update() {
+        let stream = crate::test_stream();
         let mut model = Sequential::new()
             .append(Linear::new(2, 3).unwrap())
             .append(Linear::new(3, 1).unwrap());
@@ -114,18 +115,18 @@ mod tests {
         // Check that the initial weights are not all zeros
         assert!(
             params["layers.0.weight"]
-                .abs()
+                .abs(stream)
                 .unwrap()
-                .sum(None)
+                .sum(None, stream)
                 .unwrap()
-                .item::<f32>()
+                .item::<f32>(&stream)
                 - 0.0
                 > 1e-6
         );
 
         // Update the weight with zeros
         let shape = params["layers.0.weight"].shape();
-        let zeros = zeros::<f32>(shape).unwrap();
+        let zeros = zeros::<f32>(shape, stream).unwrap();
         let value_mut = params.get_mut("layers.0.weight").unwrap();
         **value_mut = zeros;
 
@@ -133,11 +134,21 @@ mod tests {
         let first_layer = &model.layers[0];
         let linear_params = first_layer.parameters().flatten();
         let weight = linear_params["weight"];
-        assert!(weight.abs().unwrap().sum(None).unwrap().item::<f32>() - 0.0 < 1e-6);
+        assert!(
+            weight
+                .abs(stream)
+                .unwrap()
+                .sum(None, stream)
+                .unwrap()
+                .item::<f32>(&stream)
+                - 0.0
+                < 1e-6
+        );
     }
 
     #[test]
     fn test_sgd_update_sequential_linear_params() {
+        let stream = crate::test_stream();
         let lr = 1e-2;
         let input_dim = 2;
         let hidden_dim = 3;
@@ -156,29 +167,31 @@ mod tests {
             .build()
             .unwrap();
         let loss_fn = |model: &mut Sequential, (x, y): (&Array, &Array)| {
-            let y_pred = model.forward(x)?;
-            loss.apply(&y_pred, y)
+            let y_pred = model.forward(x, stream)?;
+            loss.apply(&y_pred, y, stream)
         };
 
         let mut lg = nn::value_and_grad(loss_fn);
 
         let mut optimizer = Sgd::new(lr);
+        let mut random_state = crate::random::RandomState::with_seed(0).unwrap();
 
         let mut losses = vec![];
         for _ in 0..100 {
             // Generate random data
-            let x = uniform::<_, f32>(-5.0, 5.0, &[input_dim], None).unwrap();
-            let y = &m * &x + &b;
+            let key = random_state.next_key(stream).unwrap();
+            let x = uniform::<_, f32>(-5.0, 5.0, &[input_dim], &key, stream).unwrap();
+            let y = m.multiply(&x, stream).unwrap().add(&b, stream).unwrap();
 
             eval([&x, &y]).unwrap();
 
             // Compute the loss and gradients and update the model
             let (loss, grads) = lg(&mut model, (&x, &y)).unwrap();
-            optimizer.update(&mut model, grads).unwrap();
+            optimizer.update(&mut model, grads, stream).unwrap();
 
             eval_params(model.parameters()).unwrap();
 
-            losses.push(loss.item::<f32>());
+            losses.push(loss.item::<f32>(&stream));
         }
 
         // Check that it converges

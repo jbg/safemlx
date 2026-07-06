@@ -2,20 +2,15 @@ use crate::{
     dtype::Dtype,
     error::AsSliceError,
     sealed::Sealed,
-    utils::{guard::Guarded, SUCCESS},
+    utils::{guard::Guarded, runtime_lock},
     Stream,
 };
 use element::FromSliceElement;
 use num_complex::Complex;
-use safemlx_internal_macros::default_device;
 use safemlx_sys::mlx_array;
-use std::{
-    ffi::{c_void, CStr},
-    iter::Sum,
-};
+use std::ffi::c_void;
 
 mod element;
-mod operators;
 
 cfg_safetensors! {
     mod safetensors;
@@ -30,35 +25,54 @@ pub use element::ArrayElement;
 pub type complex64 = Complex<f32>;
 
 /// An n-dimensional array.
+///
+/// Arrays are lazy MLX graph values. They are not `Send`; materialize and copy
+/// data into ordinary Rust values before moving results across threads.
 #[repr(transparent)]
 pub struct Array {
     c_array: mlx_array,
+}
+
+/// An evaluated array with materialized storage available for host reads.
+pub struct EvaluatedArray<'a> {
+    storage: EvaluatedArrayStorage<'a>,
+}
+
+enum EvaluatedArrayStorage<'a> {
+    Borrowed(&'a Array),
+    Owned(Array),
 }
 
 impl Sealed for Array {}
 
 impl Sealed for &Array {}
 
+impl std::fmt::Debug for EvaluatedArray<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvaluatedArray")
+            .field("dtype", &self.as_array().dtype())
+            .field("shape", &self.as_array().shape())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for Array {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
+        f.debug_struct("Array")
+            .field("dtype", &self.dtype())
+            .field("shape", &self.shape())
+            .finish_non_exhaustive()
     }
 }
 
 impl std::fmt::Display for Array {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe {
-            let mut mlx_str = safemlx_sys::mlx_string_new();
-            let status = safemlx_sys::mlx_array_tostring(&mut mlx_str as *mut _, self.as_ptr());
-            if status != SUCCESS {
-                return Err(std::fmt::Error);
-            }
-            let ptr = safemlx_sys::mlx_string_data(mlx_str);
-            let c_str = CStr::from_ptr(ptr);
-            write!(f, "{}", c_str.to_str().map_err(|_| std::fmt::Error)?)?;
-            safemlx_sys::mlx_string_free(mlx_str);
-            Ok(())
-        }
+        write!(
+            f,
+            "Array(dtype={:?}, shape={:?})",
+            self.dtype(),
+            self.shape()
+        )
     }
 }
 
@@ -68,21 +82,6 @@ impl Drop for Array {
 
         // Decrease the reference count
         unsafe { safemlx_sys::mlx_array_free(self.as_ptr()) };
-    }
-}
-
-unsafe impl Send for Array {}
-
-impl PartialEq for Array {
-    /// Array equality check.
-    ///
-    /// Compare two arrays for equality. Returns `true` iff the arrays have
-    /// the same shape and their values are equal. The arrays need not have
-    /// the same type to be considered equal.
-    ///
-    /// If you're looking for element-wise equality, use the [Array::eq()] method.
-    fn eq(&self, other: &Self) -> bool {
-        self.array_eq(other, None).unwrap().item()
     }
 }
 
@@ -200,10 +199,12 @@ impl Array {
     /// # Example
     ///
     /// ```rust
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     /// use safemlx::Array;
     ///
     /// let data = vec![1i32, 2, 3, 4, 5];
     /// let mut array = Array::from_iter(data.clone(), &[5]);
+    /// let array = array.evaluated().unwrap();
     /// assert_eq!(array.as_slice::<i32>(), &data[..]);
     /// ```
     pub fn from_iter<I: IntoIterator<Item = T>, T: FromSliceElement>(
@@ -297,45 +298,92 @@ impl Array {
         Dtype::try_from(dtype).unwrap()
     }
 
-    /// Evaluate the array.
-    pub fn eval(&self) -> crate::error::Result<()> {
-        <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_array_eval(self.as_ptr()) })
+    /// Evaluate the array and return a borrowed host-readable value.
+    pub fn evaluated(&self) -> crate::error::Result<EvaluatedArray<'_>> {
+        let _guard = runtime_lock::enter();
+        <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_array_eval(self.as_ptr()) })?;
+        Ok(EvaluatedArray {
+            storage: EvaluatedArrayStorage::Borrowed(self),
+        })
+    }
+
+    /// Evaluate the array and return an owned host-readable value.
+    pub fn into_evaluated(self) -> crate::error::Result<EvaluatedArray<'static>> {
+        let _guard = runtime_lock::enter();
+        <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_array_eval(self.as_ptr()) })?;
+        Ok(EvaluatedArray {
+            storage: EvaluatedArrayStorage::Owned(self),
+        })
+    }
+
+    /// Evaluate and access the value of a scalar array.
+    ///
+    /// If `T` does not match the array's dtype, the value is converted on
+    /// `stream` before evaluation.
+    pub fn item<T: ArrayElement>(self, stream: impl AsRef<Stream>) -> T {
+        self.try_item(stream).unwrap()
+    }
+
+    /// Evaluate and access the value of a scalar array.
+    ///
+    /// If `T` does not match the array's dtype, the value is converted on
+    /// `stream` before evaluation.
+    pub fn try_item<T: ArrayElement>(self, stream: impl AsRef<Stream>) -> crate::error::Result<T> {
+        let stream = stream.as_ref();
+        let array = if self.dtype() == T::DTYPE {
+            self
+        } else {
+            self.as_dtype(T::DTYPE, stream)?
+        };
+
+        array.into_evaluated()?.try_item()
+    }
+
+    /// Clone the array by copying the data.
+    ///
+    /// This is named `deep_clone` to avoid confusion with the `Clone` trait.
+    pub fn deep_clone(self) -> crate::error::Result<Self> {
+        let clone = self.into_evaluated()?.deep_clone()?;
+        Ok(clone
+            .into_array()
+            .expect("deep cloned evaluated arrays always own their storage"))
+    }
+}
+
+impl<'a> EvaluatedArray<'a> {
+    /// Return the evaluated array to the lazy array type if this value owns it.
+    pub fn into_array(self) -> Option<Array> {
+        match self.storage {
+            EvaluatedArrayStorage::Borrowed(_) => None,
+            EvaluatedArrayStorage::Owned(array) => Some(array),
+        }
+    }
+
+    /// Borrow the underlying array.
+    pub fn as_array(&self) -> &Array {
+        match &self.storage {
+            EvaluatedArrayStorage::Borrowed(array) => array,
+            EvaluatedArrayStorage::Owned(array) => array,
+        }
     }
 
     /// Access the value of a scalar array.
-    /// If `T` does not match the array's `dtype` this will convert the type first.
-    ///
-    /// _Note: This will evaluate the array._
     pub fn item<T: ArrayElement>(&self) -> T {
         self.try_item().unwrap()
     }
 
     /// Access the value of a scalar array returning an error if the array is not a scalar.
-    /// If `T` does not match the array's `dtype` this will convert the type first.
-    ///
-    /// _Note: This will evaluate the array._
     pub fn try_item<T: ArrayElement>(&self) -> crate::error::Result<T> {
-        self.eval()?;
-
-        // Evaluate the array, so we have content to work with in the conversion
-        self.eval()?;
-
-        // Though `mlx_array_item_<dtype>` returns a status code, it doesn't
-        // return any non-success status code even if the dtype doesn't match.
-        if self.dtype() != T::DTYPE {
-            let new_array = Array::try_from_op(|res| unsafe {
-                safemlx_sys::mlx_astype(
-                    res,
-                    self.as_ptr(),
-                    T::DTYPE.into(),
-                    Stream::default().as_ptr(),
-                )
-            })?;
-            new_array.eval()?;
-            return T::array_item(&new_array);
+        let array = self.as_array();
+        if array.dtype() != T::DTYPE {
+            return Err(crate::error::Exception::custom(format!(
+                "dtype mismatch: expected {:?}, found {:?}",
+                T::DTYPE,
+                array.dtype()
+            )));
         }
 
-        T::array_item(self)
+        T::array_item(array)
     }
 
     /// Returns a slice of the array data without validating the dtype.
@@ -348,22 +396,23 @@ impl Array {
     /// # Example
     ///
     /// ```rust
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     /// use safemlx::Array;
     ///
     /// let data = [1i32, 2, 3, 4, 5];
     /// let mut array = Array::from_slice(&data[..], &[5]);
     ///
     /// unsafe {
+    ///    let array = array.evaluated().unwrap();
     ///    let slice = array.as_slice_unchecked::<i32>();
     ///    assert_eq!(slice, &[1, 2, 3, 4, 5]);
     /// }
     /// ```
     pub unsafe fn as_slice_unchecked<T: ArrayElement>(&self) -> &[T] {
-        self.eval().unwrap();
-
         unsafe {
-            let data = T::array_data(self);
-            let size = self.size();
+            let array = self.as_array();
+            let data = T::array_data(array);
+            let size = array.size();
             std::slice::from_raw_parts(data, size)
         }
     }
@@ -373,27 +422,28 @@ impl Array {
     /// # Example
     ///
     /// ```rust
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     /// use safemlx::Array;
     ///
     /// let data = [1i32, 2, 3, 4, 5];
     /// let mut array = Array::from_slice(&data[..], &[5]);
     ///
+    /// let array = array.evaluated().unwrap();
     /// let slice = array.try_as_slice::<i32>();
     /// assert_eq!(slice, Ok(&data[..]));
     /// ```
     pub fn try_as_slice<T: ArrayElement>(&self) -> Result<&[T], AsSliceError> {
-        if self.dtype() != T::DTYPE {
+        let array = self.as_array();
+        if array.dtype() != T::DTYPE {
             return Err(AsSliceError::DtypeMismatch {
                 expecting: T::DTYPE,
-                found: self.dtype(),
+                found: array.dtype(),
             });
         }
 
-        self.eval()?;
-
         unsafe {
-            let size = self.size();
-            let data = T::array_data(self);
+            let size = array.size();
+            let data = T::array_data(array);
             if data.is_null() || size == 0 {
                 return Err(AsSliceError::Null);
             }
@@ -403,8 +453,6 @@ impl Array {
     }
 
     /// Returns a slice of the array data.
-    /// This method requires a mutable reference (`&self`) because it evaluates the array.
-    ///
     /// # Panics
     ///
     /// Panics if the array is not evaluated or if the desired dtype does not match the actual dtype
@@ -412,11 +460,13 @@ impl Array {
     /// # Example
     ///
     /// ```rust
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     /// use safemlx::Array;
     ///
     /// let data = [1i32, 2, 3, 4, 5];
     /// let mut array = Array::from_slice(&data[..], &[5]);
     ///
+    /// let array = array.evaluated().unwrap();
     /// let slice = array.as_slice::<i32>();
     /// assert_eq!(slice, &data[..]);
     /// ```
@@ -427,34 +477,41 @@ impl Array {
     /// Clone the array by copying the data.
     ///
     /// This is named `deep_clone` to avoid confusion with the `Clone` trait.
-    pub fn deep_clone(&self) -> Self {
+    pub fn deep_clone(&self) -> crate::error::Result<EvaluatedArray<'static>> {
         unsafe {
-            let dtype = self.dtype();
-            let shape = self.shape();
+            let array = self.as_array();
+            let dtype = array.dtype();
+            let shape = array.shape();
             let data = match dtype {
-                Dtype::Bool => safemlx_sys::mlx_array_data_bool(self.as_ptr()) as *const c_void,
-                Dtype::Uint8 => safemlx_sys::mlx_array_data_uint8(self.as_ptr()) as *const c_void,
-                Dtype::Uint16 => safemlx_sys::mlx_array_data_uint16(self.as_ptr()) as *const c_void,
-                Dtype::Uint32 => safemlx_sys::mlx_array_data_uint32(self.as_ptr()) as *const c_void,
-                Dtype::Uint64 => safemlx_sys::mlx_array_data_uint64(self.as_ptr()) as *const c_void,
-                Dtype::Int8 => safemlx_sys::mlx_array_data_int8(self.as_ptr()) as *const c_void,
-                Dtype::Int16 => safemlx_sys::mlx_array_data_int16(self.as_ptr()) as *const c_void,
-                Dtype::Int32 => safemlx_sys::mlx_array_data_int32(self.as_ptr()) as *const c_void,
-                Dtype::Int64 => safemlx_sys::mlx_array_data_int64(self.as_ptr()) as *const c_void,
+                Dtype::Bool => safemlx_sys::mlx_array_data_bool(array.as_ptr()) as *const c_void,
+                Dtype::Uint8 => safemlx_sys::mlx_array_data_uint8(array.as_ptr()) as *const c_void,
+                Dtype::Uint16 => {
+                    safemlx_sys::mlx_array_data_uint16(array.as_ptr()) as *const c_void
+                }
+                Dtype::Uint32 => {
+                    safemlx_sys::mlx_array_data_uint32(array.as_ptr()) as *const c_void
+                }
+                Dtype::Uint64 => {
+                    safemlx_sys::mlx_array_data_uint64(array.as_ptr()) as *const c_void
+                }
+                Dtype::Int8 => safemlx_sys::mlx_array_data_int8(array.as_ptr()) as *const c_void,
+                Dtype::Int16 => safemlx_sys::mlx_array_data_int16(array.as_ptr()) as *const c_void,
+                Dtype::Int32 => safemlx_sys::mlx_array_data_int32(array.as_ptr()) as *const c_void,
+                Dtype::Int64 => safemlx_sys::mlx_array_data_int64(array.as_ptr()) as *const c_void,
                 Dtype::Float16 => {
-                    safemlx_sys::mlx_array_data_float16(self.as_ptr()) as *const c_void
+                    safemlx_sys::mlx_array_data_float16(array.as_ptr()) as *const c_void
                 }
                 Dtype::Float32 => {
-                    safemlx_sys::mlx_array_data_float32(self.as_ptr()) as *const c_void
+                    safemlx_sys::mlx_array_data_float32(array.as_ptr()) as *const c_void
                 }
                 Dtype::Float64 => {
-                    safemlx_sys::mlx_array_data_float64(self.as_ptr()) as *const c_void
+                    safemlx_sys::mlx_array_data_float64(array.as_ptr()) as *const c_void
                 }
                 Dtype::Bfloat16 => {
-                    safemlx_sys::mlx_array_data_bfloat16(self.as_ptr()) as *const c_void
+                    safemlx_sys::mlx_array_data_bfloat16(array.as_ptr()) as *const c_void
                 }
                 Dtype::Complex64 => {
-                    safemlx_sys::mlx_array_data_complex64(self.as_ptr()) as *const c_void
+                    safemlx_sys::mlx_array_data_complex64(array.as_ptr()) as *const c_void
                 }
             };
 
@@ -465,7 +522,9 @@ impl Array {
                 dtype.into(),
             );
 
-            Array::from_ptr(new_c_array)
+            Ok(EvaluatedArray {
+                storage: EvaluatedArrayStorage::Owned(Array::from_ptr(new_c_array)),
+            })
         }
     }
 }
@@ -478,18 +537,62 @@ impl Clone for Array {
     }
 }
 
-impl Sum for Array {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Array::from_int(0), |acc, x| acc.add(&x).unwrap())
+impl EvaluatedArray<'_> {
+    /// Compare two evaluated arrays for equal dtype, shape, and values.
+    pub fn equal_values(&self, other: &Self) -> bool {
+        if self.as_array().dtype() != other.as_array().dtype()
+            || self.as_array().shape() != other.as_array().shape()
+        {
+            return false;
+        }
+
+        macro_rules! eq_slice {
+            ($ty:ty) => {{
+                let lhs = self.as_slice::<$ty>();
+                let rhs = other.as_slice::<$ty>();
+                lhs == rhs
+            }};
+        }
+
+        match self.as_array().dtype() {
+            Dtype::Bool => eq_slice!(bool),
+            Dtype::Uint8 => eq_slice!(u8),
+            Dtype::Uint16 => eq_slice!(u16),
+            Dtype::Uint32 => eq_slice!(u32),
+            Dtype::Uint64 => eq_slice!(u64),
+            Dtype::Int8 => eq_slice!(i8),
+            Dtype::Int16 => eq_slice!(i16),
+            Dtype::Int32 => eq_slice!(i32),
+            Dtype::Int64 => eq_slice!(i64),
+            Dtype::Float16 => eq_slice!(half::f16),
+            Dtype::Float32 => eq_slice!(f32),
+            Dtype::Float64 => eq_slice!(f64),
+            Dtype::Bfloat16 => eq_slice!(half::bf16),
+            Dtype::Complex64 => eq_slice!(crate::complex64),
+        }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn eval_vec<T>(array: &Array) -> Vec<T>
+where
+    T: ArrayElement + Clone,
+{
+    array.evaluated().unwrap().as_slice::<T>().to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn eval_equal_values(lhs: &Array, rhs: &Array) -> bool {
+    let lhs = lhs.evaluated().unwrap();
+    let rhs = rhs.evaluated().unwrap();
+    lhs.equal_values(&rhs)
 }
 
 /// Stop gradients from being computed.
 ///
 /// The operation is the identity but it prevents gradients from flowing
 /// through the array.
-#[default_device]
-pub fn stop_gradient_device(
+pub fn stop_gradient(
     a: impl AsRef<Array>,
     stream: impl AsRef<Stream>,
 ) -> crate::error::Result<Array> {
@@ -917,8 +1020,8 @@ mod tests {
 
     #[test]
     fn new_scalar_array_from_bool() {
+        let stream = crate::test_stream();
         let array = Array::from_bool(true);
-        assert!(array.item::<bool>());
         assert_eq!(array.item_size(), 1);
         assert_eq!(array.size(), 1);
         assert!(array.strides().is_empty());
@@ -926,12 +1029,13 @@ mod tests {
         assert_eq!(array.ndim(), 0);
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Bool);
+        assert!(array.item::<bool>(&stream));
     }
 
     #[test]
     fn new_scalar_array_from_int() {
+        let stream = crate::test_stream();
         let array = Array::from_int(42);
-        assert_eq!(array.item::<i32>(), 42);
         assert_eq!(array.item_size(), 4);
         assert_eq!(array.size(), 1);
         assert!(array.strides().is_empty());
@@ -939,12 +1043,13 @@ mod tests {
         assert_eq!(array.ndim(), 0);
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.item::<i32>(&stream), 42);
     }
 
     #[test]
     fn new_scalar_array_from_f32() {
+        let stream = crate::test_stream();
         let array = Array::from_f32(3.14);
-        assert_eq!(array.item::<f32>(), 3.14);
         assert_eq!(array.item_size(), 4);
         assert_eq!(array.size(), 1);
         assert!(array.strides().is_empty());
@@ -952,12 +1057,15 @@ mod tests {
         assert_eq!(array.ndim(), 0);
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Float32);
+        assert_eq!(array.item::<f32>(&stream), 3.14);
     }
 
     #[test]
     fn new_scalar_array_from_f64() {
-        let array = Array::from_f64(3.14).as_dtype(Dtype::Float64).unwrap();
-        float_eq::assert_float_eq!(array.item::<f64>(), 3.14, abs <= 1e-5);
+        let stream = crate::test_stream();
+        let array = Array::from_f64(3.14)
+            .as_dtype(Dtype::Float64, stream)
+            .unwrap();
         assert_eq!(array.item_size(), 8);
         assert_eq!(array.size(), 1);
         assert!(array.strides().is_empty());
@@ -965,6 +1073,7 @@ mod tests {
         assert_eq!(array.ndim(), 0);
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Float64);
+        float_eq::assert_float_eq!(array.item::<f64>(&stream), 3.14, abs <= 1e-5);
     }
 
     #[test]
@@ -982,9 +1091,9 @@ mod tests {
 
     #[test]
     fn new_scalar_array_from_complex() {
+        let stream = crate::test_stream();
         let val = complex64::new(1.0, 2.0);
         let array = Array::from_complex(val);
-        assert_eq!(array.item::<complex64>(), val);
         assert_eq!(array.item_size(), 8);
         assert_eq!(array.size(), 1);
         assert!(array.strides().is_empty());
@@ -992,14 +1101,13 @@ mod tests {
         assert_eq!(array.ndim(), 0);
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Complex64);
+        assert_eq!(array.item::<complex64>(&stream), val);
     }
 
     #[test]
     fn new_array_from_single_element_slice() {
         let data = [1i32];
         let array = Array::from_slice(&data, &[1]);
-        assert_eq!(array.as_slice::<i32>(), &data[..]);
-        assert_eq!(array.item::<i32>(), 1);
         assert_eq!(array.item_size(), 4);
         assert_eq!(array.size(), 1);
         assert_eq!(array.strides(), &[1]);
@@ -1008,13 +1116,13 @@ mod tests {
         assert_eq!(array.dim(0), 1);
         assert_eq!(array.shape(), &[1]);
         assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
     }
 
     #[test]
     fn new_array_from_multi_element_slice() {
         let data = [1i32, 2, 3, 4, 5];
         let array = Array::from_slice(&data, &[5]);
-        assert_eq!(array.as_slice::<i32>(), &data[..]);
         assert_eq!(array.item_size(), 4);
         assert_eq!(array.size(), 5);
         assert_eq!(array.strides(), &[1]);
@@ -1023,13 +1131,13 @@ mod tests {
         assert_eq!(array.dim(0), 5);
         assert_eq!(array.shape(), &[5]);
         assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
     }
 
     #[test]
     fn new_2d_array_from_slice() {
         let data = [1i32, 2, 3, 4, 5, 6];
         let array = Array::from_slice(&data, &[2, 3]);
-        assert_eq!(array.as_slice::<i32>(), &data[..]);
         assert_eq!(array.item_size(), 4);
         assert_eq!(array.size(), 6);
         assert_eq!(array.strides(), &[3, 1]);
@@ -1041,19 +1149,22 @@ mod tests {
         assert_eq!(array.dim(-2), 2); // negative index
         assert_eq!(array.shape(), &[2, 3]);
         assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
     }
 
     #[test]
     fn deep_cloned_array_has_different_ptr() {
         let data = [1i32, 2, 3, 4, 5];
         let orig = Array::from_slice(&data, &[5]);
-        let clone = orig.deep_clone();
+        let clone = orig.clone().deep_clone().unwrap();
+        let orig = orig.evaluated().unwrap();
+        let clone = clone.evaluated().unwrap();
 
         // Data should be the same
         assert_eq!(orig.as_slice::<i32>(), clone.as_slice::<i32>());
 
         // Addr of `mlx_array` should be different
-        assert_ne!(orig.as_ptr().ctx, clone.as_ptr().ctx);
+        assert_ne!(orig.as_array().as_ptr().ctx, clone.as_array().as_ptr().ctx);
 
         // Addr of data should be different
         assert_ne!(
@@ -1069,24 +1180,32 @@ mod tests {
         let array2 = Array::from_slice(&data, &[5]);
         let array3 = Array::from_slice(&[1i32, 2, 3, 4, 6], &[5]);
 
-        assert_eq!(&array1, &array2);
-        assert_ne!(&array1, &array3);
+        let array1 = array1.evaluated().unwrap();
+        let array2 = array2.evaluated().unwrap();
+        let array3 = array3.evaluated().unwrap();
+
+        assert!(array1.equal_values(&array2));
+        assert!(!array1.equal_values(&array3));
     }
 
     #[test]
     fn test_array_item_non_scalar() {
+        let stream = crate::test_stream();
         let data = [1i32, 2, 3, 4, 5];
         let array = Array::from_slice(&data, &[5]);
-        assert!(array.try_item::<i32>().is_err());
+        assert!(array.try_item::<i32>(&stream).is_err());
     }
 
     #[test]
     fn test_item_type_conversion() {
+        let stream = crate::test_stream();
         let array = Array::from_f32(1.0);
-        assert_eq!(array.item::<i32>(), 1);
-        assert_eq!(array.item::<complex64>(), complex64::new(1.0, 0.0));
-        assert_eq!(array.item::<u8>(), 1);
-
-        assert_eq!(array.as_slice::<f32>(), &[1.0]);
+        assert_eq!(array.clone().item::<i32>(&stream), 1);
+        assert_eq!(
+            array.clone().item::<complex64>(&stream),
+            complex64::new(1.0, 0.0)
+        );
+        assert_eq!(array.clone().item::<u8>(&stream), 1);
+        assert_eq!(array.evaluated().unwrap().as_slice::<f32>(), &[1.0]);
     }
 }

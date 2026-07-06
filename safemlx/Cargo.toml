@@ -1,10 +1,7 @@
 [package]
 name = "safemlx"
-version = "0.25.3"
-authors = [
-    "Minghua Wu <michael.wu1107@gmail.com>",
-    "David Chavez <david@dcvz.io>",
-]
+version.workspace = true
+authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -42,6 +39,7 @@ itertools.workspace = true
 # optional dependencies
 safetensors = { version = "0.6", optional = true }
 bytemuck = { version = "1", optional = true, features = ["extern_crate_std"] }
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
@@ -55,4 +53,4 @@ accelerate = ["safemlx-sys/accelerate"]
 metal = ["safemlx-sys/metal"]
 
 # Enables conversion between `Array` and `safetensors::TensorView`
-safetensors = ["dep:safetensors", "dep:bytemuck"]
+safetensors = ["dep:safetensors", "dep:bytemuck", "dep:memmap2"]

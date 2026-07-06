@@ -83,12 +83,14 @@ impl Optimizer for Adam {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let betas = &self.betas;
         let state = get_mut_or_insert_with(&mut self.state, key, || (array!(0.0), array!(0.0)));
 
-        let (new_parameter, new_state) =
-            adam_apply_single(&self.lr, betas, &self.eps, gradient, parameter, state)?;
+        let (new_parameter, new_state) = adam_apply_single(
+            &self.lr, betas, &self.eps, gradient, parameter, state, stream,
+        )?;
 
         *state = new_state;
         *parameter = new_parameter;
@@ -105,20 +107,25 @@ pub(super) fn adam_apply_single(
     gradient: &Array,
     parameter: &Array,
     state: &(Array, Array),
+    stream: &Stream,
 ) -> crate::error::Result<(Array, (Array, Array))> {
     let (b1, b2) = betas;
     let (m, v) = state;
 
-    let one_minus_b1 = array!(1.0).subtract(b1)?;
-    let one_minus_b2 = array!(1.0).subtract(b2)?;
+    let one_minus_b1 = array!(1.0).subtract(b1, stream)?;
+    let one_minus_b2 = array!(1.0).subtract(b2, stream)?;
 
-    let new_m = b1.multiply(m)?.add(&one_minus_b1.multiply(gradient)?)?;
-    let new_v = b2
-        .multiply(v)?
-        .add(&one_minus_b2.multiply(gradient.square()?)?)?;
+    let new_m = b1
+        .multiply(m, stream)?
+        .add(&one_minus_b1.multiply(gradient, stream)?, stream)?;
+    let new_v = b2.multiply(v, stream)?.add(
+        &one_minus_b2.multiply(gradient.square(stream)?, stream)?,
+        stream,
+    )?;
 
-    let new_parameter =
-        parameter.subtract(&lr.multiply(&new_m.divide(&new_v.sqrt()?.add(eps)?)?)?)?;
+    let denom = new_v.sqrt(stream)?.add(eps, stream)?;
+    let step = lr.multiply(&new_m.divide(&denom, stream)?, stream)?;
+    let new_parameter = parameter.subtract(&step, stream)?;
 
     Ok((new_parameter, (new_m, new_v)))
 }

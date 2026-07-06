@@ -109,9 +109,18 @@ mod tests {
         let flattened = map.flatten();
 
         assert_eq!(flattened.len(), 3);
-        assert_eq!(flattened["first"], array!([1, 2, 3]));
-        assert_eq!(flattened["second.a"], array!([4, 5, 6]));
-        assert_eq!(flattened["second.b"], array!([7, 8, 9]));
+        assert!(crate::array::eval_equal_values(
+            &flattened["first"],
+            &array!([1, 2, 3])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.a"],
+            &array!([4, 5, 6])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.b"],
+            &array!([7, 8, 9])
+        ));
     }
 
     #[test]
@@ -140,9 +149,18 @@ mod tests {
         let flattened = map.flatten();
 
         assert_eq!(flattened.len(), 3);
-        assert_eq!(flattened["first"], &first_entry_content);
-        assert_eq!(flattened["second.a"], &second_entry_content_a);
-        assert_eq!(flattened["second.b"], &second_entry_content_b);
+        assert!(crate::array::eval_equal_values(
+            &flattened["first"],
+            &first_entry_content
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.a"],
+            &second_entry_content_a
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.b"],
+            &second_entry_content_b
+        ));
     }
 
     #[test]
@@ -171,9 +189,18 @@ mod tests {
         let flattened = map.flatten();
 
         assert_eq!(flattened.len(), 3);
-        assert_eq!(flattened["first"], &mut array!([1, 2, 3]));
-        assert_eq!(flattened["second.a"], &mut array!([4, 5, 6]));
-        assert_eq!(flattened["second.b"], &mut array!([7, 8, 9]));
+        assert!(crate::array::eval_equal_values(
+            &flattened["first"],
+            &array!([1, 2, 3])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.a"],
+            &array!([4, 5, 6])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &flattened["second.b"],
+            &array!([7, 8, 9])
+        ));
     }
 
     #[test]

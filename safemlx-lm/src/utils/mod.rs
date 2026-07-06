@@ -4,10 +4,10 @@ use safemlx::{
     fast::ScaledDotProductAttentionMask,
     ops::{
         expand_dims,
-        indexing::{IndexOp, NewAxis},
+        indexing::{NewAxis, TryIndexOp},
         quantized_matmul, reshape, softmax_axis,
     },
-    Array, Dtype,
+    Array, Dtype, Stream,
 };
 
 use crate::cache::KeyValueCache;
@@ -81,6 +81,7 @@ pub(crate) fn quantized_scaled_dot_product_attention(
     mask: Option<&Array>,
     group_size: i32,
     bits: i32,
+    stream: &Stream,
 ) -> Result<Array, Exception> {
     let q_shape = queries.shape();
     let B = *q_shape.first().ok_or_else(index_out_of_bound_exception)?;
@@ -92,18 +93,18 @@ pub(crate) fn quantized_scaled_dot_product_attention(
     let n_kv_heads = q_keys_shape[q_keys_shape.len() - 3];
     let n_repeats = n_q_heads / n_kv_heads;
 
-    let mut queries = queries * scale;
+    let mut queries = queries.multiply(Array::from_f32(scale), stream)?;
 
     if n_repeats > 1 {
-        queries = reshape(&queries, &[B, n_kv_heads, n_repeats, L, D])?;
+        queries = reshape(&queries, &[B, n_kv_heads, n_repeats, L, D], stream)?;
 
-        q_keys.keys = expand_dims(q_keys.keys, -3)?;
-        q_keys.scales = expand_dims(q_keys.scales, -3)?;
-        q_keys.biases = expand_dims(q_keys.biases, -3)?;
+        q_keys.keys = expand_dims(q_keys.keys, -3, stream)?;
+        q_keys.scales = expand_dims(q_keys.scales, -3, stream)?;
+        q_keys.biases = expand_dims(q_keys.biases, -3, stream)?;
 
-        q_values.values = expand_dims(q_values.values, -3)?;
-        q_values.scales = expand_dims(q_values.scales, -3)?;
-        q_values.biases = expand_dims(q_values.biases, -3)?;
+        q_values.values = expand_dims(q_values.values, -3, stream)?;
+        q_values.scales = expand_dims(q_values.scales, -3, stream)?;
+        q_values.biases = expand_dims(q_values.biases, -3, stream)?;
     }
 
     let mut scores = quantized_matmul(
@@ -114,6 +115,7 @@ pub(crate) fn quantized_scaled_dot_product_attention(
         true,
         group_size,
         bits,
+        stream,
     )?;
 
     if let Some(mask) = mask {
@@ -121,12 +123,12 @@ pub(crate) fn quantized_scaled_dot_product_attention(
 
         if mask.dtype() == Dtype::Bool {
             let finfo_min = scores.dtype().finfo_min()?;
-            scores = safemlx::ops::r#where(mask, scores, Array::from_f64(finfo_min))?;
+            scores = safemlx::ops::r#where(mask, scores, Array::from_f64(finfo_min), stream)?;
         } else {
-            scores += mask;
+            scores = scores.add(mask, stream)?;
         }
     }
-    scores = softmax_axis(scores, -1, true)?;
+    scores = softmax_axis(scores, -1, true, stream)?;
     let mut out = quantized_matmul(
         scores,
         q_values.values,
@@ -135,10 +137,11 @@ pub(crate) fn quantized_scaled_dot_product_attention(
         false,
         group_size,
         bits,
+        stream,
     )?;
 
     if n_repeats > 1 {
-        out = reshape(out, &[B, n_q_heads, L, D])?;
+        out = reshape(out, &[B, n_q_heads, L, D], stream)?;
     }
 
     Ok(out)
@@ -197,6 +200,7 @@ pub(crate) fn scaled_dot_product_attention<C>(
     cache: Option<C>,
     scale: f32,
     mask: Option<&Array>,
+    stream: &Stream,
 ) -> Result<Array, Exception>
 where
     C: KeyValueCache,
@@ -225,7 +229,7 @@ where
             };
 
             return quantized_scaled_dot_product_attention(
-                queries, keys, values, scale, mask, group_size, bits,
+                queries, keys, values, scale, mask, group_size, bits, stream,
             );
         }
     }
@@ -248,6 +252,7 @@ where
         scale,
         mask.map(ScaledDotProductAttentionMask::Array),
         None,
+        stream,
     )
 }
 
@@ -272,22 +277,24 @@ pub(crate) fn create_causal_mask(
     offset: Option<i32>,
     window_size: Option<i32>,
     lengths: Option<Array>,
+    stream: &Stream,
 ) -> Result<Array, Exception> {
     let offset = offset.unwrap_or(0);
 
-    let rinds = arange!(stop = offset + N)?;
-    let linds = arange!(start = offset, stop = offset + N)?;
-    let linds = linds.index((.., NewAxis));
-    let rinds = rinds.index(NewAxis);
+    let rinds = arange!(stop = offset + N, stream = stream)?;
+    let linds = arange!(start = offset, stop = offset + N, stream = stream)?;
+    let linds = linds.try_index_device((.., NewAxis), stream)?;
+    let rinds = rinds.try_index_device(NewAxis, stream)?;
 
-    let mut mask = linds.ge(&rinds)?;
+    let mut mask = linds.ge(&rinds, stream)?;
     if let Some(window_size) = window_size {
-        mask = mask.logical_and(&linds.le(&(rinds + window_size))?)?;
+        let rinds_window = rinds.add(Array::from_int(window_size), stream)?;
+        mask = mask.logical_and(&linds.le(&rinds_window, stream)?, stream)?;
     }
 
     if let Some(lengths) = lengths {
-        let lengths = lengths.index((.., NewAxis, NewAxis, NewAxis));
-        mask = mask.logical_and(&linds.lt(&lengths)?)?;
+        let lengths = lengths.try_index_device((.., NewAxis, NewAxis, NewAxis), stream)?;
+        mask = mask.logical_and(&linds.lt(&lengths, stream)?, stream)?;
     }
 
     Ok(mask)
@@ -298,6 +305,7 @@ pub(crate) fn create_attention_mask<C>(
     h: &Array,
     cache: &[Option<C>],
     return_array: Option<bool>,
+    stream: &Stream,
 ) -> Result<Option<AttentionMask>, Exception>
 where
     C: KeyValueCache,
@@ -318,7 +326,7 @@ where
         }
 
         if return_array {
-            create_causal_mask(T, Some(offset), window_size, None)
+            create_causal_mask(T, Some(offset), window_size, None, stream)
                 .map(AttentionMask::Array)
                 .map(Some)
         } else {

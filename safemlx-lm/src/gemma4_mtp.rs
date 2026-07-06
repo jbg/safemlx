@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use safemlx::{
-    ops::{concatenate_axis, indexing::IndexOp},
+    ops::{concatenate_axis, indexing::TryIndexOp},
     transforms::eval,
-    Array,
+    Array, Stream,
 };
 
 use crate::{
@@ -42,6 +42,7 @@ pub fn generate_gemma4_mtp(
     eos_token_ids: &[u32],
     max_tokens: usize,
     temp: f32,
+    stream: &Stream,
 ) -> Result<(Vec<u32>, MtpStats), Error> {
     let start = Instant::now();
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
@@ -50,23 +51,30 @@ pub fn generate_gemma4_mtp(
 
     let prompt_len = prompt_tokens.shape()[1];
     if prompt_len > 1 {
-        let prefix = prompt_tokens.index((.., ..prompt_len - 1));
-        target.forward_with_state(ModelInput {
-            inputs: &prefix,
-            mask: None,
-            cache: &mut cache,
-        })?;
+        let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
+        target.forward_with_state(
+            ModelInput {
+                inputs: &prefix,
+                mask: None,
+                cache: &mut cache,
+            },
+            stream,
+        )?;
     }
 
-    let last = prompt_tokens.index((.., prompt_len - 1..));
-    let first_out = target.forward_with_state(ModelInput {
-        inputs: &last,
-        mask: None,
-        cache: &mut cache,
-    })?;
-    let first_token = sample(&first_out.logits.index((.., -1, ..)), temp)?;
+    let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
+    let first_out = target.forward_with_state(
+        ModelInput {
+            inputs: &last,
+            mask: None,
+            cache: &mut cache,
+        },
+        stream,
+    )?;
+    let first_logits = first_out.logits.try_index_device((.., -1, ..), stream)?;
+    let first_token = sample(&first_logits, temp, stream)?;
     eval([&first_token])?;
-    let mut bonus = first_token.item::<u32>();
+    let mut bonus = first_token.item::<u32>(&stream);
     stats.target_tokens += 1;
     if eos_token_ids.contains(&bonus) || max_tokens == 0 {
         stats.elapsed = start.elapsed();
@@ -74,7 +82,7 @@ pub fn generate_gemma4_mtp(
     }
 
     generated.push(bonus);
-    let mut hidden = first_out.hidden.index((.., -1.., ..));
+    let mut hidden = first_out.hidden.try_index_device((.., -1.., ..), stream)?;
     let mut shared_kv = first_out.shared_kv_states;
     assistant.reset();
     let mut emitted = 1usize;
@@ -92,22 +100,28 @@ pub fn generate_gemma4_mtp(
             .map(KeyValueCache::offset)
             .unwrap_or(0);
         assistant.set_shared_kv(shared_kv.clone(), kv_offset);
-        let draft = assistant.draft_block(target, bonus, &hidden, block, temp)?;
+        let draft = assistant.draft_block(target, bonus, &hidden, block, temp, stream)?;
         eval([&draft])?;
 
-        let verify_input =
-            concatenate_axis(&[Array::from_slice(&[bonus], &[1, 1]), draft.clone()], 1)?;
-        let verify_out = target.forward_with_state(ModelInput {
-            inputs: &verify_input,
-            mask: None,
-            cache: &mut cache,
-        })?;
-        let target_tokens = sample(&verify_out.logits, temp)?;
+        let verify_input = concatenate_axis(
+            &[Array::from_slice(&[bonus], &[1, 1]), draft.clone()],
+            1,
+            stream,
+        )?;
+        let verify_out = target.forward_with_state(
+            ModelInput {
+                inputs: &verify_input,
+                mask: None,
+                cache: &mut cache,
+            },
+            stream,
+        )?;
+        let target_tokens = sample(&verify_out.logits, temp, stream)?;
         eval([&target_tokens])?;
         stats.target_tokens += verify_input.shape()[1] as usize;
 
-        let draft_ids = array_to_ids(&draft);
-        let target_ids = array_to_ids(&target_tokens);
+        let draft_ids = array_to_ids(&draft, stream);
+        let target_ids = array_to_ids(&target_tokens, stream);
         stats.draft_tokens += draft_ids.len();
 
         let mut accepted = 0usize;
@@ -143,12 +157,12 @@ pub fn generate_gemma4_mtp(
 
         let block_size = draft_ids.len() + 1;
         if accepted < draft_ids.len() {
-            target.rollback_speculative_cache(&mut cache, accepted, block_size)?;
+            target.rollback_speculative_cache(&mut cache, accepted, block_size, stream)?;
         }
 
         hidden = verify_out
             .hidden
-            .index((.., accepted as i32..accepted as i32 + 1, ..));
+            .try_index_device((.., accepted as i32..accepted as i32 + 1, ..), stream)?;
         shared_kv = verify_out.shared_kv_states;
         if let Some(last) = generated.last().copied() {
             bonus = last;
@@ -159,10 +173,12 @@ pub fn generate_gemma4_mtp(
     Ok((generated, stats))
 }
 
-fn array_to_ids(array: &Array) -> Vec<u32> {
+fn array_to_ids(array: &Array, stream: &Stream) -> Vec<u32> {
     array
-        .flatten(None, None)
+        .flatten(None, None, stream)
         .expect("flatten token array")
+        .into_evaluated()
+        .expect("evaluate token array")
         .as_slice::<u32>()
         .to_vec()
 }

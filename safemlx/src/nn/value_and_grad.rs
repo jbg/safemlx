@@ -148,7 +148,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::module::Module;
-    use crate::{array, error::Exception, Array};
+    use crate::{error::Exception, Array};
 
     use crate::nn::{self, Linear};
 
@@ -156,87 +156,121 @@ mod tests {
     // `mlx/python/tests/test_optimizers.py``
     #[test]
     fn test_value_and_grad() {
+        let stream = crate::test_stream();
         let mut model = Linear::new(2, 2).unwrap();
-        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], None).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], &key, stream).unwrap();
 
         let loss = |model: &mut Linear, x: &Array| -> Vec<Array> {
-            vec![model.forward(x).unwrap().sum(None).unwrap()]
+            vec![model.forward(x, stream).unwrap().sum(None, stream).unwrap()]
         };
 
         let mut vg = nn::value_and_grad(loss);
         let (v, g) = vg(&mut model, &x).unwrap();
 
-        assert_ne!(v[0].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["weight"].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["bias"].sum(None).unwrap(), array!(0.0));
+        assert_ne!(v[0].sum(None, stream).unwrap().item::<f32>(stream), 0.0);
+        assert_ne!(
+            g["weight"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
+        assert_ne!(
+            g["bias"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
     }
 
     #[test]
     fn test_value_and_grad_with_unary_output() {
+        let stream = crate::test_stream();
         let mut model = Linear::new(2, 2).unwrap();
-        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], None).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], &key, stream).unwrap();
 
         let loss = |model: &mut Linear, x: &Array| -> Array {
-            model.forward(x).unwrap().sum(None).unwrap()
+            model.forward(x, stream).unwrap().sum(None, stream).unwrap()
         };
 
         let mut vg = nn::value_and_grad(loss);
         let (v, g) = vg(&mut model, &x).unwrap();
 
-        assert_ne!(v.sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["weight"].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["bias"].sum(None).unwrap(), array!(0.0));
+        assert_ne!(v.sum(None, stream).unwrap().item::<f32>(stream), 0.0);
+        assert_ne!(
+            g["weight"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
+        assert_ne!(
+            g["bias"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
     }
 
     #[test]
     fn test_fallible_module_value_and_grad() {
+        let stream = crate::test_stream();
         let mut model = Linear::new(2, 2).unwrap();
-        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], None).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], &key, stream).unwrap();
 
         let loss = |model: &mut Linear, x: &Array| -> Result<Vec<Array>, Exception> {
-            Ok(vec![model.forward(x)?.sum(None)?])
+            Ok(vec![model.forward(x, stream)?.sum(None, stream)?])
         };
 
         let mut vg = nn::value_and_grad(loss);
         let (v, g) = vg(&mut model, &x).unwrap();
 
-        assert_ne!(v[0].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["weight"].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["bias"].sum(None).unwrap(), array!(0.0));
+        assert_ne!(v[0].sum(None, stream).unwrap().item::<f32>(stream), 0.0);
+        assert_ne!(
+            g["weight"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
+        assert_ne!(
+            g["bias"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
     }
 
     #[test]
     fn test_value_and_grad_with_two_args() {
+        let stream = crate::test_stream();
         let mut model = Linear::new(2, 2).unwrap();
-        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], None).unwrap();
-        let y = crate::ops::ones::<f32>(x.shape()).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[2, 2], &key, stream).unwrap();
+        let y = crate::ops::ones::<f32>(x.shape(), stream).unwrap();
 
         let loss =
             |model: &mut Linear, (x, y): (&Array, &Array)| -> Result<Vec<Array>, Exception> {
                 model
-                    .forward(x)?
-                    .subtract(y)?
-                    .square()?
-                    .sum(None)
+                    .forward(x, stream)?
+                    .subtract(y, stream)?
+                    .square(stream)?
+                    .sum(None, stream)
                     .map(|v| vec![v])
             };
 
         let mut vg = nn::value_and_grad(loss);
         let (v, g) = vg(&mut model, (&x, &y)).unwrap();
 
-        assert_ne!(v[0].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["weight"].sum(None).unwrap(), array!(0.0));
-        assert_ne!(g["bias"].sum(None).unwrap(), array!(0.0));
+        assert_ne!(v[0].sum(None, stream).unwrap().item::<f32>(stream), 0.0);
+        assert_ne!(
+            g["weight"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
+        assert_ne!(
+            g["bias"].sum(None, stream).unwrap().item::<f32>(stream),
+            0.0
+        );
     }
 
     #[test]
     fn test_value_and_grad_with_error() {
+        let stream = crate::test_stream();
         let mut model = Linear::new(2, 2).unwrap();
         // Use a shape that is not compatible with the model
-        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[3, 3], None).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = crate::random::uniform::<_, f32>(1.0, 2.0, &[3, 3], &key, stream).unwrap();
 
         let loss = |model: &mut Linear, x: &Array| -> Result<Vec<Array>, Exception> {
-            Ok(vec![model.forward(x)?.sum(None)?])
+            Ok(vec![model.forward(x, stream)?.sum(None, stream)?])
         };
 
         let mut vg = nn::value_and_grad(loss);

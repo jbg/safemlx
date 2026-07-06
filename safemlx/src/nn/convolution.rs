@@ -1,8 +1,7 @@
 use crate::module::{Module, Param};
 use crate::{
     error::Exception,
-    ops::{conv1d, conv2d, zeros},
-    random::uniform,
+    ops::{conv1d, conv2d},
     Array,
 };
 use safemlx_internal_macros::{Buildable, Builder};
@@ -56,14 +55,13 @@ fn build_conv1d(builder: Conv1dBuilder) -> Result<Conv1d, Exception> {
     let with_bias = builder.bias;
 
     let scale = f32::sqrt(1.0f32 / (input_channels * kernel_size) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[output_channels, kernel_size, input_channels],
-        None,
-    )?;
+    );
     let bias = if with_bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -131,7 +129,7 @@ impl Module<&Array> for Conv1d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = conv1d(
             x,
             self.weight.as_ref(),
@@ -139,9 +137,10 @@ impl Module<&Array> for Conv1d {
             self.padding,
             self.dilation,
             self.groups,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }
@@ -198,7 +197,7 @@ fn build_conv2d(builder: Conv2dBuilder) -> Result<Conv2d, Exception> {
     let dilation = builder.dilation.into();
 
     let scale = f32::sqrt(1.0 / (input_channels * kernel_size.0 * kernel_size.1) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[
@@ -207,10 +206,9 @@ fn build_conv2d(builder: Conv2dBuilder) -> Result<Conv2d, Exception> {
             kernel_size.1,
             input_channels,
         ],
-        None,
-    )?;
+    );
     let bias = if with_bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -279,7 +277,7 @@ impl Module<&Array> for Conv2d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = conv2d(
             x,
             self.weight.as_ref(),
@@ -287,9 +285,10 @@ impl Module<&Array> for Conv2d {
             self.padding,
             self.dilation,
             self.groups,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }
@@ -347,7 +346,7 @@ fn build_conv3d(builder: Conv3dBuilder) -> Result<Conv3d, Exception> {
 
     let scale =
         f32::sqrt(1.0 / (input_channels * kernel_size.0 * kernel_size.1 * kernel_size.2) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[
@@ -357,10 +356,9 @@ fn build_conv3d(builder: Conv3dBuilder) -> Result<Conv3d, Exception> {
             kernel_size.2,
             input_channels,
         ],
-        None,
-    )?;
+    );
     let bias = if with_bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -429,7 +427,7 @@ impl Module<&Array> for Conv3d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = crate::ops::conv3d(
             x,
             self.weight.as_ref(),
@@ -437,9 +435,10 @@ impl Module<&Array> for Conv3d {
             self.padding,
             self.dilation,
             self.groups,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }
@@ -459,66 +458,68 @@ mod tests {
 
     #[test]
     fn test_conv1d() {
-        crate::random::seed(819).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(819, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.512_987_5,
             abs <= 0.010_259_75
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             131.324_8,
             abs <= 2.626_496
         );
-        let result = Conv1d::new(16, 2, 8).unwrap().forward(&a).unwrap();
+        let result = Conv1d::new(16, 2, 8).unwrap().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 1, 2]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            0.264_865_2,
-            abs <= 0.005_297_303_7
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
+            0.008_359_145,
+            abs <= 0.000_167_182_9
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            1.059_460_8,
-            abs <= 0.021_189_215
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
+            0.033_436_58,
+            abs <= 0.000_668_731_6
         );
     }
 
     #[test]
     fn test_conv2d() {
-        crate::random::seed(62).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(62, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 8, 4]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.522_504_27,
             abs <= 0.010_450_086
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             267.522_2,
             abs <= 5.350_444
         );
         let result = crate::nn::Conv2d::new(4, 2, (8, 8))
             .unwrap()
-            .forward(&a)
+            .forward(&a, stream)
             .unwrap();
         assert_eq!(result.shape(), &[2, 1, 1, 2]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            -0.279_321_5,
-            abs <= 0.005_586_43
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
+            0.366_702_44,
+            abs <= 0.007_334_049
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            -1.117_286,
-            abs <= 0.022_345_72
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
+            1.466_809_8,
+            abs <= 0.029_336_195
         );
     }
 }

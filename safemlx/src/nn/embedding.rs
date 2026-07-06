@@ -3,7 +3,7 @@
 use crate::error::Exception;
 use crate::module::Module;
 use crate::module::Param;
-use crate::ops::indexing::IndexOp;
+use crate::ops::indexing::TryIndexOp;
 use crate::quantization::Quantizable;
 use crate::Array;
 use safemlx_macros::ModuleParameters;
@@ -30,8 +30,7 @@ impl Embedding {
     /// - `dimensions`: The dimensionality of the embeddings.
     pub fn new(embedding_count: i32, dimensions: i32) -> Result<Self, Exception> {
         let scale = f32::sqrt(1.0 / (dimensions as f32));
-        let weight =
-            crate::random::normal::<f32>(&[embedding_count, dimensions], None, None, None)? * scale;
+        let weight = super::init::uniform(-scale, scale, &[embedding_count, dimensions]);
 
         Ok(Self {
             weight: Param::new(weight),
@@ -42,8 +41,8 @@ impl Embedding {
     ///
     /// Use this for example when input embedding and output projection
     /// weights are tied.
-    pub fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
-        crate::ops::matmul(x, self.weight.value.t())
+    pub fn as_linear(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
+        crate::ops::matmul(x, self.weight.value.transpose(stream)?, stream)
     }
 }
 
@@ -56,8 +55,9 @@ impl Quantizable for Embedding {
         self,
         group_size: i32,
         bits: i32,
+        stream: &crate::Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError> {
-        QuantizedEmbedding::try_from_embedding(self, group_size, bits)
+        QuantizedEmbedding::try_from_embedding(self, group_size, bits, stream)
     }
 }
 
@@ -65,8 +65,8 @@ impl Module<&Array> for Embedding {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
-        Ok(self.weight.index(x))
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+        self.weight.try_index_device(x, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -80,27 +80,32 @@ mod tests {
 
     #[test]
     fn test_embedding() {
-        crate::random::seed(557).unwrap();
-        let a = crate::random::randint::<_, i32>(0, 10, &[2, 8, 8, 4], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(557, stream);
+        let a = crate::random::randint::<_, i32>(0, 10, &[2, 8, 8, 4], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 8, 4]);
         assert_eq!(a.dtype(), crate::Dtype::Int32);
         float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             4.605_468_8,
             abs <= 0.092_109_375
         );
-        float_eq!(a.sum(None).unwrap().item::<f32>(), 2358.0, abs <= 47.16);
+        float_eq!(
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
+            2358.0,
+            abs <= 47.16
+        );
 
-        let result = Embedding::new(10, 8).unwrap().forward(&a).unwrap();
+        let result = Embedding::new(10, 8).unwrap().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 8, 4, 8]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             -0.001_197_346_3,
             abs <= 2.394_692_5e-5
         );
         float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             -4.904_330_3,
             abs <= 0.098_086_6
         );

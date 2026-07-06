@@ -9,9 +9,9 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
     nn,
-    ops::indexing::IndexOp,
+    ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
-    Array,
+    Array, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -78,7 +78,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
@@ -112,6 +112,7 @@ impl Attention {
             false,
             &args.rope_scaling,
             args.max_position_embeddings,
+            stream,
         )?;
 
         Ok(Self {
@@ -138,27 +139,34 @@ where
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, mut cache } = input;
 
         let (B, L) = batch_seq(x);
 
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let queries = self.q_proj.forward(x, stream)?;
+        let keys = self.k_proj.forward(x, stream)?;
+        let values = self.v_proj.forward(x, stream)?;
 
-        let queries =
-            self.q_norm
-                .forward(&reshape_attention_projection(queries, B, L, self.n_heads)?)?;
-        let keys =
-            self.k_norm
-                .forward(&reshape_attention_projection(keys, B, L, self.n_kv_heads)?)?;
-        let values = reshape_attention_projection(values, B, L, self.n_kv_heads)?;
+        let queries = self.q_norm.forward(
+            &reshape_attention_projection(queries, B, L, self.n_heads, stream)?,
+            stream,
+        )?;
+        let keys = self.k_norm.forward(
+            &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
+            stream,
+        )?;
+        let values = reshape_attention_projection(values, B, L, self.n_kv_heads, stream)?;
         let (queries, keys, values) =
-            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache)?;
-        let output = finish_attention(queries, keys, values, cache, self.scale, mask, B, L)?;
+            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
+        let output =
+            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?;
 
-        self.o_proj.forward(&output)
+        self.o_proj.forward(&output, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -195,11 +203,11 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let num_attention_heads = args.num_attention_heads;
         let hidden_size = args.hidden_size;
 
-        let self_attn = Attention::new(args)?;
+        let self_attn = Attention::new(args, stream)?;
         let mlp = SwiGluMlp::new(args.hidden_size, args.intermediate_size, false)?;
         let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
@@ -227,21 +235,25 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, cache } = input;
 
+        let normed = self.input_layernorm.forward(x, stream)?;
         let self_attn_input = AttentionInput {
-            x: &self.input_layernorm.forward(x)?,
+            x: &normed,
             mask,
             cache,
         };
-        let r = self.self_attn.forward(self_attn_input)?;
-        let h = x.add(r)?;
+        let r = self.self_attn.forward(self_attn_input, stream)?;
+        let h = x.add(r, stream)?;
 
-        let r = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&h)?)?;
-        h.add(r)
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        let r = self.mlp.forward(&post_normed, stream)?;
+        h.add(r, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -270,7 +282,7 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
 
         let vocab_size = args.vocab_size;
@@ -278,7 +290,7 @@ impl Qwen3Model {
 
         let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
         let layers = (0..num_hidden_layers)
-            .map(|_| TransformerBlock::new(args))
+            .map(|_| TransformerBlock::new(args, stream))
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
@@ -308,18 +320,22 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let ModelInput {
             inputs,
             mask,
             cache,
         } = input;
 
-        let mut h = self.embed_tokens.forward(inputs)?;
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
 
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
+            None => match create_attention_mask(&h, cache, Some(true), stream)? {
                 Some(AttentionMask::Array(a)) => Some(a),
                 Some(AttentionMask::Causal) => {
                     return Err(Exception::custom("Only `Array` mask is supported"));
@@ -338,10 +354,10 @@ where
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
             };
-            h = layer.forward(layer_input)?;
+            h = layer.forward(layer_input, stream)?;
         }
 
-        self.norm.forward(&h)
+        self.norm.forward(&h, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -367,8 +383,8 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(args: ModelArgs) -> Result<Self, Exception> {
-        let model = Qwen3Model::new(&args)?;
+    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        let model = Qwen3Model::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::build_maybe_quantized_lm_head(
                 args.hidden_size,
@@ -398,9 +414,18 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let out = self.model.forward(input)?;
-        project_logits_maybe_quantized(&mut self.lm_head, &mut self.model.embed_tokens, &out)
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        let out = self.model.forward(input, stream)?;
+        project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &out,
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -430,10 +455,10 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_qwen3_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+pub fn load_qwen3_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_qwen3_model_args(model_dir)?;
-    let mut model = Model::new(model_args)?;
+    let mut model = Model::new(model_args, stream)?;
 
     let weights_index = model_dir.join("model.safetensors.index.json");
     if weights_index.exists() {
@@ -461,26 +486,34 @@ where
         &mut self,
         prompt_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: prompt_tokens,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: prompt_tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 
     fn decode_logits(
         &mut self,
         input_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: input_tokens,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: input_tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 }
 
@@ -489,7 +522,7 @@ pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;
 #[cfg(test)]
 mod tests {
     use safemlx::{
-        ops::indexing::{IndexOp, NewAxis},
+        ops::indexing::{NewAxis, TryIndexOp},
         transforms::eval,
         Array,
     };
@@ -504,7 +537,8 @@ mod tests {
     #[test]
     #[ignore = "requires local model files"]
     fn test_load_qwen3_model() {
-        let _model = super::load_qwen3_model(CACHED_TEST_MODEL_DIR).unwrap();
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let _model = super::load_qwen3_model(CACHED_TEST_MODEL_DIR, ctx.stream()).unwrap();
     }
 
     #[test]
@@ -520,10 +554,14 @@ mod tests {
     fn test_load_and_run_qwen3_with_concat_cache() {
         let tokenizer = load_qwen3_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
 
-        let mut model = load_qwen3_model(CACHED_TEST_MODEL_DIR).unwrap();
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut model = load_qwen3_model(CACHED_TEST_MODEL_DIR, stream).unwrap();
 
         let encoding = tokenizer.encode("hello", true).unwrap();
-        let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
+        let prompt_tokens = Array::from(encoding.get_ids())
+            .try_index_device(NewAxis, stream)
+            .unwrap();
         let mut cache = Vec::new();
 
         let mut tokens = Vec::new();
@@ -532,6 +570,7 @@ mod tests {
             &mut cache,
             0.0,
             &prompt_tokens,
+            stream,
         );
         for (token, ntoks) in generate.zip(0..10) {
             let token = token.unwrap();
@@ -543,14 +582,14 @@ mod tests {
 
             if tokens.len() % 20 == 0 {
                 eval(&tokens).unwrap();
-                let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+                let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>(&stream)).collect();
                 let s = tokenizer.decode(&slice, true).unwrap();
                 print!("{s}");
             }
         }
 
         eval(&tokens).unwrap();
-        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>(&stream)).collect();
         let s = tokenizer.decode(&slice, true).unwrap();
         println!("{s}");
 

@@ -271,7 +271,7 @@ fn generate_macro_variants(
 fn generate_macro_variants_for_selected_args(
     fn_mod_path: &proc_macro2::TokenStream,
     fn_ident: &Ident,
-    trimmed_fn_ident: &Ident,
+    _trimmed_fn_ident: &Ident,
     args_ident: &[&Ident],
     args_type: &[ArgType],
     selected: &[bool],
@@ -310,11 +310,6 @@ fn generate_macro_variants_for_selected_args(
 
     let variant_body = quote! {
         (
-            #(#macro_args),*
-        ) => {
-            #fn_mod_path::#trimmed_fn_ident #default_generics(#(#input,)*)
-        };
-        (
             #(#macro_args,)*
             stream=$stream:expr
         ) => {
@@ -326,12 +321,6 @@ fn generate_macro_variants_for_selected_args(
 
     if let Some(dtype_generics) = &dtype_generics {
         let variant_body = quote! {
-            (
-                #(#macro_args,)*
-                dtype=$dtype:ty
-            ) => {
-                #fn_mod_path::#trimmed_fn_ident #dtype_generics(#(#input,)*)
-            };
             (
                 #(#macro_args,)*
                 dtype=$dtype:ty,

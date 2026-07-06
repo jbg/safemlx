@@ -88,43 +88,48 @@ impl Optimizer for Sgd {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let state = get_mut_or_insert_with(&mut self.state, key, || array!(0.0));
         let mut gradient = Cow::Borrowed(gradient);
 
         if self.weight_decay != 0.0 {
             let weight_decay = array!(self.weight_decay);
-            gradient = Cow::Owned(weight_decay.multiply(&*parameter)?.add(&*gradient)?);
+            gradient = Cow::Owned(
+                weight_decay
+                    .multiply(&*parameter, stream)?
+                    .add(&*gradient, stream)?,
+            );
         }
 
         if self.momentum <= 0.0 {
             let lr = array!(self.lr);
-            *parameter = parameter.subtract(lr.multiply(gradient)?)?;
+            *parameter = parameter.subtract(lr.multiply(gradient, stream)?, stream)?;
             return Ok(());
         }
 
-        let mut v = &*state * self.momentum;
+        let mut v = state.multiply(array!(self.momentum), stream)?;
 
         if self.dampening > 0.0 {
             let dampening = array!(self.dampening);
-            let one_minus_dampening = array!(1.0).subtract(dampening)?;
-            v = v.add(&one_minus_dampening.multiply(&gradient)?)?;
+            let one_minus_dampening = array!(1.0).subtract(dampening, stream)?;
+            v = v.add(&one_minus_dampening.multiply(&gradient, stream)?, stream)?;
         } else {
-            v = v.add(&gradient)?;
+            v = v.add(&gradient, stream)?;
         }
 
         match self.nesterov {
             true => {
                 let momentum = array!(self.momentum);
                 let lr = array!(self.lr);
-                let update = gradient.add(momentum.multiply(&v)?)?;
-                *parameter = parameter.subtract(lr.multiply(&update)?)?;
+                let update = gradient.add(momentum.multiply(&v, stream)?, stream)?;
+                *parameter = parameter.subtract(lr.multiply(&update, stream)?, stream)?;
                 *state = v;
             }
             false => {
                 let update = &v;
                 let lr = array!(self.lr);
-                *parameter = parameter.subtract(lr.multiply(update)?)?;
+                *parameter = parameter.subtract(lr.multiply(update, stream)?, stream)?;
                 *state = v;
             }
         }

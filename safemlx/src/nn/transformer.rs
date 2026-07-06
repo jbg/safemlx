@@ -139,16 +139,21 @@ impl MultiHeadAttention {
     pub const DEFAULT_BIAS: bool = false;
 
     /// Creates an attention mask for use with [`MultiHeadAttention`].
-    pub fn create_additive_causal_mask<T>(n: i32) -> Result<Array, Exception>
+    pub fn create_additive_causal_mask<T>(
+        n: i32,
+        stream: &crate::Stream,
+    ) -> Result<Array, Exception>
     where
         T: ArrayElement + LowerBounded,
         Array: FromScalar<T>,
     {
-        let indices = arange::<_, T>(0, n, 1)?;
-        let left = expand_dims(&indices, 1)?;
-        let right = expand_dims(&indices, 0)?;
-        let mask = left.lt(right)?;
-        let mask = mask.as_type::<T>()?.multiply(array!(T::min_value()))?; // TODO: replace with f32::MIN?
+        let indices = arange::<_, T>(0, n, 1, stream)?;
+        let left = expand_dims(&indices, 1, stream)?;
+        let right = expand_dims(&indices, 0, stream)?;
+        let mask = left.lt(right, stream)?;
+        let mask = mask
+            .as_type::<T>(stream)?
+            .multiply(array!(T::min_value()), stream)?; // TODO: replace with f32::MIN?
         Ok(mask)
     }
 }
@@ -219,38 +224,43 @@ where
     type Output = Array;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
-        let queries = self.query_proj.forward(input.queries)?;
-        let keys = self.key_proj.forward(input.keys)?;
-        let values = self.value_proj.forward(input.values)?;
+        let queries = self.query_proj.forward(input.queries, stream)?;
+        let keys = self.key_proj.forward(input.keys, stream)?;
+        let values = self.value_proj.forward(input.values, stream)?;
 
         let B = queries.dim(0);
         let L = queries.dim(1);
         let S = keys.dim(1);
 
         let queries = queries
-            .reshape(&[B, L, self.num_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[B, L, self.num_heads, -1], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
         let keys = keys
-            .reshape(&[B, S, self.num_heads, -1])?
-            .transpose_axes(&[0, 2, 3, 1])?;
+            .reshape(&[B, S, self.num_heads, -1], stream)?
+            .transpose_axes(&[0, 2, 3, 1], stream)?;
         let values = values
-            .reshape(&[B, S, self.num_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[B, S, self.num_heads, -1], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
 
         // Dimensions are [batch x num_heads x sequence x hidden_dim]
         let scale = f32::sqrt(1.0 / queries.dim(-1) as f32);
-        let mut scores = (queries * scale).matmul(&keys)?;
+        let scaled_queries = queries.multiply(array!(scale), stream)?;
+        let mut scores = scaled_queries.matmul(&keys, stream)?;
         if let Some(mask) = input.mask {
-            scores = scores.add(mask.as_dtype(scores.dtype())?)?;
+            scores = scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?;
         }
-        scores = softmax_axis(&scores, -1, None)?;
-        let value_hat = matmul(&scores, &values)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        scores = softmax_axis(&scores, -1, None, stream)?;
+        let value_hat = matmul(&scores, &values, stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?
+            .reshape(&[B, L, -1], stream)?;
 
-        self.output_proj.forward(&value_hat)
+        self.output_proj.forward(&value_hat, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -412,39 +422,43 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
         let x = input.x;
         let mask = input.mask;
 
         if self.norm_first {
-            let mut y = self.ln1.forward(x)?;
+            let mut y = self.ln1.forward(x, stream)?;
             let attention_input = MultiHeadAttentionInput::from((&y, &y, &y, mask));
-            y = self.attention.forward(attention_input)?;
-            y = self.dropout1.forward(&y)?;
-            let x = x.add(&y)?;
+            y = self.attention.forward(attention_input, stream)?;
+            y = self.dropout1.forward(&y, stream)?;
+            let x = x.add(&y, stream)?;
 
-            y = self.ln2.forward(&x)?;
-            y = self.linear1.forward(&y)?;
-            y = self.activation.forward(&y)?;
-            y = self.dropout2.forward(&y)?;
-            y = self.linear2.forward(&y)?;
-            y = x.add(&y)?;
+            y = self.ln2.forward(&x, stream)?;
+            y = self.linear1.forward(&y, stream)?;
+            y = self.activation.forward(&y, stream)?;
+            y = self.dropout2.forward(&y, stream)?;
+            y = self.linear2.forward(&y, stream)?;
+            y = x.add(&y, stream)?;
 
             Ok(y)
         } else {
             let attention_input = MultiHeadAttentionInput::from((x, x, x, mask));
-            let mut y = self.attention.forward(attention_input)?;
-            y = self.dropout1.forward(&y)?;
-            let mut x = x.add(&y)?;
-            x = self.ln1.forward(&x)?;
+            let mut y = self.attention.forward(attention_input, stream)?;
+            y = self.dropout1.forward(&y, stream)?;
+            let mut x = x.add(&y, stream)?;
+            x = self.ln1.forward(&x, stream)?;
 
-            y = self.linear1.forward(&x)?;
-            y = self.activation.forward(&y)?;
-            y = self.dropout2.forward(&y)?;
-            y = self.linear2.forward(&y)?;
-            y = x.add(&y)?;
-            y = self.ln2.forward(&y)?;
+            y = self.linear1.forward(&x, stream)?;
+            y = self.activation.forward(&y, stream)?;
+            y = self.dropout2.forward(&y, stream)?;
+            y = self.linear2.forward(&y, stream)?;
+            y = x.add(&y, stream)?;
+            y = self.ln2.forward(&y, stream)?;
 
             Ok(y)
         }
@@ -552,7 +566,11 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
         let x = input.x;
         let mask = input.mask;
@@ -561,10 +579,10 @@ where
 
         for l in &mut self.layers {
             let layer_input = TransformerEncoderInput::from((&*x, mask));
-            x = Cow::Owned(l.forward(layer_input)?);
+            x = Cow::Owned(l.forward(layer_input, stream)?);
         }
 
-        self.ln.forward(&*x)
+        self.ln.forward(&*x, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -741,7 +759,11 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
         let x = input.x;
         let memory = input.memory;
@@ -749,57 +771,49 @@ where
         let memory_mask = input.memory_mask;
 
         if self.norm_first {
-            let mut y = self.ln1.forward(x)?;
+            let mut y = self.ln1.forward(x, stream)?;
             y = self
                 .self_attention
-                .forward(MultiHeadAttentionInput::from((&y, &y, &y, x_mask)))?;
-            y = self.dropout1.forward(&y)?;
-            let x = x.add(&y)?;
+                .forward(MultiHeadAttentionInput::from((&y, &y, &y, x_mask)), stream)?;
+            y = self.dropout1.forward(&y, stream)?;
+            let x = x.add(&y, stream)?;
 
-            y = self.ln2.forward(&x)?;
-            y = self
-                .cross_attention
-                .forward(MultiHeadAttentionInput::from((
-                    &y,
-                    memory,
-                    memory,
-                    memory_mask,
-                )))?;
-            y = self.dropout2.forward(&y)?;
-            let x = x.add(&y)?;
+            y = self.ln2.forward(&x, stream)?;
+            y = self.cross_attention.forward(
+                MultiHeadAttentionInput::from((&y, memory, memory, memory_mask)),
+                stream,
+            )?;
+            y = self.dropout2.forward(&y, stream)?;
+            let x = x.add(&y, stream)?;
 
-            y = self.ln3.forward(&x)?;
-            y = self.linear1.forward(&y)?;
-            y = self.activation.forward(&y)?;
-            y = self.dropout3.forward(&y)?;
-            y = self.linear2.forward(&y)?;
-            x.add(&y)
+            y = self.ln3.forward(&x, stream)?;
+            y = self.linear1.forward(&y, stream)?;
+            y = self.activation.forward(&y, stream)?;
+            y = self.dropout3.forward(&y, stream)?;
+            y = self.linear2.forward(&y, stream)?;
+            x.add(&y, stream)
         } else {
             let mut y = self
                 .self_attention
-                .forward(MultiHeadAttentionInput::from((x, x, x, x_mask)))?;
-            y = self.dropout1.forward(&y)?;
-            let mut x = x.add(&y)?;
-            x = self.ln1.forward(&x)?;
+                .forward(MultiHeadAttentionInput::from((x, x, x, x_mask)), stream)?;
+            y = self.dropout1.forward(&y, stream)?;
+            let mut x = x.add(&y, stream)?;
+            x = self.ln1.forward(&x, stream)?;
 
-            y = self
-                .cross_attention
-                .forward(MultiHeadAttentionInput::from((
-                    &y,
-                    memory,
-                    memory,
-                    memory_mask,
-                )))?;
-            y = self.dropout2.forward(&y)?;
-            x = x.add(&y)?;
-            x = self.ln2.forward(&x)?; // TODO: https://github.com/ml-explore/mlx/issues/1636
+            y = self.cross_attention.forward(
+                MultiHeadAttentionInput::from((&y, memory, memory, memory_mask)),
+                stream,
+            )?;
+            y = self.dropout2.forward(&y, stream)?;
+            x = x.add(&y, stream)?;
+            x = self.ln2.forward(&x, stream)?; // TODO: https://github.com/ml-explore/mlx/issues/1636
 
-            y = self.linear1.forward(&x)?;
-            y = self.activation.forward(&y)?;
-            y = self.dropout3.forward(&y)?;
-            y = self.linear2.forward(&y)?;
-            y = x.add(&y)?;
-            self.ln3.forward(&y)
+            y = self.linear1.forward(&x, stream)?;
+            y = self.activation.forward(&y, stream)?;
+            y = self.dropout3.forward(&y, stream)?;
+            y = self.linear2.forward(&y, stream)?;
+            y = x.add(&y, stream)?;
+            self.ln3.forward(&y, stream)
         }
     }
 
@@ -912,7 +926,11 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
         let x = input.x;
         let memory = input.memory;
@@ -923,10 +941,10 @@ where
 
         for l in &mut self.layers {
             let layer_input = TransformerDecoderInput::from((&*x, memory, x_mask, memory_mask));
-            x = Cow::Owned(l.forward(layer_input)?);
+            x = Cow::Owned(l.forward(layer_input, stream)?);
         }
 
-        self.ln.forward(&*x)
+        self.ln.forward(&*x, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1118,7 +1136,11 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let input = input.into();
         let source = input.source;
         let target = input.target;
@@ -1128,13 +1150,11 @@ where
 
         let memory = self
             .encoder
-            .forward(TransformerEncoderInput::from((source, source_mask)))?;
-        self.decoder.forward(TransformerDecoderInput::from((
-            target,
-            &memory,
-            target_mask,
-            memory_mask,
-        )))
+            .forward(TransformerEncoderInput::from((source, source_mask)), stream)?;
+        self.decoder.forward(
+            TransformerDecoderInput::from((target, &memory, target_mask, memory_mask)),
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {

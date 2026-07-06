@@ -1,13 +1,8 @@
 //! Mixture-of-experts routing helpers.
 
-use safemlx_internal_macros::default_device;
-
 use crate::{
     error::Result,
-    ops::{
-        arange_device, argsort_device, gather_mm_device, indexing::take_axis_device,
-        ones_dtype_device, segment_sum_device,
-    },
+    ops::{arange, argsort, gather_mm, indexing::take_axis, ones_dtype, segment_sum},
     Array, Dtype, Stream,
 };
 
@@ -38,8 +33,7 @@ pub struct GroupedRoutePlan {
 /// `sorted_group_ids` are suitable for `grouped_matmul(..., sorted_indices = true)`, while
 /// `token_indices` can be used to gather source rows and later reduce routed outputs back to
 /// tokens with [`segment_sum_by_index`].
-#[default_device]
-pub fn group_by_id_device(
+pub fn group_by_id(
     group_ids: impl AsRef<Array>,
     num_groups: i32,
     stream: impl AsRef<Stream>,
@@ -53,18 +47,22 @@ pub fn group_by_id_device(
     };
 
     let flat_group_ids = group_ids
-        .reshape_device(&[-1], stream)?
-        .as_dtype_device(Dtype::Int32, stream)?;
-    let order = argsort_device(&flat_group_ids, stream)?;
-    let sorted_group_ids = flat_group_ids.take_device(&order, stream)?;
-    let route_indices = order.as_dtype_device(Dtype::Int32, stream)?;
+        .reshape(&[-1], stream)?
+        .as_dtype(Dtype::Int32, stream)?;
+    let order = argsort(&flat_group_ids, stream)?;
+    let sorted_group_ids = flat_group_ids.take(&order, stream)?;
+    let route_indices = order.as_dtype(Dtype::Int32, stream)?;
     let divisor = Array::from_int(top_k);
-    let token_indices = route_indices.floor_divide_device(&divisor, stream)?;
-    let slot_indices = route_indices.remainder_device(&divisor, stream)?;
+    let token_indices = route_indices.floor_divide(&divisor, stream)?;
+    let slot_indices = route_indices.remainder(&divisor, stream)?;
 
-    let counts = ones_dtype_device(&[flat_group_ids.size() as i32], Dtype::Int32, stream)?
-        .segment_sum_device(&flat_group_ids, num_groups, 0, stream)?;
-    let offsets = counts.cumsum_device(0, None, false, stream)?;
+    let counts = ones_dtype(&[flat_group_ids.size() as i32], Dtype::Int32, stream)?.segment_sum(
+        &flat_group_ids,
+        num_groups,
+        0,
+        stream,
+    )?;
+    let offsets = counts.cumsum(0, None, false, stream)?;
 
     Ok(GroupedRoutePlan {
         sorted_group_ids,
@@ -81,8 +79,7 @@ pub fn group_by_id_device(
 /// `inputs` has shape `[routes, in_dim]`, `weights` has shape
 /// `[num_groups, in_dim, out_dim]`, and `group_ids` has shape `[routes]`. When `group_ids` are
 /// already sorted, pass `sorted_indices = true` so MLX can use its sorted gather-matmul path.
-#[default_device]
-pub fn grouped_matmul_device(
+pub fn grouped_matmul(
     inputs: impl AsRef<Array>,
     weights: impl AsRef<Array>,
     group_ids: impl AsRef<Array>,
@@ -95,8 +92,8 @@ pub fn grouped_matmul_device(
     let routes = inputs.dim(0);
     let in_dim = inputs.dim(-1);
     let out_dim = weights.dim(-1);
-    let inputs = inputs.reshape_device(&[routes, 1, in_dim], stream)?;
-    gather_mm_device(
+    let inputs = inputs.reshape(&[routes, 1, in_dim], stream)?;
+    gather_mm(
         &inputs,
         weights,
         None::<&Array>,
@@ -104,63 +101,58 @@ pub fn grouped_matmul_device(
         sorted_indices,
         stream,
     )?
-    .reshape_device(&[routes, out_dim], stream)
+    .reshape(&[routes, out_dim], stream)
 }
 
 /// Gather source rows according to a routing plan.
-#[default_device]
-pub fn gather_grouped_rows_device(
+pub fn gather_grouped_rows(
     rows: impl AsRef<Array>,
     plan: &GroupedRoutePlan,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    take_axis_device(rows, &plan.token_indices, 0, stream)
+    take_axis(rows, &plan.token_indices, 0, stream)
 }
 
 /// Gather flattened per-route values according to a routing plan.
 ///
 /// This is useful for top-k routing weights with shape `[tokens, top_k]`.
-#[default_device]
-pub fn gather_route_values_device(
+pub fn gather_route_values(
     values: impl AsRef<Array>,
     plan: &GroupedRoutePlan,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     values
         .as_ref()
-        .reshape_device(&[-1], stream.as_ref())?
-        .take_device(&plan.route_indices, stream)
+        .reshape(&[-1], stream.as_ref())?
+        .take(&plan.route_indices, stream)
 }
 
 /// Reduce routed values back to source rows using summation.
 ///
 /// `values` should have shape `[routes, ...]`, and `indices` should have shape `[routes]`.
-#[default_device]
-pub fn segment_sum_by_index_device(
+pub fn segment_sum_by_index(
     values: impl AsRef<Array>,
     indices: impl AsRef<Array>,
     num_segments: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    segment_sum_device(values, indices, num_segments, 0, stream)
+    segment_sum(values, indices, num_segments, 0, stream)
 }
 
 /// Build a sorted top-k route plan from `[tokens, top_k]` expert ids.
-#[default_device]
-pub fn topk_route_plan_device(
+pub fn topk_route_plan(
     expert_ids: impl AsRef<Array>,
     num_experts: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<GroupedRoutePlan> {
-    group_by_id_device(expert_ids, num_experts, stream)
+    group_by_id(expert_ids, num_experts, stream)
 }
 
 /// Convenience helper for a single expert-major projection followed by reduce-back.
 ///
 /// This gathers `hidden_states` by the route plan, runs grouped matmul with expert weights, applies
 /// route weights, and sums duplicate token routes back into `[tokens, out_dim]`.
-#[default_device]
-pub fn routed_grouped_matmul_device(
+pub fn routed_grouped_matmul(
     hidden_states: impl AsRef<Array>,
     expert_weights: impl AsRef<Array>,
     expert_ids: impl AsRef<Array>,
@@ -170,25 +162,24 @@ pub fn routed_grouped_matmul_device(
 ) -> Result<Array> {
     let stream = stream.as_ref();
     let hidden_states = hidden_states.as_ref();
-    let plan = topk_route_plan_device(expert_ids, num_experts, stream)?;
-    let routed = gather_grouped_rows_device(hidden_states, &plan, stream)?;
-    let projected = grouped_matmul_device(
+    let plan = topk_route_plan(expert_ids, num_experts, stream)?;
+    let routed = gather_grouped_rows(hidden_states, &plan, stream)?;
+    let projected = grouped_matmul(
         &routed,
         expert_weights,
         &plan.sorted_group_ids,
         true,
         stream,
     )?;
-    let weights = gather_route_values_device(route_weights, &plan, stream)?
-        .reshape_device(&[projected.dim(0), 1], stream)?;
-    let weighted = projected.multiply_device(&weights, stream)?;
-    segment_sum_by_index_device(weighted, &plan.token_indices, hidden_states.dim(0), stream)
+    let weights = gather_route_values(route_weights, &plan, stream)?
+        .reshape(&[projected.dim(0), 1], stream)?;
+    let weighted = projected.multiply(&weights, stream)?;
+    segment_sum_by_index(weighted, &plan.token_indices, hidden_states.dim(0), stream)
 }
 
 /// Build `[0, 1, ..., routes - 1]` on the same stream.
-#[default_device]
-pub fn route_arange_device(routes: i32, stream: impl AsRef<Stream>) -> Result<Array> {
-    arange_device::<_, i32>(0, routes, None, stream)
+pub fn route_arange(routes: i32, stream: impl AsRef<Stream>) -> Result<Array> {
+    arange::<_, i32>(0, routes, None, stream)
 }
 
 #[cfg(test)]
@@ -200,89 +191,142 @@ mod tests {
             indexing::{take_axis, IndexOp},
             matmul, reshape, sum_axis,
         },
-        StreamOrDevice,
+        Stream,
     };
 
     #[test]
     fn test_group_by_id_topk_plan() {
+        let stream = crate::test_stream();
         let experts = Array::from_slice(&[2i32, 0, 1, 2, 0, 1], &[3, 2]);
-        let plan = topk_route_plan(&experts, 3).unwrap();
+        let plan = topk_route_plan(&experts, 3, stream).unwrap();
 
-        assert_eq!(plan.sorted_group_ids.as_slice::<i32>(), &[0, 0, 1, 1, 2, 2]);
-        assert_eq!(plan.route_indices.as_slice::<i32>(), &[1, 4, 2, 5, 0, 3]);
-        assert_eq!(plan.token_indices.as_slice::<i32>(), &[0, 2, 1, 2, 0, 1]);
-        assert_eq!(plan.slot_indices.as_slice::<i32>(), &[1, 0, 0, 1, 0, 1]);
-        assert_eq!(plan.group_counts.as_slice::<i32>(), &[2, 2, 2]);
-        assert_eq!(plan.group_offsets.as_slice::<i32>(), &[0, 2, 4]);
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.sorted_group_ids),
+            &[0, 0, 1, 1, 2, 2]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.route_indices),
+            &[1, 4, 2, 5, 0, 3]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.token_indices),
+            &[0, 2, 1, 2, 0, 1]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.slot_indices),
+            &[1, 0, 0, 1, 0, 1]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.group_counts),
+            &[2, 2, 2]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&plan.group_offsets),
+            &[0, 2, 4]
+        );
     }
 
     #[test]
     fn test_grouped_matmul_matches_gathered_reference() {
-        let inputs = reshape(Array::arange::<_, f32>(0.0, 12.0, None).unwrap(), &[4, 3]).unwrap();
+        let stream = crate::test_stream();
+        let inputs = reshape(
+            Array::arange::<_, f32>(0.0, 12.0, None, stream).unwrap(),
+            &[4, 3],
+            stream,
+        )
+        .unwrap();
         let weights = reshape(
-            Array::arange::<_, f32>(0.0, 18.0, None).unwrap(),
+            Array::arange::<_, f32>(0.0, 18.0, None, stream).unwrap(),
             &[3, 3, 2],
+            stream,
         )
         .unwrap();
         let group_ids = Array::from_slice(&[2i32, 0, 1, 2], &[4]);
-        let plan = group_by_id(&group_ids, 3).unwrap();
-        let sorted_inputs = take_axis(&inputs, &plan.token_indices, 0).unwrap();
-        let grouped =
-            grouped_matmul(&sorted_inputs, &weights, &plan.sorted_group_ids, true).unwrap();
-        let selected_weights = take_axis(&weights, &plan.sorted_group_ids, 0).unwrap();
+        let plan = group_by_id(&group_ids, 3, stream).unwrap();
+        let sorted_inputs = take_axis(&inputs, &plan.token_indices, 0, stream).unwrap();
+        let grouped = grouped_matmul(
+            &sorted_inputs,
+            &weights,
+            &plan.sorted_group_ids,
+            true,
+            stream,
+        )
+        .unwrap();
+        let selected_weights = take_axis(&weights, &plan.sorted_group_ids, 0, stream).unwrap();
         let expected = matmul(
-            sorted_inputs.index((.., crate::ops::indexing::NewAxis, ..)),
+            sorted_inputs.index_device((.., crate::ops::indexing::NewAxis, ..), stream),
             selected_weights,
+            stream,
         )
         .unwrap()
-        .reshape(&[4, 2])
+        .reshape(&[4, 2], stream)
         .unwrap();
 
-        assert!(all_close(&grouped, &expected, 1e-5, 1e-5, None)
+        assert!(all_close(&grouped, &expected, 1e-5, 1e-5, None, stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
     }
 
     #[test]
     fn test_routed_grouped_matmul_matches_reference() {
-        let hidden = reshape(Array::arange::<_, f32>(0.0, 12.0, None).unwrap(), &[3, 4]).unwrap();
+        let stream = crate::test_stream();
+        let hidden = reshape(
+            Array::arange::<_, f32>(0.0, 12.0, None, stream).unwrap(),
+            &[3, 4],
+            stream,
+        )
+        .unwrap();
         let weights = reshape(
-            Array::arange::<_, f32>(0.0, 40.0, None).unwrap(),
+            Array::arange::<_, f32>(0.0, 40.0, None, stream).unwrap(),
             &[5, 4, 2],
+            stream,
         )
         .unwrap();
         let expert_ids = Array::from_slice(&[2i32, 0, 1, 2, 0, 1], &[3, 2]);
         let route_weights = Array::from_slice(&[0.25f32, 0.75, 1.0, 0.5, 0.2, 0.8], &[3, 2]);
 
         let actual =
-            routed_grouped_matmul(&hidden, &weights, &expert_ids, &route_weights, 5).unwrap();
+            routed_grouped_matmul(&hidden, &weights, &expert_ids, &route_weights, 5, stream)
+                .unwrap();
 
-        let selected_weights = take_axis(&weights, &expert_ids, 0).unwrap();
+        let selected_weights = take_axis(&weights, &expert_ids, 0, stream).unwrap();
         let current = matmul(
-            hidden.index((
-                ..,
-                crate::ops::indexing::NewAxis,
-                crate::ops::indexing::NewAxis,
-                ..,
-            )),
+            hidden.index_device(
+                (
+                    ..,
+                    crate::ops::indexing::NewAxis,
+                    crate::ops::indexing::NewAxis,
+                    ..,
+                ),
+                stream,
+            ),
             selected_weights,
+            stream,
         )
         .unwrap()
-        .reshape(&[3, 2, 2])
+        .reshape(&[3, 2, 2], stream)
         .unwrap();
         let expected = sum_axis(
             &current
-                .multiply(route_weights.index((.., .., crate::ops::indexing::NewAxis)))
+                .multiply(
+                    route_weights.index_device((.., .., crate::ops::indexing::NewAxis), stream),
+                    stream,
+                )
                 .unwrap(),
             -2,
             false,
+            stream,
         )
         .unwrap();
 
-        assert!(all_close(&actual, &expected, 1e-5, 1e-5, None)
+        assert!(all_close(&actual, &expected, 1e-5, 1e-5, None, stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
 
-        let _ = route_arange_device(4, StreamOrDevice::default()).unwrap();
+        let _ = route_arange(
+            4,
+            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
+        )
+        .unwrap();
     }
 }

@@ -1,111 +1,49 @@
-use std::{cell::RefCell, ffi::CStr};
+use std::ffi::CStr;
 
 use crate::{
     device::Device,
     error::Result,
-    utils::{guard::Guarded, SUCCESS},
+    utils::{guard::Guarded, runtime_lock, SUCCESS},
 };
 
-thread_local! {
-    static TASK_LOCAL_DEFAULT_STREAM: RefCell<Option<Stream>> = const { RefCell::new(None) };
-}
-
-/// Gets the task local default stream.
+/// Explicit execution context for MLX operations.
 ///
-/// This is NOT intended to be used directly in most cases. Instead, use the
-/// `with_default_stream` function to temporarily set a default stream for a closure.
-pub fn task_local_default_stream() -> Option<Stream> {
-    TASK_LOCAL_DEFAULT_STREAM.with_borrow(|s| s.clone())
+/// A context owns the stream used to schedule work. Construct it from an
+/// explicit device instead of relying on MLX's process- or thread-local default
+/// device/stream state.
+#[derive(Debug)]
+pub struct ExecutionContext {
+    device: Device,
+    stream: Stream,
 }
 
-/// Use a given default stream for the duration of the closure `f`.
-pub fn with_new_default_stream<F, T>(default_stream: Stream, f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    let prev_stream = TASK_LOCAL_DEFAULT_STREAM.with_borrow_mut(|s| s.replace(default_stream));
-
-    let result = f();
-
-    TASK_LOCAL_DEFAULT_STREAM.with_borrow_mut(|s| {
-        *s = prev_stream;
-    });
-
-    result
-}
-
-/// Parameter type for all MLX operations.
-///
-/// Use this to control where operations are evaluated:
-///
-/// If omitted it will use the [Default::default()], which will be [Device::gpu()] unless
-/// set otherwise.
-#[derive(PartialEq)]
-pub struct StreamOrDevice {
-    pub(crate) stream: Stream,
-}
-
-impl StreamOrDevice {
-    /// Create a new [`StreamOrDevice`] with a [`Stream`].
-    pub fn new(stream: Stream) -> StreamOrDevice {
-        StreamOrDevice { stream }
+impl ExecutionContext {
+    /// Create a context with a new stream on `device`.
+    pub fn new(device: Device) -> Self {
+        let stream = Stream::new_with_device(&device);
+        Self { device, stream }
     }
 
-    /// Create a new [`StreamOrDevice`] with a [`Device`].
-    pub fn new_with_device(device: &Device) -> StreamOrDevice {
-        StreamOrDevice {
-            stream: Stream::new_with_device(device),
-        }
+    /// The device associated with this context.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
-    /// Current default CPU stream.
-    pub fn cpu() -> StreamOrDevice {
-        StreamOrDevice {
-            stream: Stream::cpu(),
-        }
-    }
-
-    /// Current default GPU stream.
-    pub fn gpu() -> StreamOrDevice {
-        StreamOrDevice {
-            stream: Stream::gpu(),
-        }
+    /// The stream associated with this context.
+    pub fn stream(&self) -> &Stream {
+        &self.stream
     }
 }
 
-impl Default for StreamOrDevice {
-    /// The default stream on the default device.
-    ///
-    /// This will be [Device::gpu()] unless [Device::set_default()]
-    /// sets it otherwise.
-    fn default() -> Self {
-        Self {
-            stream: Stream::new(),
-        }
-    }
-}
-
-impl AsRef<Stream> for StreamOrDevice {
+impl AsRef<Stream> for ExecutionContext {
     fn as_ref(&self) -> &Stream {
         &self.stream
     }
 }
 
-impl std::fmt::Debug for StreamOrDevice {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.stream)
-    }
-}
-
-impl std::fmt::Display for StreamOrDevice {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.stream)
-    }
-}
-
 /// A stream of evaluation attached to a particular device.
 ///
-/// Typically, this is used via the `stream:` parameter on a method with a [StreamOrDevice]:
+/// Typically, this is used via the `stream:` parameter on MLX operations.
 pub struct Stream {
     pub(crate) c_stream: safemlx_sys::mlx_stream,
 }
@@ -118,55 +56,16 @@ impl AsRef<Stream> for Stream {
 
 impl Clone for Stream {
     fn clone(&self) -> Self {
+        let _guard = runtime_lock::enter();
         Stream::try_from_op(|res| unsafe { safemlx_sys::mlx_stream_set(res, self.c_stream) })
             .expect("Failed to clone stream")
     }
 }
 
 impl Stream {
-    /// Create a new stream on the default device, or return the task local
-    /// default stream if present.
-    pub fn task_local_or_default() -> Self {
-        task_local_default_stream().unwrap_or_default()
-    }
-
-    /// Create a new stream on the default cpu device, or return the task local
-    /// default stream if present.
-    pub fn task_local_or_cpu() -> Self {
-        task_local_default_stream().unwrap_or_else(Stream::cpu)
-    }
-
-    /// Create a new stream on the default gpu device, or return the task local
-    /// default stream if present.
-    pub fn task_local_or_gpu() -> Self {
-        task_local_default_stream().unwrap_or_else(Stream::gpu)
-    }
-
-    /// Create a new stream on the default device. Panics if fails.
-    pub fn new() -> Stream {
-        unsafe {
-            let mut dev = safemlx_sys::mlx_device_new();
-            // SAFETY: mlx_get_default_device internally never throws an error
-            safemlx_sys::mlx_get_default_device(&mut dev as *mut _);
-
-            let mut c_stream = safemlx_sys::mlx_stream_new();
-            // SAFETY: mlx_get_default_stream internally never throws if dev is valid
-            safemlx_sys::mlx_get_default_stream(&mut c_stream as *mut _, dev);
-
-            safemlx_sys::mlx_device_free(dev);
-            Stream { c_stream }
-        }
-    }
-
-    /// Try to get the default stream on the given device.
-    pub fn try_default_on_device(device: &Device) -> Result<Stream> {
-        Stream::try_from_op(|res| unsafe {
-            safemlx_sys::mlx_get_default_stream(res, device.c_device)
-        })
-    }
-
     /// Create a new stream on the given device
     pub fn new_with_device(device: &Device) -> Stream {
+        let _guard = runtime_lock::enter();
         unsafe {
             let c_stream = safemlx_sys::mlx_stream_new_device(device.c_device);
             Stream { c_stream }
@@ -178,28 +77,24 @@ impl Stream {
         self.c_stream
     }
 
-    /// Current default CPU stream.
-    pub fn cpu() -> Self {
-        unsafe {
-            let c_stream = safemlx_sys::mlx_default_cpu_stream_new();
-            Stream { c_stream }
-        }
-    }
-
-    /// Current default GPU stream.
-    pub fn gpu() -> Self {
-        unsafe {
-            let c_stream = safemlx_sys::mlx_default_gpu_stream_new();
-            Stream { c_stream }
-        }
-    }
-
     /// Get the index of the stream.
     pub fn get_index(&self) -> Result<i32> {
         i32::try_from_op(|res| unsafe { safemlx_sys::mlx_stream_get_index(res, self.c_stream) })
     }
 
+    /// Synchronize with the stream.
+    pub fn synchronize(&self) -> Result<()> {
+        let _guard = runtime_lock::enter();
+        <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_synchronize(self.c_stream) })
+    }
+
+    /// Get the device associated with the stream.
+    pub fn get_device(&self) -> Result<Device> {
+        Device::try_from_op(|res| unsafe { safemlx_sys::mlx_stream_get_device(res, self.c_stream) })
+    }
+
     fn describe(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let _guard = runtime_lock::enter();
         unsafe {
             let mut mlx_str = safemlx_sys::mlx_string_new();
             let result =
@@ -219,13 +114,8 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        let _guard = runtime_lock::enter();
         unsafe { safemlx_sys::mlx_stream_free(self.c_stream) };
-    }
-}
-
-impl Default for Stream {
-    fn default() -> Self {
-        Stream::new()
     }
 }
 
@@ -252,42 +142,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scoped_default_stream() {
-        // First set default stream to CPU
-        let cpu_device = Device::cpu();
-        Device::set_default(&cpu_device);
-        let cpu_stream = Stream::default();
-
-        let task_default_stream = Stream::gpu();
-        with_new_default_stream(task_default_stream, || {
-            let task_local_stream_0 = Stream::task_local_or_default();
-            let task_local_stream_1 = Stream::task_local_or_default();
-            assert_eq!(task_local_stream_0, task_local_stream_1);
-            assert_ne!(task_local_stream_0, cpu_stream);
-        });
-    }
-
-    #[test]
     fn test_stream_clone() {
-        let stream = Stream::new();
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));
         let cloned_stream = stream.clone();
         assert_eq!(stream, cloned_stream);
     }
 
     #[test]
     fn test_cpu_gpu_stream_not_equal() {
-        let cpu_device = Device::cpu();
-        let gpu_device = Device::gpu();
-
-        // First set default stream to CPU
-        Device::set_default(&cpu_device);
-        let cpu_stream = Stream::default();
-
-        // Then set default stream to GPU
-        Device::set_default(&gpu_device);
-        let gpu_stream = Stream::default();
+        let cpu_stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let gpu_stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));
 
         // Assert that CPU and GPU streams are not equal
         assert_ne!(cpu_stream, gpu_stream);
+    }
+
+    #[test]
+    fn execution_context_can_be_used_as_stream() {
+        let ctx = ExecutionContext::new(crate::Device::new(crate::DeviceType::Cpu, 0));
+        let array = crate::Array::zeros::<f32>(&[2], &ctx).unwrap();
+        assert_eq!(array.shape(), &[2]);
+    }
+
+    #[test]
+    fn cpu_stream_creation_is_concurrent_safe() {
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..64 {
+                        let stream =
+                            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+                        let x = crate::Array::zeros::<f32>(&[1], &stream).unwrap();
+                        x.evaluated().unwrap();
+                    }
+                });
+            }
+        });
     }
 }

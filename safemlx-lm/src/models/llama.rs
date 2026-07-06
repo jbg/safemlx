@@ -9,9 +9,9 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
     nn,
-    ops::indexing::IndexOp,
+    ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
-    Array,
+    Array, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,7 +87,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
@@ -114,6 +114,7 @@ impl Attention {
             false,
             &args.rope_scaling,
             args.max_position_embeddings,
+            stream,
         )?;
 
         Ok(Self {
@@ -138,23 +139,28 @@ where
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, mut cache } = input;
 
         let (B, L) = batch_seq(x);
 
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let queries = self.q_proj.forward(x, stream)?;
+        let keys = self.k_proj.forward(x, stream)?;
+        let values = self.v_proj.forward(x, stream)?;
 
-        let queries = reshape_attention_projection(queries, B, L, self.n_heads)?;
-        let keys = reshape_attention_projection(keys, B, L, self.n_kv_heads)?;
-        let values = reshape_attention_projection(values, B, L, self.n_kv_heads)?;
+        let queries = reshape_attention_projection(queries, B, L, self.n_heads, stream)?;
+        let keys = reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?;
+        let values = reshape_attention_projection(values, B, L, self.n_kv_heads, stream)?;
         let (queries, keys, values) =
-            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache)?;
-        let output = finish_attention(queries, keys, values, cache, self.scale, mask, B, L)?;
+            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
+        let output =
+            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?;
 
-        self.o_proj.forward(&output)
+        self.o_proj.forward(&output, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -189,11 +195,11 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let num_attention_heads = args.num_attention_heads;
         let hidden_size = args.hidden_size;
 
-        let self_attn = Attention::new(args)?;
+        let self_attn = Attention::new(args, stream)?;
         let mlp = SwiGluMlp::new(args.hidden_size, args.intermediate_size, args.mlp_bias)?;
         let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
@@ -221,21 +227,25 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, cache } = input;
 
+        let normed = self.input_layernorm.forward(x, stream)?;
         let self_attn_input = AttentionInput {
-            x: &self.input_layernorm.forward(x)?,
+            x: &normed,
             mask,
             cache,
         };
-        let r = self.self_attn.forward(self_attn_input)?;
-        let h = x.add(r)?;
+        let r = self.self_attn.forward(self_attn_input, stream)?;
+        let h = x.add(r, stream)?;
 
-        let r = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&h)?)?;
-        h.add(r)
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        let r = self.mlp.forward(&post_normed, stream)?;
+        h.add(r, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -264,7 +274,7 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
 
         let vocab_size = args.vocab_size;
@@ -272,7 +282,7 @@ impl LlamaModel {
 
         let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
         let layers = (0..num_hidden_layers)
-            .map(|_| TransformerBlock::new(args))
+            .map(|_| TransformerBlock::new(args, stream))
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
@@ -302,22 +312,28 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let ModelInput {
             inputs,
             mask,
             cache,
         } = input;
 
-        let mut h = self.embed_tokens.forward(inputs)?;
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
 
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
             None => {
                 if h.shape()[1] > 1 {
-                    let m =
-                        nn::MultiHeadAttention::create_additive_causal_mask::<f32>(h.shape()[1])?;
-                    Some(m.as_dtype(h.dtype())?)
+                    let m = nn::MultiHeadAttention::create_additive_causal_mask::<f32>(
+                        h.shape()[1],
+                        stream,
+                    )?;
+                    Some(m.as_dtype(h.dtype(), stream)?)
                 } else {
                     None
                 }
@@ -334,10 +350,10 @@ where
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
             };
-            h = layer.forward(layer_input)?;
+            h = layer.forward(layer_input, stream)?;
         }
 
-        self.norm.forward(&h)
+        self.norm.forward(&h, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -363,8 +379,8 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(args: ModelArgs) -> Result<Self, Exception> {
-        let model = LlamaModel::new(&args)?;
+    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        let model = LlamaModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::build_maybe_quantized_lm_head(
                 args.hidden_size,
@@ -394,9 +410,18 @@ where
 
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let out = self.model.forward(input)?;
-        project_logits_maybe_quantized(&mut self.lm_head, &mut self.model.embed_tokens, &out)
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        let out = self.model.forward(input, stream)?;
+        project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &out,
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -435,10 +460,10 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_llama_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+pub fn load_llama_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_llama_model_args(model_dir)?;
-    let mut model = Model::new(model_args)?;
+    let mut model = Model::new(model_args, stream)?;
 
     let weights_index = model_dir.join("model.safetensors.index.json");
     if weights_index.exists() {
@@ -468,26 +493,34 @@ where
         &mut self,
         prompt_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: prompt_tokens,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: prompt_tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 
     fn decode_logits(
         &mut self,
         input_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: input_tokens,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: input_tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 }
 
@@ -499,7 +532,7 @@ mod tests {
 
     use lazy_static::lazy_static;
     use safemlx::{
-        ops::indexing::{IndexOp, NewAxis},
+        ops::indexing::{NewAxis, TryIndexOp},
         transforms::eval,
         Array,
     };
@@ -554,8 +587,10 @@ mod tests {
         use safemlx::module::ModuleParameters;
 
         let model_dir = CACHED_TEST_MODEL_DIR.as_str();
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let model_args = super::get_llama_model_args(model_dir).unwrap();
-        let model = super::Model::new(model_args).unwrap();
+        let model = super::Model::new(model_args, stream).unwrap();
 
         // Print some model parameter keys
         let params = model.parameters().flatten();
@@ -614,11 +649,15 @@ mod tests {
     #[ignore = "requires local model files"]
     fn test_load_and_run_llama_with_concat_cache() {
         let tokenizer = load_llama_tokenizer(CACHED_TEST_MODEL_DIR.as_str()).unwrap();
-        let mut model = load_llama_model(CACHED_TEST_MODEL_DIR.as_str()).unwrap();
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut model = load_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream).unwrap();
 
         let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
         let encoding = tokenizer.encode(prompt, false).unwrap();
-        let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
+        let prompt_tokens = Array::from(encoding.get_ids())
+            .try_index_device(NewAxis, stream)
+            .unwrap();
         let mut cache = Vec::new();
 
         let eos_token_id = 128001u32;
@@ -630,11 +669,12 @@ mod tests {
             &mut cache,
             0.0,
             &prompt_tokens,
+            stream,
         );
         for (token, _ntoks) in generate.zip(0..50) {
             let token = token.unwrap();
             eval([&token]).unwrap();
-            let token_id = token.item::<u32>();
+            let token_id = token.item::<u32>(&stream);
             print!("[{}]", token_id);
             if token_id == eos_token_id || token_id == eot_token_id {
                 break;

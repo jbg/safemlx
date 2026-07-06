@@ -5,9 +5,8 @@ use crate::{
     module::Module,
     ops::{
         abs, broadcast_to, ceil, clip, expand_dims_axes, floor,
-        indexing::{ArrayIndex, ArrayIndexOp, Ellipsis, IndexOp, NewAxis, TryIndexOp},
+        indexing::{ArrayIndex, ArrayIndexOp, Ellipsis, NewAxis, TryIndexOp},
     },
-    transforms::compile::compile,
     Array,
 };
 
@@ -55,14 +54,19 @@ impl Upsample {
         Upsample { scale_factor, mode }
     }
 
-    fn forward_inner(&self, x: &Array, scale: &[f32]) -> Result<Array, Exception> {
+    fn forward_inner(
+        &self,
+        x: &Array,
+        scale: &[f32],
+        stream: &crate::Stream,
+    ) -> Result<Array, Exception> {
         match self.mode {
-            UpsampleMode::Nearest => upsample_nearest(x, scale),
+            UpsampleMode::Nearest => upsample_nearest(x, scale, stream),
             UpsampleMode::Linear { align_corners } => {
-                interpolate(x, scale, linear_indices, align_corners)
+                interpolate(x, scale, linear_indices, align_corners, stream)
             }
             UpsampleMode::Cubic { align_corners } => {
-                interpolate(x, scale, cubic_indices, align_corners)
+                interpolate(x, scale, cubic_indices, align_corners, stream)
             }
         }
     }
@@ -72,7 +76,7 @@ impl Module<&Array> for Upsample {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Self::Output, Self::Error> {
         let dimensions = x.ndim() - 2;
 
         if dimensions == 0 {
@@ -87,9 +91,9 @@ impl Module<&Array> for Upsample {
         match &self.scale_factor {
             SingleOrVec::Single(scale) => {
                 let scale = vec![*scale; dimensions];
-                self.forward_inner(x, &scale[..])
+                self.forward_inner(x, &scale[..], stream)
             }
-            SingleOrVec::Vec(scales) => self.forward_inner(x, &scales[..]),
+            SingleOrVec::Vec(scales) => self.forward_inner(x, &scales[..], stream),
         }
     }
 
@@ -97,7 +101,7 @@ impl Module<&Array> for Upsample {
 }
 
 #[allow(non_snake_case)]
-fn upsample_nearest(x: &Array, scale: &[f32]) -> Result<Array, Exception> {
+fn upsample_nearest(x: &Array, scale: &[f32], stream: &crate::Stream) -> Result<Array, Exception> {
     let dimensions = x.ndim() - 2;
     if dimensions != scale.len() {
         return Err(Exception::custom(format!(
@@ -117,18 +121,18 @@ fn upsample_nearest(x: &Array, scale: &[f32]) -> Result<Array, Exception> {
         (0..dimensions).for_each(|d| {
             shape.insert(2 + 2 * d, 1);
         });
-        let mut x = x.reshape(&shape)?;
+        let mut x = x.reshape(&shape, stream)?;
 
         (0..dimensions).for_each(|d| {
             shape[2 + 2 * d] = int_scales[d];
         });
-        x = broadcast_to(&x, &shape)?;
+        x = broadcast_to(&x, &shape, stream)?;
 
         (0..dimensions).for_each(|d| {
             shape[d + 1] *= shape[d + 2];
             shape.remove(d + 2);
         });
-        x = x.reshape(&shape)?;
+        x = x.reshape(&shape, stream)?;
 
         Ok(x)
     } else {
@@ -138,16 +142,17 @@ fn upsample_nearest(x: &Array, scale: &[f32]) -> Result<Array, Exception> {
         let mut indices: Vec<ArrayIndexOp> = vec![(..).index_op()];
 
         for (i, (n, s)) in N.iter().zip(scale.iter()).enumerate() {
-            indices.push(nearest_indices(*n, *s, i, dimensions)?.index_op());
+            indices.push(nearest_indices(*n, *s, i, dimensions, stream)?.index_op());
         }
 
-        x.try_index(&indices[..])
+        x.try_index_device(&indices[..], stream)
     }
 }
 
 type IndexWeight = (Array, Array);
 
-type IndicesFn = fn(i32, f32, bool, usize, usize) -> Result<Vec<IndexWeight>, Exception>;
+type IndicesFn =
+    fn(i32, f32, bool, usize, usize, &crate::Stream) -> Result<Vec<IndexWeight>, Exception>;
 
 #[allow(non_snake_case)]
 fn interpolate(
@@ -155,6 +160,7 @@ fn interpolate(
     scale: &[f32],
     indices_fn: IndicesFn,
     align_corners: bool,
+    stream: &crate::Stream,
 ) -> Result<Array, Exception> {
     let dimensions = x.ndim() - 2;
     if dimensions != scale.len() {
@@ -170,7 +176,7 @@ fn interpolate(
     // compute the sampling grid
     let mut index_weights = Vec::with_capacity(N.len());
     for (i, (n, s)) in N.iter().zip(scale.iter()).enumerate() {
-        index_weights.push(indices_fn(*n, *s, align_corners, i, dimensions)?);
+        index_weights.push(indices_fn(*n, *s, align_corners, i, dimensions, stream)?);
     }
 
     // sample and compute the weights
@@ -184,17 +190,23 @@ fn interpolate(
 
         let mut sample_indices = vec![(..).index_op()];
         sample_indices.append(&mut index_ops);
-        samples.push(x.index(&sample_indices[..]));
+        samples.push(x.try_index_device(&sample_indices[..], stream)?);
 
-        weights.push(weight.into_iter().product::<Array>());
+        let mut weight_iter = weight.into_iter();
+        let first = weight_iter
+            .next()
+            .ok_or_else(|| Exception::custom("empty interpolation weights"))?
+            .clone();
+        let weight = weight_iter.try_fold(first, |acc, w| acc.multiply(w, stream))?;
+        weights.push(weight);
     }
 
     // interpolate
-    let acc = &weights[0] * &samples[0];
+    let acc = weights[0].multiply(&samples[0], stream)?;
     weights[1..]
         .iter()
         .zip(samples[1..].iter())
-        .try_fold(acc, |acc, (w, s)| acc.add(w.multiply(s)?))
+        .try_fold(acc, |acc, (w, s)| acc.add(w.multiply(s, stream)?, stream))
 }
 
 fn product<T>(values: &[Vec<T>]) -> Vec<Vec<&T>> {
@@ -230,8 +242,9 @@ fn nearest_indices(
     scale: f32,
     dim: usize,
     ndim: usize,
+    stream: &crate::Stream,
 ) -> Result<Array, Exception> {
-    scaled_indices(dimension, scale, true, dim, ndim).and_then(|i| i.as_type::<i32>())
+    scaled_indices(dimension, scale, true, dim, ndim, stream).and_then(|i| i.as_type::<i32>(stream))
 }
 
 fn linear_indices(
@@ -240,19 +253,19 @@ fn linear_indices(
     align_corners: bool,
     dim: usize,
     ndim: usize,
+    stream: &crate::Stream,
 ) -> Result<Vec<IndexWeight>, Exception> {
-    let mut indices = scaled_indices(dimension, scale, align_corners, dim, ndim)?;
-    indices = clip(&indices, (0, dimension - 1))?;
-    let indices_left = floor(&indices)?;
-    let indices_right = ceil(&indices)?;
-    let weight = expand_dims_axes(&indices.subtract(&indices_left)?, &[-1])?;
+    let mut indices = scaled_indices(dimension, scale, align_corners, dim, ndim, stream)?;
+    indices = clip(&indices, (0, dimension - 1), stream)?;
+    let indices_left = floor(&indices, stream)?;
+    let indices_right = ceil(&indices, stream)?;
+    let weight = expand_dims_axes(&indices.subtract(&indices_left, stream)?, &[-1], stream)?;
 
-    let indices_left = indices_left.as_type::<i32>()?;
-    let indices_right = indices_right.as_type::<i32>()?;
+    let indices_left = indices_left.as_type::<i32>(stream)?;
+    let indices_right = indices_right.as_type::<i32>(stream)?;
 
     Ok(vec![
-        // SAFETY: arith ops with scalars won't panic
-        (indices_left, array!(1.0) - &weight),
+        (indices_left, array!(1.0).subtract(&weight, stream)?),
         (indices_right, weight),
     ])
 }
@@ -263,25 +276,29 @@ fn cubic_indices(
     align_corners: bool,
     dim: usize,
     ndim: usize,
+    stream: &crate::Stream,
 ) -> Result<Vec<IndexWeight>, Exception> {
-    let indices = scaled_indices(dimension, scale, align_corners, dim, ndim)?;
+    let indices = scaled_indices(dimension, scale, align_corners, dim, ndim, stream)?;
 
-    // SAFETY: arith ops with scalars won't panic
-    let mut indices_l1 = floor(&indices)?;
-    let mut indices_r1 = floor(&(&indices + 1))?;
-    let mut indices_l2 = (&indices_l1) - 1;
-    let mut indices_r2 = (&indices_r1) + 1;
+    let mut indices_l1 = floor(&indices, stream)?;
+    let mut indices_r1 = floor(&indices.add(array!(1), stream)?, stream)?;
+    let mut indices_l2 = indices_l1.subtract(array!(1), stream)?;
+    let mut indices_r2 = indices_r1.add(array!(1), stream)?;
 
-    let weight_l1 = compiled_get_weight1(&indices, &indices_l1)?.index((Ellipsis, NewAxis));
-    let weight_r1 = compiled_get_weight1(&indices, &indices_r1)?.index((Ellipsis, NewAxis));
-    let weight_l2 = compiled_get_weight2(&indices, &indices_l2)?.index((Ellipsis, NewAxis));
-    let weight_r2 = compiled_get_weight2(&indices, &indices_r2)?.index((Ellipsis, NewAxis));
+    let weight_l1 = get_weight1(&indices, &indices_l1, stream)?
+        .try_index_device((Ellipsis, NewAxis), stream)?;
+    let weight_r1 = get_weight1(&indices, &indices_r1, stream)?
+        .try_index_device((Ellipsis, NewAxis), stream)?;
+    let weight_l2 = get_weight2(&indices, &indices_l2, stream)?
+        .try_index_device((Ellipsis, NewAxis), stream)?;
+    let weight_r2 = get_weight2(&indices, &indices_r2, stream)?
+        .try_index_device((Ellipsis, NewAxis), stream)?;
 
     // Padding with border value
-    indices_l1 = clip(&indices_l1, (0, dimension - 1))?.as_type::<i32>()?;
-    indices_r1 = clip(&indices_r1, (0, dimension - 1))?.as_type::<i32>()?;
-    indices_l2 = clip(&indices_l2, (0, dimension - 1))?.as_type::<i32>()?;
-    indices_r2 = clip(&indices_r2, (0, dimension - 1))?.as_type::<i32>()?;
+    indices_l1 = clip(&indices_l1, (0, dimension - 1), stream)?.as_type::<i32>(stream)?;
+    indices_r1 = clip(&indices_r1, (0, dimension - 1), stream)?.as_type::<i32>(stream)?;
+    indices_l2 = clip(&indices_l2, (0, dimension - 1), stream)?.as_type::<i32>(stream)?;
+    indices_r2 = clip(&indices_r2, (0, dimension - 1), stream)?.as_type::<i32>(stream)?;
 
     Ok(vec![
         (indices_l1, weight_l1),
@@ -291,27 +308,26 @@ fn cubic_indices(
     ])
 }
 
-fn compiled_get_weight1(ind: &Array, grid: &Array) -> Result<Array, Exception> {
-    // PyTorch uses -0.5 for antialiasing=true (compatibility with PIL)
-    // and uses -0.75 for antialiasing=false (compatibility with OpenCV)
-
-    let get_weight1 = |(ind_, grid_): (&Array, &Array)| {
-        let a = -0.75;
-        let x = abs(ind_ - grid_)?;
-        Ok((array!(a + 2.0) * &x - array!(a + 3.0)) * &x * &x + 1.0)
-    };
-    let mut compiled = compile(get_weight1, true);
-    compiled((ind, grid))
+fn get_weight1(ind: &Array, grid: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
+    let a = -0.75;
+    let x = abs(&ind.subtract(grid, stream)?, stream)?;
+    array!(a + 2.0)
+        .multiply(&x, stream)?
+        .subtract(array!(a + 3.0), stream)?
+        .multiply(&x, stream)?
+        .multiply(&x, stream)?
+        .add(array!(1.0), stream)
 }
 
-fn compiled_get_weight2(ind: &Array, grid: &Array) -> Result<Array, Exception> {
-    let get_weight2 = |(ind_, grid_): (&Array, &Array)| {
-        let a = -0.75;
-        let x = abs(ind_ - grid_)?;
-        Ok((((&x - 5.0) * &x + 8.0) * &x - 4.0) * a)
-    };
-    let mut compiled = compile(get_weight2, true);
-    compiled((ind, grid))
+fn get_weight2(ind: &Array, grid: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
+    let a = -0.75;
+    let x = abs(&ind.subtract(grid, stream)?, stream)?;
+    x.subtract(array!(5.0), stream)?
+        .multiply(&x, stream)?
+        .add(array!(8.0), stream)?
+        .multiply(&x, stream)?
+        .subtract(array!(4.0), stream)?
+        .multiply(array!(a), stream)
 }
 
 #[allow(non_snake_case)]
@@ -321,26 +337,28 @@ fn scaled_indices(
     align_corners: bool,
     dim: usize,
     ndim: usize,
+    stream: &crate::Stream,
 ) -> Result<Array, Exception> {
     let M = (scale * N as f32) as i32;
 
     let indices = match align_corners {
-        true => {
-            // SAFETY: arith ops on with scalars won't panic
-            Array::from_iter(0..M, &[M]).as_type::<f32>()? * ((N as f32 - 1.0) / (M as f32 - 1.0))
-        }
+        true => Array::from_iter(0..M, &[M])
+            .as_type::<f32>(stream)?
+            .multiply(array!((N as f32 - 1.0) / (M as f32 - 1.0)), stream)?,
         false => {
             let step = 1.0 / scale;
             let start = ((M as f32 - 1.0) * step - N as f32 + 1.0) / 2.0;
-            // SAFETY: arith ops with scalars won't panic
-            Array::from_iter(0..M, &[M]).as_type::<f32>()? * step - start
+            Array::from_iter(0..M, &[M])
+                .as_type::<f32>(stream)?
+                .multiply(array!(step), stream)?
+                .subtract(array!(start), stream)?
         }
     };
 
     let mut shape = vec![1; ndim];
     shape[dim] = -1;
 
-    indices.reshape(&shape)
+    indices.reshape(&shape, stream)
 }
 
 #[cfg(test)]
@@ -352,11 +370,15 @@ mod tests {
     // The unit test below is adapted from the swift binding.
     #[test]
     fn test_nearest() {
+        let stream = crate::test_stream();
         // BHWC
         let input = array!([1, 2, 3, 4], shape = [1, 2, 2, 1]);
 
         let mut up = Upsample::new(2.0, UpsampleMode::Nearest);
-        let result = up.forward(&input).and_then(|r| r.squeeze()).unwrap();
+        let result = up
+            .forward(&input, stream)
+            .and_then(|r| r.squeeze(stream))
+            .unwrap();
 
         assert_eq!(result.shape(), &[4, 4]);
 
@@ -368,14 +390,15 @@ mod tests {
             [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4],
             shape = [4, 4]
         )
-        .as_type::<i32>()
+        .as_type::<i32>(stream)
         .unwrap();
-        assert_eq!(result, expected);
+        assert!(crate::array::eval_equal_values(&result, &expected));
     }
 
     // The unit test below is adapted from the swift binding.
     #[test]
     fn test_linear() {
+        let stream = crate::test_stream();
         // BHWC
         let input = array!([1, 2, 3, 4], shape = [1, 2, 2, 1]);
 
@@ -385,7 +408,10 @@ mod tests {
                 align_corners: false,
             },
         );
-        let result = up.forward(&input).and_then(|r| r.squeeze()).unwrap();
+        let result = up
+            .forward(&input, stream)
+            .and_then(|r| r.squeeze(stream))
+            .unwrap();
 
         assert_eq!(result.shape(), &[4, 4]);
 
@@ -400,14 +426,15 @@ mod tests {
             ],
             shape = [4, 4]
         )
-        .as_type::<f32>()
+        .as_type::<f32>(stream)
         .unwrap();
-        assert_eq!(result, expected);
+        assert!(crate::array::eval_equal_values(&result, &expected));
     }
 
     // The expected output for the test case below is obtained from the python binding.
     #[test]
     fn test_cubic() {
+        let stream = crate::test_stream();
         // BHWC
         let input = array!([1, 2, 3, 4], shape = [1, 2, 2, 1]);
 
@@ -417,7 +444,10 @@ mod tests {
                 align_corners: false,
             },
         );
-        let result = up.forward(&input).and_then(|r| r.squeeze()).unwrap();
+        let result = up
+            .forward(&input, stream)
+            .and_then(|r| r.squeeze(stream))
+            .unwrap();
 
         assert_eq!(result.shape(), &[4, 4]);
 
@@ -433,9 +463,9 @@ mod tests {
             ],
             shape = [4, 4]
         )
-        .as_type::<f32>()
+        .as_type::<f32>(stream)
         .unwrap();
 
-        assert_array_eq!(result, expected, 1e-5);
+        assert_array_eq!(result, expected, 1e-5, stream = stream);
     }
 }

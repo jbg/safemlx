@@ -17,6 +17,7 @@
 //! ## Basics
 //!
 //! ```rust
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 //! use safemlx::{array, Dtype};
 //!
 //! let a = array!([1, 2, 3, 4]);
@@ -27,25 +28,29 @@
 //! assert_eq!(b.dtype(), Dtype::Float32);
 //! ```
 //!
-//! Operations in MLX are lazy. Use [`Array::eval`] to evaluate the the output
-//! of an operation. Operations are also automatically evaluated when inspecting
-//! an array with [`Array::item`], printing an array, or attempting to obtain
-//! the underlying data with [`Array::as_slice`].
+//! Operations in MLX are lazy. Array-producing operations are scheduled on an
+//! explicit stream, and the resulting arrays carry that execution choice. Use
+//! [`Array::eval`] to evaluate an existing array graph. Host readback methods
+//! such as [`Array::as_slice`] evaluate as needed; methods that perform
+//! additional typed conversion, such as [`Array::item`], take a stream for that
+//! conversion.
 //!
 //! ```rust
-//! use safemlx::{array, transforms::eval};
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! use safemlx::array;
 //!
 //! let a = array!([1, 2, 3, 4]);
 //! let b = array!([1.0, 2.0, 3.0, 4.0]);
 //!
-//! let c = &a + &b; // c is not evaluated
-//! c.eval().unwrap(); // evaluates c
+//! let c = a.add(&b, &stream).unwrap(); // c is not evaluated
+//! c.evaluated().unwrap(); // evaluates c and returns a borrowed host-readable view
 //!
-//! let d = &a + &b;
-//! println!("{:?}", d); // evaluates d
+//! let d = a.add(&b, &stream).unwrap();
+//! println!("{:?}", d); // prints array metadata
 //!
-//! let e = &a + &b;
-//! let e_slice: &[f32] = e.as_slice(); // evaluates e
+//! let e = a.add(&b, &stream).unwrap();
+//! let e = e.evaluated().unwrap();
+//! let e_slice: &[f32] = e.as_slice();
 //! ```
 //!
 //! See [Lazy Evaluation](#lazy-evaluation) for more details.
@@ -118,8 +123,8 @@
 //!
 //! ## When to Evaluate
 //!
-//! A common question is when to use `eval()`. The trade-off is between letting
-//! graphs get too large and not batching enough useful work.
+//! A common question is when to evaluate arrays. The trade-off is between
+//! letting graphs get too large and not batching enough useful work.
 //!
 //! For example
 //!
@@ -129,9 +134,9 @@
 //!
 //! for _ in 0..100 {
 //!     a = a + b;
-//!     a.eval()?;
+//!     a.evaluated()?;
 //!     b = b * 2.0;
-//!     b.eval()?;
+//!     b.evaluated()?;
 //! }
 //! ```
 //!
@@ -146,7 +151,7 @@
 //!
 //! Most numerical computations have an iterative outer loop (e.g. the iteration
 //! in stochastic gradient descent). A natural and usually efficient place to
-//! use `eval()` is at each iteration of this outer loop.
+//! evaluate arrays is at each iteration of this outer loop.
 //!
 //! Here is a concrete example:
 //!
@@ -172,12 +177,12 @@
 //!
 //! Calling [`Array::item`] on a scalar array will also evaluate it. In the
 //! example above, printing the loss (`println!("{:?}", loss)`) or pushing the
-//! loss scalar to a [`Vec`] (`losses.push(loss.item::<f32>())`) would cause a
+//! loss scalar to a [`Vec`] (`losses.push(loss.item::<f32>(&stream))`) would cause a
 //! graph evaluation. If these lines are before evaluating the loss and module
 //! parameters, then this will be a partial evaluation, computing only the
 //! forward pass.
 //!
-//! Also, calling `eval()` on an array or set of arrays multiple times is
+//! Also, evaluating an array or set of arrays multiple times is
 //! perfectly fine. This is effectively a no-op.
 //!
 //! **Warning**: Using scalar arrays for control-flow will cause an evaluation.
@@ -186,7 +191,7 @@
 //! fn fun(x: &Array) -> Array {
 //!     let (h, y) = first_layer(x);
 //!
-//!     if y.gt(array!(0.5)).unwrap().item() {
+//!     if y.gt(array!(0.5)).unwrap().item(&stream) {
 //!         second_layer_a(h)
 //!     } else {
 //!         second_layer_b(h)
@@ -210,11 +215,13 @@
 //! location:
 //!
 //! ```rust
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 //! // let a = safemlx::random::normal(&[100], None, None, None, None).unwrap();
 //! // let b = safemlx::random::normal(&[100], None, None, None, None).unwrap();
 //!
-//! let a = safemlx::normal!(shape=&[100]).unwrap();
-//! let b = safemlx::normal!(shape=&[100]).unwrap();
+//! let key = safemlx::random::key(0).unwrap();
+//! let a = safemlx::normal!(shape=&[100], key=&key, stream=&stream).unwrap();
+//! let b = safemlx::normal!(shape=&[100], key=&key, stream=&stream).unwrap();
 //! ```
 //!
 //! Both `a` and `b` live in unified memory.
@@ -225,11 +232,12 @@
 //! example:
 //!
 //! ```rust,ignore
-//! // safemlx::ops::add_device(&a, &b, StreamOrDevice::cpu()).unwrap();
-//! // safemlx::ops::add_device(&a, &b, StreamOrDevice::gpu()).unwrap();
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! // safemlx::ops::add(&a, &b, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
+//! // safemlx::ops::add(&a, &b, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
 //!
-//! safemlx::add!(&a, &b, stream=StreamOrDevice::cpu()).unwrap();
-//! safemlx::add!(&a, &b, stream=StreamOrDevice::gpu()).unwrap();
+//! safemlx::add!(&a, &b, stream=Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
+//! safemlx::add!(&a, &b, stream=Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
 //! ```
 //!
 //! In the above, both the CPU and the GPU will perform the same add operation.
@@ -307,6 +315,22 @@ pub use array::*;
 pub use device::*;
 pub use dtype::*;
 pub use stream::*;
+
+#[cfg(test)]
+/// Return an explicit stream for unit tests.
+pub(crate) fn test_stream() -> &'static Stream {
+    Box::leak(Box::new(Stream::new_with_device(&Device::new(
+        DeviceType::Cpu,
+        0,
+    ))))
+}
+
+#[cfg(test)]
+/// Return the first PRNG subkey produced after seeding a local random state.
+pub(crate) fn test_key(seed: u64, stream: &Stream) -> Array {
+    let mut state = random::RandomState::with_seed(seed).unwrap();
+    state.next_key(stream).unwrap()
+}
 
 pub(crate) mod constants {
     /// The default length of the stack-allocated vector in `SmallVec<[T; DEFAULT_STACK_VEC_LEN]>`

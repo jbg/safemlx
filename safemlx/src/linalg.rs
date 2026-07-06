@@ -4,7 +4,7 @@ use crate::error::{Exception, Result};
 use crate::utils::guard::Guarded;
 use crate::utils::{IntoOption, VectorArray};
 use crate::{Array, Stream};
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 use smallvec::SmallVec;
 use std::f64;
 use std::ffi::CString;
@@ -62,8 +62,7 @@ impl<'a> IntoOption<Ord<'a>> for f64 {
 
 /// Compute p-norm of an [`Array`]
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn norm_device<'a>(
+pub fn norm<'a>(
     array: impl AsRef<Array>,
     ord: f64,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -100,8 +99,7 @@ pub fn norm_device<'a>(
 
 /// Matrix or vector norm.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn norm_matrix_device<'a>(
+pub fn norm_matrix<'a>(
     array: impl AsRef<Array>,
     ord: &'a str,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -139,8 +137,7 @@ pub fn norm_matrix_device<'a>(
 
 /// Compute the L2 norm of an [`Array`]
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn norm_l2_device<'a>(
+pub fn norm_l2<'a>(
     array: impl AsRef<Array>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
     #[optional] keep_dims: impl Into<Option<bool>>,
@@ -212,8 +209,8 @@ pub fn norm_l2_device<'a>(
 // /// - `keep_dims`: if `true` the axes which are normed over are left in the result as dimensions
 // ///   with size one
 // #[generate_macro(customize(root = "$crate::linalg"))]
-// #[default_device]
-// pub fn norm_device<'a>(
+//
+// pub fn norm<'a>(
 //     array: impl AsRef<Array>,
 //     #[optional] ord: impl IntoOption<Ord<'a>>,
 //     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -277,24 +274,21 @@ pub fn norm_l2_device<'a>(
 /// # Example
 ///
 /// ```rust
-/// use safemlx::{Array, StreamOrDevice, linalg::*};
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[2.0f32, 3.0, 1.0, 2.0], &[2, 2]);
 ///
-/// let (q, r) = qr_device(&a, StreamOrDevice::cpu()).unwrap();
+/// let (q, r) = qr(&a, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 ///
 /// let q_expected = Array::from_slice(&[-0.894427, -0.447214, -0.447214, 0.894427], &[2, 2]);
 /// let r_expected = Array::from_slice(&[-2.23607, -3.57771, 0.0, 0.447214], &[2, 2]);
 ///
-/// assert!(q.all_close(&q_expected, None, None, None).unwrap().item::<bool>());
-/// assert!(r.all_close(&r_expected, None, None, None).unwrap().item::<bool>());
+/// assert!(q.all_close(&q_expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
+/// assert!(r.all_close(&r_expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
 /// ```
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn qr_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<(Array, Array)> {
+pub fn qr(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<(Array, Array)> {
     <(Array, Array)>::try_from_op(|(res_0, res_1)| unsafe {
         safemlx_sys::mlx_linalg_qr(res_0, res_1, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -316,20 +310,20 @@ pub fn qr_device(
 /// # Example
 ///
 /// ```rust
-/// use safemlx::{Array, StreamOrDevice, linalg::*};
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
-/// let (u, s, vt) = svd_device(&a, StreamOrDevice::cpu()).unwrap();
+/// let (u, s, vt) = svd(&a, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 /// let u_expected = Array::from_slice(&[-0.404554, 0.914514, -0.914514, -0.404554], &[2, 2]);
 /// let s_expected = Array::from_slice(&[5.46499, 0.365966], &[2]);
 /// let vt_expected = Array::from_slice(&[-0.576048, -0.817416, -0.817415, 0.576048], &[2, 2]);
-/// assert!(u.all_close(&u_expected, None, None, None).unwrap().item::<bool>());
-/// assert!(s.all_close(&s_expected, None, None, None).unwrap().item::<bool>());
-/// assert!(vt.all_close(&vt_expected, None, None, None).unwrap().item::<bool>());
+/// assert!(u.all_close(&u_expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
+/// assert!(s.all_close(&s_expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
+/// assert!(vt.all_close(&vt_expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
 /// ```
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn svd_device(
+pub fn svd(
     array: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<(Array, Array, Array)> {
@@ -360,16 +354,16 @@ pub fn svd_device(
 /// # Example
 ///
 /// ```rust
-/// use safemlx::{Array, StreamOrDevice, linalg::*};
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
-/// let a_inv = inv_device(&a, StreamOrDevice::cpu()).unwrap();
+/// let a_inv = inv(&a, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 /// let expected = Array::from_slice(&[-2.0, 1.0, 1.5, -0.5], &[2, 2]);
-/// assert!(a_inv.all_close(&expected, None, None, None).unwrap().item::<bool>());
+/// assert!(a_inv.all_close(&expected, None, None, None, &stream).unwrap().item::<bool>(&stream));
 /// ```
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn inv_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
+pub fn inv(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_linalg_inv(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -389,8 +383,7 @@ pub fn inv_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) 
 /// - `upper`: If `true`, return the upper triangular Cholesky factor. If `false`, return the lower
 ///   triangular Cholesky factor. Default: `false`.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn cholesky_device(
+pub fn cholesky(
     a: impl AsRef<Array>,
     #[optional] upper: Option<bool>,
     #[optional] stream: impl AsRef<Stream>,
@@ -405,8 +398,7 @@ pub fn cholesky_device(
 ///
 /// Please see the python documentation for more details.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn cholesky_inv_device(
+pub fn cholesky_inv(
     a: impl AsRef<Array>,
     #[optional] upper: Option<bool>,
     #[optional] stream: impl AsRef<Stream>,
@@ -427,8 +419,7 @@ pub fn cholesky_inv_device(
 /// The cross product is defined for arrays with size 2 or 3 in the specified axis. If the size is 2
 /// then the third value is assumed to be zero.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn cross_device(
+pub fn cross(
     a: impl AsRef<Array>,
     b: impl AsRef<Array>,
     #[optional] axis: Option<i32>,
@@ -452,8 +443,7 @@ pub fn cross_device(
 /// dimensions, the eigenvalues and eigenvectors are computed for each matrix in the last two
 /// dimensions.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn eigh_device(
+pub fn eigh(
     a: impl AsRef<Array>,
     #[optional] uplo: Option<&str>,
     #[optional] stream: impl AsRef<Stream>,
@@ -477,8 +467,7 @@ pub fn eigh_device(
 /// This function supports arrays with at least 2 dimensions. When the input has more than two
 /// dimensions, the eigenvalues are computed for each matrix in the last two dimensions.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn eigvalsh_device(
+pub fn eigvalsh(
     a: impl AsRef<Array>,
     #[optional] uplo: Option<&str>,
     #[optional] stream: impl AsRef<Stream>,
@@ -511,18 +500,15 @@ pub fn eigvalsh_device(
 /// # Example
 ///
 /// ```rust
-/// use safemlx::{Array, linalg::*, StreamOrDevice};
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// use safemlx::{Array, linalg::*, Stream};
 ///
 /// let a = Array::from_slice(&[1.0f32, 1.0, 3.0, 4.0], &[2, 2]);
-/// let (eigenvalues, eigenvectors) = eig_device(&a, StreamOrDevice::cpu()).unwrap();
+/// let (eigenvalues, eigenvectors) = eig(&a, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 /// // eigenvalues and eigenvectors are complex even for real input
 /// ```
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn eig_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<(Array, Array)> {
+pub fn eig(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<(Array, Array)> {
     <(Array, Array) as Guarded>::try_from_op(|(res_0, res_1)| unsafe {
         safemlx_sys::mlx_linalg_eig(res_0, res_1, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -547,17 +533,14 @@ pub fn eig_device(
 /// # Example
 ///
 /// ```rust
-/// use safemlx::{Array, linalg::*, StreamOrDevice};
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// use safemlx::{Array, linalg::*, Stream};
 ///
 /// let a = Array::from_slice(&[1.0f32, 1.0, 3.0, 4.0], &[2, 2]);
-/// let eigenvalues = eigvals_device(&a, StreamOrDevice::cpu()).unwrap();
+/// let eigenvalues = eigvals(&a, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 /// ```
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn eigvals_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn eigvals(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_linalg_eigvals(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -565,8 +548,7 @@ pub fn eigvals_device(
 
 /// Compute the (Moore-Penrose) pseudo-inverse of a matrix.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn pinv_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
+pub fn pinv(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_linalg_pinv(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -577,8 +559,7 @@ pub fn pinv_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>)
 /// This function supports arrays with at least 2 dimensions. When the input has more than two
 /// dimensions, the inverse is computed for each matrix in the last two dimensions of a.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn tri_inv_device(
+pub fn tri_inv(
     a: impl AsRef<Array>,
     #[optional] upper: Option<bool>,
     #[optional] stream: impl AsRef<Stream>,
@@ -617,8 +598,7 @@ pub fn tri_inv_device(
 ///
 /// The `p`, `L`, and `U` arrays, such that `A = L[P, :] @ U`
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn lu_device(
+pub fn lu(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<(Array, Array, Array)> {
@@ -643,8 +623,7 @@ pub fn lu_device(
 ///
 /// The `LU` matrix and `pivots` array.
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn lu_factor_device(
+pub fn lu_factor(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<(Array, Array)> {
@@ -670,8 +649,7 @@ pub fn lu_factor_device(
 ///
 /// The unique solution to the system `AX = B`
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn solve_device(
+pub fn solve(
     a: impl AsRef<Array>,
     b: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
@@ -699,8 +677,7 @@ pub fn solve_device(
 ///
 /// The unique solution to the system `AX = B`
 #[generate_macro(customize(root = "$crate::linalg"))]
-#[default_device]
-pub fn solve_triangular_device(
+pub fn solve_triangular(
     a: impl AsRef<Array>,
     b: impl AsRef<Array>,
     #[optional] upper: impl Into<Option<bool>>,
@@ -725,8 +702,8 @@ mod tests {
 
     use crate::{
         array,
-        ops::{eye, indexing::IndexOp, tril, triu},
-        StreamOrDevice,
+        ops::{indexing::IndexOp, tril, triu},
+        Stream,
     };
 
     use super::*;
@@ -737,70 +714,91 @@ mod tests {
 
     #[test]
     fn test_norm_no_axes() {
-        let a = Array::from_iter(0..9, &[9]) - 4;
-        let b = a.reshape(&[3, 3]).unwrap();
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let a = Array::from_iter(0..9, &[9])
+            .subtract(array!(4), &stream)
+            .unwrap();
+        let b = a.reshape(&[3, 3], &stream).unwrap();
 
         assert_float_eq!(
-            norm_l2(&a, None, None).unwrap().item::<f32>(),
+            norm_l2(&a, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             7.74597,
             abs <= 0.001
         );
         assert_float_eq!(
-            norm_l2(&b, None, None).unwrap().item::<f32>(),
+            norm_l2(&b, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             7.74597,
             abs <= 0.001
         );
 
         assert_float_eq!(
-            norm_matrix(&b, "fro", None, None).unwrap().item::<f32>(),
+            norm_matrix(&b, "fro", None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             7.74597,
             abs <= 0.001
         );
 
         assert_float_eq!(
-            norm(&a, f64::INFINITY, None, None).unwrap().item::<f32>(),
+            norm(&a, f64::INFINITY, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             4.0,
             abs <= 0.001
         );
         assert_float_eq!(
-            norm(&b, f64::INFINITY, None, None).unwrap().item::<f32>(),
+            norm(&b, f64::INFINITY, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             9.0,
             abs <= 0.001
         );
 
         assert_float_eq!(
-            norm(&a, f64::NEG_INFINITY, None, None)
+            norm(&a, f64::NEG_INFINITY, None, None, &stream)
                 .unwrap()
-                .item::<f32>(),
+                .item::<f32>(&stream),
             0.0,
             abs <= 0.001
         );
         assert_float_eq!(
-            norm(&b, f64::NEG_INFINITY, None, None)
+            norm(&b, f64::NEG_INFINITY, None, None, &stream)
                 .unwrap()
-                .item::<f32>(),
+                .item::<f32>(&stream),
             2.0,
             abs <= 0.001
         );
 
         assert_float_eq!(
-            norm(&a, 1.0, None, None).unwrap().item::<f32>(),
+            norm(&a, 1.0, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             20.0,
             abs <= 0.001
         );
         assert_float_eq!(
-            norm(&b, 1.0, None, None).unwrap().item::<f32>(),
+            norm(&b, 1.0, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             7.0,
             abs <= 0.001
         );
 
         assert_float_eq!(
-            norm(&a, -1.0, None, None).unwrap().item::<f32>(),
+            norm(&a, -1.0, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             0.0,
             abs <= 0.001
         );
         assert_float_eq!(
-            norm(&b, -1.0, None, None).unwrap().item::<f32>(),
+            norm(&b, -1.0, None, None, &stream)
+                .unwrap()
+                .item::<f32>(&stream),
             6.0,
             abs <= 0.001
         );
@@ -808,45 +806,48 @@ mod tests {
 
     #[test]
     fn test_norm_axis() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let c = Array::from_slice(&[1, 2, 3, -1, 1, 4], &[2, 3]);
 
-        let result = norm_l2(&c, &[0], None).unwrap();
+        let result = norm_l2(&c, &[0], None, &stream).unwrap();
         let expected = Array::from_slice(&[1.41421, 2.23607, 5.0], &[3]);
         assert!(result
-            .all_close(&expected, None, None, None)
+            .all_close(&expected, None, None, None, &stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
     }
 
     #[test]
     fn test_norm_axes() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let m = Array::from_iter(0..8, &[2, 2, 2]);
 
-        let result = norm_l2(&m, &[1, 2][..], None).unwrap();
+        let result = norm_l2(&m, &[1, 2][..], None, &stream).unwrap();
         let expected = Array::from_slice(&[3.74166, 11.225], &[2]);
         assert!(result
-            .all_close(&expected, None, None, None)
+            .all_close(&expected, None, None, None, &stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
     }
 
     #[test]
     fn test_qr() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let a = Array::from_slice(&[2.0f32, 3.0, 1.0, 2.0], &[2, 2]);
 
-        let (q, r) = qr_device(&a, StreamOrDevice::cpu()).unwrap();
+        let (q, r) = qr(&a, &stream).unwrap();
 
         let q_expected = Array::from_slice(&[-0.894427, -0.447214, -0.447214, 0.894427], &[2, 2]);
         let r_expected = Array::from_slice(&[-2.23607, -3.57771, 0.0, 0.447214], &[2, 2]);
 
         assert!(q
-            .all_close(&q_expected, None, None, None)
+            .all_close(&q_expected, None, None, None, &stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
         assert!(r
-            .all_close(&r_expected, None, None, None)
+            .all_close(&r_expected, None, None, None, &stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
     }
 
     // The tests below are adapted from the c++ tests
@@ -854,18 +855,18 @@ mod tests {
     #[test]
     fn test_svd() {
         // eval_gpu is not implemented yet.
-        let stream = StreamOrDevice::cpu();
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
 
         // 0D and 1D returns error
         let a = Array::from_f32(0.0);
-        assert!(svd_device(&a, &stream).is_err());
+        assert!(svd(&a, &stream).is_err());
 
         let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(svd_device(&a, &stream).is_err());
+        assert!(svd(&a, &stream).is_err());
 
         // Unsupported types returns error
         let a = Array::from_slice(&[0, 1], &[1, 2]);
-        assert!(svd_device(&a, &stream).is_err());
+        assert!(svd(&a, &stream).is_err());
 
         // TODO: wait for random
     }
@@ -873,18 +874,18 @@ mod tests {
     #[test]
     fn test_inv() {
         // eval_gpu is not implemented yet.
-        let stream = StreamOrDevice::cpu();
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
 
         // 0D and 1D returns error
         let a = Array::from_f32(0.0);
-        assert!(inv_device(&a, &stream).is_err());
+        assert!(inv(&a, &stream).is_err());
 
         let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(inv_device(&a, &stream).is_err());
+        assert!(inv(&a, &stream).is_err());
 
         // Unsupported types returns error
         let a = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        assert!(inv_device(&a, &stream).is_err());
+        assert!(inv(&a, &stream).is_err());
 
         // TODO: wait for random
     }
@@ -892,22 +893,22 @@ mod tests {
     #[test]
     fn test_cholesky() {
         // eval_gpu is not implemented yet.
-        let stream = StreamOrDevice::cpu();
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
 
         // 0D and 1D returns error
         let a = Array::from_f32(0.0);
-        assert!(cholesky_device(&a, None, &stream).is_err());
+        assert!(cholesky(&a, None, &stream).is_err());
 
         let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(cholesky_device(&a, None, &stream).is_err());
+        assert!(cholesky(&a, None, &stream).is_err());
 
         // Unsupported types returns error
         let a = Array::from_slice(&[0, 1, 1, 2], &[2, 2]);
-        assert!(cholesky_device(&a, None, &stream).is_err());
+        assert!(cholesky(&a, None, &stream).is_err());
 
         // Non-square returns error
         let a = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        assert!(cholesky_device(&a, None, &stream).is_err());
+        assert!(cholesky(&a, None, &stream).is_err());
 
         // TODO: wait for random
     }
@@ -915,67 +916,70 @@ mod tests {
     // The unit test below is adapted from the python unit test `test_linalg.py/test_lu`
     #[test]
     fn test_lu() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let scalar = array!(1.0);
-        let result = lu_device(&scalar, StreamOrDevice::cpu());
+        let result = lu(&scalar, &stream);
         assert!(result.is_err());
 
         // # Test 3x3 matrix
         let a = array!([[3.0f32, 1.0, 2.0], [1.0, 8.0, 6.0], [9.0, 2.0, 5.0]]);
-        let (p, l, u) = lu_device(&a, StreamOrDevice::cpu()).unwrap();
-        let a_rec = l.index((p, ..)).matmul(u).unwrap();
-        assert_array_all_close!(a, a_rec);
+        let (p, l, u) = lu(&a, &stream).unwrap();
+        let a_rec = l.index_device((p, ..), &stream).matmul(u, &stream).unwrap();
+        assert_array_all_close!(a, a_rec, stream = &stream);
     }
 
     // The unit test below is adapted from the python unit test `test_linalg.py/test_lu_factor`
     #[test]
     fn test_lu_factor() {
-        crate::random::seed(7).unwrap();
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let key = crate::random::key(7).unwrap();
 
         // Test 3x3 matrix
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[5, 5], None).unwrap();
-        let (lu, pivots) = lu_factor_device(&a, StreamOrDevice::cpu()).unwrap();
+        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[5, 5], &key, &stream).unwrap();
+        let (lu, pivots) = lu_factor(&a, &stream).unwrap();
         let shape = a.shape();
         let n = shape[shape.len() - 1];
 
-        let pivots: Vec<u32> = pivots.as_slice().to_vec();
+        let pivots: Vec<u32> = crate::array::eval_vec(&pivots).to_vec();
         let mut perm: Vec<u32> = (0..n as u32).collect();
         for (i, p) in pivots.iter().enumerate() {
             perm.swap(i, *p as usize);
         }
 
-        let l = tril(&lu, -1)
-            .and_then(|l| l.add(eye::<f32>(n, None, None)?))
+        let l = tril(&lu, -1, &stream)
+            .and_then(|l| l.add(Array::eye::<f32>(n, None, None, &stream)?, &stream))
             .unwrap();
-        let u = triu(&lu, None).unwrap();
+        let u = triu(&lu, None, &stream).unwrap();
 
-        let lhs = l.matmul(&u).unwrap();
+        let lhs = l.matmul(&u, &stream).unwrap();
         let perm = Array::from_slice(&perm, &[n]);
-        let rhs = a.index((perm, ..));
-        assert_array_all_close!(lhs, rhs);
+        let rhs = a.index_device((perm, ..), &stream);
+        assert_array_all_close!(lhs, rhs, stream = &stream);
     }
 
     // The unit test below is adapted from the python unit test `test_linalg.py/test_solve`
     #[test]
     fn test_solve() {
-        crate::random::seed(7).unwrap();
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
 
         // Test 3x3 matrix with 1D rhs
         let a = array!([[3.0f32, 1.0, 2.0], [1.0, 8.0, 6.0], [9.0, 2.0, 5.0]]);
         let b = array!([11.0f32, 35.0, 28.0]);
 
-        let result = solve_device(&a, &b, StreamOrDevice::cpu()).unwrap();
+        let result = solve(&a, &b, &stream).unwrap();
         let expected = array!([1.0f32, 2.0, 3.0]);
-        assert_array_all_close!(result, expected);
+        assert_array_all_close!(result, expected, stream = &stream);
     }
 
     #[test]
     fn test_solve_triangular() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let a = array!([[4.0f32, 0.0, 0.0], [2.0, 3.0, 0.0], [1.0, -2.0, 5.0]]);
         let b = array!([8.0f32, 14.0, 3.0]);
 
-        let result = solve_triangular_device(&a, &b, false, StreamOrDevice::cpu()).unwrap();
+        let result = solve_triangular(&a, &b, false, &stream).unwrap();
         let expected = array!([2.0f32, 3.333_333_3, 1.533_333_3]);
-        assert_array_all_close!(result, expected);
+        assert_array_all_close!(result, expected, stream = &stream);
     }
 
     // The tests below are adapted from the python unit test `test_linalg.py/test_eig`
@@ -984,62 +988,66 @@ mod tests {
         use crate::ops::expand_dims;
 
         // Helper to check eigenvalues and eigenvectors
-        fn check_eigs_and_vecs(a: &Array) {
-            let (eig_vals, eig_vecs) = eig_device(a, StreamOrDevice::cpu()).unwrap();
+        fn check_eigs_and_vecs(a: &Array, stream: &crate::Stream) {
+            let (eig_vals, eig_vecs) = eig(a, stream).unwrap();
 
             // Check A @ eig_vecs == eig_vals * eig_vecs
-            let lhs = a.matmul(&eig_vecs).unwrap();
+            let lhs = a.matmul(&eig_vecs, stream).unwrap();
             // eig_vals[..., None, :] * eig_vecs - broadcast eigenvalues
             // For a 1D eigenvalues array (n,), we need shape (1, n) to broadcast with eigenvectors (n, n)
             // For batched eigenvalues (..., n), we need shape (..., 1, n)
-            let eig_vals_broadcast = expand_dims(&eig_vals, -2).unwrap();
-            let rhs = eig_vals_broadcast.multiply(&eig_vecs).unwrap();
+            let eig_vals_broadcast = expand_dims(&eig_vals, -2, stream).unwrap();
+            let rhs = eig_vals_broadcast.multiply(&eig_vecs, stream).unwrap();
             assert!(
-                lhs.all_close(&rhs, 1e-4, 1e-4, None)
+                lhs.all_close(&rhs, 1e-4, 1e-4, None, stream)
                     .unwrap()
-                    .item::<bool>(),
+                    .item::<bool>(&stream),
                 "A @ eig_vecs should equal eig_vals * eig_vecs"
             );
 
             // Check eigvals returns same values
-            let eig_vals_only = eigvals_device(a, StreamOrDevice::cpu()).unwrap();
+            let eig_vals_only = eigvals(a, stream).unwrap();
             assert!(
                 eig_vals
-                    .all_close(&eig_vals_only, 1e-4, 1e-4, None)
+                    .all_close(&eig_vals_only, 1e-4, 1e-4, None, stream)
                     .unwrap()
-                    .item::<bool>(),
+                    .item::<bool>(&stream),
                 "eigvals should return same eigenvalues as eig"
             );
         }
 
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+
         // Test a simple 2x2 matrix
         let a = array!([[1.0f32, 1.0], [3.0, 4.0]]);
-        check_eigs_and_vecs(&a);
+        check_eigs_and_vecs(&a, &stream);
 
         // Test complex eigenvalues (rotation-like matrix)
         let a = array!([[1.0f32, -1.0], [1.0, 1.0]]);
-        check_eigs_and_vecs(&a);
+        check_eigs_and_vecs(&a, &stream);
 
         // Test a larger random matrix
-        crate::random::seed(1).unwrap();
-        let a = crate::random::normal::<f32>(&[5, 5], None, None, None).unwrap();
-        check_eigs_and_vecs(&a);
+        let key = crate::random::key(1).unwrap();
+        let a = crate::random::normal::<f32>(&[5, 5], None, None, &key, &stream).unwrap();
+        check_eigs_and_vecs(&a, &stream);
 
         // Test with batched input
-        let a = crate::random::normal::<f32>(&[3, 5, 5], None, None, None).unwrap();
-        check_eigs_and_vecs(&a);
+        let key = crate::random::key(2).unwrap();
+        let a = crate::random::normal::<f32>(&[3, 5, 5], None, None, &key, &stream).unwrap();
+        check_eigs_and_vecs(&a, &stream);
     }
 
     #[test]
     fn test_eig_errors() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         // 1D array should fail
         let a = array!([1.0f32, 2.0]);
-        assert!(eig_device(&a, StreamOrDevice::cpu()).is_err());
-        assert!(eigvals_device(&a, StreamOrDevice::cpu()).is_err());
+        assert!(eig(&a, &stream).is_err());
+        assert!(eigvals(&a, &stream).is_err());
 
         // Non-square matrix should fail
         let a = array!([[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
-        assert!(eig_device(&a, StreamOrDevice::cpu()).is_err());
-        assert!(eigvals_device(&a, StreamOrDevice::cpu()).is_err());
+        assert!(eig(&a, &stream).is_err());
+        assert!(eigvals(&a, &stream).is_err());
     }
 }

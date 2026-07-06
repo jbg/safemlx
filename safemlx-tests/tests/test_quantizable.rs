@@ -4,7 +4,7 @@ use safemlx::{
     module::Module,
     nn::Linear,
     quantization::MaybeQuantized,
-    Array,
+    Array, Stream,
 };
 
 #[derive(Debug, ModuleParameters, Quantizable)]
@@ -18,8 +18,8 @@ impl Module<&Array> for QuantizableExample {
 
     type Error = Exception;
 
-    fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
-        self.ql.forward(x)
+    fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        self.ql.forward(x, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {

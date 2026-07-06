@@ -96,13 +96,15 @@ impl Optimizer for AdamW {
         key: &std::rc::Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> Result<(), crate::error::Exception> {
         let betas = &self.betas;
         let state = get_mut_or_insert_with(&mut self.state, key, || (array!(0.0), array!(0.0)));
 
         // SAFETY: These are all single-element arrays and won't panic.
-        let one_minus_lr_wd = array!(1.0) - (&self.lr * &self.weight_decay);
-        let decayed_parameter = &*parameter * &one_minus_lr_wd;
+        let one_minus_lr_wd =
+            array!(1.0).subtract(&self.lr.multiply(&self.weight_decay, stream)?, stream)?;
+        let decayed_parameter = parameter.multiply(&one_minus_lr_wd, stream)?;
 
         let (new_parameter, new_states) = super::adam_apply_single(
             &self.lr,
@@ -111,6 +113,7 @@ impl Optimizer for AdamW {
             gradient,
             &decayed_parameter,
             state,
+            stream,
         )?;
 
         *state = new_states;

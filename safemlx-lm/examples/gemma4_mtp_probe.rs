@@ -1,6 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
-use safemlx::{ops::indexing::IndexOp, transforms::eval, Array};
+use safemlx::{
+    ops::indexing::{NewAxis, TryIndexOp},
+    transforms::eval,
+    Array, ExecutionContext, Stream,
+};
 use safemlx_lm::{
     gemma4_mtp::generate_gemma4_mtp,
     models::{
@@ -33,10 +37,12 @@ fn main() -> anyhow::Result<()> {
     println!("assistant: {}", assistant_dir.display());
     println!("prompt: {prompt:?}");
 
-    let rendered = render_prompt(&target_dir, &prompt)?;
+    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let stream = ctx.stream();
+    let rendered = render_prompt(&target_dir, &prompt, stream)?;
     println!("\n=== rendered prompt ===\n{rendered}\n");
 
-    let greedy = run_greedy(&target_dir, &rendered, max_tokens)?;
+    let greedy = run_greedy(&target_dir, &rendered, max_tokens, stream)?;
     println!("\n=== greedy ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -45,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!("{}", greedy.text);
 
-    let mtp = run_mtp(&target_dir, &assistant_dir, &rendered, max_tokens)?;
+    let mtp = run_mtp(&target_dir, &assistant_dir, &rendered, max_tokens, stream)?;
     println!("\n=== mtp ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -65,8 +71,8 @@ struct ProbeResult {
     accept_lens: Vec<usize>,
 }
 
-fn render_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<String> {
-    let mut loaded = LoadedModel::load(target_dir)?;
+fn render_prompt(target_dir: &PathBuf, prompt: &str, stream: &Stream) -> anyhow::Result<String> {
+    let mut loaded = LoadedModel::load(target_dir, stream)?;
     Ok(loaded
         .apply_chat_template_json(
             vec![vec![serde_json::json!({
@@ -83,21 +89,22 @@ fn run_greedy(
     target_dir: &PathBuf,
     prompt: &str,
     max_tokens: usize,
+    stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let mut loaded = LoadedModel::load(target_dir)?;
-    let prompt_tokens = loaded.encode_to_array(prompt, false)?;
+    let mut loaded = LoadedModel::load(target_dir, stream)?;
+    let prompt_tokens = loaded.encode_to_array(prompt, false, stream)?;
     let eos = loaded.eos_token_ids().to_vec();
     let mut cache = loaded.new_cache();
     let mut ids = Vec::new();
     let start = Instant::now();
     {
         let generator = loaded
-            .generate_with_cache(&mut cache, 0.0, &prompt_tokens)
+            .generate_with_cache(&mut cache, 0.0, &prompt_tokens, stream)
             .take(max_tokens);
         for token in generator {
             let token = token?;
             eval([&token])?;
-            let id = token.item::<u32>();
+            let id = token.item::<u32>(stream);
             if eos.contains(&id) {
                 break;
             }
@@ -119,13 +126,14 @@ fn run_mtp(
     assistant_dir: &PathBuf,
     prompt: &str,
     max_tokens: usize,
+    stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let tokenizer_holder = LoadedModel::load(target_dir)?;
+    let tokenizer_holder = LoadedModel::load(target_dir, stream)?;
     let prompt_ids = tokenizer_holder.encode(prompt, false)?;
-    let prompt_tokens = Array::from(prompt_ids.as_slice()).index(safemlx::ops::indexing::NewAxis);
+    let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
 
-    let mut target = load_gemma4_model(target_dir)?;
-    let mut assistant = load_gemma4_assistant_model(assistant_dir)?;
+    let mut target = load_gemma4_model(target_dir, stream)?;
+    let mut assistant = load_gemma4_assistant_model(assistant_dir, stream)?;
     let (generated, stats) = generate_gemma4_mtp(
         &mut target,
         &mut assistant,
@@ -133,6 +141,7 @@ fn run_mtp(
         tokenizer_holder.eos_token_ids(),
         max_tokens,
         0.0,
+        stream,
     )?;
 
     let text = tokenizer_holder.decode(&generated, true)?;

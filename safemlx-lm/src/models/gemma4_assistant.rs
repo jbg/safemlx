@@ -8,10 +8,10 @@ use safemlx::{
     nn,
     ops::{
         argpartition_axis, full, gt,
-        indexing::{put_along_axis, IndexOp},
+        indexing::{put_along_axis, NewAxis, TryIndexOp},
         lt, matmul, which,
     },
-    Array,
+    Array, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -71,7 +71,7 @@ pub struct DraftInner {
 }
 
 impl DraftInner {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let embed_tokens = Gemma4Embedding::new(
             args.vocab_size,
             args.hidden_size,
@@ -81,7 +81,12 @@ impl DraftInner {
         )?;
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                TransformerBlock::new(args, args.layer_type(index as usize), index as usize)
+                TransformerBlock::new(
+                    args,
+                    args.layer_type(index as usize),
+                    index as usize,
+                    stream,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(args.hidden_size)
@@ -123,7 +128,10 @@ impl MaskedEmbedder {
             centroids: nn::LinearBuilder::new(hidden_size, num_centroids)
                 .bias(false)
                 .build()?,
-            token_ordering: Param::new(Array::zeros::<i32>(&[vocab_size])?),
+            token_ordering: Param::new(Array::from_slice(
+                &vec![0i32; vocab_size as usize],
+                &[vocab_size],
+            )),
         })
     }
 
@@ -131,34 +139,45 @@ impl MaskedEmbedder {
         &mut self,
         hidden_states: &Array,
         lm_head_weight: &Array,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let shape = hidden_states.shape();
         let b = shape[0];
         let l = shape[1];
-        let centroid_logits = self.centroids.forward(hidden_states)?;
-        let topk_idx =
-            argpartition_axis(&centroid_logits, -self.top_k, -1)?.index((.., .., -self.top_k..));
+        let centroid_logits = self.centroids.forward(hidden_states, stream)?;
+        let topk_idx = argpartition_axis(&centroid_logits, -self.top_k, -1, stream)?
+            .try_index_device((.., .., -self.top_k..), stream)?;
         let ordering = self
             .token_ordering
             .as_ref()
-            .reshape(&[self.num_centroids, self.vocab_size_per_centroid])?;
-        let selected_canonical = ordering.index(&topk_idx);
-        let flat_idx = selected_canonical.reshape(&[-1])?;
-        let selected_emb = lm_head_weight.index(&flat_idx).reshape(&[
-            b,
-            l,
-            self.top_k * self.vocab_size_per_centroid,
-            self.hidden_size,
-        ])?;
+            .reshape(&[self.num_centroids, self.vocab_size_per_centroid], stream)?;
+        let selected_canonical = ordering.try_index_device(&topk_idx, stream)?;
+        let flat_idx = selected_canonical.reshape(&[-1], stream)?;
+        let selected_emb = lm_head_weight
+            .try_index_device(&flat_idx, stream)?
+            .reshape(
+                &[
+                    b,
+                    l,
+                    self.top_k * self.vocab_size_per_centroid,
+                    self.hidden_size,
+                ],
+                stream,
+            )?;
         let selected_logits = matmul(
-            &hidden_states.index((.., .., safemlx::ops::indexing::NewAxis, ..)),
-            selected_emb.transpose_axes(&[0, 1, 3, 2])?,
+            &hidden_states.try_index_device((.., .., NewAxis, ..), stream)?,
+            selected_emb.transpose_axes(&[0, 1, 3, 2], stream)?,
+            stream,
         )?
-        .squeeze_axes(&[-2])?;
-        let mask_value = selected_logits.min(None)?.item::<f32>() - 1.0;
-        let out = full::<f32>(&[b, l, self.vocab_size], safemlx::array!(mask_value))?;
-        let scatter_idx = selected_canonical.reshape(&[b, l, -1])?;
-        put_along_axis(&out, &scatter_idx, &selected_logits, -1)
+        .squeeze_axes(&[-2], stream)?;
+        let mask_value = selected_logits.min(None, stream)?.item::<f32>(&stream) - 1.0;
+        let out = full::<f32>(
+            &[b, l, self.vocab_size],
+            safemlx::array!(mask_value),
+            stream,
+        )?;
+        let scatter_idx = selected_canonical.reshape(&[b, l, -1], stream)?;
+        put_along_axis(&out, &scatter_idx, &selected_logits, -1, stream)
     }
 }
 
@@ -181,7 +200,7 @@ pub struct Gemma4AssistantDraftModel {
 }
 
 impl Gemma4AssistantDraftModel {
-    pub fn new(mut config: Gemma4AssistantConfig) -> Result<Self, Exception> {
+    pub fn new(mut config: Gemma4AssistantConfig, stream: &Stream) -> Result<Self, Exception> {
         config.text_config.model_type = "gemma4".to_string();
         config.text_config.quantized = false;
         config.text_config.quantization_group_size = 64;
@@ -191,7 +210,7 @@ impl Gemma4AssistantDraftModel {
         }
 
         let text_config = &config.text_config;
-        let model = DraftInner::new(text_config)?;
+        let model = DraftInner::new(text_config, stream)?;
         let pre_projection =
             nn::LinearBuilder::new(2 * config.backbone_hidden_size, text_config.hidden_size)
                 .bias(false)
@@ -242,8 +261,12 @@ impl Gemma4AssistantDraftModel {
         self.kv_offset = kv_offset;
     }
 
-    fn forward(&mut self, inputs_embeds: &Array) -> Result<(Array, Array), Exception> {
-        let mut h = self.pre_projection.forward(inputs_embeds)?;
+    fn forward(
+        &mut self,
+        inputs_embeds: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let mut h = self.pre_projection.forward(inputs_embeds, stream)?;
         let query_len = h.shape()[1];
         let query_offset = self.kv_offset.saturating_sub(1);
         let shared_kv = self
@@ -263,28 +286,32 @@ impl Gemma4AssistantDraftModel {
                 kv.0.shape()[kv.0.shape().len() - 2],
                 self.config.text_config.sliding_window.unwrap_or(0),
                 h.dtype(),
+                stream,
             )?;
             let mut kv_map = HashMap::new();
             kv_map.insert(layer.layer_type, kv);
-            h = layer.forward(crate::models::gemma4::AttentionInput {
-                x: &h,
-                mask: mask.as_ref(),
-                cache: None::<&mut crate::cache::ConcatKeyValueCache>,
-                position_offset: query_offset,
-                per_layer_input: None,
-                shared_kv: Some(&mut kv_map),
-                disable_generated_mask: true,
-            })?;
+            h = layer.forward(
+                crate::models::gemma4::AttentionInput {
+                    x: &h,
+                    mask: mask.as_ref(),
+                    cache: None::<&mut crate::cache::ConcatKeyValueCache>,
+                    position_offset: query_offset,
+                    per_layer_input: None,
+                    shared_kv: Some(&mut kv_map),
+                    disable_generated_mask: true,
+                },
+                stream,
+            )?;
         }
 
-        h = self.model.norm.forward(&h)?;
-        let last_hidden = self.post_projection.forward(&h)?;
+        h = self.model.norm.forward(&h, stream)?;
+        let last_hidden = self.post_projection.forward(&h, stream)?;
         let logits = if let Some(masked) = self.masked_embedding.as_mut() {
-            masked.forward(&h, self.model.embed_tokens.weight.as_ref())?
+            masked.forward(&h, self.model.embed_tokens.weight.as_ref(), stream)?
         } else if let Some(lm_head) = self.lm_head.as_mut() {
-            lm_head.forward(&h)?
+            lm_head.forward(&h, stream)?
         } else {
-            self.model.embed_tokens.as_linear(&h)?
+            self.model.embed_tokens.as_linear(&h, stream)?
         };
         Ok((last_hidden, logits))
     }
@@ -296,6 +323,7 @@ impl Gemma4AssistantDraftModel {
         hidden: &Array,
         block_size: usize,
         temp: f32,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let mut token = Array::from_slice(&[last_bonus], &[1, 1]);
         let mut h_prev = hidden.clone();
@@ -306,13 +334,14 @@ impl Gemma4AssistantDraftModel {
                 .model
                 .language_model
                 .embed_tokens
-                .forward(&token)?
-                .multiply(Array::from_f32(
-                    (target_model.args.hidden_size as f32).sqrt(),
-                ))?;
-            let inputs_embeds = safemlx::ops::concatenate_axis(&[token_embed, h_prev], -1)?;
-            let (next_hidden, logits) = self.forward(&inputs_embeds)?;
-            token = sample(&logits, temp)?;
+                .forward(&token, stream)?
+                .multiply(
+                    Array::from_f32((target_model.args.hidden_size as f32).sqrt()),
+                    stream,
+                )?;
+            let inputs_embeds = safemlx::ops::concatenate_axis(&[token_embed, h_prev], -1, stream)?;
+            let (next_hidden, logits) = self.forward(&inputs_embeds, stream)?;
+            token = sample(&logits, temp, stream)?;
             tokens.push(token.clone());
             h_prev = next_hidden;
         }
@@ -320,7 +349,7 @@ impl Gemma4AssistantDraftModel {
         if tokens.is_empty() {
             Ok(Array::from_slice::<u32>(&[], &[1, 0]))
         } else {
-            safemlx::ops::concatenate_axis(&tokens, 1)
+            safemlx::ops::concatenate_axis(&tokens, 1, stream)
         }
     }
 }
@@ -332,6 +361,7 @@ fn drafter_mask(
     kv_len: i32,
     sliding_window: i32,
     _dtype: safemlx::Dtype,
+    stream: &Stream,
 ) -> Result<Option<Array>, Exception> {
     if layer_type == LayerType::FullAttention {
         return Ok(None);
@@ -341,24 +371,23 @@ fn drafter_mask(
     {
         return Ok(None);
     }
-    let q_idx = safemlx::ops::arange::<_, i32>(Some(query_offset), query_offset + query_len, None)?
-        .index((.., safemlx::ops::indexing::NewAxis));
-    let k_idx = safemlx::ops::arange::<_, i32>(None, kv_len, None)?
-        .index((safemlx::ops::indexing::NewAxis, ..));
-    let dist = q_idx.subtract(k_idx)?;
-    let inside = gt(&dist, Array::from_int(-sliding_window))?
-        .logical_and(lt(&dist, Array::from_int(sliding_window))?)?;
+    let q_idx =
+        safemlx::ops::arange::<_, i32>(Some(query_offset), query_offset + query_len, None, stream)?
+            .try_index_device((.., NewAxis), stream)?;
+    let k_idx = safemlx::ops::arange::<_, i32>(None, kv_len, None, stream)?
+        .try_index_device((NewAxis, ..), stream)?;
+    let dist = q_idx.subtract(k_idx, stream)?;
+    let inside = gt(&dist, Array::from_int(-sliding_window), stream)?
+        .logical_and(lt(&dist, Array::from_int(sliding_window), stream)?, stream)?;
     let bias = which(
         &inside,
         Array::from_f32(0.0),
         Array::from_f32(f32::NEG_INFINITY),
+        stream,
     )?;
-    Ok(Some(bias.index((
-        safemlx::ops::indexing::NewAxis,
-        safemlx::ops::indexing::NewAxis,
-        ..,
-        ..,
-    ))))
+    Ok(Some(
+        bias.try_index_device((NewAxis, NewAxis, .., ..), stream)?,
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -370,11 +399,12 @@ struct WeightMap {
 
 pub fn load_gemma4_assistant_model(
     model_dir: impl AsRef<Path>,
+    stream: &Stream,
 ) -> Result<Gemma4AssistantDraftModel, Error> {
     let model_dir = model_dir.as_ref();
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     let config: Gemma4AssistantConfig = serde_json::from_reader(file)?;
-    let mut model = Gemma4AssistantDraftModel::new(config)?;
+    let mut model = Gemma4AssistantDraftModel::new(config, stream)?;
     let load_config = StrictLoadConfig::default()
         .allow_missing_suffix(".bias")
         .allow_missing_contains(".self_attn.k_proj.")

@@ -10,14 +10,14 @@ use safemlx::{
     macros::ModuleParameters,
     module::{FlattenedModuleParam, Module, ModuleParameters, Param},
     nn,
-    ops::{ones, zeros},
+    ops::{full, ones, zeros},
     optimizers::{
         AdaDelta, AdaGrad, AdafactorBuilder, Adam, AdamW, Adamax, Lion, LionBuilder, Optimizer,
         RmsProp, RmsPropBuilder, Sgd, SgdBuilder,
     },
-    random::uniform,
+    random::{uniform, RandomState},
     transforms::{eval, eval_params},
-    Array, Dtype,
+    Array, Dtype, Stream,
 };
 
 mod common;
@@ -33,17 +33,19 @@ where
     F: FnOnce() -> O,
     O: Optimizer,
 {
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(0)?;
     let mut optimizer = f();
 
     let mse_loss = MseLossBuilder::new()
         .reduction(LossReduction::Mean)
         .build()?;
     let loss = |model: &mut LinearFunctionModel, (x, y): (&Array, &Array)| {
-        mse_loss.apply(model.forward(x)?, y)
+        mse_loss.apply(model.forward(x, stream)?, y, stream)
     };
 
     // TODO: check compiled model once we have it
-    let mut model = LinearFunctionModel::new(None)?;
+    let mut model = LinearFunctionModel::new(None, stream)?;
     eval_params(model.parameters())?;
 
     let m = array!(0.25);
@@ -59,14 +61,15 @@ where
         // generate random training data along with the ground truth.
         // notice that the shape is [B, 1] where B is the batch
         // dimension -- this allows us to train on 10 samples simultaneously
-        let x = uniform::<_, f32>(-5.0, 5.0, &[10, 1], None)?;
-        let y = &m * &x + &b;
+        let x_key = rng.next_key(stream)?;
+        let x = uniform::<_, f32>(-5.0, 5.0, &[10, 1], &x_key, stream)?;
+        let y = m.multiply(&x, stream)?.add(&b, stream)?;
         eval([&x, &y])?;
 
         // compute the loss and gradients.  use the optimizer
         // to adjust the parameters closer to the target
         let (loss, g) = lg(&mut model, (&x, &y))?;
-        optimizer.update(&mut model, g)?;
+        optimizer.update(&mut model, g, stream)?;
 
         eval_params(model.parameters())?;
 
@@ -80,10 +83,11 @@ const NUM_TRIALS: usize = 3;
 
 #[test]
 fn test_sgd_converges() {
+    let stream = test_stream();
     let mut total_loss = 0.0;
     for _ in 0..NUM_TRIALS {
         let loss = train(|| Sgd::new(0.1), 30).unwrap();
-        total_loss += loss.item::<f32>();
+        total_loss += loss.item::<f32>(&stream);
     }
     // It sometimes doesn't converge that fast, so we take the average loss
     // across multiple trials
@@ -93,11 +97,12 @@ fn test_sgd_converges() {
 
 #[test]
 fn test_rmsprop_converges() {
+    let stream = test_stream();
     let mut total_loss = 0.0;
     for _ in 0..NUM_TRIALS {
         // RMSProp doesn't seem to converge as fast as SGD
         let loss = train(|| RmsProp::new(0.1).unwrap(), 100).unwrap();
-        total_loss += loss.item::<f32>();
+        total_loss += loss.item::<f32>(&stream);
     }
     // It sometimes doesn't converge that fast, so we take the average loss
     // across multiple trials
@@ -135,6 +140,20 @@ struct NestedModel {
 
 type GradsMap = FlattenedModuleParam;
 
+fn next_normal(rng: &mut RandomState, shape: &[i32], stream: &Stream) -> Array {
+    let key = rng.next_key(stream).unwrap();
+    safemlx::random::normal::<f32>(shape, None, None, &key, stream).unwrap()
+}
+
+fn next_uniform(rng: &mut RandomState, shape: &[i32], stream: &Stream) -> Array {
+    let key = rng.next_key(stream).unwrap();
+    safemlx::random::uniform::<_, f32>(0.0, 1.0, shape, &key, stream).unwrap()
+}
+
+fn constant(shape: &[i32], value: f32, stream: &Stream) -> Array {
+    full::<f32>(shape, array!(value), stream).unwrap()
+}
+
 fn assert_save_and_load<O>(optimizer: O, new_optimizer: O) -> Result<(), Box<dyn std::error::Error>>
 where
     O: Optimizer,
@@ -153,19 +172,25 @@ where
     let loaded_state: HashMap<_, _> = loaded_optimizer.state().flatten().collect();
 
     assert!(!loaded_state.is_empty());
-    assert_eq!(original_state, loaded_state);
+    assert_eq!(original_state.len(), loaded_state.len());
+    for (key, original) in original_state {
+        let loaded = loaded_state
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing optimizer state key {key}"));
+        assert!(eval_equal_values(original, loaded));
+    }
 
     Ok(())
 }
 
-fn create_default_test_model_and_grads() -> (NestedModel, GradsMap) {
+fn create_default_test_model_and_grads(stream: &Stream) -> (NestedModel, GradsMap) {
     let first = First {
-        a: Param::new(zeros::<f32>(&[10]).unwrap()),
-        b: Param::new(zeros::<f32>(&[1]).unwrap()),
+        a: Param::new(zeros::<f32>(&[10], stream).unwrap()),
+        b: Param::new(zeros::<f32>(&[1], stream).unwrap()),
     };
     let model = NestedModel {
         first,
-        second: Param::new(zeros::<f32>(&[1]).unwrap()),
+        second: Param::new(zeros::<f32>(&[1], stream).unwrap()),
     };
 
     let grads_map: GradsMap = model
@@ -173,7 +198,7 @@ fn create_default_test_model_and_grads() -> (NestedModel, GradsMap) {
         .flatten()
         .iter()
         .map(|(k, v)| {
-            let g = ones::<f32>(v.shape()).unwrap();
+            let g = ones::<f32>(v.shape(), stream).unwrap();
             (k.clone(), g)
         })
         .collect();
@@ -187,33 +212,38 @@ const ATOL: f64 = 1e-5;
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_ada_delta() {
-    safemlx::random::seed(547).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(547).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), safemlx::Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(-0.348_337_02),
-        0.006966740489006043
+        0.006966740489006043,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(-4.180_044),
-        0.08360088348388672
+        0.08360088348388672,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), safemlx::Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.522_678_4),
-        0.010453567504882813
+        0.010453567504882813,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(6.272_14),
-        0.12544280052185058
+        0.12544280052185058,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -224,19 +254,23 @@ fn test_ada_delta() {
 
     let mut optimizer = AdaDelta::new(0.1).unwrap();
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
 
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), safemlx::Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(-0.348_442_4),
-        0.348442405462265
+        0.348442405462265,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(-4.181_308_7),
-        0.08362617492675782
+        0.08362617492675782,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, AdaDelta::new(0.1).unwrap()).unwrap();
@@ -246,18 +280,39 @@ fn test_ada_delta() {
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_adagrad() {
-    safemlx::random::seed(958).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(958).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
-    assert_array_eq!(a.mean(None).unwrap(), array!(-0.045_843_333), ATOL);
-    assert_array_eq!(a.sum(None).unwrap(), array!(-0.550_12), ATOL);
+    assert_array_eq!(
+        a.mean(None, stream).unwrap(),
+        array!(-0.045_843_333),
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        a.sum(None, stream).unwrap(),
+        array!(-0.550_12),
+        ATOL,
+        stream = stream
+    );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
-    assert_array_eq!(a_grad.mean(None).unwrap(), array!(0.232_503_94), ATOL);
-    assert_array_eq!(a_grad.sum(None).unwrap(), array!(2.790_047_2), ATOL);
+    assert_array_eq!(
+        a_grad.mean(None, stream).unwrap(),
+        array!(0.232_503_94),
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        a_grad.sum(None, stream).unwrap(),
+        array!(2.790_047_2),
+        ATOL,
+        stream = stream
+    );
 
     let mut a_model = SimpleModel {
         a: Param::new(a.clone()),
@@ -267,11 +322,23 @@ fn test_adagrad() {
 
     let mut optimizer = AdaGrad::new(0.1);
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
-    assert_array_eq!(a_model.a.mean(None).unwrap(), array!(-0.062_509_984), ATOL);
-    assert_array_eq!(a_model.a.sum(None).unwrap(), array!(-0.750_119_8), ATOL);
+    assert_array_eq!(
+        a_model.a.mean(None, stream).unwrap(),
+        array!(-0.062_509_984),
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        a_model.a.sum(None, stream).unwrap(),
+        array!(-0.750_119_8),
+        ATOL,
+        stream = stream
+    );
 
     assert_save_and_load(optimizer, AdaGrad::new(0.1)).unwrap();
 }
@@ -280,33 +347,38 @@ fn test_adagrad() {
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_adam() {
-    safemlx::random::seed(616).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(616).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(0.112_293_06),
-        0.002245861142873764
+        0.002245861142873764,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(1.347_516_7),
-        0.02695033311843872
+        0.02695033311843872,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.305_597_72),
-        0.0061119544506073
+        0.0061119544506073,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(3.667_172_7),
-        0.0733434534072876
+        0.0733434534072876,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -317,18 +389,22 @@ fn test_adam() {
 
     let mut optimizer = Adam::new(0.1);
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(0.112_292_78),
-        0.0022458556294441224
+        0.0022458556294441224,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(1.347_513_3),
-        0.026950266361236572
+        0.026950266361236572,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, Adam::new(0.1)).unwrap();
@@ -338,33 +414,38 @@ fn test_adam() {
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_adamw() {
-    safemlx::random::seed(696).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(696).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(-0.363_391_88),
-        0.007267837524414063
+        0.007267837524414063,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(-4.360_702_5),
-        0.08721405029296875
+        0.08721405029296875,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.221_754_48),
-        0.0044350895285606385
+        0.0044350895285606385,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(2.661_053_7),
-        0.05322107315063477
+        0.05322107315063477,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -375,18 +456,22 @@ fn test_adamw() {
 
     let mut optimizer = AdamW::new(0.1);
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(-0.468_437_6),
-        0.009368752241134645
+        0.009368752241134645,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(-5.621_251),
-        0.11242502212524415
+        0.11242502212524415,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, AdamW::new(0.1)).unwrap();
@@ -396,33 +481,38 @@ fn test_adamw() {
 // `mlx/python/tests/test_optimizers.py`.
 #[test]
 fn test_adamax() {
-    safemlx::random::seed(75).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(75).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(-0.303_923_6),
-        0.006078472137451172
+        0.006078472137451172,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(-3.647_083_3),
-        0.07294166564941407
+        0.07294166564941407,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(-0.242_717_24),
-        0.004854344725608826
+        0.004854344725608826,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(-2.912_606_7),
-        0.05825213432312012
+        0.05825213432312012,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -433,18 +523,22 @@ fn test_adamax() {
 
     let mut optimizer = Adamax::new(0.1);
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(-0.303_923_6),
-        0.006078472137451172
+        0.006078472137451172,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(-3.647_083_3),
-        0.07294166564941407
+        0.07294166564941407,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, Adamax::new(0.1)).unwrap();
@@ -456,38 +550,57 @@ fn test_adamax() {
 fn test_rmsprop() {
     const LR: f32 = 1e-2;
     const ALPHA: f32 = 0.99;
+    let stream = test_stream();
 
-    let (mut model, gradients) = create_default_test_model_and_grads();
+    let (mut model, gradients) = create_default_test_model_and_grads(stream);
 
     let mut optim = RmsPropBuilder::new(LR).alpha(ALPHA).build().unwrap();
-    optim.update(&mut model, gradients).unwrap();
+    optim.update(&mut model, gradients, stream).unwrap();
 
-    let expected_first_a = ones::<f32>(&[10]).unwrap() * -0.1;
-    let expected_first_b = ones::<f32>(&[1]).unwrap() * -0.1;
-    let expected_second = ones::<f32>(&[1]).unwrap() * -0.1;
+    let expected_first_a = constant(&[10], -0.1, stream);
+    let expected_first_b = constant(&[1], -0.1, stream);
+    let expected_second = constant(&[1], -0.1, stream);
 
-    assert_array_eq!(model.first.a.as_ref(), expected_first_a, ATOL);
-    assert_array_eq!(model.first.b.as_ref(), expected_first_b, ATOL);
-    assert_array_eq!(model.second.as_ref(), expected_second, ATOL);
+    assert_array_eq!(
+        model.first.a.as_ref(),
+        expected_first_a,
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        model.first.b.as_ref(),
+        expected_first_b,
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        model.second.as_ref(),
+        expected_second,
+        ATOL,
+        stream = stream
+    );
 
-    let expected_state_first_a = ones::<f32>(&[10]).unwrap() * 0.01;
-    let expected_state_first_b = ones::<f32>(&[1]).unwrap() * 0.01;
-    let expected_state_second = ones::<f32>(&[1]).unwrap() * 0.01;
+    let expected_state_first_a = constant(&[10], 0.01, stream);
+    let expected_state_first_b = constant(&[1], 0.01, stream);
+    let expected_state_second = constant(&[1], 0.01, stream);
 
     assert_array_eq!(
         optim.state.get("first.a").unwrap(),
         expected_state_first_a,
-        ATOL
+        ATOL,
+        stream = stream
     );
     assert_array_eq!(
         optim.state.get("first.b").unwrap(),
         expected_state_first_b,
-        ATOL
+        ATOL,
+        stream = stream
     );
     assert_array_eq!(
         optim.state.get("second").unwrap(),
         expected_state_second,
-        ATOL
+        ATOL,
+        stream = stream
     );
 
     assert_save_and_load(optim, RmsPropBuilder::new(LR).alpha(ALPHA).build().unwrap()).unwrap();
@@ -497,67 +610,95 @@ fn test_rmsprop() {
 // `mlx/python/tests/test_optimizers.py`
 #[test]
 fn test_sgd() {
-    let (mut model, gradients) = create_default_test_model_and_grads();
+    let stream = test_stream();
+    let (mut model, gradients) = create_default_test_model_and_grads(stream);
 
     let mut optim = SgdBuilder::new(1e-2).momentum(0.9).build().unwrap();
-    optim.update(&mut model, gradients).unwrap();
+    optim.update(&mut model, gradients, stream).unwrap();
 
-    let expected_first_a = ones::<f32>(&[10]).unwrap() * -0.01;
-    let expected_first_b = ones::<f32>(&[1]).unwrap() * -0.01;
-    let expected_second = ones::<f32>(&[1]).unwrap() * -0.01;
+    let expected_first_a = constant(&[10], -0.01, stream);
+    let expected_first_b = constant(&[1], -0.01, stream);
+    let expected_second = constant(&[1], -0.01, stream);
 
-    assert_array_eq!(model.first.a.as_ref(), expected_first_a, ATOL);
-    assert_array_eq!(model.first.b.as_ref(), expected_first_b, ATOL);
-    assert_array_eq!(model.second.as_ref(), expected_second, ATOL);
+    assert_array_eq!(
+        model.first.a.as_ref(),
+        expected_first_a,
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        model.first.b.as_ref(),
+        expected_first_b,
+        ATOL,
+        stream = stream
+    );
+    assert_array_eq!(
+        model.second.as_ref(),
+        expected_second,
+        ATOL,
+        stream = stream
+    );
 
-    let expected_state_first_a = ones::<f32>(&[10]).unwrap();
-    let expected_state_first_b = ones::<f32>(&[1]).unwrap();
-    let expected_state_second = ones::<f32>(&[1]).unwrap();
+    let expected_state_first_a = ones::<f32>(&[10], stream).unwrap();
+    let expected_state_first_b = ones::<f32>(&[1], stream).unwrap();
+    let expected_state_second = ones::<f32>(&[1], stream).unwrap();
 
     assert_array_eq!(
         optim.state["first.a"].as_ref(),
         expected_state_first_a,
-        ATOL
+        ATOL,
+        stream = stream
     );
     assert_array_eq!(
         optim.state["first.b"].as_ref(),
         expected_state_first_b,
-        ATOL
+        ATOL,
+        stream = stream
     );
-    assert_array_eq!(optim.state["second"].as_ref(), expected_state_second, ATOL);
+    assert_array_eq!(
+        optim.state["second"].as_ref(),
+        expected_state_second,
+        ATOL,
+        stream = stream
+    );
 }
 
 // This unit test is adapted from the swift binding unit test `testLion` in
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_lion() {
-    safemlx::random::seed(27).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(27).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(0.177_692_23),
-        0.003553844690322876
+        0.003553844690322876,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(2.132_306_8),
-        0.042646136283874515
+        0.042646136283874515,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(-0.021_187_237),
-        0.00042374473065137863
+        0.00042374473065137863,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(-0.254_246_83),
-        0.005084936618804932
+        0.005084936618804932,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -568,18 +709,22 @@ fn test_lion() {
 
     let mut optimizer = Lion::new(0.1);
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(0.211_025_57),
-        0.004220511317253113
+        0.004220511317253113,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(2.532_306_7),
-        0.05064613342285156
+        0.05064613342285156,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, Lion::new(0.1)).unwrap();
@@ -589,33 +734,38 @@ fn test_lion() {
 // `mlx-swift/Tests/MLXTests/IntegrationTests.swift`
 #[test]
 fn test_lion1() {
-    safemlx::random::seed(127).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(127).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(-0.184_610_6),
-        0.0036922121047973633
+        0.0036922121047973633,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(-2.215_327_3),
-        0.04430654525756836
+        0.04430654525756836,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(-0.036_004_007),
-        0.0007200801372528076
+        0.0007200801372528076,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(-0.432_048_08),
-        0.008640961647033691
+        0.008640961647033691,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -626,18 +776,22 @@ fn test_lion1() {
 
     let mut optimizer = LionBuilder::new(0.1).weight_decay(0.1).build().unwrap();
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(-0.182_764_5),
-        0.003655290007591248
+        0.003655290007591248,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(-2.193_174),
-        0.04386347770690918
+        0.04386347770690918,
+        stream = stream
     );
 
     assert_save_and_load(
@@ -649,33 +803,38 @@ fn test_lion1() {
 
 #[test]
 fn test_adafactor() {
-    safemlx::random::seed(650).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(650).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(-0.520_713_7),
-        0.010414273738861083
+        0.010414273738861083,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(-6.248_564),
-        0.12497127532958985
+        0.12497127532958985,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.433_303_65),
-        0.008666073083877564
+        0.008666073083877564,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(5.199_643_6),
-        0.10399287223815919
+        0.10399287223815919,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -686,22 +845,26 @@ fn test_adafactor() {
 
     let mut optimizer = AdafactorBuilder::new().lr(0.1).build().unwrap();
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     println!(
-        "a_model.a.mean(None).unwrap(): {:?}",
-        a_model.a.mean(None).unwrap()
+        "a_model.a.mean(None, stream).unwrap(): {:?}",
+        a_model.a.mean(None, stream).unwrap()
     );
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(-0.526_828_47),
-        0.010536569356918336
+        0.010536569356918336,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(-6.321_941_4),
-        0.12643882751464844
+        0.12643882751464844,
+        stream = stream
     );
 
     assert_save_and_load(optimizer, AdafactorBuilder::new().lr(0.1).build().unwrap()).unwrap();
@@ -709,29 +872,38 @@ fn test_adafactor() {
 
 #[test]
 fn test_adafactor1() {
-    safemlx::random::seed(193).unwrap();
-    let a = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(193).unwrap();
+    let a = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a.shape(), &[4, 3]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(0.400_818_17),
-        0.008016363382339478
+        0.008016363382339478,
+        stream = stream
     );
-    assert_array_eq!(a.sum(None).unwrap(), array!(4.809_818), 0.09619635581970215);
+    assert_array_eq!(
+        a.sum(None, stream).unwrap(),
+        array!(4.809_818),
+        0.09619635581970215,
+        stream = stream
+    );
 
-    let a_grad = safemlx::random::normal::<f32>(&[4, 3], None, None, None).unwrap();
+    let a_grad = next_normal(&mut rng, &[4, 3], stream);
     assert_eq!(a_grad.shape(), &[4, 3]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.214_474_72),
-        0.004289494454860688
+        0.004289494454860688,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(2.573_696_6),
-        0.05147393226623535
+        0.05147393226623535,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -742,50 +914,59 @@ fn test_adafactor1() {
 
     let mut optimizer = AdafactorBuilder::new().lr(0.1).beta1(0.1).build().unwrap();
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[4, 3]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(0.399_430_7),
-        0.007988613843917847
+        0.007988613843917847,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(4.793_168),
-        0.09586336135864258
+        0.09586336135864258,
+        stream = stream
     );
 }
 
 #[test]
 fn test_adafactor2() {
-    safemlx::random::seed(620).unwrap();
-    let a = safemlx::random::uniform::<_, f32>(0.0, 1.0, &[10], None).unwrap();
+    let stream = test_stream();
+    let mut rng = RandomState::with_seed(620).unwrap();
+    let a = next_uniform(&mut rng, &[10], stream);
     assert_eq!(a.shape(), &[10]);
     assert_eq!(a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a.mean(None).unwrap(),
+        a.mean(None, stream).unwrap(),
         array!(0.489_024_55),
-        0.00978049099445343
+        0.00978049099445343,
+        stream = stream
     );
     assert_array_eq!(
-        a.sum(None).unwrap(),
+        a.sum(None, stream).unwrap(),
         array!(4.890_245_4),
-        0.09780490875244141
+        0.09780490875244141,
+        stream = stream
     );
 
-    let a_grad = safemlx::random::uniform::<_, f32>(0.0, 1.0, &[10], None).unwrap();
+    let a_grad = next_uniform(&mut rng, &[10], stream);
     assert_eq!(a_grad.shape(), &[10]);
     assert_eq!(a_grad.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_grad.mean(None).unwrap(),
+        a_grad.mean(None, stream).unwrap(),
         array!(0.681_890_2),
-        0.013637803792953491
+        0.013637803792953491,
+        stream = stream
     );
     assert_array_eq!(
-        a_grad.sum(None).unwrap(),
+        a_grad.sum(None, stream).unwrap(),
         array!(6.818_902),
-        0.1363780403137207
+        0.1363780403137207,
+        stream = stream
     );
 
     let mut a_model = SimpleModel {
@@ -796,17 +977,21 @@ fn test_adafactor2() {
 
     let mut optimizer = AdafactorBuilder::new().lr(0.1).build().unwrap();
 
-    optimizer.update(&mut a_model, a_grad_params).unwrap();
+    optimizer
+        .update(&mut a_model, a_grad_params, stream)
+        .unwrap();
     assert_eq!(a_model.a.shape(), &[10]);
     assert_eq!(a_model.a.dtype(), Dtype::Float32);
     assert_array_eq!(
-        a_model.a.mean(None).unwrap(),
+        a_model.a.mean(None, stream).unwrap(),
         array!(0.483_533_05),
-        0.009670661091804504
+        0.009670661091804504,
+        stream = stream
     );
     assert_array_eq!(
-        a_model.a.sum(None).unwrap(),
+        a_model.a.sum(None, stream).unwrap(),
         array!(4.835_330_5),
-        0.09670660972595214
+        0.09670660972595214,
+        stream = stream
     );
 }

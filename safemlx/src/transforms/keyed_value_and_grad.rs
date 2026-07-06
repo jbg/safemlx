@@ -6,7 +6,7 @@ use crate::{
     Array,
 };
 
-use super::{value_and_gradient, ClosureValueAndGrad};
+use super::{transform_guard, value_and_gradient, ClosureValueAndGrad};
 
 /// Type alias for a hashmap of parameters.
 pub type KeyedParameters<Arr> = HashMap<Rc<str>, Arr>;
@@ -34,6 +34,7 @@ macro_rules! keyed_value_and_grad {
             let argument_numbers = (0..flattened_values.len() as i32).collect::<Vec<_>>();
 
             let closure = Closure::$cls_new(inner);
+            let _transform_guard = transform_guard::enter();
             let cvg = ClosureValueAndGrad::try_from_op(|res| unsafe {
                 safemlx_sys::mlx_value_and_grad(
                     res,
@@ -112,8 +113,9 @@ mod tests {
 
     #[test]
     fn test_keyed_value_and_grad() {
-        let f = |parameters: HashMap<Rc<str>, Array>, _: i32| -> Vec<Array> {
-            vec![&parameters["x"] * &parameters["y"]]
+        let stream = crate::test_stream();
+        let f = move |parameters: HashMap<Rc<str>, Array>, _: i32| -> Vec<Array> {
+            vec![parameters["x"].multiply(&parameters["y"], stream).unwrap()]
         };
 
         let x = array!(1.5f32);
@@ -127,8 +129,8 @@ mod tests {
 
         let (value, grad) = vg(parameters, 0).unwrap();
 
-        assert_eq!(value[0].item::<f32>(), 1.5 * 2.0);
-        assert_eq!(grad["x"].item::<f32>(), 2.0);
-        assert_eq!(grad["y"].item::<f32>(), 1.5);
+        assert_eq!(value[0].clone().item::<f32>(&stream), 1.5 * 2.0);
+        assert_eq!(grad["x"].clone().item::<f32>(&stream), 2.0);
+        assert_eq!(grad["y"].clone().item::<f32>(&stream), 1.5);
     }
 }

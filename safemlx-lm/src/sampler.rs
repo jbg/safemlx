@@ -1,18 +1,18 @@
-use safemlx::{argmax_axis, array, categorical, error::Exception, Array};
+use safemlx::{argmax_axis, array, categorical, error::Exception, Array, Stream};
 
 pub trait Sampler {
-    fn sample(&mut self, logits: &Array, temp: f32) -> Result<Array, Exception>;
+    fn sample(&mut self, logits: &Array, temp: f32, stream: &Stream) -> Result<Array, Exception>;
 }
 
 pub struct DefaultSampler;
 
 impl Sampler for DefaultSampler {
-    fn sample(&mut self, logits: &Array, temp: f32) -> Result<Array, Exception> {
+    fn sample(&mut self, logits: &Array, temp: f32, stream: &Stream) -> Result<Array, Exception> {
         match temp {
-            0.0 => argmax_axis!(logits, -1),
+            0.0 => argmax_axis!(logits, -1, stream = stream),
             _ => {
-                let logits = logits.multiply(array!(1.0 / temp))?;
-                categorical!(logits)
+                let logits = logits.multiply(array!(1.0 / temp), stream)?;
+                categorical!(logits, stream = stream)
             }
         }
     }

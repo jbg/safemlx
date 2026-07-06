@@ -80,16 +80,20 @@ impl Optimizer for Adamax {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let (b1, b2) = &self.betas;
         let (m, v) = get_mut_or_insert_with(&mut self.state, key, || (array!(0.0), array!(0.0)));
 
-        let one_minus_b1 = array!(1.0).subtract(b1)?;
-        let new_m = b1.multiply(&*m)?.add(&one_minus_b1.multiply(gradient)?)?;
-        let new_v = maximum(b2.multiply(&*v)?, abs(gradient)?)?;
+        let one_minus_b1 = array!(1.0).subtract(b1, stream)?;
+        let new_m = b1
+            .multiply(&*m, stream)?
+            .add(&one_minus_b1.multiply(gradient, stream)?, stream)?;
+        let new_v = maximum(b2.multiply(&*v, stream)?, abs(gradient, stream)?, stream)?;
 
-        let new_parameter =
-            parameter.subtract(self.lr.multiply(&new_m)?.divide(&new_v.add(&self.eps)?)?)?;
+        let denom = new_v.add(&self.eps, stream)?;
+        let step = self.lr.multiply(&new_m, stream)?.divide(&denom, stream)?;
+        let new_parameter = parameter.subtract(step, stream)?;
 
         *m = new_m;
         *v = new_v;

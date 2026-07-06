@@ -7,7 +7,7 @@ use safemlx::{
     module::Module,
     nn,
     ops::{arange, concatenate_axis, which, zeros},
-    Array,
+    Array, Stream,
 };
 use serde::Deserialize;
 
@@ -79,15 +79,16 @@ impl Llama3Rope {
         factor: f32,
         low_freq_factor: f32,
         high_freq_factor: f32,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
         let half_dims = dims / 2;
 
         // Compute freqs using MLX ops, matching Python:
         //   freqs = base ** (mx.arange(0, dims, 2) / dims)
         // which equals base^(2i/dims) for i in 0..half_dims
-        let indices = arange::<_, f32>(None, half_dims, None)?;
-        let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32))?;
-        let freqs = Array::from_f32(base).power(&exponents)?;
+        let indices = arange::<_, f32>(None, half_dims, None, stream)?;
+        let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32), stream)?;
+        let freqs = Array::from_f32(base).power(&exponents, stream)?;
 
         let old_context_len = original_max_position_embeddings as f32;
         let low_freq_wavelen = old_context_len / low_freq_factor;
@@ -101,31 +102,39 @@ impl Llama3Rope {
         //   smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
         //   freqs = where(is_medium, smooth_freqs, freqs)
         let two_pi = Array::from_f32(2.0 * std::f32::consts::PI);
-        let wavelens = freqs.multiply(&two_pi)?;
+        let wavelens = freqs.multiply(&two_pi, stream)?;
 
         // First pass: scale low frequencies (long wavelengths) by factor
-        let is_low = wavelens.gt(Array::from_f32(low_freq_wavelen))?;
-        let freqs = which(&is_low, &freqs.multiply(Array::from_f32(factor))?, &freqs)?;
+        let is_low = wavelens.gt(Array::from_f32(low_freq_wavelen), stream)?;
+        let freqs = which(
+            &is_low,
+            &freqs.multiply(Array::from_f32(factor), stream)?,
+            &freqs,
+            stream,
+        )?;
 
         // Second pass: smooth interpolation for medium frequencies
         let is_medium = wavelens
-            .gt(Array::from_f32(high_freq_wavelen))?
-            .logical_and(&wavelens.lt(Array::from_f32(low_freq_wavelen))?)?;
+            .gt(Array::from_f32(high_freq_wavelen), stream)?
+            .logical_and(
+                &wavelens.lt(Array::from_f32(low_freq_wavelen), stream)?,
+                stream,
+            )?;
 
         let smooth_factors = wavelens
-            .reciprocal()?
-            .multiply(Array::from_f32(old_context_len))?
-            .subtract(Array::from_f32(low_freq_factor))?
-            .divide(Array::from_f32(high_freq_factor - low_freq_factor))?;
+            .reciprocal(stream)?
+            .multiply(Array::from_f32(old_context_len), stream)?
+            .subtract(Array::from_f32(low_freq_factor), stream)?
+            .divide(Array::from_f32(high_freq_factor - low_freq_factor), stream)?;
 
         // smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-        let one_minus_smooth = Array::from_f32(1.0).subtract(&smooth_factors)?;
+        let one_minus_smooth = Array::from_f32(1.0).subtract(&smooth_factors, stream)?;
         let denom = one_minus_smooth
-            .divide(Array::from_f32(factor))?
-            .add(&smooth_factors)?;
-        let smooth_freqs = freqs.divide(&denom)?;
+            .divide(Array::from_f32(factor), stream)?
+            .add(&smooth_factors, stream)?;
+        let smooth_freqs = freqs.divide(&denom, stream)?;
 
-        let freqs = which(&is_medium, &smooth_freqs, &freqs)?;
+        let freqs = which(&is_medium, &smooth_freqs, &freqs, stream)?;
 
         Ok(Self {
             dimensions: dims,
@@ -143,10 +152,10 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         let nn::RopeInput { x, offset } = input.into();
         let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
+        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
         let x = safemlx::fast::rope(
             x,
             self.dimensions,
@@ -155,8 +164,9 @@ where
             self.scale,
             offset,
             &self.freqs,
+            stream,
         )?;
-        x.reshape(shape)
+        x.reshape(shape, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -183,21 +193,26 @@ impl ProportionalRope {
         base: f32,
         factor: f32,
         proportion: f32,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
         let half_dims = dims / 2;
         let rope_angles = ((proportion * dims as f32) / 2.0).floor() as i32;
         let rotated_freqs = if rope_angles > 0 {
-            let indices = arange::<_, f32>(None, rope_angles, None)?;
-            let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32))?;
+            let indices = arange::<_, f32>(None, rope_angles, None, stream)?;
+            let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32), stream)?;
             Array::from_f32(base)
-                .power(&exponents)?
-                .divide(Array::from_f32(factor))?
+                .power(&exponents, stream)?
+                .divide(Array::from_f32(factor), stream)?
         } else {
-            zeros::<f32>(&[0])?
+            zeros::<f32>(&[0], stream)?
         };
         let nope_angles = half_dims - rope_angles;
         let freqs = if nope_angles > 0 {
-            concatenate_axis(&[rotated_freqs, zeros::<f32>(&[nope_angles])?], 0)?
+            concatenate_axis(
+                &[rotated_freqs, zeros::<f32>(&[nope_angles], stream)?],
+                0,
+                stream,
+            )?
         } else {
             rotated_freqs
         };
@@ -217,10 +232,10 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         let nn::RopeInput { x, offset } = input.into();
         let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
+        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
         let x = safemlx::fast::rope(
             x,
             self.dimensions,
@@ -229,8 +244,9 @@ where
             self.scale,
             offset,
             &self.freqs,
+            stream,
         )?;
-        x.reshape(shape)
+        x.reshape(shape, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -319,11 +335,11 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         match self {
-            RopeVariant::Default(rope) => rope.forward(input),
-            RopeVariant::Llama3(rope) => rope.forward(input),
-            RopeVariant::Proportional(rope) => rope.forward(input),
+            RopeVariant::Default(rope) => rope.forward(input, stream),
+            RopeVariant::Llama3(rope) => rope.forward(input, stream),
+            RopeVariant::Proportional(rope) => rope.forward(input, stream),
         }
     }
 
@@ -348,6 +364,7 @@ pub fn initialize_rope(
     traditional: bool,
     scaling_config: &Option<HashMap<String, FloatOrString>>,
     _max_position_embeddings: i32,
+    stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
     let rope_type = scaling_config
         .as_ref()
@@ -393,6 +410,7 @@ pub fn initialize_rope(
             factor,
             low_freq_factor,
             high_freq_factor,
+            stream,
         )?;
         return Ok(RopeVariant::Llama3(rope));
     } else if rope_type == FloatOrStr::Str("proportional") {
@@ -415,6 +433,7 @@ pub fn initialize_rope(
             base,
             factor,
             proportion,
+            stream,
         )?));
     } else if rope_type == FloatOrStr::Str("yarn") {
         todo!()

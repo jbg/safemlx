@@ -2,7 +2,7 @@ use crate::error::Result;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
 use crate::{Array, Stream};
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 /// General convolution over an input with several channels returning an error if the inputs are invalid.
 ///
@@ -22,9 +22,8 @@ use safemlx_internal_macros::{default_device, generate_macro};
 ///   Performs the cross-correlation operator when `flip` is `false` and the convolution
 ///   operator otherwise.
 #[generate_macro]
-#[default_device]
 #[allow(clippy::too_many_arguments)]
-pub fn conv_general_device<'a>(
+pub fn conv_general<'a>(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] strides: impl IntoOption<&'a [i32]>,
@@ -77,8 +76,7 @@ pub fn conv_general_device<'a>(
 /// - dilation: kernel dilation. Default to 1 if not specified.
 /// - groups: input feature groups. Default to 1 if not specified.
 #[generate_macro]
-#[default_device]
-pub fn conv1d_device(
+pub fn conv1d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<i32>>,
@@ -119,8 +117,7 @@ pub fn conv1d_device(
 /// - dilation: kernel dilation. Default to (1, 1) if not specified.
 /// - groups: input feature groups. Default to 1 if not specified.
 #[generate_macro]
-#[default_device]
-pub fn conv2d_device(
+pub fn conv2d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<(i32, i32)>>,
@@ -155,8 +152,7 @@ pub fn conv2d_device(
 ///
 /// Only the default `groups=1` is currently supported.
 #[generate_macro]
-#[default_device]
-pub fn conv3d_device(
+pub fn conv3d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<(i32, i32, i32)>>,
@@ -205,8 +201,7 @@ pub fn conv3d_device(
 /// - stream: stream or device to evaluate on.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn conv_transpose1d_device(
+pub fn conv_transpose1d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<i32>>,
@@ -253,8 +248,7 @@ pub fn conv_transpose1d_device(
 /// - stream: stream or device to evaluate on.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn conv_transpose2d_device(
+pub fn conv_transpose2d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<(i32, i32)>>,
@@ -305,8 +299,7 @@ pub fn conv_transpose2d_device(
 /// - stream: stream or device to evaluate on.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn conv_transpose3d_device(
+pub fn conv_transpose3d(
     array: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     #[optional] stride: impl Into<Option<(i32, i32, i32)>>,
@@ -352,6 +345,7 @@ mod tests {
 
     #[test]
     fn test_conv1d_complex_device() {
+        let stream = crate::test_stream();
         // Define a 1D input with two channels
         let input_data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let input_array = Array::from_slice(&input_data, &[1, 5, 2]);
@@ -367,16 +361,18 @@ mod tests {
             Some(0), // padding
             Some(1), // dilation
             Some(1), // groups
+            stream,
         )
         .unwrap();
 
         let expected_output = [12.0, 8.0, 17.0, 13.0, 22.0, 18.0];
         assert_eq!(result.shape(), &[1, 3, 2]);
-        assert_eq!(result.as_slice::<f32>(), &expected_output);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &expected_output);
     }
 
     #[test]
     fn test_conv_transpose1d() {
+        let stream = crate::test_stream();
         // Single channel input
         let input = Array::from_slice(&[1.0, 2.0, 3.0], &[1, 3, 1]);
         // Single input/output channel kernel
@@ -390,16 +386,18 @@ mod tests {
             Some(1), // dilation
             None,    // output padding
             Some(1), // groups
+            stream,
         )
         .unwrap();
 
         let expected = [1.0, 2.5, 4.0, 1.5];
         assert_eq!(result.shape(), &[1, 4, 1]);
-        assert_eq!(result.as_slice::<f32>(), &expected);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &expected);
     }
 
     #[test]
     fn test_conv2d() {
+        let stream = crate::test_stream();
         // Define a 2x2 input with one channel (grayscale image or similar)
         let input_data = [1.0, 2.0, 3.0, 4.0];
         let input_shape = [1, 2, 2, 1]; // [N, H, W, C]
@@ -418,16 +416,18 @@ mod tests {
             Some((0, 0)), // padding
             Some((1, 1)), // dilation
             Some(1),      // groups
+            stream,
         )
         .unwrap();
 
         // Expected result is the convolution of a 2x2 filter over a 2x2 input with valid padding, resulting in a single output value
         let expected_output = 1.0 * 1.0 + 2.0 * 0.0 + 3.0 * 0.0 + 4.0 * 1.0; // = 1*1 + 4*1 = 5
-        assert_eq!(result.as_slice::<f32>(), &[expected_output]);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &[expected_output]);
     }
 
     #[test]
     fn test_conv_transpose2d() {
+        let stream = crate::test_stream();
         // 2x2 single channel input
         let input = Array::from_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2, 1]);
         // 2x2 single channel kernel (identity-like)
@@ -441,16 +441,18 @@ mod tests {
             Some((1, 1)), // dilation
             None,         // output padding
             Some(1),      // groups
+            stream,
         )
         .unwrap();
 
         let expected = [1.0, 2.0, 0.0, 3.0, 5.0, 2.0, 0.0, 3.0, 4.0];
         assert_eq!(result.shape(), &[1, 3, 3, 1]);
-        assert_eq!(result.as_slice::<f32>(), &expected);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &expected);
     }
 
     #[test]
     fn test_conv3d() {
+        let stream = crate::test_stream();
         // Define a 2x2x2 input with one channel
         let input_data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let input_shape = [1, 2, 2, 2, 1]; // [N, D, H, W, C]
@@ -469,6 +471,7 @@ mod tests {
             Some((0, 0, 0)), // padding
             Some((1, 1, 1)), // dilation
             Some(1),         // groups
+            stream,
         )
         .unwrap();
 
@@ -481,11 +484,12 @@ mod tests {
             + 6.0 * 1.0
             + 7.0 * 1.0
             + 8.0 * 0.0; // = 1*1 + 4*1 + 6*1 + 7*1 = 18
-        assert_eq!(result.as_slice::<f32>(), &[expected_output]);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &[expected_output]);
     }
 
     #[test]
     fn test_conv_transpose3d() {
+        let stream = crate::test_stream();
         // 2x2x2 single channel input
         let input = Array::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 2, 2, 2, 1]);
         // 2x2x2 single channel kernel
@@ -500,6 +504,7 @@ mod tests {
             Some((1, 1, 1)), // dilation
             None,            // output padding
             Some(1),         // groups
+            stream,
         )
         .unwrap();
 
@@ -508,6 +513,7 @@ mod tests {
 
     #[test]
     fn test_conv_wrong_dimensions() {
+        let stream = crate::test_stream();
         let input_data = [1.0, 2.0, 3.0, 4.0];
         let input_shape = [1, 2, 2, 1]; // [N, H, W, C]
         let input_array = Array::from_slice(&input_data, &input_shape);
@@ -523,6 +529,7 @@ mod tests {
             Some((0, 0)), // padding
             Some((1, 1)), // dilation
             Some(1),      // groups
+            stream,
         );
 
         assert!(result.is_err());
@@ -530,6 +537,7 @@ mod tests {
 
     #[test]
     fn test_conv_invalid_group_size() {
+        let stream = crate::test_stream();
         let input_data = [1.0, 2.0, 3.0, 4.0];
         let input_shape = [1, 2, 2, 1]; // [N, H, W, C]
         let input_array = Array::from_slice(&input_data, &input_shape);
@@ -545,6 +553,7 @@ mod tests {
             Some((0, 0)), // padding
             Some((1, 1)), // dilation
             Some(2),      // groups
+            stream,
         );
 
         assert!(result.is_err());
@@ -552,6 +561,7 @@ mod tests {
 
     #[test]
     fn test_conv_non_float() {
+        let stream = crate::test_stream();
         let input_data = [1, 2, 3, 4];
         let input_shape = [1, 2, 2, 1]; // [N, H, W, C]
         let input_array = Array::from_slice(&input_data, &input_shape);
@@ -567,6 +577,7 @@ mod tests {
             Some((0, 0)), // padding
             Some((1, 1)), // dilation
             Some(1),      // groups
+            stream,
         );
 
         assert!(result.is_err());

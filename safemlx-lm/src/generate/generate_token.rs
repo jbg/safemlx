@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use safemlx::{error::Exception, module::Module, Array};
+use safemlx::{error::Exception, module::Module, Array, Stream};
 
 use crate::{
     cache::KeyValueCache, sampler::Sampler, utils::try_unwrap, ModelInput, ModelInputBuilder,
@@ -35,6 +35,7 @@ pub(super) struct GenerateToken<M, I, S, C, T> {
     pub model_input_marker: PhantomData<I>,
     pub sampler: S,
     pub temp: f32,
+    pub stream: Stream,
     pub stage: Stage<C, T>,
 }
 
@@ -54,6 +55,7 @@ where
             model,
             model_input_marker: _,
             temp,
+            stream,
             sampler,
             stage,
         } = self;
@@ -67,9 +69,9 @@ where
                     state: &mut state,
                 };
                 let input = I::from_model_input_builder(builder);
-                let output = try_unwrap!(model.forward(input));
+                let output = try_unwrap!(model.forward(input, stream));
                 let logits = output.logits();
-                let y = try_unwrap!(sampler.sample(logits, *temp));
+                let y = try_unwrap!(sampler.sample(logits, *temp, stream));
 
                 *stage = Stage::Decode {
                     y: y.clone(),
@@ -91,9 +93,9 @@ where
                 };
 
                 let input = I::from_model_input_builder(builder);
-                let output = try_unwrap!(model.forward(input));
+                let output = try_unwrap!(model.forward(input, stream));
                 let logits = output.logits();
-                let y = try_unwrap!(sampler.sample(logits, *temp));
+                let y = try_unwrap!(sampler.sample(logits, *temp, stream));
 
                 *stage = Stage::Decode {
                     y: y.clone(),

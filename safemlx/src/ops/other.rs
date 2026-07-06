@@ -1,6 +1,6 @@
 use std::ffi::CString;
 
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::utils::guard::Guarded;
 use crate::utils::VectorArray;
@@ -19,12 +19,7 @@ impl Array {
     ///
     /// - `k`: the diagonal to extract or construct
     /// - `stream`: stream or device to evaluate on
-    #[default_device]
-    pub fn diag_device(
-        &self,
-        k: impl Into<Option<i32>>,
-        stream: impl AsRef<Stream>,
-    ) -> Result<Array> {
+    pub fn diag(&self, k: impl Into<Option<i32>>, stream: impl AsRef<Stream>) -> Result<Array> {
         Array::try_from_op(|res| unsafe {
             safemlx_sys::mlx_diag(
                 res,
@@ -49,8 +44,7 @@ impl Array {
     /// - `axis1`: first axis of the 2-D sub-array from which the diagonals should be taken
     /// - `axis2`: second axis of the 2-D sub-array from which the diagonals should be taken
     /// - `stream`: stream or device to evaluate on
-    #[default_device]
-    pub fn diagonal_device(
+    pub fn diagonal(
         &self,
         offset: impl Into<Option<i32>>,
         axis1: impl Into<Option<i32>>,
@@ -77,8 +71,7 @@ impl Array {
     /// # Params
     /// - scale: scale the output by this factor -- default is `1.0/sqrt(array.dim(-1))`
     /// - stream: stream to evaluate on.
-    #[default_device]
-    pub fn hadamard_transform_device(
+    pub fn hadamard_transform(
         &self,
         scale: impl Into<Option<f32>>,
         stream: impl AsRef<Stream>,
@@ -97,26 +90,24 @@ impl Array {
 
 /// See [`Array::diag`]
 #[generate_macro]
-#[default_device]
-pub fn diag_device(
+pub fn diag(
     a: impl AsRef<Array>,
     #[optional] k: impl Into<Option<i32>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    a.as_ref().diag_device(k, stream)
+    a.as_ref().diag(k, stream)
 }
 
 /// See [`Array::diagonal`]
 #[generate_macro]
-#[default_device]
-pub fn diagonal_device(
+pub fn diagonal(
     a: impl AsRef<Array>,
     #[optional] offset: impl Into<Option<i32>>,
     #[optional] axis1: impl Into<Option<i32>>,
     #[optional] axis2: impl Into<Option<i32>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    a.as_ref().diagonal_device(offset, axis1, axis2, stream)
+    a.as_ref().diagonal(offset, axis1, axis2, stream)
 }
 
 /// Perform the Einstein summation convention on the operands.
@@ -127,8 +118,7 @@ pub fn diagonal_device(
 /// - operands: input arrays
 /// - stream: stream or device to evaluate on
 #[generate_macro]
-#[default_device]
-pub fn einsum_device<'a>(
+pub fn einsum<'a>(
     subscripts: &str,
     operands: impl IntoIterator<Item = &'a Array>,
     #[optional] stream: impl AsRef<Stream>,
@@ -155,8 +145,7 @@ pub fn einsum_device<'a>(
 /// - `b`: second array
 /// - `stream`: stream or device to evaluate on
 #[generate_macro]
-#[default_device]
-pub fn kron_device(
+pub fn kron(
     a: impl AsRef<Array>,
     b: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
@@ -175,6 +164,7 @@ pub fn kron_device(
 mod tests {
     use crate::{
         array,
+        ops::indexing::IndexOp,
         ops::{arange, diag, einsum, reshape},
         Array,
     };
@@ -184,113 +174,159 @@ mod tests {
 
     #[test]
     fn test_diagonal() {
+        let stream = crate::test_stream();
         let x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7], &[4, 2]);
-        let out = diagonal(&x, None, None, None).unwrap();
-        assert_eq!(out, array!([0, 3]));
+        let out = diagonal(&x, None, None, None, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([0, 3])));
 
-        assert!(diagonal(&x, 1, 6, 0).is_err());
-        assert!(diagonal(&x, 1, 0, -3).is_err());
+        assert!(diagonal(&x, 1, 6, 0, stream).is_err());
+        assert!(diagonal(&x, 1, 0, -3, stream).is_err());
 
         let x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[3, 4]);
-        let out = diagonal(&x, 2, 1, 0).unwrap();
-        assert_eq!(out, array!([8]));
+        let out = diagonal(&x, 2, 1, 0, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([8])));
 
-        let out = diagonal(&x, -1, 0, 1).unwrap();
-        assert_eq!(out, array!([4, 9]));
+        let out = diagonal(&x, -1, 0, 1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([4, 9])));
 
-        let out = diagonal(&x, -5, 0, 1).unwrap();
-        out.eval().unwrap();
+        let out = diagonal(&x, -5, 0, 1, stream).unwrap();
         assert_eq!(out.shape(), &[0]);
+        out.evaluated().unwrap();
 
         let x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[3, 2, 2]);
-        let out = diagonal(&x, 1, 0, 1).unwrap();
-        assert_eq!(out, array!([[2], [3]]));
+        let out = diagonal(&x, 1, 0, 1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([[2], [3]])));
 
-        let out = diagonal(&x, 0, 2, 0).unwrap();
-        assert_eq!(out, array!([[0, 5], [2, 7]]));
+        let out = diagonal(&x, 0, 2, 0, stream).unwrap();
+        assert_eq!(out.shape(), &[2, 2]);
+        assert_eq!(out.index_device((0, 0), stream).item::<i32>(&stream), 0);
+        assert_eq!(out.index_device((0, 1), stream).item::<i32>(&stream), 5);
+        assert_eq!(out.index_device((1, 0), stream).item::<i32>(&stream), 2);
+        assert_eq!(out.index_device((1, 1), stream).item::<i32>(&stream), 7);
 
-        let out = diagonal(&x, 1, -1, 0).unwrap();
-        assert_eq!(out, array!([[4, 9], [6, 11]]));
+        let out = diagonal(&x, 1, -1, 0, stream).unwrap();
+        assert_eq!(out.shape(), &[2, 2]);
+        assert_eq!(out.index_device((0, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(out.index_device((0, 1), stream).item::<i32>(&stream), 9);
+        assert_eq!(out.index_device((1, 0), stream).item::<i32>(&stream), 6);
+        assert_eq!(out.index_device((1, 1), stream).item::<i32>(&stream), 11);
 
-        let x = reshape(arange::<_, f32>(None, 16, None).unwrap(), &[2, 2, 2, 2]).unwrap();
-        let out = diagonal(&x, 0, 0, 1).unwrap();
+        let x = reshape(
+            arange::<_, f32>(None, 16, None, stream).unwrap(),
+            &[2, 2, 2, 2],
+            stream,
+        )
+        .unwrap();
+        let out = diagonal(&x, 0, 0, 1, stream).unwrap();
+        assert_eq!(out.shape(), &[2, 2, 2]);
         assert_eq!(
-            out,
-            Array::from_slice(&[0, 12, 1, 13, 2, 14, 3, 15], &[2, 2, 2])
+            out.index_device((0, 0, 0), stream).item::<f32>(&stream),
+            0.0
+        );
+        assert_eq!(
+            out.index_device((0, 0, 1), stream).item::<f32>(&stream),
+            12.0
+        );
+        assert_eq!(
+            out.index_device((0, 1, 0), stream).item::<f32>(&stream),
+            1.0
+        );
+        assert_eq!(
+            out.index_device((0, 1, 1), stream).item::<f32>(&stream),
+            13.0
+        );
+        assert_eq!(
+            out.index_device((1, 0, 0), stream).item::<f32>(&stream),
+            2.0
+        );
+        assert_eq!(
+            out.index_device((1, 0, 1), stream).item::<f32>(&stream),
+            14.0
+        );
+        assert_eq!(
+            out.index_device((1, 1, 0), stream).item::<f32>(&stream),
+            3.0
+        );
+        assert_eq!(
+            out.index_device((1, 1, 1), stream).item::<f32>(&stream),
+            15.0
         );
 
-        assert!(diagonal(&x, 0, 1, 1).is_err());
+        assert!(diagonal(&x, 0, 1, 1, stream).is_err());
 
         let x = array!([0, 1]);
-        assert!(diagonal(&x, 0, 0, 1).is_err());
+        assert!(diagonal(&x, 0, 0, 1, stream).is_err());
     }
 
     #[test]
     fn test_diag() {
+        let stream = crate::test_stream();
         // Too few or too many dimensions
-        assert!(diag(Array::from_f32(0.0), None).is_err());
-        assert!(diag(Array::from_slice(&[0.0], &[1, 1, 1]), None).is_err());
+        assert!(diag(Array::from_f32(0.0), None, stream).is_err());
+        assert!(diag(Array::from_slice(&[0.0], &[1, 1, 1]), None, stream).is_err());
 
         // Test with 1D array
         let x = array!([0, 1, 2, 3]);
-        let out = diag(&x, 0).unwrap();
-        assert_eq!(
-            out,
-            array!([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3]])
-        );
+        let out = diag(&x, 0, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &out,
+            &array!([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3]])
+        ));
 
-        let out = diag(&x, 1).unwrap();
-        assert_eq!(
-            out,
-            array!([
+        let out = diag(&x, 1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &out,
+            &array!([
                 [0, 0, 0, 0, 0],
                 [0, 0, 1, 0, 0],
                 [0, 0, 0, 2, 0],
                 [0, 0, 0, 0, 3],
                 [0, 0, 0, 0, 0]
             ])
-        );
+        ));
 
-        let out = diag(&x, -1).unwrap();
-        assert_eq!(
-            out,
-            array!([
+        let out = diag(&x, -1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &out,
+            &array!([
                 [0, 0, 0, 0, 0],
                 [0, 0, 0, 0, 0],
                 [0, 1, 0, 0, 0],
                 [0, 0, 2, 0, 0],
                 [0, 0, 0, 3, 0]
             ])
-        );
+        ));
 
         // Test with 2D array
         let x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8], &[3, 3]);
-        let out = diag(&x, 0).unwrap();
-        assert_eq!(out, array!([0, 4, 8]));
+        let out = diag(&x, 0, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([0, 4, 8])));
 
-        let out = diag(&x, 1).unwrap();
-        assert_eq!(out, array!([1, 5]));
+        let out = diag(&x, 1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([1, 5])));
 
-        let out = diag(&x, -1).unwrap();
-        assert_eq!(out, array!([3, 7]));
+        let out = diag(&x, -1, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!([3, 7])));
     }
 
     #[test]
     fn test_einsum() {
+        let stream = crate::test_stream();
         // Test dot product (vector-vector)
         let a = array!([0.0, 1.0, 2.0, 3.0]);
         let b = array!([4.0, 5.0, 6.0, 7.0]);
-        let out = einsum("i,i->", &[a, b]).unwrap();
-        assert_eq!(out, array!(38.0));
+        let out = einsum("i,i->", &[a, b], stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!(38.0)));
 
         // Test trace (diagonal sum)
         let m = array!([[1, 2], [3, 4]]);
-        let out = einsum("ii->", &[m]).unwrap();
-        assert_eq!(out, array!(5.0));
+        let out = einsum("ii->", &[m], stream).unwrap();
+        assert!(crate::array::eval_equal_values(&out, &array!(5)));
     }
 
     #[test]
     fn test_hadamard_transform() {
+        let stream = crate::test_stream();
         let input = Array::from_slice(&[1.0, -1.0, -1.0, 1.0], &[2, 2]);
         let expected = Array::from_slice(
             &[
@@ -301,34 +337,37 @@ mod tests {
             ],
             &[2, 2],
         );
-        let result = input.hadamard_transform(None).unwrap();
+        let result = input.hadamard_transform(None, stream).unwrap();
 
-        let c = result.all_close(&expected, 1e-5, 1e-5, None).unwrap();
-        let c_data: &[bool] = c.as_slice();
+        let c = result
+            .all_close(&expected, 1e-5, 1e-5, None, stream)
+            .unwrap();
+        let c_data: Vec<bool> = crate::array::eval_vec(&c);
         assert_eq!(c_data, [true]);
     }
 
     // This test is adapted from the python unit test `mlx/test/test_ops.py` `test_kron`
     #[test]
     fn test_kron() {
+        let stream = crate::test_stream();
         // Basic vector test
         let x = array!([1, 2]);
         let y = array!([3, 4]);
-        let z = super::kron(&x, &y).unwrap();
-        assert_eq!(z, array!([3, 4, 6, 8]));
+        let z = super::kron(&x, &y, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&z, &array!([3, 4, 6, 8])));
 
         // Basic matrix test
         let x = array!([[1, 2], [3, 4]]);
         let y = array!([[0, 5], [6, 7]]);
-        let z = super::kron(&x, &y).unwrap();
-        assert_eq!(
-            z,
-            array!([
+        let z = super::kron(&x, &y, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &z,
+            &array!([
                 [0, 5, 0, 10],
                 [6, 7, 12, 14],
                 [0, 15, 0, 20],
                 [18, 21, 24, 28]
             ])
-        );
+        ));
     }
 }

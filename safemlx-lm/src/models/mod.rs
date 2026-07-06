@@ -2,8 +2,8 @@ use std::path::Path;
 
 use safemlx::{
     error::Exception,
-    ops::indexing::{IndexOp, NewAxis},
-    Array,
+    ops::indexing::{NewAxis, TryIndexOp},
+    Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
     load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
@@ -94,17 +94,30 @@ impl Model {
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
         temp: f32,
         prompt_tokens: &'a Array,
+        stream: &'a Stream,
     ) -> Generate<'a> {
         match self {
-            Self::Gemma4(model) => {
-                Generate::Gemma4(gemma4::Generate::new(model, cache, temp, prompt_tokens))
-            }
-            Self::Llama(model) => {
-                Generate::Llama(llama::Generate::new(model, cache, temp, prompt_tokens))
-            }
-            Self::Qwen3(model) => {
-                Generate::Qwen3(qwen3::Generate::new(model, cache, temp, prompt_tokens))
-            }
+            Self::Gemma4(model) => Generate::Gemma4(gemma4::Generate::new(
+                model,
+                cache,
+                temp,
+                prompt_tokens,
+                stream,
+            )),
+            Self::Llama(model) => Generate::Llama(llama::Generate::new(
+                model,
+                cache,
+                temp,
+                prompt_tokens,
+                stream,
+            )),
+            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::new(
+                model,
+                cache,
+                temp,
+                prompt_tokens,
+                stream,
+            )),
             Self::Qwen35Moe(_) => {
                 panic!("qwen3_5_moe requires ModelCache; use generate_with_cache")
             }
@@ -123,19 +136,20 @@ impl Model {
         cache: &'a mut ModelCache,
         temp: f32,
         prompt_tokens: &'a Array,
+        stream: &'a Stream,
     ) -> ModelGenerate<'a> {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Gemma4(gemma4::Generate::new(model, cache, temp, prompt_tokens))
-            }
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Llama(llama::Generate::new(model, cache, temp, prompt_tokens))
-            }
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Qwen3(qwen3::Generate::new(model, cache, temp, prompt_tokens))
-            }
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => ModelGenerate::Gemma4(
+                gemma4::Generate::new(model, cache, temp, prompt_tokens, stream),
+            ),
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
+                llama::Generate::new(model, cache, temp, prompt_tokens, stream),
+            ),
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
+                qwen3::Generate::new(model, cache, temp, prompt_tokens, stream),
+            ),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => ModelGenerate::Qwen35Moe(
-                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens),
+                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens, stream),
             ),
             _ => panic!("model cache type does not match model kind"),
         }
@@ -194,7 +208,7 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
+    pub fn load(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
         let model_type = effective_model_type(&metadata);
@@ -202,11 +216,11 @@ impl LoadedModel {
         let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
         let model = match kind {
-            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(model_dir)?),
-            ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir)?),
-            ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir)?),
+            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(model_dir, stream)?),
+            ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir, stream)?),
+            ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream)?),
             ModelKind::Qwen35Moe => {
-                Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(model_dir)?)
+                Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(model_dir, stream)?)
             }
         };
         let eos_token_ids = metadata
@@ -298,9 +312,14 @@ impl LoadedModel {
             .to_vec())
     }
 
-    pub fn encode_to_array(&self, text: &str, add_special_tokens: bool) -> Result<Array, Error> {
+    pub fn encode_to_array(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
         let ids = self.encode(text, add_special_tokens)?;
-        Ok(Array::from(ids.as_slice()).index(NewAxis))
+        Ok(Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?)
     }
 
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
@@ -322,8 +341,9 @@ impl LoadedModel {
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
         temp: f32,
         prompt_tokens: &'a Array,
+        stream: &'a Stream,
     ) -> Generate<'a> {
-        self.model.generate(cache, temp, prompt_tokens)
+        self.model.generate(cache, temp, prompt_tokens, stream)
     }
 
     pub fn new_cache(&self) -> ModelCache {
@@ -335,8 +355,10 @@ impl LoadedModel {
         cache: &'a mut ModelCache,
         temp: f32,
         prompt_tokens: &'a Array,
+        stream: &'a Stream,
     ) -> ModelGenerate<'a> {
-        self.model.generate_with_cache(cache, temp, prompt_tokens)
+        self.model
+            .generate_with_cache(cache, temp, prompt_tokens, stream)
     }
 
     pub fn model_mut(&mut self) -> &mut Model {
@@ -344,15 +366,15 @@ impl LoadedModel {
     }
 }
 
-pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+pub fn load_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
-        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(model_dir)?)),
-        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir)?)),
-        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir)?)),
+        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(model_dir, stream)?)),
+        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir, stream)?)),
+        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream)?)),
         ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
-            model_dir,
+            model_dir, stream,
         )?)),
     }
 }

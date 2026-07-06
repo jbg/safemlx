@@ -1,6 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
-use safemlx::{ops::indexing::IndexOp, transforms::eval, Array};
+use safemlx::{
+    ops::indexing::{NewAxis, TryIndexOp},
+    transforms::eval,
+    Array, ExecutionContext, Stream,
+};
 use safemlx_lm::models::{qwen3_5_moe, LoadedModel};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
@@ -32,14 +36,16 @@ fn main() -> anyhow::Result<()> {
     println!("decode_tokens={decode_tokens}");
     println!("profile_components={profile_components}");
 
+    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let stream = ctx.stream();
     let load_start = Instant::now();
-    let mut model = LoadedModel::load(&model_dir)?;
+    let mut model = LoadedModel::load(&model_dir, stream)?;
     let load_elapsed = load_start.elapsed();
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;
-    let _ = run_case(&mut model, &warmup_prompt, 2, false)?;
+    let _ = run_case(&mut model, &warmup_prompt, 2, false, stream)?;
     println!("warmup_s={:.3}", warmup_start.elapsed().as_secs_f64());
 
     println!(
@@ -56,7 +62,13 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let prompt = prompt_near_token_count(&mut model, *target_tokens)?;
-        let result = run_case(&mut model, &prompt, decode_tokens, profile_components)?;
+        let result = run_case(
+            &mut model,
+            &prompt,
+            decode_tokens,
+            profile_components,
+            stream,
+        )?;
         println!(
             "{},{},{:.6},{},{:.6},{:.3},{},{}",
             name,
@@ -97,11 +109,12 @@ fn run_case(
     prompt: &str,
     decode_tokens: usize,
     profile_components: bool,
+    stream: &Stream,
 ) -> anyhow::Result<BenchResult> {
     let prompt_ids = model.encode(prompt, false)?;
-    let prompt_tokens = Array::from(prompt_ids.as_slice()).index(safemlx::ops::indexing::NewAxis);
+    let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
     let mut cache = model.new_cache();
-    let mut generator = model.generate_with_cache(&mut cache, 0.0, &prompt_tokens);
+    let mut generator = model.generate_with_cache(&mut cache, 0.0, &prompt_tokens, stream);
     let mut ids = Vec::with_capacity(decode_tokens);
 
     qwen3_5_moe::set_perf_profiling(profile_components);
@@ -114,7 +127,7 @@ fn run_case(
     eval([&first])?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
     let prefill_profile = profile_components.then(qwen3_5_moe::perf_stats).flatten();
-    ids.push(first.item::<u32>());
+    ids.push(first.item::<u32>(stream));
 
     qwen3_5_moe::reset_perf_stats();
     let decode_start = Instant::now();
@@ -124,7 +137,7 @@ fn run_case(
         };
         let token = token?;
         eval([&token])?;
-        ids.push(token.item::<u32>());
+        ids.push(token.item::<u32>(stream));
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
     let decode_profile = profile_components.then(qwen3_5_moe::perf_stats).flatten();

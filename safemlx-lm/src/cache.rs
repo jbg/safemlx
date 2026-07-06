@@ -1,7 +1,7 @@
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::IndexOp},
-    Array,
+    ops::{concatenate_axis, indexing::TryIndexOp},
+    Array, Stream,
 };
 
 // TODO: somehow move quantized methods to a separate trait?
@@ -24,8 +24,12 @@ pub trait KeyValueCache {
 
     fn max_size(&self) -> Option<i32>;
 
-    fn update_and_fetch(&mut self, keys: Array, values: Array)
-        -> Result<(Array, Array), Exception>;
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception>;
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -56,8 +60,9 @@ where
         &mut self,
         keys: Array,
         values: Array,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
-        T::update_and_fetch(self, keys, values)
+        T::update_and_fetch(self, keys, values, stream)
     }
 }
 
@@ -73,12 +78,12 @@ impl ConcatKeyValueCache {
         Self::default()
     }
 
-    pub fn truncate(&mut self, len: i32) -> Result<(), Exception> {
+    pub fn truncate(&mut self, len: i32, stream: &Stream) -> Result<(), Exception> {
         if let Some(keys) = self.keys.take() {
-            self.keys = Some(keys.index((.., .., ..len, ..)));
+            self.keys = Some(keys.try_index_device((.., .., ..len, ..), stream)?);
         }
         if let Some(values) = self.values.take() {
-            self.values = Some(values.index((.., .., ..len, ..)));
+            self.values = Some(values.try_index_device((.., .., ..len, ..), stream)?);
         }
         self.offset = len;
         Ok(())
@@ -102,11 +107,12 @@ impl KeyValueCache for ConcatKeyValueCache {
         &mut self,
         keys: Array,
         values: Array,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         match (self.keys.take(), self.values.take()) {
             (Some(k), Some(v)) => {
-                self.keys = Some(concatenate_axis(&[k, keys], -2)?);
-                self.values = Some(concatenate_axis(&[v, values], -2)?);
+                self.keys = Some(concatenate_axis(&[k, keys], -2, stream)?);
+                self.values = Some(concatenate_axis(&[v, values], -2, stream)?);
             }
             _ => {
                 self.keys = Some(keys);

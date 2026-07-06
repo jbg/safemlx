@@ -1,6 +1,9 @@
 //! Traits for quantization
 
-use crate::module::{Module, ModuleParameters};
+use crate::{
+    module::{Module, ModuleParameters},
+    Stream,
+};
 
 /// Trait for quantization of modules.
 pub trait Quantizable {
@@ -21,6 +24,7 @@ pub trait Quantizable {
         self,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError>;
 }
 
@@ -36,9 +40,10 @@ where
         self,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError> {
         self.into_iter()
-            .map(|m| m.try_into_quantized(group_size, bits))
+            .map(|m| m.try_into_quantized(group_size, bits, stream))
             .collect()
     }
 }
@@ -55,8 +60,11 @@ where
         self,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError> {
-        (*self).try_into_quantized(group_size, bits).map(Box::new)
+        (*self)
+            .try_into_quantized(group_size, bits, stream)
+            .map(Box::new)
     }
 }
 
@@ -72,9 +80,10 @@ where
         self,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError> {
         match self {
-            Some(m) => m.try_into_quantized(group_size, bits).map(Some),
+            Some(m) => m.try_into_quantized(group_size, bits, stream).map(Some),
             None => Ok(None),
         }
     }
@@ -104,10 +113,11 @@ where
         self,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self, Self::QuantizationError> {
         match self {
             MaybeQuantized::Original(m) => {
-                let quantized = m.try_into_quantized(group_size, bits)?;
+                let quantized = m.try_into_quantized(group_size, bits, stream)?;
                 Ok(MaybeQuantized::Quantized(quantized))
             }
             MaybeQuantized::Quantized(q) => Ok(MaybeQuantized::Quantized(q)),
@@ -218,10 +228,10 @@ where
 
     type Error = <M as Module<Input>>::Error;
 
-    fn forward(&mut self, x: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, x: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         match self {
-            MaybeQuantized::Original(m) => m.forward(x),
-            MaybeQuantized::Quantized(q) => q.forward(x),
+            MaybeQuantized::Original(m) => m.forward(x, stream),
+            MaybeQuantized::Quantized(q) => q.forward(x, stream),
         }
     }
 
@@ -241,21 +251,23 @@ mod tests {
 
     #[test]
     fn test_quantizable_linear() {
+        let stream = crate::test_stream();
         let linear = Linear::new(64, 64).unwrap();
         let mut qlinear = MaybeQuantized::new(linear);
         assert!(!qlinear.is_quantized());
 
-        qlinear = nn::quantize(qlinear, None, None).unwrap();
+        qlinear = nn::quantize(qlinear, None, None, stream).unwrap();
         assert!(qlinear.is_quantized());
     }
 
     #[test]
     fn test_quantizable_embedding() {
+        let stream = crate::test_stream();
         let embedding = Embedding::new(64, 64).unwrap();
         let mut qembedding = MaybeQuantized::new(embedding);
         assert!(!qembedding.is_quantized());
 
-        qembedding = nn::quantize(qembedding, None, None).unwrap();
+        qembedding = nn::quantize(qembedding, None, None, stream).unwrap();
         assert!(qembedding.is_quantized());
     }
 }

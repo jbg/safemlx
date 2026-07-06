@@ -9,11 +9,11 @@ use safemlx::{
     module::Module,
     nn,
     ops::{
-        indexing::{IndexOp, NewAxis},
+        indexing::{NewAxis, TryIndexOp},
         sigmoid,
     },
     quantization::MaybeQuantized,
-    Array,
+    Array, Stream,
 };
 
 use crate::{
@@ -21,8 +21,8 @@ use crate::{
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
 
-pub fn silu(x: Array) -> Result<Array, Exception> {
-    x.multiply(sigmoid(&x)?)
+pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
+    x.multiply(sigmoid(&x, stream)?, stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -58,10 +58,10 @@ impl Module<&Array> for SwiGluMlp {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
-        let down_proj_input =
-            silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
-        self.down_proj.forward(&down_proj_input)
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        let down_proj_input = silu(self.gate_proj.forward(input, stream)?, stream)?
+            .multiply(self.up_proj.forward(input, stream)?, stream)?;
+        self.down_proj.forward(&down_proj_input, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -95,9 +95,10 @@ impl Module<&Array> for DenseSwiGluMlp {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
-        let h = silu(self.gate_proj.forward(input)?)?.multiply(self.up_proj.forward(input)?)?;
-        self.down_proj.forward(&h)
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        let h = silu(self.gate_proj.forward(input, stream)?, stream)?
+            .multiply(self.up_proj.forward(input, stream)?, stream)?;
+        self.down_proj.forward(&h, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -127,12 +128,15 @@ pub fn project_logits_maybe_quantized(
     lm_head: &mut Option<MaybeQuantized<nn::Linear>>,
     embed_tokens: &mut MaybeQuantized<nn::Embedding>,
     hidden_states: &Array,
+    stream: &Stream,
 ) -> Result<Array, Exception> {
     match lm_head.as_mut() {
-        Some(lm_head) => lm_head.forward(hidden_states),
+        Some(lm_head) => lm_head.forward(hidden_states, stream),
         None => match embed_tokens {
-            MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(hidden_states),
-            MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(hidden_states),
+            MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(hidden_states, stream),
+            MaybeQuantized::Quantized(q_embed_tokens) => {
+                q_embed_tokens.as_linear(hidden_states, stream)
+            }
         },
     }
 }
@@ -141,10 +145,11 @@ pub fn project_logits_dense(
     lm_head: &mut Option<nn::Linear>,
     embed_tokens: &nn::Embedding,
     hidden_states: &Array,
+    stream: &Stream,
 ) -> Result<Array, Exception> {
     match lm_head.as_mut() {
-        Some(lm_head) => lm_head.forward(hidden_states),
-        None => embed_tokens.as_linear(hidden_states),
+        Some(lm_head) => lm_head.forward(hidden_states, stream),
+        None => embed_tokens.as_linear(hidden_states, stream),
     }
 }
 
@@ -164,10 +169,11 @@ pub fn reshape_attention_projection(
     batch: i32,
     seq_len: i32,
     heads: i32,
+    stream: &Stream,
 ) -> Result<Array, Exception> {
     projection
-        .reshape(&[batch, seq_len, heads, -1])?
-        .transpose_axes(&[0, 2, 1, 3])
+        .reshape(&[batch, seq_len, heads, -1], stream)?
+        .transpose_axes(&[0, 2, 1, 3], stream)
 }
 
 pub fn apply_rope_and_update_cache<C>(
@@ -176,18 +182,25 @@ pub fn apply_rope_and_update_cache<C>(
     mut keys: Array,
     mut values: Array,
     cache: &mut Option<&mut C>,
+    stream: &Stream,
 ) -> Result<(Array, Array, Array), Exception>
 where
     C: KeyValueCache,
 {
     if let Some(cache) = cache.as_mut() {
         let offset = cache.offset();
-        queries = rope.forward(nn::RopeInputBuilder::new(&queries).offset(offset).build()?)?;
-        keys = rope.forward(nn::RopeInputBuilder::new(&keys).offset(offset).build()?)?;
-        (keys, values) = cache.update_and_fetch(keys, values)?;
+        queries = rope.forward(
+            nn::RopeInputBuilder::new(&queries).offset(offset).build()?,
+            stream,
+        )?;
+        keys = rope.forward(
+            nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
+            stream,
+        )?;
+        (keys, values) = cache.update_and_fetch(keys, values, stream)?;
     } else {
-        queries = rope.forward(nn::RopeInput::new(&queries))?;
-        keys = rope.forward(nn::RopeInput::new(&keys))?;
+        queries = rope.forward(nn::RopeInput::new(&queries), stream)?;
+        keys = rope.forward(nn::RopeInput::new(&keys), stream)?;
     }
 
     Ok((queries, keys, values))
@@ -202,31 +215,47 @@ pub fn finish_attention<C>(
     mask: Option<&Array>,
     batch: i32,
     seq_len: i32,
+    stream: &Stream,
 ) -> Result<Array, Exception>
 where
     C: KeyValueCache,
 {
-    scaled_dot_product_attention(queries, keys, values, cache, scale, mask)?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[batch, seq_len, -1])
+    scaled_dot_product_attention(queries, keys, values, cache, scale, mask, stream)?
+        .transpose_axes(&[0, 2, 1, 3], stream)?
+        .reshape(&[batch, seq_len, -1], stream)
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
+pub fn sample(logits: &Array, temp: f32, stream: &Stream) -> Result<Array, Exception> {
     match temp {
-        0.0 => argmax_axis!(logits, -1),
+        0.0 => argmax_axis!(logits, -1, stream = stream),
         _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits)
+            let logits = logits.multiply(array!(1.0 / temp), stream)?;
+            categorical!(logits, stream = stream)
         }
     }
 }
 
 pub trait CausalLm<C> {
-    fn prefill_logits(&mut self, prompt_tokens: &Array, cache: &mut C) -> Result<Array, Exception>;
+    fn prefill_logits(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut C,
+        stream: &Stream,
+    ) -> Result<Array, Exception>;
 
-    fn decode_logits(&mut self, input_tokens: &Array, cache: &mut C) -> Result<Array, Exception>;
+    fn decode_logits(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut C,
+        stream: &Stream,
+    ) -> Result<Array, Exception>;
 
-    fn adjust_prefill_logits(&mut self, logits: Array, _cache: &mut C) -> Result<Array, Exception> {
+    fn adjust_prefill_logits(
+        &mut self,
+        logits: Array,
+        _cache: &mut C,
+        _stream: &Stream,
+    ) -> Result<Array, Exception> {
         Ok(logits)
     }
 }
@@ -243,6 +272,7 @@ where
     model: &'a mut M,
     cache: &'a mut C,
     temp: f32,
+    stream: &'a Stream,
     state: GenerateState<'a>,
     _cache: PhantomData<C>,
 }
@@ -251,11 +281,18 @@ impl<'a, M, C> Generate<'a, M, C>
 where
     M: CausalLm<C>,
 {
-    pub fn new(model: &'a mut M, cache: &'a mut C, temp: f32, prompt_tokens: &'a Array) -> Self {
+    pub fn new(
+        model: &'a mut M,
+        cache: &'a mut C,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        stream: &'a Stream,
+    ) -> Self {
         Self {
             model,
             cache,
             temp,
+            stream,
             state: GenerateState::Prefill { prompt_tokens },
             _cache: PhantomData,
         }
@@ -271,15 +308,21 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match &self.state {
             GenerateState::Prefill { prompt_tokens } => {
-                let logits = match self.model.prefill_logits(prompt_tokens, self.cache) {
+                let logits = match self
+                    .model
+                    .prefill_logits(prompt_tokens, self.cache, self.stream)
+                {
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let logits = match self.model.adjust_prefill_logits(logits, self.cache) {
+                let logits = match self
+                    .model
+                    .adjust_prefill_logits(logits, self.cache, self.stream)
+                {
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp) {
+                let y = match sample(&logits, self.temp, self.stream) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };
@@ -287,12 +330,15 @@ where
                 Some(Ok(y))
             }
             GenerateState::Decode { y } => {
-                let inputs = y.index((.., NewAxis));
-                let logits = match self.model.decode_logits(&inputs, self.cache) {
+                let inputs = match y.try_index_device((.., NewAxis), self.stream) {
+                    Ok(inputs) => inputs,
+                    Err(err) => return Some(Err(err)),
+                };
+                let logits = match self.model.decode_logits(&inputs, self.cache, self.stream) {
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp) {
+                let y = match sample(&logits, self.temp, self.stream) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };

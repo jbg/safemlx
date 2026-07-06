@@ -80,25 +80,29 @@ impl Optimizer for Lion {
         key: &std::rc::Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> Result<(), crate::error::Exception> {
         use crate::ops::sign;
 
         let (b1, b2) = &self.betas;
         let m = get_mut_or_insert_with(&mut self.state, key, || array!(0.0));
 
-        let one_minus_b1 = array!(1.0).subtract(b1)?;
-        let one_minus_b2 = array!(1.0).subtract(b2)?;
+        let one_minus_b1 = array!(1.0).subtract(b1, stream)?;
+        let one_minus_b2 = array!(1.0).subtract(b2, stream)?;
 
-        let c = b1.multiply(&m)?.add(&one_minus_b1.multiply(gradient)?)?;
-        *m = b2.multiply(&m)?.add(&one_minus_b2.multiply(gradient)?)?;
+        let c = b1
+            .multiply(&m, stream)?
+            .add(&one_minus_b1.multiply(gradient, stream)?, stream)?;
+        *m = b2
+            .multiply(&m, stream)?
+            .add(&one_minus_b2.multiply(gradient, stream)?, stream)?;
 
         if self.weight_decay > 0.0 {
-            // SAFETY: These coeffs are all single-element arrays and won't panic.
-            *parameter = array!(1.0 - self.lr * self.weight_decay) * &*parameter;
+            *parameter = array!(1.0 - self.lr * self.weight_decay).multiply(&*parameter, stream)?;
         }
 
         let lr = array!(self.lr);
-        *parameter = parameter.subtract(lr.multiply(sign(&c)?)?)?;
+        *parameter = parameter.subtract(lr.multiply(sign(&c, stream)?, stream)?, stream)?;
 
         Ok(())
     }

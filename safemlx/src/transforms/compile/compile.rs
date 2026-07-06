@@ -6,7 +6,9 @@ use std::marker::PhantomData;
 
 use crate::{error::Exception, Array};
 
-use super::{type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorArray};
+use super::{
+    transform_guard, type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorArray,
+};
 
 /// Returns a compiled function that produces the same output as `f`.
 ///
@@ -16,7 +18,7 @@ use super::{type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorA
 pub fn compile<F, A, O, E>(
     f: F,
     shapeless: impl Into<Option<bool>>,
-) -> impl for<'a> FnMut(F::Args<'a>) -> Result<O, Exception>
+) -> impl for<'a> FnMut(F::Args<'a>) -> Result<O, Exception> + 'static
 where
     F: Compile<A, O, E> + 'static + Copy,
 {
@@ -45,7 +47,12 @@ pub trait Compile<A, O, E>: Sized {
     type Args<'a>;
 
     /// Compiles the function.
-    fn compile<'args>(self, shapeless: bool) -> impl CallMut<Self::Args<'args>, O, E>;
+    fn compile<'args, 'compiled>(
+        self,
+        shapeless: bool,
+    ) -> impl CallMut<Self::Args<'args>, O, E> + 'compiled
+    where
+        Self: 'compiled;
 }
 
 impl<F> Compile<&[Array], Vec<Array>, ()> for F
@@ -54,7 +61,13 @@ where
 {
     type Args<'a> = &'a [Array];
 
-    fn compile<'args>(self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Vec<Array>, ()> {
+    fn compile<'args, 'compiled>(
+        self,
+        shapeless: bool,
+    ) -> impl CallMut<Self::Args<'args>, Vec<Array>, ()> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
@@ -75,7 +88,13 @@ where
 {
     type Args<'a> = &'a Array;
 
-    fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
+    fn compile<'args, 'compiled>(
+        mut self,
+        shapeless: bool,
+    ) -> impl CallMut<Self::Args<'args>, Array, ()> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)(&args[0]);
@@ -95,7 +114,13 @@ where
 {
     type Args<'a> = (&'a Array, &'a Array);
 
-    fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
+    fn compile<'args, 'compiled>(
+        mut self,
+        shapeless: bool,
+    ) -> impl CallMut<Self::Args<'args>, Array, ()> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)((&args[0], &args[1]));
@@ -115,7 +140,13 @@ where
 {
     type Args<'a> = (&'a Array, &'a Array, &'a Array);
 
-    fn compile<'args>(mut self, shapeless: bool) -> impl CallMut<Self::Args<'args>, Array, ()> {
+    fn compile<'args, 'compiled>(
+        mut self,
+        shapeless: bool,
+    ) -> impl CallMut<Self::Args<'args>, Array, ()> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Vec<Array> {
             let result = (self)((&args[0], &args[1], &args[2]));
@@ -135,10 +166,13 @@ where
 {
     type Args<'a> = &'a [Array];
 
-    fn compile<'args>(
+    fn compile<'args, 'compiled>(
         self,
         shapeless: bool,
-    ) -> impl CallMut<Self::Args<'args>, Vec<Array>, Exception> {
+    ) -> impl CallMut<Self::Args<'args>, Vec<Array>, Exception> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let state = CompiledState {
             f: self,
@@ -158,10 +192,13 @@ where
 {
     type Args<'a> = &'a Array;
 
-    fn compile<'args>(
+    fn compile<'args, 'compiled>(
         mut self,
         shapeless: bool,
-    ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
+    ) -> impl CallMut<Self::Args<'args>, Array, Exception> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)(&args[0])?;
@@ -181,10 +218,13 @@ where
 {
     type Args<'a> = (&'a Array, &'a Array);
 
-    fn compile<'args>(
+    fn compile<'args, 'compiled>(
         mut self,
         shapeless: bool,
-    ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
+    ) -> impl CallMut<Self::Args<'args>, Array, Exception> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)((&args[0], &args[1]))?;
@@ -204,10 +244,13 @@ where
 {
     type Args<'a> = (&'a Array, &'a Array, &'a Array);
 
-    fn compile<'args>(
+    fn compile<'args, 'compiled>(
         mut self,
         shapeless: bool,
-    ) -> impl CallMut<Self::Args<'args>, Array, Exception> {
+    ) -> impl CallMut<Self::Args<'args>, Array, Exception> + 'compiled
+    where
+        Self: 'compiled,
+    {
         let id = type_id_to_usize(&self);
         let f = move |args: &[Array]| -> Result<Vec<Array>, Exception> {
             let result = (self)((&args[0], &args[1], &args[2]))?;
@@ -327,6 +370,8 @@ fn call_mut_inner(
     shapeless: bool,
     args: &[impl AsRef<Array>],
 ) -> crate::error::Result<Vec<Array>> {
+    let _transform_guard = transform_guard::enter();
+
     // note: this will use the cached compile (via the id)
     // but will be able to re-evaluate with fresh state if needed
     let compiled = Closure::try_from_op(|res| unsafe {
@@ -434,12 +479,15 @@ mod tests {
     #[test]
     fn test_compile() {
         // This unit test is modified from the mlx-swift codebase
+        let stream = crate::test_stream();
 
-        let f = |inputs: &[Array]| -> Vec<Array> { vec![&inputs[0] * &inputs[1]] };
+        let f = move |inputs: &[Array]| -> Vec<Array> {
+            vec![inputs[0].multiply(&inputs[1], stream).unwrap()]
+        };
         let mut compiled = compile(f, None);
 
-        let i1 = ones::<f32>(&[20, 20]).unwrap();
-        let i2 = ones::<f32>(&[20, 20]).unwrap();
+        let i1 = ones::<f32>(&[20, 20], stream).unwrap();
+        let i2 = ones::<f32>(&[20, 20], stream).unwrap();
 
         let args = [i1, i2];
 
@@ -448,21 +496,22 @@ mod tests {
         // evaluate compiled
         let r2 = compiled(&args).unwrap().drain(0..1).next().unwrap();
 
-        assert_eq!(&r1, &r2);
+        assert!(crate::array::eval_equal_values(&r1, &r2));
 
         let r3 = compiled(&args).unwrap().drain(0..1).next().unwrap();
-        assert_eq!(&r1, &r3);
+        assert!(crate::array::eval_equal_values(&r1, &r3));
     }
 
     #[test]
     fn test_compile_with_error() {
-        let f = |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
-            multiply(&inputs[0], &inputs[1]).map(|x| vec![x])
+        let stream = crate::test_stream();
+        let f = move |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            multiply(&inputs[0], &inputs[1], stream).map(|x| vec![x])
         };
 
         // Success case
-        let i1 = ones::<f32>(&[20, 20]).unwrap();
-        let i2 = ones::<f32>(&[20, 20]).unwrap();
+        let i1 = ones::<f32>(&[20, 20], stream).unwrap();
+        let i2 = ones::<f32>(&[20, 20], stream).unwrap();
         let args = [i1, i2];
 
         // evaluate directly
@@ -472,10 +521,10 @@ mod tests {
         let mut compiled = compile(f, None);
         let r2 = compiled(&args).unwrap().drain(0..1).next().unwrap();
 
-        assert_eq!(&r1, &r2);
+        assert!(crate::array::eval_equal_values(&r1, &r2));
 
         let r3 = compiled(&args).unwrap().drain(0..1).next().unwrap();
-        assert_eq!(&r1, &r3);
+        assert!(crate::array::eval_equal_values(&r1, &r3));
 
         // Error case
         let a = array!([1.0, 2.0, 3.0]);
@@ -505,9 +554,10 @@ mod tests {
 
     #[test]
     fn test_compile_with_one_arg() {
-        let f = |x: &Array| x * x;
+        let stream = crate::test_stream();
+        let f = move |x: &Array| x.multiply(x, stream).unwrap();
 
-        let i = ones::<f32>(&[20, 20]).unwrap();
+        let i = ones::<f32>(&[20, 20], stream).unwrap();
 
         // evaluate directly
         let r1 = f(&i);
@@ -516,18 +566,19 @@ mod tests {
         let mut compiled = compile(f, None);
         let r2 = compiled(&i).unwrap();
 
-        assert_eq!(&r1, &r2);
+        assert!(crate::array::eval_equal_values(&r1, &r2));
 
         let r3 = compiled(&i).unwrap();
-        assert_eq!(&r1, &r3);
+        assert!(crate::array::eval_equal_values(&r1, &r3));
     }
 
     #[test]
     fn test_compile_with_two_args() {
-        let f = |(x, y): (&Array, &Array)| x * y;
+        let stream = crate::test_stream();
+        let f = move |(x, y): (&Array, &Array)| x.multiply(y, stream).unwrap();
 
-        let i1 = ones::<f32>(&[20, 20]).unwrap();
-        let i2 = ones::<f32>(&[20, 20]).unwrap();
+        let i1 = ones::<f32>(&[20, 20], stream).unwrap();
+        let i2 = ones::<f32>(&[20, 20], stream).unwrap();
 
         // evaluate directly
         let r1 = f((&i1, &i2));
@@ -536,20 +587,23 @@ mod tests {
         let mut compiled = compile(f, None);
         let r2 = compiled((&i1, &i2)).unwrap();
 
-        assert_eq!(&r1, &r2);
+        assert!(crate::array::eval_equal_values(&r1, &r2));
 
         let r3 = compiled((&i1, &i2)).unwrap();
-        assert_eq!(&r1, &r3);
+        assert!(crate::array::eval_equal_values(&r1, &r3));
     }
 
     #[test]
     fn test_compile_with_three_args() {
-        let f = |(x, y, z): (&Array, &Array, &Array)| x * y * z;
+        let stream = crate::test_stream();
+        let f = move |(x, y, z): (&Array, &Array, &Array)| {
+            x.multiply(y, stream).unwrap().multiply(z, stream).unwrap()
+        };
         let mut compiled = compile(f, None);
 
-        let i1 = ones::<f32>(&[20, 20]).unwrap();
-        let i2 = ones::<f32>(&[20, 20]).unwrap();
-        let i3 = ones::<f32>(&[20, 20]).unwrap();
+        let i1 = ones::<f32>(&[20, 20], stream).unwrap();
+        let i2 = ones::<f32>(&[20, 20], stream).unwrap();
+        let i3 = ones::<f32>(&[20, 20], stream).unwrap();
 
         // evaluate directly
         let r1 = f((&i1, &i2, &i3));
@@ -557,9 +611,9 @@ mod tests {
         // evaluate compiled
         let r2 = compiled((&i1, &i2, &i3)).unwrap();
 
-        assert_eq!(&r1, &r2);
+        assert!(crate::array::eval_equal_values(&r1, &r2));
 
         let r3 = compiled((&i1, &i2, &i3)).unwrap();
-        assert_eq!(&r1, &r3);
+        assert!(crate::array::eval_equal_values(&r1, &r3));
     }
 }

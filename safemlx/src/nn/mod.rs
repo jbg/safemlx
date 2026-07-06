@@ -11,6 +11,7 @@ mod convolution;
 mod convolution_transpose;
 mod dropout;
 mod embedding;
+mod init;
 mod linear;
 mod normalization;
 mod pooling;

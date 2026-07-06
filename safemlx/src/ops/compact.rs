@@ -1,8 +1,8 @@
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::{
     error::{Exception, Result},
-    ops::{concatenate_axis_device, indexing::scatter_max_single_device, r#where_device},
+    ops::{concatenate_axis, indexing::scatter_max_single, r#where},
     Array, Dtype, Stream,
 };
 
@@ -23,7 +23,7 @@ fn bool_condition(mask: &Array, stream: impl AsRef<Stream>) -> Result<Array> {
     if mask.dtype() == Dtype::Bool {
         Ok(mask.clone())
     } else {
-        mask.ne_device(Array::from_int(0), stream)
+        mask.ne(Array::from_int(0), stream)
     }
 }
 
@@ -35,28 +35,24 @@ impl Array {
     /// Count non-zero entries and keep the result on device.
     ///
     /// Returns a scalar `i32` array.
-    #[default_device]
-    pub fn count_nonzero_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+    pub fn count_nonzero(&self, stream: impl AsRef<Stream>) -> Result<Array> {
         let stream = stream.as_ref();
         let condition = bool_condition(self, stream)?;
-        condition
-            .as_type_device::<i32>(stream)?
-            .sum_device(None, stream)
+        condition.as_type::<i32>(stream)?.sum(None, stream)
     }
 
     /// Compact flattened indices where `self` is non-zero.
     ///
     /// Returns a fixed-capacity `[self.size()]` `i32` index buffer and a scalar `i32`
     /// count. The first `count` entries are valid, and the rest are padded with `-1`.
-    #[default_device]
-    pub fn compact_indices_device(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
+    pub fn compact_indices(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
         let stream = stream.as_ref();
         let condition = bool_condition(self, stream)?;
-        let flat = condition.reshape_device(&[-1], stream)?;
+        let flat = condition.reshape(&[-1], stream)?;
         let n = checked_size_i32(&flat)?;
-        let flags = flat.as_type_device::<i32>(stream)?;
-        let count = flags.sum_device(None, stream)?;
-        let padded = Array::full_device::<i32>(&[n], Array::from_int(-1), stream)?;
+        let flags = flat.as_type::<i32>(stream)?;
+        let count = flags.sum(None, stream)?;
+        let padded = Array::full::<i32>(&[n], Array::from_int(-1), stream)?;
 
         if n == 0 {
             return Ok(CompactIndices {
@@ -65,16 +61,15 @@ impl Array {
             });
         }
 
-        let prefix = flags.cumsum_device(0, None, None, stream)?;
-        let positions = prefix.subtract_device(Array::from_int(1), stream)?;
-        let zero_positions = Array::zeros_device::<i32>(&[n], stream)?;
-        let scatter_positions = r#where_device(&flat, positions, zero_positions, stream)?;
+        let prefix = flags.cumsum(0, None, None, stream)?;
+        let positions = prefix.subtract(Array::from_int(1), stream)?;
+        let zero_positions = Array::zeros::<i32>(&[n], stream)?;
+        let scatter_positions = r#where(&flat, positions, zero_positions, stream)?;
 
-        let flat_indices = Array::arange_device::<_, i32>(None, n, None, stream)?;
-        let masked_indices = r#where_device(&flat, flat_indices, padded.clone(), stream)?
-            .reshape_device(&[n, 1], stream)?;
-        let indices =
-            scatter_max_single_device(padded, scatter_positions, masked_indices, 0, stream)?;
+        let flat_indices = Array::arange::<_, i32>(None, n, None, stream)?;
+        let masked_indices =
+            r#where(&flat, flat_indices, padded.clone(), stream)?.reshape(&[n, 1], stream)?;
+        let indices = scatter_max_single(padded, scatter_positions, masked_indices, 0, stream)?;
 
         Ok(CompactIndices { indices, count })
     }
@@ -83,9 +78,8 @@ impl Array {
     ///
     /// This is a fixed-capacity device-side form of `nonzero`; inspect only the
     /// first `count` entries of the returned `indices`.
-    #[default_device]
-    pub fn nonzero_device(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
-        self.compact_indices_device(stream)
+    pub fn nonzero(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
+        self.compact_indices(stream)
     }
 
     /// Return padded coordinate rows where `self` is non-zero.
@@ -93,38 +87,37 @@ impl Array {
     /// Returns a fixed-capacity `[self.size(), self.ndim()]` `i32` coordinate
     /// buffer and a scalar `i32` count. The first `count` rows are valid, and
     /// remaining rows are padded with `-1`.
-    #[default_device]
-    pub fn argwhere_device(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
+    pub fn argwhere(&self, stream: impl AsRef<Stream>) -> Result<CompactIndices> {
         let stream = stream.as_ref();
-        let flat = self.compact_indices_device(stream)?;
+        let flat = self.compact_indices(stream)?;
         let n = checked_size_i32(self)?;
         let rank = i32::try_from(self.ndim())
             .map_err(|_| Exception::from("array rank is too large to compact as i32"))?;
 
         if rank == 0 {
-            let indices = Array::full_device::<i32>(&[n, 0], Array::from_int(-1), stream)?;
+            let indices = Array::full::<i32>(&[n, 0], Array::from_int(-1), stream)?;
             return Ok(CompactIndices {
                 indices,
                 count: flat.count,
             });
         }
 
-        let valid = flat.indices.ge_device(Array::from_int(0), stream)?;
-        let safe_flat = r#where_device(
+        let valid = flat.indices.ge(Array::from_int(0), stream)?;
+        let safe_flat = r#where(
             &valid,
             flat.indices.clone(),
-            Array::zeros_device::<i32>(&[n], stream)?,
+            Array::zeros::<i32>(&[n], stream)?,
             stream,
         )?;
-        let padding = Array::full_device::<i32>(&[n], Array::from_int(-1), stream)?;
+        let padding = Array::full::<i32>(&[n], Array::from_int(-1), stream)?;
 
         let mut stride = 1;
         let mut coords = Vec::with_capacity(self.ndim());
         for &dim in self.shape().iter().rev() {
             let coord = safe_flat
-                .floor_divide_device(Array::from_int(stride), stream)?
-                .remainder_device(Array::from_int(dim), stream)?;
-            coords.push(r#where_device(&valid, coord, padding.clone(), stream)?);
+                .floor_divide(Array::from_int(stride), stream)?
+                .remainder(Array::from_int(dim), stream)?;
+            coords.push(r#where(&valid, coord, padding.clone(), stream)?);
             stride = stride
                 .checked_mul(dim)
                 .ok_or_else(|| Exception::from("array shape is too large to compact as i32"))?;
@@ -133,9 +126,9 @@ impl Array {
 
         let coord_cols = coords
             .iter()
-            .map(|coord| coord.expand_dims_device(1, stream))
+            .map(|coord| coord.expand_dims(1, stream))
             .collect::<Result<Vec<_>>>()?;
-        let indices = concatenate_axis_device(&coord_cols, 1, stream)?;
+        let indices = concatenate_axis(&coord_cols, 1, stream)?;
 
         Ok(CompactIndices {
             indices,
@@ -146,42 +139,38 @@ impl Array {
 
 /// See [`Array::count_nonzero`].
 #[generate_macro]
-#[default_device]
-pub fn count_nonzero_device(
+pub fn count_nonzero(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    a.as_ref().count_nonzero_device(stream)
+    a.as_ref().count_nonzero(stream)
 }
 
 /// See [`Array::compact_indices`].
 #[generate_macro]
-#[default_device]
-pub fn compact_indices_device(
+pub fn compact_indices(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<CompactIndices> {
-    a.as_ref().compact_indices_device(stream)
+    a.as_ref().compact_indices(stream)
 }
 
 /// See [`Array::nonzero`].
 #[generate_macro]
-#[default_device]
-pub fn nonzero_device(
+pub fn nonzero(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<CompactIndices> {
-    a.as_ref().nonzero_device(stream)
+    a.as_ref().nonzero(stream)
 }
 
 /// See [`Array::argwhere`].
 #[generate_macro]
-#[default_device]
-pub fn argwhere_device(
+pub fn argwhere(
     a: impl AsRef<Array>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<CompactIndices> {
-    a.as_ref().argwhere_device(stream)
+    a.as_ref().argwhere(stream)
 }
 
 #[cfg(test)]
@@ -191,61 +180,71 @@ mod tests {
 
     #[test]
     fn test_count_nonzero_bool() {
+        let stream = crate::test_stream();
         let mask = array!([true, false, true, true]);
-        let count = count_nonzero(&mask).unwrap();
-        assert_eq!(count.item::<i32>(), 3);
+        let count = count_nonzero(&mask, stream).unwrap();
+        assert_eq!(count.item::<i32>(&stream), 3);
     }
 
     #[test]
     fn test_count_nonzero_numeric() {
+        let stream = crate::test_stream();
         let mask = array!([0, 4, -2, 0]);
-        let count = count_nonzero(&mask).unwrap();
-        assert_eq!(count.item::<i32>(), 2);
+        let count = count_nonzero(&mask, stream).unwrap();
+        assert_eq!(count.item::<i32>(&stream), 2);
     }
 
     #[test]
     fn test_compact_indices() {
+        let stream = crate::test_stream();
         let mask = array!([false, true, false, true, true, false]);
-        let out = compact_indices(&mask).unwrap();
-        assert_eq!(out.count.item::<i32>(), 3);
+        let out = compact_indices(&mask, stream).unwrap();
+        assert_eq!(out.count.item::<i32>(&stream), 3);
         assert_eq!(out.indices.shape(), &[6]);
-        assert_eq!(out.indices.as_slice::<i32>(), &[1, 3, 4, -1, -1, -1]);
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&out.indices),
+            &[1, 3, 4, -1, -1, -1]
+        );
     }
 
     #[test]
     fn test_compact_indices_empty_mask() {
+        let stream = crate::test_stream();
         let mask = Array::from_slice::<bool>(&[], &[0]);
-        let out = compact_indices(&mask).unwrap();
-        assert_eq!(out.count.item::<i32>(), 0);
+        let out = compact_indices(&mask, stream).unwrap();
+        assert_eq!(out.count.item::<i32>(&stream), 0);
         assert_eq!(out.indices.shape(), &[0]);
         assert_eq!(out.indices.size(), 0);
     }
 
     #[test]
     fn test_compact_indices_all_false() {
+        let stream = crate::test_stream();
         let mask = array!([false, false, false]);
-        let out = compact_indices(&mask).unwrap();
-        assert_eq!(out.count.item::<i32>(), 0);
-        assert_eq!(out.indices.as_slice::<i32>(), &[-1, -1, -1]);
+        let out = compact_indices(&mask, stream).unwrap();
+        assert_eq!(out.count.item::<i32>(&stream), 0);
+        assert_eq!(crate::array::eval_vec::<i32>(&out.indices), &[-1, -1, -1]);
     }
 
     #[test]
     fn test_argwhere_1d() {
+        let stream = crate::test_stream();
         let mask = array!([false, true, false, true]);
-        let out = argwhere(&mask).unwrap();
-        assert_eq!(out.count.item::<i32>(), 2);
+        let out = argwhere(&mask, stream).unwrap();
+        assert_eq!(out.count.item::<i32>(&stream), 2);
         assert_eq!(out.indices.shape(), &[4, 1]);
-        assert_eq!(out.indices.as_slice::<i32>(), &[1, 3, -1, -1]);
+        assert_eq!(crate::array::eval_vec::<i32>(&out.indices), &[1, 3, -1, -1]);
     }
 
     #[test]
     fn test_argwhere_2d() {
+        let stream = crate::test_stream();
         let mask = array!([[true, false, true], [false, true, false]]);
-        let out = argwhere(&mask).unwrap();
-        assert_eq!(out.count.item::<i32>(), 3);
+        let out = argwhere(&mask, stream).unwrap();
+        assert_eq!(out.count.item::<i32>(&stream), 3);
         assert_eq!(out.indices.shape(), &[6, 2]);
         assert_eq!(
-            out.indices.as_slice::<i32>(),
+            crate::array::eval_vec::<i32>(&out.indices),
             &[0, 0, 0, 2, 1, 1, -1, -1, -1, -1, -1, -1]
         );
     }

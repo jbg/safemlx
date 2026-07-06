@@ -1,4 +1,4 @@
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::{
     array::Array,
@@ -20,8 +20,7 @@ const DEFAULT_NORM: safemlx_sys::mlx_fft_norm = safemlx_sys::mlx_fft_norm__MLX_F
 ///   with zeros to match `n`. The default value is `a.shape[axis]`.
 /// - `axis`: Axis along which to perform the FFT. The default is -1.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn fft_device(
+pub fn fft(
     a: impl AsRef<Array>,
     #[optional] n: impl Into<Option<i32>>,
     #[optional] axis: impl Into<Option<i32>>,
@@ -50,8 +49,7 @@ pub fn fft_device(
 /// with zeros to match `s`. The default value is the sizes of `a` along `axes`.
 /// - `axes`: Axes along which to perform the FFT. The default is `[-2, -1]`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn fft2_device<'a>(
+pub fn fft2<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -92,8 +90,7 @@ pub fn fft2_device<'a>(
 /// - `axes`: Axes along which to perform the FFT. The default is `None` in which case the FFT is
 /// over the last `len(s)` axes are or all axes if `s` is also `None`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn fftn_device<'a>(
+pub fn fftn<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -130,8 +127,7 @@ pub fn fftn_device<'a>(
 ///  with zeros to match `n`. The default value is `a.shape[axis]` if not specified.
 /// - `axis`: Axis along which to perform the FFT. The default is `-1` if not specified.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn ifft_device(
+pub fn ifft(
     a: impl AsRef<Array>,
     #[optional] n: impl Into<Option<i32>>,
     #[optional] axis: impl Into<Option<i32>>,
@@ -161,8 +157,7 @@ pub fn ifft_device(
 /// with zeros to match `s`. The default value is the sizes of `a` along `axes`.
 /// - `axes`: Axes along which to perform the FFT. The default is `[-2, -1]`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn ifft2_device<'a>(
+pub fn ifft2<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -203,8 +198,7 @@ pub fn ifft2_device<'a>(
 /// - `axes`: Axes along which to perform the FFT. The default is `None` in which case the FFT is
 /// over the last `len(s)` axes are or all axes if `s` is also `None`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn ifftn_device<'a>(
+pub fn ifftn<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -238,6 +232,7 @@ mod tests {
 
     #[test]
     fn test_fft() {
+        let stream = crate::test_stream();
         const FFT_DATA: &[f32] = &[1.0, 2.0, 3.0, 4.0];
         const FFT_SHAPE: &[i32] = &[4];
         const FFT_EXPECTED: &[complex64; 4] = &[
@@ -248,16 +243,16 @@ mod tests {
         ];
 
         let array = Array::from_slice(FFT_DATA, FFT_SHAPE);
-        let fft = fft(&array, None, None).unwrap();
+        let fft = fft(&array, None, None, stream).unwrap();
 
         assert_eq!(fft.dtype(), Dtype::Complex64);
-        assert_eq!(fft.as_slice::<complex64>(), FFT_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&fft), FFT_EXPECTED);
 
-        let ifft = ifft(&fft, None, None).unwrap();
+        let ifft = ifft(&fft, None, None, stream).unwrap();
 
         assert_eq!(ifft.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifft.as_slice::<complex64>(),
+            crate::array::eval_vec::<complex64>(&ifft),
             FFT_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))
@@ -265,12 +260,13 @@ mod tests {
         );
 
         // The original array is not modified and valid
-        let data: &[f32] = array.as_slice();
+        let data: Vec<f32> = crate::array::eval_vec(&array);
         assert_eq!(data, FFT_DATA);
     }
 
     #[test]
     fn test_fft2() {
+        let stream = crate::test_stream();
         const FFT2_DATA: &[f32] = &[1.0, 1.0, 1.0, 1.0];
         const FFT2_SHAPE: &[i32] = &[2, 2];
         const FFT2_EXPECTED: &[complex64; 4] = &[
@@ -281,16 +277,16 @@ mod tests {
         ];
 
         let array = Array::from_slice(FFT2_DATA, FFT2_SHAPE);
-        let fft2 = fft2(&array, None, None).unwrap();
+        let fft2 = fft2(&array, None, None, stream).unwrap();
 
         assert_eq!(fft2.dtype(), Dtype::Complex64);
-        assert_eq!(fft2.as_slice::<complex64>(), FFT2_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&fft2), FFT2_EXPECTED);
 
-        let ifft2 = ifft2(&fft2, None, None).unwrap();
+        let ifft2 = ifft2(&fft2, None, None, stream).unwrap();
 
         assert_eq!(ifft2.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifft2.as_slice::<complex64>(),
+            crate::array::eval_vec::<complex64>(&ifft2),
             FFT2_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))
@@ -298,12 +294,13 @@ mod tests {
         );
 
         // test that previous array is not modified and valid
-        let data: &[f32] = array.as_slice();
+        let data: Vec<f32> = crate::array::eval_vec(&array);
         assert_eq!(data, FFT2_DATA);
     }
 
     #[test]
     fn test_fftn() {
+        let stream = crate::test_stream();
         const FFTN_DATA: &[f32] = &[1.0; 8];
         const FFTN_SHAPE: &[i32] = &[2, 2, 2];
         const FFTN_EXPECTED: &[complex64; 8] = &[
@@ -318,16 +315,16 @@ mod tests {
         ];
 
         let array = Array::from_slice(FFTN_DATA, FFTN_SHAPE);
-        let fftn = fftn(&array, None, None).unwrap();
+        let fftn = fftn(&array, None, None, stream).unwrap();
 
         assert_eq!(fftn.dtype(), Dtype::Complex64);
-        assert_eq!(fftn.as_slice::<complex64>(), FFTN_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&fftn), FFTN_EXPECTED);
 
-        let ifftn = ifftn(&fftn, FFTN_SHAPE, &[0, 1, 2]).unwrap();
+        let ifftn = ifftn(&fftn, FFTN_SHAPE, &[0, 1, 2], stream).unwrap();
 
         assert_eq!(ifftn.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifftn.as_slice::<complex64>(),
+            crate::array::eval_vec::<complex64>(&ifftn),
             FFTN_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))
@@ -335,7 +332,7 @@ mod tests {
         );
 
         // test that previous array is not modified and valid
-        let data: &[f32] = array.as_slice();
+        let data: Vec<f32> = crate::array::eval_vec(&array);
         assert_eq!(data, FFTN_DATA);
     }
 }

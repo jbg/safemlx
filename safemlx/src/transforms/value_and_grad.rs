@@ -4,13 +4,14 @@ use crate::{
     Array,
 };
 
-use super::{value_and_gradient, ClosureValueAndGrad};
+use super::{transform_guard, value_and_gradient, ClosureValueAndGrad};
 
 fn build_value_and_gradient_inner<'a>(
     closure: Closure<'a>,
     argnums: &'a [i32],
 ) -> impl FnMut(&[Array]) -> Result<(Vec<Array>, Vec<Array>)> + 'a {
     move |arrays: &[Array]| unsafe {
+        let _transform_guard = transform_guard::enter();
         let cvg = ClosureValueAndGrad::try_from_op(|res| {
             safemlx_sys::mlx_value_and_grad(res, closure.as_ptr(), argnums.as_ptr(), argnums.len())
         })?;
@@ -118,22 +119,26 @@ mod tests {
     // The unit tests below are adapted from the mlx c++ codebase
     #[test]
     fn test_value_and_grad() {
+        let stream = crate::test_stream();
         let x = &[Array::from_f32(1.0)];
-        let fun = |argin: &[Array]| -> Vec<Array> { vec![&argin[0] + 1.0] };
+        let fun = move |argin: &[Array]| -> Vec<Array> {
+            vec![argin[0].add(Array::from_f32(1.0), stream).unwrap()]
+        };
         let argnums = &[0];
         let (y, dfdx) = value_and_grad_with_argnums(fun, argnums)(x).unwrap();
-        assert_eq!(y[0].item::<f32>(), 2.0);
-        assert_eq!(dfdx[0].item::<f32>(), 1.0);
+        assert_eq!(y[0].clone().item::<f32>(&stream), 2.0);
+        assert_eq!(dfdx[0].clone().item::<f32>(&stream), 1.0);
 
         let (y, dfdx) = value_and_grad(fun)(x).unwrap();
-        assert_eq!(y[0].item::<f32>(), 2.0);
-        assert_eq!(dfdx[0].item::<f32>(), 1.0);
+        assert_eq!(y[0].clone().item::<f32>(&stream), 2.0);
+        assert_eq!(dfdx[0].clone().item::<f32>(&stream), 1.0);
     }
 
     #[test]
     fn test_value_and_grad_with_error() {
-        let fun = |argin: &[Array]| -> Result<Vec<Array>> {
-            argin[0].add(array!(1.0)).map(|res| vec![res])
+        let stream = crate::test_stream();
+        let fun = move |argin: &[Array]| -> Result<Vec<Array>> {
+            argin[0].add(array!(1.0), stream).map(|res| vec![res])
         };
 
         // Success case

@@ -36,15 +36,10 @@ fn build_linear(builder: LinearBuilder) -> Result<Linear, Exception> {
     let with_bias = builder.bias;
 
     let scale = f32::sqrt(1.0 / (input_dims as f32));
-    let weight = crate::random::uniform::<_, f32>(-scale, scale, &[output_dims, input_dims], None)?;
+    let weight = super::init::uniform(-scale, scale, &[output_dims, input_dims]);
 
     let bias = if with_bias {
-        Some(crate::random::uniform::<_, f32>(
-            -scale,
-            scale,
-            &[output_dims],
-            None,
-        )?)
+        Some(super::init::uniform(-scale, scale, &[output_dims]))
     } else {
         None
     };
@@ -84,10 +79,11 @@ impl Module<&Array> for Linear {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+        let weight_t = self.weight.value.transpose(stream)?;
         match &self.bias.value {
-            Some(bias) => crate::ops::addmm(bias, x, self.weight.value.t(), None, None),
-            None => crate::ops::matmul(x, self.weight.value.t()),
+            Some(bias) => crate::ops::addmm(bias, x, &weight_t, None, None, stream),
+            None => crate::ops::matmul(x, &weight_t, stream),
         }
     }
 
@@ -102,8 +98,9 @@ impl Quantizable for Linear {
         self,
         group_size: i32,
         bits: i32,
+        stream: &crate::Stream,
     ) -> Result<Self::Quantized, Self::QuantizationError> {
-        QuantizedLinear::try_from_linear(self, group_size, bits)
+        QuantizedLinear::try_from_linear(self, group_size, bits, stream)
     }
 }
 
@@ -136,20 +133,10 @@ fn build_bilinear(builder: BilinearBuilder) -> Result<Bilinear, Exception> {
     let with_bias = builder.bias;
 
     let scale = f32::sqrt(1.0 / (input_dims_1 as f32));
-    let weights = crate::random::uniform::<_, f32>(
-        -scale,
-        scale,
-        &[output_dims, input_dims_2, input_dims_1],
-        None,
-    )?;
+    let weights = super::init::uniform(-scale, scale, &[output_dims, input_dims_2, input_dims_1]);
 
     let bias = if with_bias {
-        Some(crate::random::uniform::<_, f32>(
-            -scale,
-            scale,
-            &[output_dims],
-            None,
-        )?)
+        Some(super::init::uniform(-scale, scale, &[output_dims]))
     } else {
         None
     };
@@ -183,26 +170,28 @@ impl Module<&Array> for Bilinear {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let shape = self.weights.shape();
         let (out, in2, in1) = (shape[0], shape[1], shape[2]);
         let x_shape = &x.shape()[..x.shape().len() - 1];
-        let x1 = x.reshape(&[-1, in1])?;
-        let x2 = x.reshape(&[-1, 1, in2])?;
+        let x1 = x.reshape(&[-1, in1], stream)?;
+        let x2 = x.reshape(&[-1, 1, in2], stream)?;
 
         // perform the bilinear transform
-        let w = self.weights.reshape(&[out * in2, in1])?;
-        let mut y = crate::ops::matmul(&x1, w.t())?;
-        y = y.reshape(&[-1, out, in2])?.swap_axes(-2, -1)?;
-        y = crate::ops::matmul(&x2, &y)?;
-        y = y.squeeze_axes(&[1])?;
+        let w = self.weights.reshape(&[out * in2, in1], stream)?;
+        let mut y = crate::ops::matmul(&x1, w.transpose(stream)?, stream)?;
+        y = y
+            .reshape(&[-1, out, in2], stream)?
+            .swap_axes(-2, -1, stream)?;
+        y = crate::ops::matmul(&x2, &y, stream)?;
+        y = y.squeeze_axes(&[1], stream)?;
 
         // reset the shape
         let new_shape = x_shape.iter().cloned().chain(once(out)).collect::<Vec<_>>();
-        y = y.reshape(&new_shape)?;
+        y = y.reshape(&new_shape, stream)?;
 
         if let Some(bias) = &self.bias.value {
-            y = crate::ops::add(&y, bias)?;
+            y = crate::ops::add(&y, bias, stream)?;
         }
 
         Ok(y)
@@ -222,32 +211,33 @@ mod tests {
 
     #[test]
     fn test_linear() {
-        crate::random::seed(744).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(744, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.508_688_57,
             abs <= 0.010_173_771_5
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             130.224_27,
             abs <= 2.604_485_5
         );
-        let result = Linear::new(16, 5).unwrap().forward(&a).unwrap();
+        let result = Linear::new(16, 5).unwrap().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 5]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
-            0.104_193_09,
-            abs <= 0.002_083_861_7
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
+            0.020_411_247,
+            abs <= 0.000_408_224_94
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
-            8.335_447,
-            abs <= 0.166_708_95
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
+            1.632_899_8,
+            abs <= 0.032_657_996
         );
     }
 }

@@ -1,4 +1,7 @@
-use safemlx::{error::Exception, macros::ModuleParameters, module::Module, nn::Linear, Array};
+use safemlx::{
+    error::Exception, macros::ModuleParameters, module::Module, nn::Linear, Array,
+    ExecutionContext, Stream,
+};
 
 #[derive(Debug, ModuleParameters)]
 struct M {
@@ -18,8 +21,8 @@ impl Module<&Array> for M {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
-        self.linear.forward(x)
+    fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Self::Error> {
+        self.linear.forward(x, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -28,7 +31,10 @@ impl Module<&Array> for M {
 #[test]
 fn test_nested_module() {
     let mut m = M::new();
-    let x = safemlx::random::uniform::<_, f32>(1.0, 2.0, &[1, 5], None).unwrap();
-    let y = m.forward(&x).unwrap();
-    assert_ne!(y.sum(None).unwrap(), safemlx::array!(0.0));
+    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let stream = ctx.stream();
+    let key = safemlx::random::key(0).unwrap();
+    let x = safemlx::random::uniform::<_, f32>(1.0, 2.0, &[1, 5], &key, stream).unwrap();
+    let y = m.forward(&x, stream).unwrap();
+    assert_ne!(y.sum(None, stream).unwrap().item::<f32>(stream), 0.0);
 }

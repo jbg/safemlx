@@ -15,11 +15,11 @@ use safemlx::{
     ops::{
         argpartition_axis, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows,
         gather_route_values, grouped_matmul,
-        indexing::{take_along_axis, IndexOp, NewAxis},
+        indexing::{take_along_axis, NewAxis, TryIndexOp},
         matmul, segment_sum_by_index, sigmoid, softmax_axis, sum_axis, topk_route_plan, zeros,
     },
     transforms::eval,
-    Array, Dtype,
+    Array, Dtype, Stream,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -410,31 +410,31 @@ impl Cache {
             .unwrap_or(0)
     }
 
-    fn prefill_state_dependency(&self) -> Result<Option<Array>, Exception> {
+    fn prefill_state_dependency(&self, stream: &Stream) -> Result<Option<Array>, Exception> {
         let mut dependency: Option<Array> = None;
         for layer in &self.layers {
             match layer {
                 LayerCache::FullAttention(cache) => {
                     for array in cache.arrays() {
-                        let term = array.sum(None)?;
+                        let term = array.sum(None, stream)?;
                         dependency = Some(match dependency {
-                            Some(acc) => acc.add(term)?,
+                            Some(acc) => acc.add(term, stream)?,
                             None => term,
                         });
                     }
                 }
                 LayerCache::LinearAttention(cache) => {
                     if let Some(conv_state) = &cache.conv_state {
-                        let term = conv_state.sum(None)?;
+                        let term = conv_state.sum(None, stream)?;
                         dependency = Some(match dependency {
-                            Some(acc) => acc.add(term)?,
+                            Some(acc) => acc.add(term, stream)?,
                             None => term,
                         });
                     }
                     if let Some(recurrent_state) = &cache.recurrent_state {
-                        let term = recurrent_state.sum(None)?;
+                        let term = recurrent_state.sum(None, stream)?;
                         dependency = Some(match dependency {
-                            Some(acc) => acc.add(term)?,
+                            Some(acc) => acc.add(term, stream)?,
                             None => term,
                         });
                     }
@@ -442,7 +442,7 @@ impl Cache {
             }
         }
         dependency
-            .map(|dependency| dependency.multiply(Array::from_f32(0.0)))
+            .map(|dependency| dependency.multiply(Array::from_f32(0.0), stream))
             .transpose()
     }
 }
@@ -470,18 +470,19 @@ pub struct Qwen3NextRmsNorm {
 impl Qwen3NextRmsNorm {
     pub fn new(dim: i32, eps: f32) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::zeros::<f32>(&[dim])?),
+            weight: Param::new(Array::from_slice(&vec![0.0f32; dim as usize], &[dim])),
             eps,
         })
     }
 
-    pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        let variance = safemlx::ops::mean_axis(&x.square()?, -1, true)?;
-        let normalized = x.multiply(safemlx::ops::rsqrt(
-            variance.add(Array::from_f32(self.eps))?,
-        )?)?;
-        let scale = self.weight.as_ref().add(Array::from_f32(1.0))?;
-        normalized.multiply(scale)
+    pub fn forward(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let variance = safemlx::ops::mean_axis(&x.square(stream)?, -1, true, stream)?;
+        let normalized = x.multiply(
+            safemlx::ops::rsqrt(variance.add(Array::from_f32(self.eps), stream)?, stream)?,
+            stream,
+        )?;
+        let scale = self.weight.as_ref().add(Array::from_f32(1.0), stream)?;
+        normalized.multiply(scale, stream)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -497,19 +498,20 @@ pub struct Qwen3NextRmsNormGated {
 impl Qwen3NextRmsNormGated {
     pub fn new(dim: i32, eps: f32) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::ones::<f32>(&[dim])?),
+            weight: Param::new(Array::from_slice(&vec![1.0f32; dim as usize], &[dim])),
             eps,
         })
     }
 
-    pub fn forward(&self, x: &Array, gate: &Array) -> Result<Array, Exception> {
-        let variance = safemlx::ops::mean_axis(&x.square()?, -1, true)?;
-        let normalized = x.multiply(safemlx::ops::rsqrt(
-            variance.add(Array::from_f32(self.eps))?,
-        )?)?;
+    pub fn forward(&self, x: &Array, gate: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let variance = safemlx::ops::mean_axis(&x.square(stream)?, -1, true, stream)?;
+        let normalized = x.multiply(
+            safemlx::ops::rsqrt(variance.add(Array::from_f32(self.eps), stream)?, stream)?,
+            stream,
+        )?;
         normalized
-            .multiply(&*self.weight)?
-            .multiply(silu(gate.clone())?)
+            .multiply(&*self.weight, stream)?
+            .multiply(silu(gate.clone(), stream)?, stream)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -538,7 +540,7 @@ pub struct FullAttention {
 }
 
 impl FullAttention {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let hidden = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
@@ -562,6 +564,7 @@ impl FullAttention {
             false,
             &rope_config,
             args.max_position_embeddings,
+            stream,
         )?;
         Ok(Self {
             n_heads,
@@ -590,57 +593,66 @@ impl Module<FullAttentionInput<'_>> for FullAttention {
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: FullAttentionInput<'_>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: FullAttentionInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let FullAttentionInput { x, mask, mut cache } = input;
         let shape = x.shape();
         let B = shape[0];
         let L = shape[1];
         let q_proj = self
             .q_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_heads, 2 * self.head_dim])?;
-        let query = q_proj.index((.., .., .., ..self.head_dim));
-        let gate = q_proj.index((.., .., .., self.head_dim..)).reshape(&[
-            B,
-            L,
-            self.n_heads * self.head_dim,
-        ])?;
-        let mut query = self.q_norm.forward(&query)?.transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x, stream)?
+            .reshape(&[B, L, self.n_heads, 2 * self.head_dim], stream)?;
+        let query = q_proj.try_index_device((.., .., .., ..self.head_dim), stream)?;
+        let gate = q_proj
+            .try_index_device((.., .., .., self.head_dim..), stream)?
+            .reshape(&[B, L, self.n_heads * self.head_dim], stream)?;
+        let mut query = self
+            .q_norm
+            .forward(&query, stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
         let mut key = self
             .k_norm
             .forward(
                 &self
                     .k_proj
-                    .forward(x)?
-                    .reshape(&[B, L, self.n_kv_heads, self.head_dim])?,
+                    .forward(x, stream)?
+                    .reshape(&[B, L, self.n_kv_heads, self.head_dim], stream)?,
+                stream,
             )?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
         let mut value = self
             .v_proj
-            .forward(x)?
-            .reshape(&[B, L, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x, stream)?
+            .reshape(&[B, L, self.n_kv_heads, self.head_dim], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
 
         if let Some(cache) = cache.as_mut() {
             let offset = cache.offset();
-            query = self
-                .rope
-                .forward(nn::RopeInputBuilder::new(&query).offset(offset).build()?)?;
-            key = self
-                .rope
-                .forward(nn::RopeInputBuilder::new(&key).offset(offset).build()?)?;
-            (key, value) = cache.update_and_fetch(key, value)?;
+            query = self.rope.forward(
+                nn::RopeInputBuilder::new(&query).offset(offset).build()?,
+                stream,
+            )?;
+            key = self.rope.forward(
+                nn::RopeInputBuilder::new(&key).offset(offset).build()?,
+                stream,
+            )?;
+            (key, value) = cache.update_and_fetch(key, value, stream)?;
         } else {
-            query = self.rope.forward(nn::RopeInput::new(&query))?;
-            key = self.rope.forward(nn::RopeInput::new(&key))?;
+            query = self.rope.forward(nn::RopeInput::new(&query), stream)?;
+            key = self.rope.forward(nn::RopeInput::new(&key), stream)?;
         }
 
-        let out =
-            crate::utils::scaled_dot_product_attention(query, key, value, cache, self.scale, mask)?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?
-                .multiply(sigmoid(gate)?)?;
-        self.o_proj.forward(&out)
+        let out = crate::utils::scaled_dot_product_attention(
+            query, key, value, cache, self.scale, mask, stream,
+        )?
+        .transpose_axes(&[0, 2, 1, 3], stream)?
+        .reshape(&[B, L, -1], stream)?
+        .multiply(sigmoid(gate, stream)?, stream)?;
+        self.o_proj.forward(&out, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -663,7 +675,10 @@ pub struct DepthwiseConv1d {
 impl DepthwiseConv1d {
     pub fn new(channels: i32, kernel_size: i32) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::zeros::<f32>(&[channels, 1, kernel_size])?),
+            weight: Param::new(Array::from_slice(
+                &vec![0.0f32; (channels * kernel_size) as usize],
+                &[channels, 1, kernel_size],
+            )),
         })
     }
 }
@@ -731,8 +746,14 @@ impl LinearAttention {
             in_proj_a: nn::LinearBuilder::new(args.hidden_size, num_v_heads)
                 .bias(false)
                 .build()?,
-            dt_bias: Param::new(Array::ones::<f32>(&[num_v_heads])?),
-            A_log: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
+            dt_bias: Param::new(Array::from_slice(
+                &vec![1.0f32; num_v_heads as usize],
+                &[num_v_heads],
+            )),
+            A_log: Param::new(Array::from_slice(
+                &vec![0.0f32; num_v_heads as usize],
+                &[num_v_heads],
+            )),
             norm: Qwen3NextRmsNormGated::new(head_v_dim, args.rms_norm_eps)?,
             out_proj: nn::LinearBuilder::new(value_dim, args.hidden_size)
                 .bias(false)
@@ -745,6 +766,7 @@ impl LinearAttention {
         &self,
         mixed_qkv: &Array,
         cache: Option<&mut LinearAttentionCache>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let shape = mixed_qkv.shape();
         let B = shape[0];
@@ -754,35 +776,40 @@ impl LinearAttention {
         let state = cache
             .as_ref()
             .and_then(|cache| cache.conv_state.clone())
-            .unwrap_or(zeros::<f32>(&[B, state_len, C])?);
-        let padded = concatenate_axis(&[state, mixed_qkv.clone()], 1)?;
+            .unwrap_or(zeros::<f32>(&[B, state_len, C], stream)?);
+        let padded = concatenate_axis(&[state, mixed_qkv.clone()], 1, stream)?;
         if let Some(cache) = cache {
-            cache.conv_state = Some(padded.index((.., L.., ..)));
+            cache.conv_state = Some(padded.try_index_device((.., L.., ..), stream)?);
             cache.offset += L;
         }
 
         if L > 1 {
-            let weight = self.conv1d.weight.swap_axes(1, 2)?;
-            let out = conv1d(&padded, &weight, Some(1), Some(0), Some(1), Some(C))?;
-            return silu(out);
+            let weight = self.conv1d.weight.swap_axes(1, 2, stream)?;
+            let out = conv1d(&padded, &weight, Some(1), Some(0), Some(1), Some(C), stream)?;
+            return silu(out, stream);
         }
 
         let mut out: Option<Array> = None;
         for k in 0..self.conv_kernel_size {
-            let window = padded.index((.., k..k + L, ..));
-            let weight = self.conv1d.weight.index((.., 0, k)).reshape(&[1, 1, C])?;
-            let term = window.multiply(weight)?;
+            let window = padded.try_index_device((.., k..k + L, ..), stream)?;
+            let weight = self
+                .conv1d
+                .weight
+                .try_index_device((.., 0, k), stream)?
+                .reshape(&[1, 1, C], stream)?;
+            let term = window.multiply(weight, stream)?;
             out = Some(match out {
-                Some(acc) => acc.add(term)?,
+                Some(acc) => acc.add(term, stream)?,
                 None => term,
             });
         }
-        silu(out.expect("conv kernel must have at least one tap"))
+        silu(out.expect("conv kernel must have at least one tap"), stream)
     }
 
-    fn l2norm(x: Array) -> Result<Array, Exception> {
-        let denom = sum_axis(&x.square()?, -1, true)?.add(Array::from_f32(1e-6))?;
-        x.multiply(safemlx::ops::rsqrt(denom)?)
+    fn l2norm(x: Array, stream: &Stream) -> Result<Array, Exception> {
+        let denom =
+            sum_axis(&x.square(stream)?, -1, true, stream)?.add(Array::from_f32(1e-6), stream)?;
+        x.multiply(safemlx::ops::rsqrt(denom, stream)?, stream)
     }
 
     fn recurrent_delta_kernels() -> Result<RecurrentScanKernel, Exception> {
@@ -866,18 +893,19 @@ impl LinearAttention {
         value: &Array,
         g: &Array,
         beta: &Array,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let shape = state.shape();
         let b = shape[0];
         let h = shape[1];
         let kd = shape[2];
         let vd = shape[3];
-        let state = state.as_dtype(Dtype::Float32)?;
-        let query = query.as_dtype(Dtype::Float32)?;
-        let key = key.as_dtype(Dtype::Float32)?;
-        let value = value.as_dtype(Dtype::Float32)?;
-        let g = g.as_dtype(Dtype::Float32)?;
-        let beta = beta.as_dtype(Dtype::Float32)?;
+        let state = state.as_dtype(Dtype::Float32, stream)?;
+        let query = query.as_dtype(Dtype::Float32, stream)?;
+        let key = key.as_dtype(Dtype::Float32, stream)?;
+        let value = value.as_dtype(Dtype::Float32, stream)?;
+        let g = g.as_dtype(Dtype::Float32, stream)?;
+        let beta = beta.as_dtype(Dtype::Float32, stream)?;
 
         let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -893,7 +921,7 @@ impl LinearAttention {
             cell.borrow()
                 .as_ref()
                 .expect("recurrent delta kernels initialized")
-                .decode([&state, &query, &key, &value, &g, &beta], &config)
+                .decode_device([&state, &query, &key, &value, &g, &beta], &config, stream)
         })?;
 
         let (out, state) = output.into_tuple();
@@ -907,6 +935,7 @@ impl LinearAttention {
         value: &Array,
         g: &Array,
         beta: &Array,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let shape = query.shape();
         let b = shape[0];
@@ -914,12 +943,12 @@ impl LinearAttention {
         let h = shape[2];
         let kd = shape[3];
         let vd = value.shape()[3];
-        let state = state.as_dtype(Dtype::Float32)?;
-        let query = query.as_dtype(Dtype::Float32)?;
-        let key = key.as_dtype(Dtype::Float32)?;
-        let value = value.as_dtype(Dtype::Float32)?;
-        let g = g.as_dtype(Dtype::Float32)?;
-        let beta = beta.as_dtype(Dtype::Float32)?;
+        let state = state.as_dtype(Dtype::Float32, stream)?;
+        let query = query.as_dtype(Dtype::Float32, stream)?;
+        let key = key.as_dtype(Dtype::Float32, stream)?;
+        let value = value.as_dtype(Dtype::Float32, stream)?;
+        let g = g.as_dtype(Dtype::Float32, stream)?;
+        let beta = beta.as_dtype(Dtype::Float32, stream)?;
 
         let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -937,7 +966,7 @@ impl LinearAttention {
             cell.borrow()
                 .as_ref()
                 .expect("recurrent delta kernels initialized")
-                .prefill([&state, &query, &key, &value, &g, &beta], &config)
+                .prefill_device([&state, &query, &key, &value, &g, &beta], &config, stream)
         })?;
 
         let (out, state) = output.into_tuple();
@@ -951,6 +980,7 @@ impl LinearAttention {
         value: &Array,
         g: &Array,
         beta: &Array,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let l = query.shape()[1];
         let chunk_tokens = if l <= RECURRENT_PREFILL_SHORT_SCAN_TOKENS {
@@ -964,11 +994,11 @@ impl LinearAttention {
         let mut start = 0;
         while start < l {
             let end = (start + chunk_tokens).min(l);
-            let query_chunk = query.index((.., start..end, .., ..));
-            let key_chunk = key.index((.., start..end, .., ..));
-            let value_chunk = value.index((.., start..end, .., ..));
-            let g_chunk = g.index((.., start..end, ..));
-            let beta_chunk = beta.index((.., start..end, ..));
+            let query_chunk = query.try_index_device((.., start..end, .., ..), stream)?;
+            let key_chunk = key.try_index_device((.., start..end, .., ..), stream)?;
+            let value_chunk = value.try_index_device((.., start..end, .., ..), stream)?;
+            let g_chunk = g.try_index_device((.., start..end, ..), stream)?;
+            let beta_chunk = beta.try_index_device((.., start..end, ..), stream)?;
             let (new_state, out) = Self::recurrent_delta_prefill_kernel(
                 &state,
                 &query_chunk,
@@ -976,13 +1006,14 @@ impl LinearAttention {
                 &value_chunk,
                 &g_chunk,
                 &beta_chunk,
+                stream,
             )?;
             state = new_state;
             outs.push(out);
             start = end;
         }
 
-        Ok((state, concatenate_axis(&outs, 1)?))
+        Ok((state, concatenate_axis(&outs, 1, stream)?))
     }
 
     #[allow(non_snake_case)]
@@ -994,6 +1025,7 @@ impl LinearAttention {
         g: Array,
         beta: Array,
         cache: Option<&mut LinearAttentionCache>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let shape = query.shape();
         let B = shape[0];
@@ -1002,28 +1034,30 @@ impl LinearAttention {
         let KD = shape[3];
         let VD = value.shape()[3];
         let scale = (KD as f32).sqrt().recip();
-        let query = query.multiply(Array::from_f32(scale))?;
+        let query = query.multiply(Array::from_f32(scale), stream)?;
         let state = cache
             .as_ref()
             .and_then(|cache| cache.recurrent_state.clone())
-            .unwrap_or(zeros::<f32>(&[B, H, KD, VD])?);
+            .unwrap_or(zeros::<f32>(&[B, H, KD, VD], stream)?);
 
         if L == 1 {
-            let q_t = query.index((.., 0, .., ..));
-            let k_t = key.index((.., 0, .., ..));
-            let v_t = value.index((.., 0, .., ..));
-            let g_t = g.index((.., 0, ..));
-            let beta_t = beta.index((.., 0, ..));
-            let (new_state, out_t) =
-                Self::recurrent_delta_decode_kernel(&state, &q_t, &k_t, &v_t, &g_t, &beta_t)?;
+            let q_t = query.try_index_device((.., 0, .., ..), stream)?;
+            let k_t = key.try_index_device((.., 0, .., ..), stream)?;
+            let v_t = value.try_index_device((.., 0, .., ..), stream)?;
+            let g_t = g.try_index_device((.., 0, ..), stream)?;
+            let beta_t = beta.try_index_device((.., 0, ..), stream)?;
+            let (new_state, out_t) = Self::recurrent_delta_decode_kernel(
+                &state, &q_t, &k_t, &v_t, &g_t, &beta_t, stream,
+            )?;
             if let Some(cache) = cache {
                 cache.recurrent_state = Some(new_state);
             }
             return Ok(out_t);
         }
 
-        let (new_state, out) =
-            Self::recurrent_delta_prefill_scan_chunked(state, &query, &key, &value, &g, &beta)?;
+        let (new_state, out) = Self::recurrent_delta_prefill_scan_chunked(
+            state, &query, &key, &value, &g, &beta, stream,
+        )?;
         if let Some(cache) = cache {
             cache.recurrent_state = Some(new_state);
         }
@@ -1041,67 +1075,70 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: LinearAttentionInput<'_>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: LinearAttentionInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let LinearAttentionInput { x, mut cache } = input;
         let shape = x.shape();
         let B = shape[0];
         let L = shape[1];
-        let mixed_qkv = self.in_proj_qkv.forward(x)?;
+        let mixed_qkv = self.in_proj_qkv.forward(x, stream)?;
         let z = self
             .in_proj_z
-            .forward(x)?
-            .reshape(&[B, L, self.num_v_heads, self.head_v_dim])?;
-        let b = self.in_proj_b.forward(x)?;
-        let a = self.in_proj_a.forward(x)?;
-        let mixed_qkv = self.depthwise_causal_conv(&mixed_qkv, cache.as_deref_mut())?;
-        let query = mixed_qkv.index((.., .., ..self.key_dim)).reshape(&[
-            B,
-            L,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
+            .forward(x, stream)?
+            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        let b = self.in_proj_b.forward(x, stream)?;
+        let a = self.in_proj_a.forward(x, stream)?;
+        let mixed_qkv = self.depthwise_causal_conv(&mixed_qkv, cache.as_deref_mut(), stream)?;
+        let query = mixed_qkv
+            .try_index_device((.., .., ..self.key_dim), stream)?
+            .reshape(&[B, L, self.num_k_heads, self.head_k_dim], stream)?;
         let key = mixed_qkv
-            .index((.., .., self.key_dim..2 * self.key_dim))
-            .reshape(&[B, L, self.num_k_heads, self.head_k_dim])?;
-        let mut value = mixed_qkv.index((.., .., 2 * self.key_dim..)).reshape(&[
-            B,
-            L,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
-        let mut query = Self::l2norm(query)?;
-        let mut key = Self::l2norm(key)?;
-        let beta = sigmoid(b)?;
-        let g = nn::softplus(a.add(self.dt_bias.reshape(&[1, 1, self.num_v_heads])?)?)?
-            .multiply(exp(self.A_log.as_ref())?.multiply(Array::from_f32(-1.0))?)?;
+            .try_index_device((.., .., self.key_dim..2 * self.key_dim), stream)?
+            .reshape(&[B, L, self.num_k_heads, self.head_k_dim], stream)?;
+        let mut value = mixed_qkv
+            .try_index_device((.., .., 2 * self.key_dim..), stream)?
+            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        let mut query = Self::l2norm(query, stream)?;
+        let mut key = Self::l2norm(key, stream)?;
+        let beta = sigmoid(b, stream)?;
+        let dt_bias = self.dt_bias.reshape(&[1, 1, self.num_v_heads], stream)?;
+        let g = nn::softplus(a.add(dt_bias, stream)?, stream)?.multiply(
+            exp(self.A_log.as_ref(), stream)?.multiply(Array::from_f32(-1.0), stream)?,
+            stream,
+        )?;
 
         let repeats = self.num_v_heads / self.num_k_heads;
         if repeats > 1 {
-            let expanded_query = query.index((.., .., .., NewAxis, ..));
+            let expanded_query = query.try_index_device((.., .., .., NewAxis, ..), stream)?;
             query = broadcast_to(
                 &expanded_query,
                 &[B, L, self.num_k_heads, repeats, self.head_k_dim],
+                stream,
             )?
-            .reshape(&[B, L, self.num_v_heads, self.head_k_dim])?;
-            let expanded_key = key.index((.., .., .., NewAxis, ..));
+            .reshape(&[B, L, self.num_v_heads, self.head_k_dim], stream)?;
+            let expanded_key = key.try_index_device((.., .., .., NewAxis, ..), stream)?;
             key = broadcast_to(
                 &expanded_key,
                 &[B, L, self.num_k_heads, repeats, self.head_k_dim],
+                stream,
             )?
-            .reshape(&[B, L, self.num_v_heads, self.head_k_dim])?;
+            .reshape(&[B, L, self.num_v_heads, self.head_k_dim], stream)?;
         }
 
-        value = value.as_dtype(x.dtype())?;
-        let core = self.recurrent_delta_rule(query, key, value, g, beta, cache)?;
+        value = value.as_dtype(x.dtype(), stream)?;
+        let core = self.recurrent_delta_rule(query, key, value, g, beta, cache, stream)?;
         let z_shape = z.shape().to_vec();
-        let core = core.reshape(&[-1, self.head_v_dim])?;
-        let z = z.reshape(&[-1, self.head_v_dim])?;
-        let out =
-            self.norm
-                .forward(&core, &z)?
-                .reshape(&z_shape)?
-                .reshape(&[B, L, self.value_dim])?;
-        self.out_proj.forward(&out)
+        let core = core.reshape(&[-1, self.head_v_dim], stream)?;
+        let z = z.reshape(&[-1, self.head_v_dim], stream)?;
+        let out = self
+            .norm
+            .forward(&core, &z, stream)?
+            .reshape(&z_shape, stream)?
+            .reshape(&[B, L, self.value_dim], stream)?;
+        self.out_proj.forward(&out, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1133,16 +1170,29 @@ impl Experts {
             num_experts: args.num_experts,
             hidden_dim: args.hidden_size,
             intermediate_dim: args.moe_intermediate_size,
-            gate_up_proj: Param::new(Array::zeros::<f32>(&[
-                args.num_experts,
-                2 * args.moe_intermediate_size,
-                args.hidden_size,
-            ])?),
-            down_proj: Param::new(Array::zeros::<f32>(&[
-                args.num_experts,
-                args.hidden_size,
-                args.moe_intermediate_size,
-            ])?),
+            gate_up_proj: Param::new(Array::from_slice(
+                &vec![
+                    0.0f32;
+                    (args.num_experts * 2 * args.moe_intermediate_size * args.hidden_size)
+                        as usize
+                ],
+                &[
+                    args.num_experts,
+                    2 * args.moe_intermediate_size,
+                    args.hidden_size,
+                ],
+            )),
+            down_proj: Param::new(Array::from_slice(
+                &vec![
+                    0.0f32;
+                    (args.num_experts * args.hidden_size * args.moe_intermediate_size) as usize
+                ],
+                &[
+                    args.num_experts,
+                    args.hidden_size,
+                    args.moe_intermediate_size,
+                ],
+            )),
         })
     }
 
@@ -1151,28 +1201,33 @@ impl Experts {
         hidden_states: &Array,
         top_k_index: &Array,
         top_k_weights: &Array,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
         let top_k = top_k_index.shape()[1];
-        let selected_gate_up = self.gate_up_proj.as_ref().take_axis(top_k_index, 0)?;
-        let hidden = hidden_states.index((.., NewAxis, NewAxis, ..));
-        let gate_up = matmul(&hidden, selected_gate_up.swap_axes(-1, -2)?)?.reshape(&[
-            num_tokens,
-            top_k,
-            2 * self.intermediate_dim,
-        ])?;
-        let gate = gate_up.index((.., .., ..self.intermediate_dim));
-        let up = gate_up.index((.., .., self.intermediate_dim..));
-        let current = silu(gate)?.multiply(up)?;
+        let selected_gate_up = self
+            .gate_up_proj
+            .as_ref()
+            .take_axis(top_k_index, 0, stream)?;
+        let hidden = hidden_states.try_index_device((.., NewAxis, NewAxis, ..), stream)?;
+        let gate_up = matmul(&hidden, selected_gate_up.swap_axes(-1, -2, stream)?, stream)?
+            .reshape(&[num_tokens, top_k, 2 * self.intermediate_dim], stream)?;
+        let gate = gate_up.try_index_device((.., .., ..self.intermediate_dim), stream)?;
+        let up = gate_up.try_index_device((.., .., self.intermediate_dim..), stream)?;
+        let current = silu(gate, stream)?.multiply(up, stream)?;
 
-        let selected_down = self.down_proj.as_ref().take_axis(top_k_index, 0)?;
+        let selected_down = self.down_proj.as_ref().take_axis(top_k_index, 0, stream)?;
         let current = matmul(
-            current.index((.., .., NewAxis, ..)),
-            selected_down.swap_axes(-1, -2)?,
+            current.try_index_device((.., .., NewAxis, ..), stream)?,
+            selected_down.swap_axes(-1, -2, stream)?,
+            stream,
         )?
-        .reshape(&[num_tokens, top_k, self.hidden_dim])?;
-        let weighted = current.multiply(top_k_weights.index((.., .., NewAxis)))?;
-        sum_axis(&weighted, -2, false)
+        .reshape(&[num_tokens, top_k, self.hidden_dim], stream)?;
+        let weighted = current.multiply(
+            top_k_weights.try_index_device((.., .., NewAxis), stream)?,
+            stream,
+        )?;
+        sum_axis(&weighted, -2, false, stream)
     }
 
     pub fn forward_chunked(
@@ -1180,10 +1235,11 @@ impl Experts {
         hidden_states: &Array,
         top_k_index: &Array,
         top_k_weights: &Array,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
         if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
-            return self.forward(hidden_states, top_k_index, top_k_weights);
+            return self.forward(hidden_states, top_k_index, top_k_weights, stream);
         }
 
         let mut outputs = Vec::with_capacity(
@@ -1194,17 +1250,18 @@ impl Experts {
         let mut start = 0;
         while start < num_tokens {
             let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
-            let hidden_chunk = hidden_states.index((start..end, ..));
-            let expert_chunk = top_k_index.index((start..end, ..));
-            let weight_chunk = top_k_weights.index((start..end, ..));
+            let hidden_chunk = hidden_states.try_index_device((start..end, ..), stream)?;
+            let expert_chunk = top_k_index.try_index_device((start..end, ..), stream)?;
+            let weight_chunk = top_k_weights.try_index_device((start..end, ..), stream)?;
             outputs.push(self.forward_expert_major_chunk(
                 &hidden_chunk,
                 &expert_chunk,
                 &weight_chunk,
+                stream,
             )?);
             start = end;
         }
-        concatenate_axis(&outputs, 0)
+        concatenate_axis(&outputs, 0, stream)
     }
 
     fn forward_expert_major_chunk(
@@ -1212,21 +1269,35 @@ impl Experts {
         hidden_states: &Array,
         top_k_index: &Array,
         top_k_weights: &Array,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
-        let plan = topk_route_plan(top_k_index, self.num_experts)?;
-        let hidden = gather_grouped_rows(hidden_states, &plan)?;
-        let gate_up_weights = self.gate_up_proj.as_ref().swap_axes(-1, -2)?;
-        let gate_up = grouped_matmul(&hidden, &gate_up_weights, &plan.sorted_group_ids, true)?;
-        let gate = gate_up.index((.., ..self.intermediate_dim));
-        let up = gate_up.index((.., self.intermediate_dim..));
-        let current = silu(gate)?.multiply(up)?;
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate_up_weights = self.gate_up_proj.as_ref().swap_axes(-1, -2, stream)?;
+        let gate_up = grouped_matmul(
+            &hidden,
+            &gate_up_weights,
+            &plan.sorted_group_ids,
+            true,
+            stream,
+        )?;
+        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        let current = silu(gate, stream)?.multiply(up, stream)?;
 
-        let down_weights = self.down_proj.as_ref().swap_axes(-1, -2)?;
-        let current = grouped_matmul(&current, &down_weights, &plan.sorted_group_ids, true)?;
-        let weights = gather_route_values(top_k_weights, &plan)?.index((.., NewAxis));
-        let weighted = current.multiply(weights)?;
-        segment_sum_by_index(weighted, &plan.token_indices, num_tokens)
+        let down_weights = self.down_proj.as_ref().swap_axes(-1, -2, stream)?;
+        let current = grouped_matmul(
+            &current,
+            &down_weights,
+            &plan.sorted_group_ids,
+            true,
+            stream,
+        )?;
+        let weights = gather_route_values(top_k_weights, &plan, stream)?
+            .try_index_device((.., NewAxis), stream)?;
+        let weighted = current.multiply(weights, stream)?;
+        segment_sum_by_index(weighted, &plan.token_indices, num_tokens, stream)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -1247,18 +1318,29 @@ impl TopKRouter {
             top_k: args.num_experts_per_tok,
             num_experts: args.num_experts,
             norm_topk_prob: args.norm_topk_prob,
-            weight: Param::new(Array::zeros::<f32>(&[args.num_experts, args.hidden_size])?),
+            weight: Param::new(Array::from_slice(
+                &vec![0.0f32; (args.num_experts * args.hidden_size) as usize],
+                &[args.num_experts, args.hidden_size],
+            )),
         })
     }
 
-    pub fn forward(&mut self, hidden_states: &Array) -> Result<(Array, Array), Exception> {
-        let router_logits = matmul(hidden_states, self.weight.t())?;
-        let router_probs = softmax_axis(&router_logits, -1, true)?;
-        let top_k_index =
-            argpartition_axis(&router_probs, -self.top_k, -1)?.index((.., -self.top_k..));
-        let mut top_k_weights = take_along_axis(&router_probs, &top_k_index, -1)?;
-        top_k_weights = top_k_weights.divide(sum_axis(&top_k_weights, -1, true)?)?;
-        Ok((top_k_index, top_k_weights.as_dtype(router_logits.dtype())?))
+    pub fn forward(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let router_logits = matmul(hidden_states, self.weight.transpose(stream)?, stream)?;
+        let router_probs = softmax_axis(&router_logits, -1, true, stream)?;
+        let top_k_index = argpartition_axis(&router_probs, -self.top_k, -1, stream)?
+            .try_index_device((.., -self.top_k..), stream)?;
+        let mut top_k_weights = take_along_axis(&router_probs, &top_k_index, -1, stream)?;
+        top_k_weights =
+            top_k_weights.divide(sum_axis(&top_k_weights, -1, true, stream)?, stream)?;
+        Ok((
+            top_k_index,
+            top_k_weights.as_dtype(router_logits.dtype(), stream)?,
+        ))
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -1298,27 +1380,31 @@ impl Module<&Array> for SparseMoeBlock {
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, hidden_states: &Array) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let shape = hidden_states.shape();
         let B = shape[0];
         let L = shape[1];
         let H = shape[2];
-        let flat = hidden_states.reshape(&[-1, H])?;
-        let shared = self
-            .shared_expert
-            .forward(&flat)?
-            .multiply(sigmoid(self.shared_expert_gate.forward(&flat)?)?)?;
+        let flat = hidden_states.reshape(&[-1, H], stream)?;
+        let shared = self.shared_expert.forward(&flat, stream)?.multiply(
+            sigmoid(self.shared_expert_gate.forward(&flat, stream)?, stream)?,
+            stream,
+        )?;
         profile_array(PerfComponent::MoeShared, &shared)?;
-        let (selected_experts, routing_weights) = self.gate.forward(&flat)?;
+        let (selected_experts, routing_weights) = self.gate.forward(&flat, stream)?;
         profile_arrays(
             PerfComponent::MoeRouter,
             &[&selected_experts, &routing_weights],
         )?;
-        let routed = self
-            .experts
-            .forward_chunked(&flat, &selected_experts, &routing_weights)?;
+        let routed =
+            self.experts
+                .forward_chunked(&flat, &selected_experts, &routing_weights, stream)?;
         profile_array(PerfComponent::MoeRouted, &routed)?;
-        let output = routed.add(shared)?.reshape(&[B, L, H])?;
+        let output = routed.add(shared, stream)?.reshape(&[B, L, H], stream)?;
         profile_array(PerfComponent::MoeCombine, &output)?;
         Ok(output)
     }
@@ -1347,12 +1433,12 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(args: &ModelArgs, layer_idx: usize) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         let layer_type = args.layer_type(layer_idx);
         Ok(Self {
             layer_type,
             self_attn: if layer_type == LayerType::FullAttention {
-                Some(FullAttention::new(args)?)
+                Some(FullAttention::new(args, stream)?)
             } else {
                 None
             },
@@ -1378,53 +1464,65 @@ impl Module<BlockInput<'_>> for TransformerBlock {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: BlockInput<'_>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: BlockInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let BlockInput { x, mask, cache } = input;
         let residual = x;
-        let h = self.input_layernorm.forward(x)?;
+        let h = self.input_layernorm.forward(x, stream)?;
         let h = match (self.layer_type, cache) {
             (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
-                .forward(FullAttentionInput {
-                    x: &h,
-                    mask,
-                    cache: Some(cache),
-                })?,
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
             (LayerType::FullAttention, _) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
-                .forward(FullAttentionInput {
-                    x: &h,
-                    mask,
-                    cache: None,
-                })?,
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?,
             (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
-                .forward(LinearAttentionInput {
-                    x: &h,
-                    cache: Some(cache),
-                })?,
+                .forward(
+                    LinearAttentionInput {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
             (LayerType::LinearAttention, _) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
-                .forward(LinearAttentionInput { x: &h, cache: None })?,
+                .forward(LinearAttentionInput { x: &h, cache: None }, stream)?,
         };
         match self.layer_type {
             LayerType::FullAttention => profile_array(PerfComponent::FullAttention, &h)?,
             LayerType::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
         }
-        let h = residual.add(h)?;
+        let h = residual.add(h, stream)?;
         let residual = h.clone();
-        let h = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&h)?)?;
-        residual.add(h)
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        let h = self.mlp.forward(&post_normed, stream)?;
+        residual.add(h, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1453,10 +1551,10 @@ pub struct Qwen35MoeTextModel {
 }
 
 impl Qwen35MoeTextModel {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
         let layers = (0..args.num_hidden_layers)
-            .map(|idx| TransformerBlock::new(args, idx as usize))
+            .map(|idx| TransformerBlock::new(args, idx as usize, stream))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             vocab_size: args.vocab_size,
@@ -1478,20 +1576,24 @@ impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let ModelInput {
             inputs,
             mask,
             mut cache,
         } = input;
-        let mut h = self.embed_tokens.forward(inputs)?;
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
         profile_array(PerfComponent::Embed, &h)?;
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
             None => {
                 let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
                 if h.shape()[1] > 1 {
-                    match create_attention_mask(&h, &offset_cache(offset), Some(true))? {
+                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
                         Some(AttentionMask::Array(a)) => Some(a),
                         Some(AttentionMask::Causal) => {
                             return Err(Exception::custom("Only `Array` mask is supported"));
@@ -1506,22 +1608,28 @@ impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
 
         if let Some(cache) = cache.as_mut() {
             for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
-                h = layer.forward(BlockInput {
-                    x: &h,
-                    mask: mask.as_ref(),
-                    cache: Some(layer_cache),
-                })?;
+                h = layer.forward(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: Some(layer_cache),
+                    },
+                    stream,
+                )?;
             }
         } else {
             for layer in &mut self.layers {
-                h = layer.forward(BlockInput {
-                    x: &h,
-                    mask: mask.as_ref(),
-                    cache: None,
-                })?;
+                h = layer.forward(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: None,
+                    },
+                    stream,
+                )?;
             }
         }
-        let h = self.norm.forward(&h)?;
+        let h = self.norm.forward(&h, stream)?;
         profile_array(PerfComponent::FinalNorm, &h)?;
         Ok(h)
     }
@@ -1556,6 +1664,7 @@ impl KeyValueCache for OffsetOnlyCache {
         &mut self,
         keys: Array,
         values: Array,
+        _stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         Ok((keys, values))
     }
@@ -1577,8 +1686,9 @@ impl Model {
         args: ModelArgs,
         image_token_id: Option<i32>,
         video_token_id: Option<i32>,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
-        let model = Qwen35MoeTextModel::new(&args)?;
+        let model = Qwen35MoeTextModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::build_lm_head(args.hidden_size, args.vocab_size)?)
         } else {
@@ -1601,16 +1711,16 @@ impl Model {
         &self.args.model_type
     }
 
-    fn reject_multimodal_tokens(&self, inputs: &Array) -> Result<(), Exception> {
+    fn reject_multimodal_tokens(&self, inputs: &Array, stream: &Stream) -> Result<(), Exception> {
         for (name, token_id) in [
             ("image", self.image_token_id),
             ("video", self.video_token_id),
         ] {
             if let Some(token_id) = token_id {
                 let contains = inputs
-                    .eq(Array::from_int(token_id))?
-                    .max(None)?
-                    .item::<bool>();
+                    .eq(Array::from_int(token_id), stream)?
+                    .max(None, stream)?
+                    .item::<bool>(&stream);
                 if contains {
                     return Err(Exception::custom(format!(
                         "qwen3_5_moe text-generation support does not accept {name} tokens"
@@ -1621,9 +1731,17 @@ impl Model {
         Ok(())
     }
 
-    fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
-        let logits =
-            project_logits_dense(&mut self.lm_head, &self.model.embed_tokens, hidden_states)?;
+    fn project_logits(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let logits = project_logits_dense(
+            &mut self.lm_head,
+            &self.model.embed_tokens,
+            hidden_states,
+            stream,
+        )?;
         profile_array(PerfComponent::LmHead, &logits)?;
         Ok(logits)
     }
@@ -1632,15 +1750,16 @@ impl Model {
         &mut self,
         input: ModelInput<'_>,
         last_token_only: bool,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.reject_multimodal_tokens(input.inputs)?;
-        let hidden_states = self.model.forward(input)?;
+        self.reject_multimodal_tokens(input.inputs, stream)?;
+        let hidden_states = self.model.forward(input, stream)?;
         let hidden_states = if last_token_only {
-            hidden_states.index((.., -1, ..))
+            hidden_states.try_index_device((.., -1, ..), stream)?
         } else {
             hidden_states
         };
-        self.project_logits(&hidden_states)
+        self.project_logits(&hidden_states, stream)
     }
 }
 
@@ -1648,8 +1767,12 @@ impl Module<ModelInput<'_>> for Model {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_>) -> Result<Self::Output, Self::Error> {
-        self.forward_logits(input, false)
+    fn forward(
+        &mut self,
+        input: ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        self.forward_logits(input, false, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1700,10 +1823,13 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_qwen3_5_moe_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+pub fn load_qwen3_5_moe_model(
+    model_dir: impl AsRef<Path>,
+    stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let (args, image_token_id, video_token_id) = get_qwen3_5_moe_model_args(model_dir)?;
-    let mut model = Model::new(args, image_token_id, video_token_id)?;
+    let mut model = Model::new(args, image_token_id, video_token_id, stream)?;
     let config = qwen3_5_moe_strict_load_config();
     let mut report = StrictLoadReport::default();
     let weights_index = model_dir.join("model.safetensors.index.json");
@@ -1748,6 +1874,7 @@ impl CausalLm<Cache> for Model {
         &mut self,
         prompt_tokens: &Array,
         cache: &mut Cache,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         self.forward_logits(
             ModelInput {
@@ -1756,6 +1883,7 @@ impl CausalLm<Cache> for Model {
                 cache: Some(cache),
             },
             true,
+            stream,
         )
     }
 
@@ -1763,25 +1891,30 @@ impl CausalLm<Cache> for Model {
         &mut self,
         input_tokens: &Array,
         cache: &mut Cache,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: input_tokens,
-            mask: None,
-            cache: Some(cache),
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: input_tokens,
+                mask: None,
+                cache: Some(cache),
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 
     fn adjust_prefill_logits(
         &mut self,
         mut logits: Array,
         cache: &mut Cache,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         // Keep the first sampled token dependent on all prefill cache state while
         // avoiding a prompt-length vocabulary projection.
-        if let Some(dependency) = cache.prefill_state_dependency()? {
+        if let Some(dependency) = cache.prefill_state_dependency(stream)? {
             profile_array(PerfComponent::PrefillStateDependency, &dependency)?;
-            logits = logits.add(dependency)?;
+            logits = logits.add(dependency, stream)?;
         }
         Ok(logits)
     }
@@ -1803,9 +1936,9 @@ mod tests {
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
-        ops::indexing::{IndexOp, NewAxis},
+        ops::indexing::{NewAxis, TryIndexOp},
         transforms::eval,
-        Array,
+        Array, ExecutionContext,
     };
     use std::{
         fs,
@@ -1972,15 +2105,20 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn full_attention_forward_shape_smoke() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::FullAttention]);
-        let mut attn = FullAttention::new(&args).unwrap();
-        let x = Array::zeros::<f32>(&[1, 2, args.hidden_size]).unwrap();
+        let mut attn = FullAttention::new(&args, stream).unwrap();
+        let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let out = attn
-            .forward(FullAttentionInput {
-                x: &x,
-                mask: None,
-                cache: None,
-            })
+            .forward(
+                FullAttentionInput {
+                    x: &x,
+                    mask: None,
+                    cache: None,
+                },
+                stream,
+            )
             .unwrap();
         assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
     }
@@ -1989,11 +2127,13 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn linear_attention_forward_shape_smoke() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
         let mut attn = LinearAttention::new(&args).unwrap();
-        let x = Array::zeros::<f32>(&[1, 2, args.hidden_size]).unwrap();
+        let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let out = attn
-            .forward(LinearAttentionInput { x: &x, cache: None })
+            .forward(LinearAttentionInput { x: &x, cache: None }, stream)
             .unwrap();
         assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
     }
@@ -2002,6 +2142,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn sparse_moe_forward_shape_smoke() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
         let mut moe = SparseMoeBlock::new(&args).unwrap();
         let gate_values = (0..args.num_experts)
@@ -2011,16 +2153,16 @@ mod tests {
             .collect::<Vec<_>>();
         moe.gate.weight = Param::new(
             Array::from(gate_values.as_slice())
-                .reshape(&[args.num_experts, args.hidden_size])
+                .reshape(&[args.num_experts, args.hidden_size], stream)
                 .unwrap(),
         );
         let input_values = (0..(2 * args.hidden_size))
             .map(|index| index as f32 * 0.01)
             .collect::<Vec<_>>();
         let x = Array::from(input_values.as_slice())
-            .reshape(&[1, 2, args.hidden_size])
+            .reshape(&[1, 2, args.hidden_size], stream)
             .unwrap();
-        let out = moe.forward(&x).unwrap();
+        let out = moe.forward(&x, stream).unwrap();
         assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
     }
 
@@ -2028,8 +2170,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn parameter_tree_matches_public_checkpoint_key_patterns() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention, LayerType::FullAttention]);
-        let model = Model::new(args, Some(248056), Some(248057)).unwrap();
+        let model = Model::new(args, Some(248056), Some(248057), stream).unwrap();
         let params = model.parameters().flatten();
 
         for key in [
@@ -2065,8 +2209,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn strict_load_allows_unused_non_text_prefixes() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let source = Model::new(args.clone(), None, None).unwrap();
+        let source = Model::new(args.clone(), None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");
         save_model_parameters(
@@ -2076,20 +2222,20 @@ mod tests {
             vec![
                 (
                     "visual.extra.weight".to_string(),
-                    Array::zeros::<f32>(&[1]).unwrap(),
+                    Array::zeros::<f32>(&[1], stream).unwrap(),
                 ),
                 (
                     "model.vision_tower.extra.weight".to_string(),
-                    Array::zeros::<f32>(&[1]).unwrap(),
+                    Array::zeros::<f32>(&[1], stream).unwrap(),
                 ),
                 (
                     "mtp.extra.weight".to_string(),
-                    Array::zeros::<f32>(&[1]).unwrap(),
+                    Array::zeros::<f32>(&[1], stream).unwrap(),
                 ),
             ],
         );
 
-        let mut target = Model::new(args, None, None).unwrap();
+        let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
@@ -2100,8 +2246,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn strict_load_fails_on_missing_text_weight() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let source = Model::new(args.clone(), None, None).unwrap();
+        let source = Model::new(args.clone(), None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");
         save_model_parameters(
@@ -2111,7 +2259,7 @@ mod tests {
             Vec::new(),
         );
 
-        let mut target = Model::new(args, None, None).unwrap();
+        let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
@@ -2127,8 +2275,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn strict_load_fails_on_unexpected_text_weight() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let source = Model::new(args.clone(), None, None).unwrap();
+        let source = Model::new(args.clone(), None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");
         save_model_parameters(
@@ -2137,11 +2287,11 @@ mod tests {
             |_| true,
             vec![(
                 "model.layers.0.linear_attn.unexpected.weight".to_string(),
-                Array::zeros::<f32>(&[1]).unwrap(),
+                Array::zeros::<f32>(&[1], stream).unwrap(),
             )],
         );
 
-        let mut target = Model::new(args, None, None).unwrap();
+        let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
@@ -2159,9 +2309,11 @@ mod tests {
     #[ignore = "requires local Qwen3.5-MoE model files"]
     fn test_load_and_run_qwen3_5_moe_with_model_cache() {
         let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
         let model_dir = cached_test_model_dir();
         let tokenizer = load_qwen3_5_moe_tokenizer(&model_dir).unwrap();
-        let mut model = load_qwen3_5_moe_model(&model_dir).unwrap();
+        let mut model = load_qwen3_5_moe_model(&model_dir, stream).unwrap();
         let cases = [
             (
                 "What is 84 * 3 / 2?",
@@ -2182,14 +2334,17 @@ mod tests {
 
         for (prompt, expected_tokens) in cases {
             let encoding = tokenizer.encode(prompt, false).unwrap();
-            let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
+            let prompt_tokens = Array::from(encoding.get_ids())
+                .try_index_device(NewAxis, stream)
+                .unwrap();
             let mut cache = model.new_cache();
             let mut tokens = Vec::new();
-            let generate = super::Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens);
+            let generate =
+                super::Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens, stream);
             for token in generate.take(expected_tokens.len()) {
                 let token = token.unwrap();
                 eval([&token]).unwrap();
-                tokens.push(token.item::<u32>());
+                tokens.push(token.item::<u32>(&stream));
             }
             assert_eq!(tokens, expected_tokens, "prompt: {prompt}");
         }

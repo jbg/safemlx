@@ -6,17 +6,20 @@ use safemlx::{
     Array,
 };
 
+mod common;
+
 #[test]
 fn test_disable_compile() {
-    disable_compile();
+    let stream = common::test_stream();
+    disable_compile().unwrap();
 
-    let f = |x: &Array| -> Result<Array, Exception> {
-        let z = negative!(x)?;
+    let f = move |x: &Array| -> Result<Array, Exception> {
+        let z = negative!(x, stream = stream)?;
 
         // this will crash is compile is enabled
         println!("{z:?}");
 
-        exp!(z)
+        exp!(z, stream = stream)
     };
 
     let x = array!(10.0);
@@ -26,5 +29,5 @@ fn test_disable_compile() {
     let _result = compiled(&x).unwrap();
 
     // Re-enable compilation for other tests
-    enable_compile();
+    enable_compile().unwrap();
 }

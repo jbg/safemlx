@@ -1,4 +1,4 @@
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::{
     error::Result,
@@ -22,8 +22,7 @@ const DEFAULT_NORM: safemlx_sys::mlx_fft_norm = safemlx_sys::mlx_fft_norm__MLX_F
 ///  with zeros to match `n`. The default value is `a.shape[axis]` if not specified.
 /// - `axis`: Axis along which to perform the FFT. The default is `-1` if not specified.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn rfft_device(
+pub fn rfft(
     a: impl AsRef<Array>,
     #[optional] n: impl Into<Option<i32>>,
     #[optional] axis: impl Into<Option<i32>>,
@@ -56,8 +55,7 @@ pub fn rfft_device(
 /// padded with zeros to match `s`. The default value is the sizes of `a` along `axes`.
 /// - `axes`: Axes along which to perform the FFT. The default is `[-2, -1]`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn rfft2_device<'a>(
+pub fn rfft2<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -101,8 +99,7 @@ pub fn rfft2_device<'a>(
 /// - `axes`: Axes along which to perform the FFT. The default is `None` in which case the FFT is over
 ///   the last `len(s)` axes or all axes if `s` is also `None`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn rfftn_device<'a>(
+pub fn rfftn<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -142,8 +139,7 @@ pub fn rfftn_device<'a>(
 ///   with zeros to match `n // 2 + 1`. The default value is `a.shape[axis] // 2 + 1`.
 /// - `axis`: Axis along which to perform the FFT. The default is `-1`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn irfft_device(
+pub fn irfft(
     a: impl AsRef<Array>,
     #[optional] n: impl Into<Option<i32>>,
     #[optional] axis: impl Into<Option<i32>>,
@@ -184,8 +180,7 @@ pub fn irfft_device(
 ///   `s[s.len()-1] // 2 + 1`. The default value is the sizes of `a` along `axes`.
 /// - `axes`: Axes along which to perform the FFT. The default is `[-2, -1]`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn irfft2_device<'a>(
+pub fn irfft2<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -237,8 +232,7 @@ pub fn irfft2_device<'a>(
 /// - `axes`: Axes along which to perform the FFT. The default is `None` in which case the FFT is
 ///  over the last `len(s)` axes or all axes if `s` is also `None`.
 #[generate_macro(customize(root = "$crate::fft"))]
-#[default_device]
-pub fn irfftn_device<'a>(
+pub fn irfftn<'a>(
     a: impl AsRef<Array>,
     #[optional] s: impl IntoOption<&'a [i32]>,
     #[optional] axes: impl IntoOption<&'a [i32]>,
@@ -281,6 +275,7 @@ mod tests {
 
     #[test]
     fn test_rfft() {
+        let stream = crate::test_stream();
         const RFFT_DATA: &[f32] = &[1.0, 2.0, 3.0, 4.0];
         const RFFT_N: i32 = 4;
         const RFFT_SHAPE: &[i32] = &[RFFT_N];
@@ -292,37 +287,40 @@ mod tests {
         ];
 
         let a = Array::from_slice(RFFT_DATA, RFFT_SHAPE);
-        let rfft = super::rfft(&a, RFFT_N, RFFT_AXIS).unwrap();
+        let rfft = super::rfft(&a, RFFT_N, RFFT_AXIS, stream).unwrap();
         assert_eq!(rfft.dtype(), Dtype::Complex64);
-        assert_eq!(rfft.as_slice::<complex64>(), RFFT_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&rfft), RFFT_EXPECTED);
 
-        let irfft = super::irfft(&rfft, RFFT_N, RFFT_AXIS).unwrap();
+        let irfft = super::irfft(&rfft, RFFT_N, RFFT_AXIS, stream).unwrap();
         assert_eq!(irfft.dtype(), Dtype::Float32);
-        assert_eq!(irfft.as_slice::<f32>(), RFFT_DATA);
+        assert_eq!(crate::array::eval_vec::<f32>(&irfft), RFFT_DATA);
     }
 
     #[test]
     fn test_rfft_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_N: i32 = 8;
         const OUT_N: i32 = IN_N / 2 + 1;
 
-        let a = Array::ones::<f32>(&[IN_N]).unwrap();
-        let rfft = super::rfft(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(&[IN_N], stream).unwrap();
+        let rfft = super::rfft(&a, None, None, stream).unwrap();
         assert_eq!(rfft.shape(), &[OUT_N]);
     }
 
     #[test]
     fn test_irfft_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_N: i32 = 8;
         const OUT_N: i32 = (IN_N - 1) * 2;
 
-        let a = Array::ones::<f32>(&[IN_N]).unwrap();
-        let irfft = super::irfft(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(&[IN_N], stream).unwrap();
+        let irfft = super::irfft(&a, None, None, stream).unwrap();
         assert_eq!(irfft.shape(), &[OUT_N]);
     }
 
     #[test]
     fn test_rfft2() {
+        let stream = crate::test_stream();
         const RFFT2_DATA: &[f32] = &[1.0; 4];
         const RFFT2_SHAPE: &[i32] = &[2, 2];
         const RFFT2_EXPECTED: &[complex64] = &[
@@ -333,37 +331,40 @@ mod tests {
         ];
 
         let a = Array::from_slice(RFFT2_DATA, RFFT2_SHAPE);
-        let rfft2 = super::rfft2(&a, None, None).unwrap();
+        let rfft2 = super::rfft2(&a, None, None, stream).unwrap();
         assert_eq!(rfft2.dtype(), Dtype::Complex64);
-        assert_eq!(rfft2.as_slice::<complex64>(), RFFT2_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&rfft2), RFFT2_EXPECTED);
 
-        let irfft2 = super::irfft2(&rfft2, None, None).unwrap();
+        let irfft2 = super::irfft2(&rfft2, None, None, stream).unwrap();
         assert_eq!(irfft2.dtype(), Dtype::Float32);
-        assert_eq!(irfft2.as_slice::<f32>(), RFFT2_DATA);
+        assert_eq!(crate::array::eval_vec::<f32>(&irfft2), RFFT2_DATA);
     }
 
     #[test]
     fn test_rfft2_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_SHAPE: &[i32] = &[6, 6];
         const OUT_SHAPE: &[i32] = &[6, 6 / 2 + 1];
 
-        let a = Array::ones::<f32>(IN_SHAPE).unwrap();
-        let rfft2 = super::rfft2(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
+        let rfft2 = super::rfft2(&a, None, None, stream).unwrap();
         assert_eq!(rfft2.shape(), OUT_SHAPE);
     }
 
     #[test]
     fn test_irfft2_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_SHAPE: &[i32] = &[6, 6];
         const OUT_SHAPE: &[i32] = &[6, (6 - 1) * 2];
 
-        let a = Array::ones::<f32>(IN_SHAPE).unwrap();
-        let irfft2 = super::irfft2(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
+        let irfft2 = super::irfft2(&a, None, None, stream).unwrap();
         assert_eq!(irfft2.shape(), OUT_SHAPE);
     }
 
     #[test]
     fn test_rfftn() {
+        let stream = crate::test_stream();
         const RFFTN_DATA: &[f32] = &[1.0; 8];
         const RFFTN_SHAPE: &[i32] = &[2, 2, 2];
         const RFFTN_EXPECTED: &[complex64] = &[
@@ -378,32 +379,34 @@ mod tests {
         ];
 
         let a = Array::from_slice(RFFTN_DATA, RFFTN_SHAPE);
-        let rfftn = super::rfftn(&a, None, None).unwrap();
+        let rfftn = super::rfftn(&a, None, None, stream).unwrap();
         assert_eq!(rfftn.dtype(), Dtype::Complex64);
-        assert_eq!(rfftn.as_slice::<complex64>(), RFFTN_EXPECTED);
+        assert_eq!(crate::array::eval_vec::<complex64>(&rfftn), RFFTN_EXPECTED);
 
-        let irfftn = super::irfftn(&rfftn, None, None).unwrap();
+        let irfftn = super::irfftn(&rfftn, None, None, stream).unwrap();
         assert_eq!(irfftn.dtype(), Dtype::Float32);
-        assert_eq!(irfftn.as_slice::<f32>(), RFFTN_DATA);
+        assert_eq!(crate::array::eval_vec::<f32>(&irfftn), RFFTN_DATA);
     }
 
     #[test]
     fn test_fftn_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_SHAPE: &[i32] = &[6, 6, 6];
         const OUT_SHAPE: &[i32] = &[6, 6, 6 / 2 + 1];
 
-        let a = Array::ones::<f32>(IN_SHAPE).unwrap();
-        let rfftn = super::rfftn(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
+        let rfftn = super::rfftn(&a, None, None, stream).unwrap();
         assert_eq!(rfftn.shape(), OUT_SHAPE);
     }
 
     #[test]
     fn test_irfftn_shape_with_default_params() {
+        let stream = crate::test_stream();
         const IN_SHAPE: &[i32] = &[6, 6, 6];
         const OUT_SHAPE: &[i32] = &[6, 6, (6 - 1) * 2];
 
-        let a = Array::ones::<f32>(IN_SHAPE).unwrap();
-        let irfftn = super::irfftn(&a, None, None).unwrap();
+        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
+        let irfftn = super::irfftn(&a, None, None, stream).unwrap();
         assert_eq!(irfftn.shape(), OUT_SHAPE);
     }
 }

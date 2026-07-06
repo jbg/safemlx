@@ -3,7 +3,7 @@ use std::{borrow::Borrow, collections::HashMap, hash::Hash, path::Path, rc::Rc};
 use crate::{
     error::{Exception, IoError},
     nested::{NestedHashMap, NestedValue},
-    Array,
+    Array, Stream,
 };
 
 /// Type alias for owned module parameters.
@@ -33,7 +33,7 @@ pub trait Module<Input>: ModuleParameters + std::fmt::Debug {
     type Error: std::error::Error;
 
     /// Forward pass of the module.
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error>;
+    fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error>;
 
     /// Set whether the module is in training mode.
     ///
@@ -264,6 +264,7 @@ pub trait ModuleParametersExt: ModuleParameters {
     }
 
     /// Load module parameters from a `safetensors` file.
+    #[cfg(feature = "safetensors")]
     fn load_safetensors(&mut self, path: impl AsRef<Path>) -> Result<(), IoError> {
         let loaded = Array::load_safetensors(path)?;
 

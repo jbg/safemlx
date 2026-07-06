@@ -5,6 +5,7 @@
 /// # Examples
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::array;
 ///
 /// // Create an empty array
@@ -89,70 +90,75 @@ mod tests {
 
     #[test]
     fn test_scalar_array() {
+        let stream = crate::test_stream();
         let arr = array!(1);
 
         // Scalar array has 0 dimension
         assert_eq!(arr.ndim(), 0);
         // Scalar array has empty shape
         assert!(arr.shape().is_empty());
-        assert_eq!(arr.item::<i32>(), 1);
+        assert_eq!(arr.item::<i32>(&stream), 1);
     }
 
     #[test]
     fn test_array_1d() {
+        let stream = crate::test_stream();
         let arr = array!([1, 2, 3]);
 
         // One element array has 1 dimension
         assert_eq!(arr.ndim(), 1);
         assert_eq!(arr.shape(), &[3]);
-        assert_eq!(arr.index(0).item::<i32>(), 1);
-        assert_eq!(arr.index(1).item::<i32>(), 2);
-        assert_eq!(arr.index(2).item::<i32>(), 3);
+        assert_eq!(arr.index_device(0, stream).item::<i32>(&stream), 1);
+        assert_eq!(arr.index_device(1, stream).item::<i32>(&stream), 2);
+        assert_eq!(arr.index_device(2, stream).item::<i32>(&stream), 3);
     }
 
     #[test]
     fn test_array_2d() {
+        let stream = crate::test_stream();
         let a = array!([[1, 2, 3], [4, 5, 6]]);
 
         assert_eq!(a.ndim(), 2);
         assert_eq!(a.shape(), &[2, 3]);
-        assert_eq!(a.index((0, 0)).item::<i32>(), 1);
-        assert_eq!(a.index((0, 1)).item::<i32>(), 2);
-        assert_eq!(a.index((0, 2)).item::<i32>(), 3);
-        assert_eq!(a.index((1, 0)).item::<i32>(), 4);
-        assert_eq!(a.index((1, 1)).item::<i32>(), 5);
-        assert_eq!(a.index((1, 2)).item::<i32>(), 6);
+        assert_eq!(a.index_device((0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(a.index_device((0, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(a.index_device((0, 2), stream).item::<i32>(&stream), 3);
+        assert_eq!(a.index_device((1, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(a.index_device((1, 1), stream).item::<i32>(&stream), 5);
+        assert_eq!(a.index_device((1, 2), stream).item::<i32>(&stream), 6);
     }
 
     #[test]
     fn test_array_3d() {
+        let stream = crate::test_stream();
         let a = array!([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]]);
 
         assert!(a.ndim() == 3);
         assert_eq!(a.shape(), &[2, 2, 3]);
-        assert_eq!(a.index((0, 0, 0)).item::<i32>(), 1);
-        assert_eq!(a.index((0, 0, 1)).item::<i32>(), 2);
-        assert_eq!(a.index((0, 0, 2)).item::<i32>(), 3);
-        assert_eq!(a.index((0, 1, 0)).item::<i32>(), 4);
-        assert_eq!(a.index((0, 1, 1)).item::<i32>(), 5);
-        assert_eq!(a.index((0, 1, 2)).item::<i32>(), 6);
-        assert_eq!(a.index((1, 0, 0)).item::<i32>(), 7);
-        assert_eq!(a.index((1, 0, 1)).item::<i32>(), 8);
-        assert_eq!(a.index((1, 0, 2)).item::<i32>(), 9);
-        assert_eq!(a.index((1, 1, 0)).item::<i32>(), 10);
-        assert_eq!(a.index((1, 1, 1)).item::<i32>(), 11);
-        assert_eq!(a.index((1, 1, 2)).item::<i32>(), 12);
+        assert_eq!(a.index_device((0, 0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(a.index_device((0, 0, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(a.index_device((0, 0, 2), stream).item::<i32>(&stream), 3);
+        assert_eq!(a.index_device((0, 1, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(a.index_device((0, 1, 1), stream).item::<i32>(&stream), 5);
+        assert_eq!(a.index_device((0, 1, 2), stream).item::<i32>(&stream), 6);
+        assert_eq!(a.index_device((1, 0, 0), stream).item::<i32>(&stream), 7);
+        assert_eq!(a.index_device((1, 0, 1), stream).item::<i32>(&stream), 8);
+        assert_eq!(a.index_device((1, 0, 2), stream).item::<i32>(&stream), 9);
+        assert_eq!(a.index_device((1, 1, 0), stream).item::<i32>(&stream), 10);
+        assert_eq!(a.index_device((1, 1, 1), stream).item::<i32>(&stream), 11);
+        assert_eq!(a.index_device((1, 1, 2), stream).item::<i32>(&stream), 12);
     }
 
     #[test]
     fn test_array_with_shape() {
+        let stream = crate::test_stream();
         let a = array!([1, 2, 3, 4], shape = [2, 2]);
 
         assert_eq!(a.ndim(), 2);
         assert_eq!(a.shape(), &[2, 2]);
-        assert_eq!(a.index((0, 0)).item::<i32>(), 1);
-        assert_eq!(a.index((0, 1)).item::<i32>(), 2);
-        assert_eq!(a.index((1, 0)).item::<i32>(), 3);
-        assert_eq!(a.index((1, 1)).item::<i32>(), 4);
+        assert_eq!(a.index_device((0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(a.index_device((0, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(a.index_device((1, 0), stream).item::<i32>(&stream), 3);
+        assert_eq!(a.index_device((1, 1), stream).item::<i32>(&stream), 4);
     }
 }

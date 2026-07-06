@@ -83,7 +83,7 @@ let loss_fn = |w: &Array| -> Result<Array, Exception> {
     Ok(loss)
 };
 
-let grad_fn = transforms::grad(loss_fn, &[0]);
+let grad_fn = transforms::grad_with_argnums(loss_fn, &[0], stream);
 ```
 
 ✅ Instead, pass all required arrays as inputs to ensure proper tracing:
@@ -101,7 +101,7 @@ let argnums = &[0];  // Specify which argument to differentiate with respect to
 
 // Pass all required arrays in the inputs slice
 let mut inputs = vec![w, x, y];
-let grad = transforms::grad(loss_fn, argnums)(&inputs)?;
+let grad = transforms::grad_with_argnums(loss_fn, argnums, stream)(&inputs)?;
 ```
 
 When using gradients in training loops, remember to update the appropriate array in your inputs:
@@ -110,7 +110,7 @@ When using gradients in training loops, remember to update the appropriate array
 let mut inputs = vec![w, x, y];
 
 for _ in 0..num_iterations {
-    let grad = transforms::grad(loss_fn, argnums)(&inputs)?;
+    let grad = transforms::grad_with_argnums(loss_fn, argnums, stream)(&inputs)?;
     inputs[0] = &inputs[0] - Array::from_f32(learning_rate) * grad;  // Update the weight array
     inputs[0].eval()?;
 }

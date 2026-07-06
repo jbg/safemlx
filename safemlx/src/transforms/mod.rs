@@ -32,17 +32,17 @@
 //!     x.square()
 //! }
 //!
-//! fn calculate_grad(func: impl Fn(&Array) -> Result<Array>, arg: &Array) -> Result<Array> {
-//!     grad(&func, &[0])(arg)
+//! fn calculate_grad(func: impl Fn(&Array) -> Result<Array>, arg: &Array, stream: &safemlx::Stream) -> Result<Array> {
+//!     grad(&func)(arg)
 //! }
 //!
 //! let x = Array::from(1.5);
 //!
 //! let dfdx = calculate_grad(f, &x).unwrap();
-//! assert_eq!(dfdx.item::<f32>(), 2.0 * 1.5);
+//! assert_eq!(dfdx.item::<f32>(&stream), 2.0 * 1.5);
 //!
 //! let dfdx2 = calculate_grad(|args| calculate_grad(f, args), &x).unwrap();
-//! assert_eq!(dfdx2.item::<f32>(), 2.0);
+//! assert_eq!(dfdx2.item::<f32>(&stream), 2.0);
 //! ```
 
 use safemlx_sys::mlx_closure_value_and_grad;
@@ -50,13 +50,14 @@ use safemlx_sys::mlx_closure_value_and_grad;
 use crate::{
     error::{get_and_clear_closure_error, Result},
     module::ModuleParamRef,
-    utils::{guard::Guarded, Closure, VectorArray, SUCCESS},
+    utils::{guard::Guarded, runtime_lock, Closure, VectorArray, SUCCESS},
     Array,
 };
 
 pub mod compile;
 mod grad;
 mod keyed_value_and_grad;
+mod transform_guard;
 mod value_and_grad;
 
 pub use grad::*;
@@ -66,6 +67,7 @@ pub use value_and_grad::*;
 /// Evaluate an iterator of [`Array`]s.
 pub fn eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    let _guard = runtime_lock::enter();
     <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_eval(vec.as_ptr()) })
 }
 
@@ -81,6 +83,7 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<()> {
 /// Please note that this is not a rust async function.
 pub fn async_eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    let _guard = runtime_lock::enter();
     <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_async_eval(vec.as_ptr()) })
 }
 
@@ -99,6 +102,7 @@ fn jvp_inner(
 ) -> Result<(Vec<Array>, Vec<Array>)> {
     let c_primals = VectorArray::try_from_iter(primals.iter())?;
     let c_tangents = VectorArray::try_from_iter(tangents.iter())?;
+    let _transform_guard = transform_guard::enter();
 
     <(Vec<Array>, Vec<Array>) as Guarded>::try_from_op(|(res_0, res_1)| unsafe {
         safemlx_sys::mlx_jvp(
@@ -162,6 +166,7 @@ fn vjp_inner(
 ) -> Result<(Vec<Array>, Vec<Array>)> {
     let c_primals = VectorArray::try_from_iter(primals.iter())?;
     let c_cotangents = VectorArray::try_from_iter(cotangents.iter())?;
+    let _transform_guard = transform_guard::enter();
 
     <(Vec<Array>, Vec<Array>) as Guarded>::try_from_op(|(res_0, res_1)| unsafe {
         safemlx_sys::mlx_vjp(
@@ -238,6 +243,7 @@ fn value_and_gradient(
     arrays: impl Iterator<Item = impl AsRef<Array>>,
 ) -> Result<(Vec<Array>, Vec<Array>)> {
     let input_vector = VectorArray::try_from_iter(arrays)?;
+    let _transform_guard = transform_guard::enter();
 
     <(Vec<Array>, Vec<Array>) as Guarded>::try_from_op(|(res_0, res_1)| unsafe {
         safemlx_sys::mlx_closure_value_and_grad_apply(
@@ -268,26 +274,30 @@ mod tests {
 
     #[test]
     fn test_jvp() {
-        let f = |inputs: &[Array]| -> Vec<Array> { vec![&inputs[0] + &inputs[1]] };
+        let stream = crate::test_stream();
+        let f = move |inputs: &[Array]| -> Vec<Array> {
+            vec![inputs[0].add(&inputs[1], stream).unwrap()]
+        };
         let x = array!(1.0f32);
         let y = array!(1.0f32);
         let (out, dout) = jvp(f, &[x, y], &[array!(1.0f32), array!(3.0f32)]).unwrap();
-        assert_eq!(out[0].item::<f32>(), 2.0f32);
-        assert_eq!(dout[0].item::<f32>(), 4.0f32);
+        assert_eq!(out[0].clone().item::<f32>(&stream), 2.0f32);
+        assert_eq!(dout[0].clone().item::<f32>(&stream), 4.0f32);
     }
 
     #[test]
     fn test_jvp_with_error() {
-        let f = |inputs: &[Array]| -> Result<Vec<Array>> {
-            inputs[0].add(&inputs[1]).map(|res| vec![res])
+        let stream = crate::test_stream();
+        let f = move |inputs: &[Array]| -> Result<Vec<Array>> {
+            inputs[0].add(&inputs[1], stream).map(|res| vec![res])
         };
 
         // Success case
         let x = array!(1.0f32);
         let y = array!(1.0f32);
         let (out, dout) = fallible_jvp(f, &[x, y], &[array!(1.0f32), array!(3.0f32)]).unwrap();
-        assert_eq!(out[0].item::<f32>(), 2.0f32);
-        assert_eq!(dout[0].item::<f32>(), 4.0f32);
+        assert_eq!(out[0].clone().item::<f32>(&stream), 2.0f32);
+        assert_eq!(dout[0].clone().item::<f32>(&stream), 4.0f32);
 
         // Error case
         // Use non-broadcastable shapes
@@ -303,20 +313,24 @@ mod tests {
 
     #[test]
     fn test_vjp() {
-        let f = |inputs: &[Array]| -> Vec<Array> { vec![&inputs[0] + &inputs[1]] };
+        let stream = crate::test_stream();
+        let f = move |inputs: &[Array]| -> Vec<Array> {
+            vec![inputs[0].add(&inputs[1], stream).unwrap()]
+        };
         let x = array!(1.0f32);
         let y = array!(1.0f32);
         let primals = vec![x, y];
         let cotangents = vec![array!(1.0f32)];
         let (out, dout) = vjp(f, &primals, &cotangents).unwrap();
-        assert_eq!(out[0].item::<f32>(), 2.0f32);
-        assert_eq!(dout[0].item::<f32>(), 1.0f32);
+        assert_eq!(out[0].clone().item::<f32>(&stream), 2.0f32);
+        assert_eq!(dout[0].clone().item::<f32>(&stream), 1.0f32);
     }
 
     #[test]
     fn test_vjp_with_error() {
-        let f = |inputs: &[Array]| -> Result<Vec<Array>> {
-            inputs[0].add(&inputs[1]).map(|res| vec![res])
+        let stream = crate::test_stream();
+        let f = move |inputs: &[Array]| -> Result<Vec<Array>> {
+            inputs[0].add(&inputs[1], stream).map(|res| vec![res])
         };
 
         // Success case
@@ -325,8 +339,8 @@ mod tests {
         let primals = vec![x, y];
         let cotangents = vec![array!(1.0f32)];
         let (out, dout) = fallible_vjp(f, &primals, &cotangents).unwrap();
-        assert_eq!(out[0].item::<f32>(), 2.0f32);
-        assert_eq!(dout[0].item::<f32>(), 1.0f32);
+        assert_eq!(out[0].clone().item::<f32>(&stream), 2.0f32);
+        assert_eq!(dout[0].clone().item::<f32>(&stream), 1.0f32);
 
         // Error case
         // Use non-broadcastable shapes
@@ -338,5 +352,24 @@ mod tests {
         // Check that the error is not just "mlx_closure returned a non-zero value"
         let err = result.unwrap_err();
         assert!(!err.what().contains("non-zero value"))
+    }
+
+    #[test]
+    fn async_eval_cpu_streams_are_concurrent_safe() {
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..64 {
+                        let stream = crate::Stream::new_with_device(&crate::Device::new(
+                            crate::DeviceType::Cpu,
+                            0,
+                        ));
+                        let x = crate::Array::zeros::<f32>(&[1], &stream).unwrap();
+                        async_eval([&x]).unwrap();
+                        x.evaluated().unwrap();
+                    }
+                });
+            }
+        });
     }
 }

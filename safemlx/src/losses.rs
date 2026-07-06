@@ -43,11 +43,15 @@ pub enum LossReduction {
 
 impl LossReduction {
     /// Reduces the loss according to the reduction type.
-    pub fn reduce(&self, loss: Array) -> Result<Array, Exception> {
+    pub fn reduce(
+        &self,
+        loss: Array,
+        stream: impl AsRef<crate::Stream>,
+    ) -> Result<Array, Exception> {
         match self {
             LossReduction::None => Ok(loss),
-            LossReduction::Sum => Ok(loss.sum(None)?),
-            LossReduction::Mean => Ok(loss.mean(None)?),
+            LossReduction::Sum => Ok(loss.sum(None, stream)?),
+            LossReduction::Mean => Ok(loss.mean(None, stream)?),
         }
     }
 }
@@ -126,42 +130,55 @@ impl<'a> CrossEntropy<'a> {
         &self,
         logits: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let logits = logits.as_ref();
         let targets = targets.as_ref();
 
         let target_as_probs = targets.ndim() == logits.ndim();
 
         let score = if target_as_probs {
-            sum_axes(&logits.multiply(targets)?, &[self.axis], None)?
+            sum_axes(
+                &logits.multiply(targets, stream)?,
+                &[self.axis],
+                None,
+                stream,
+            )?
         } else {
-            take_along_axis(logits, &targets.expand_dims_axes(&[-1])?, self.axis)?
-                .squeeze_axes(&[-1])?
+            take_along_axis(
+                logits,
+                &targets.expand_dims_axes(&[-1], stream)?,
+                self.axis,
+                stream,
+            )?
+            .squeeze_axes(&[-1], stream)?
         };
-        let log_sum_exp_logits = logsumexp_axes(logits, &[self.axis], None)?;
+        let log_sum_exp_logits = logsumexp_axes(logits, &[self.axis], None, stream)?;
 
         let mut loss = if self.label_smoothing > 0.0 {
             // adjust the true class score with label smoothing
-            let adjusted_score = multiply(array!(1.0 - self.label_smoothing), score)?;
+            let adjusted_score = multiply(array!(1.0 - self.label_smoothing), score, stream)?;
 
             // calculate the mean logit across the classes for smoothed loss
-            let mean_logits = logits.mean_axis(self.axis, None)?;
-            let smoothed_loss = -multiply(mean_logits, array!(self.label_smoothing))?;
+            let mean_logits = logits.mean_axis(self.axis, None, stream)?;
+            let smoothed_loss =
+                multiply(mean_logits, array!(self.label_smoothing), stream)?.negative(stream)?;
 
             // combine the adjusted score and smoothed loss with the logsumexp logits
             log_sum_exp_logits
-                .subtract(adjusted_score)?
-                .add(smoothed_loss)?
+                .subtract(adjusted_score, stream)?
+                .add(smoothed_loss, stream)?
         } else {
-            log_sum_exp_logits.subtract(score)?
+            log_sum_exp_logits.subtract(score, stream)?
         };
 
         if let Some(weights) = self.weights {
             check_shape(weights, &loss, "weights", "loss")?;
-            loss = multiply(loss, weights)?;
+            loss = multiply(loss, weights, stream)?;
         }
 
-        self.reduction.reduce(loss)
+        self.reduction.reduce(loss, stream)
     }
 }
 
@@ -211,7 +228,9 @@ impl<'a> BinaryCrossEntropy<'a> {
         &self,
         logits: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let logits = logits.as_ref();
         let targets = targets.as_ref();
         let weights = self.weights;
@@ -219,23 +238,32 @@ impl<'a> BinaryCrossEntropy<'a> {
         let reduction = self.reduction;
 
         let mut loss = if inputs_are_logits {
-            logaddexp(array!(0.0), logits)?.subtract(targets.multiply(logits)?)?
+            logaddexp(array!(0.0), logits, stream)?
+                .subtract(targets.multiply(logits, stream)?, stream)?
         } else {
-            let log_inputs_clip = clip(log(logits)?, (-100.0, ()))?;
-            let log_inputs_inverse_clip = clip(log(&array!(1.0).subtract(logits)?)?, (-100.0, ()))?;
-            -(targets.multiply(log_inputs_clip)?.add(
-                array!(1.0)
-                    .subtract(targets)?
-                    .multiply(log_inputs_inverse_clip)?,
-            )?)
+            let log_inputs_clip = clip(log(logits, stream)?, (-100.0, ()), stream)?;
+            let log_inputs_inverse_clip = clip(
+                log(&array!(1.0).subtract(logits, stream)?, stream)?,
+                (-100.0, ()),
+                stream,
+            )?;
+            targets
+                .multiply(log_inputs_clip, stream)?
+                .add(
+                    array!(1.0)
+                        .subtract(targets, stream)?
+                        .multiply(log_inputs_inverse_clip, stream)?,
+                    stream,
+                )?
+                .negative(stream)?
         };
 
         if let Some(weights) = weights {
             check_shape(weights, &loss, "weights", "loss")?;
-            loss = multiply(loss, weights)?;
+            loss = multiply(loss, weights, stream)?;
         }
 
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -265,14 +293,16 @@ impl L1Loss {
         &self,
         predictions: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let predictions = predictions.as_ref();
         let targets = targets.as_ref();
         let reduction = self.reduction;
 
         check_shape(predictions, targets, "predictions", "targets")?;
-        let loss = predictions.subtract(targets)?.abs()?;
-        reduction.reduce(loss)
+        let loss = predictions.subtract(targets, stream)?.abs(stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -302,14 +332,16 @@ impl MseLoss {
         &self,
         predictions: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let predictions = predictions.as_ref();
         let targets = targets.as_ref();
         let reduction = self.reduction;
 
         check_shape(predictions, targets, "predictions", "targets")?;
-        let loss = predictions.subtract(targets)?.square()?;
-        reduction.reduce(loss)
+        let loss = predictions.subtract(targets, stream)?.square(stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -346,15 +378,23 @@ impl NllLoss {
         &self,
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let axis = self.axis;
         let reduction = self.reduction;
 
-        let loss = -take_along_axis(inputs, &targets.expand_dims_axes(&[-1])?, axis)?
-            .squeeze_axes(&[-1])?;
-        reduction.reduce(loss)
+        let loss = take_along_axis(
+            inputs,
+            &targets.expand_dims_axes(&[-1], stream)?,
+            axis,
+            stream,
+        )?
+        .squeeze_axes(&[-1], stream)?
+        .negative(stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -402,7 +442,9 @@ impl GaussianNllLoss {
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
         vars: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let vars = vars.as_ref();
@@ -413,16 +455,24 @@ impl GaussianNllLoss {
         check_shape(inputs, targets, "inputs", "targets")?;
         check_shape(inputs, vars, "inputs", "vars")?;
 
-        let vars = maximum(vars, array!(eps))?;
-        let mut loss =
-            array!(0.5) * (log(&vars)?.add(square(&targets.subtract(inputs)?)?.divide(&vars)?)?);
+        let vars = maximum(vars, array!(eps), stream)?;
+        let mut loss = array!(0.5).multiply(
+            log(&vars, stream)?.add(
+                square(&targets.subtract(inputs, stream)?, stream)?.divide(&vars, stream)?,
+                stream,
+            )?,
+            stream,
+        )?;
 
         if full {
             let pi = array!(std::f32::consts::PI);
-            loss = loss.add(array!(0.5).multiply(log(&array!(2.0).multiply(pi)?)?)?)?;
+            loss = loss.add(
+                array!(0.5).multiply(log(&array!(2.0).multiply(pi, stream)?, stream)?, stream)?,
+                stream,
+            )?;
         }
 
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -465,18 +515,21 @@ impl KlDivLoss {
         &self,
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let axis = self.axis;
         let reduction = self.reduction;
 
         let loss = sum_axis(
-            &exp(targets)?.multiply(targets.subtract(inputs)?)?,
+            &exp(targets, stream)?.multiply(targets.subtract(inputs, stream)?, stream)?,
             axis,
             None,
+            stream,
         )?;
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -518,21 +571,26 @@ impl SmoothL1Loss {
         &self,
         predictions: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let predictions = predictions.as_ref();
         let targets = targets.as_ref();
         let beta = self.beta;
         let reduction = self.reduction;
 
         check_shape(predictions, targets, "predictions", "targets")?;
-        let diff = predictions.subtract(targets)?.abs()?;
+        let diff = predictions.subtract(targets, stream)?.abs(stream)?;
         let beta = array!(beta);
         let loss = r#where(
-            &diff.lt(&beta)?,
-            array!(0.5).multiply(square(&diff)?)?.divide(&beta)?,
-            diff.subtract(array!(0.5).multiply(beta)?)?,
+            &diff.lt(&beta, stream)?,
+            array!(0.5)
+                .multiply(square(&diff, stream)?, stream)?
+                .divide(&beta, stream)?,
+            diff.subtract(array!(0.5).multiply(beta, stream)?, stream)?,
+            stream,
         )?;
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -594,7 +652,9 @@ impl TripletLoss {
         anchors: impl AsRef<Array>,
         positives: impl AsRef<Array>,
         negatives: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let anchors = anchors.as_ref();
         let positives = positives.as_ref();
         let negatives = negatives.as_ref();
@@ -609,17 +669,23 @@ impl TripletLoss {
         let margin = array!(margin);
 
         let pos = sqrt(
-            &power(&anchors.subtract(positives)?, &p)?
-                .sum_axis(axis, None)?
-                .add(&eps)?,
+            &power(&anchors.subtract(positives, stream)?, &p, stream)?
+                .sum_axis(axis, None, stream)?
+                .add(&eps, stream)?,
+            stream,
         )?;
         let neg = sqrt(
-            &power(&anchors.subtract(negatives)?, &p)?
-                .sum_axis(axis, None)?
-                .add(&eps)?,
+            &power(&anchors.subtract(negatives, stream)?, &p, stream)?
+                .sum_axis(axis, None, stream)?
+                .add(&eps, stream)?,
+            stream,
         )?;
-        let loss = maximum(pos.subtract(neg)?.add(margin)?, array!(0.0))?;
-        reduction.reduce(loss)
+        let loss = maximum(
+            pos.subtract(neg, stream)?.add(margin, stream)?,
+            array!(0.0),
+            stream,
+        )?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -649,15 +715,17 @@ impl HingeLoss {
         &self,
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let reduction = self.reduction;
 
-        let a = array!(1.0).subtract(inputs.multiply(targets)?)?;
+        let a = array!(1.0).subtract(inputs.multiply(targets, stream)?, stream)?;
         let b = array!(0.0);
-        let loss = maximum(a, b)?;
-        reduction.reduce(loss)
+        let loss = maximum(a, b, stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -695,20 +763,22 @@ impl HuberLoss {
         &self,
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let delta = self.delta;
         let reduction = self.reduction;
 
-        let errors = inputs.subtract(targets)?;
-        let abs_errors = errors.abs()?;
-        let quadratic = minimum(&abs_errors, array!(delta))?;
-        let linear = abs_errors.subtract(&quadratic)?;
+        let errors = inputs.subtract(targets, stream)?;
+        let abs_errors = errors.abs(stream)?;
+        let quadratic = minimum(&abs_errors, array!(delta), stream)?;
+        let linear = abs_errors.subtract(&quadratic, stream)?;
         let loss = array!(0.5)
-            .multiply(square(&quadratic)?)?
-            .add(array!(delta).multiply(linear)?)?;
-        reduction.reduce(loss)
+            .multiply(square(&quadratic, stream)?, stream)?
+            .add(array!(delta).multiply(linear, stream)?, stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -742,15 +812,18 @@ impl LogCoshLoss {
         &self,
         inputs: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs = inputs.as_ref();
         let targets = targets.as_ref();
         let reduction = self.reduction;
 
-        let errors = inputs.subtract(targets)?;
-        let neg_errors = errors.negative()?;
-        let loss = logaddexp(errors, neg_errors)?.subtract(log(&array!(2.0))?)?;
-        reduction.reduce(loss)
+        let errors = inputs.subtract(targets, stream)?;
+        let neg_errors = errors.negative(stream)?;
+        let loss =
+            logaddexp(errors, neg_errors, stream)?.subtract(log(&array!(2.0), stream)?, stream)?;
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -791,29 +864,41 @@ impl CosineSimilarityLoss {
     ///
     /// - `x1`: first array
     /// - `x2`: second array
-    pub fn apply(&self, x1: impl AsRef<Array>, x2: impl AsRef<Array>) -> Result<Array, Exception> {
+    pub fn apply(
+        &self,
+        x1: impl AsRef<Array>,
+        x2: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
+    ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let x1 = x1.as_ref();
         let x2 = x2.as_ref();
         let axis = self.axis;
         let eps = self.eps;
         let reduction = self.reduction;
 
-        fn l2_loss(a: &Array, axis: i32) -> Result<Array, Exception> {
+        fn l2_loss(a: &Array, axis: i32, stream: &crate::Stream) -> Result<Array, Exception> {
             if a.dtype().is_complex() {
-                Ok(sqrt(&sum_axis(&abs(a)?.square()?, axis, None)?)?)
+                Ok(sqrt(
+                    &sum_axis(&abs(a, stream)?.square(stream)?, axis, None, stream)?,
+                    stream,
+                )?)
             } else {
-                Ok(sqrt(&sum_axis(&a.square()?, axis, None)?)?)
+                Ok(sqrt(
+                    &sum_axis(&a.square(stream)?, axis, None, stream)?,
+                    stream,
+                )?)
             }
         }
 
-        let x1_norm = l2_loss(x1, axis)?;
-        let x2_norm = l2_loss(x2, axis)?;
+        let x1_norm = l2_loss(x1, axis, stream)?;
+        let x2_norm = l2_loss(x2, axis, stream)?;
 
-        let num = sum_axis(&x1.multiply(x2)?, axis, None)?;
-        let den = maximum(x1_norm.multiply(x2_norm)?, array!(eps))?;
-        let loss = num.divide(&den)?;
+        let num = sum_axis(&x1.multiply(x2, stream)?, axis, None, stream)?;
+        let den = maximum(x1_norm.multiply(x2_norm, stream)?, array!(eps), stream)?;
+        let loss = num.divide(&den, stream)?;
 
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -854,7 +939,9 @@ impl MarginRankingLoss {
         inputs1: impl AsRef<Array>,
         inputs2: impl AsRef<Array>,
         targets: impl AsRef<Array>,
+        stream: impl AsRef<crate::Stream>,
     ) -> Result<Array, Exception> {
+        let stream = stream.as_ref();
         let inputs1 = inputs1.as_ref();
         let inputs2 = inputs2.as_ref();
         let targets = targets.as_ref();
@@ -865,12 +952,16 @@ impl MarginRankingLoss {
         check_shape(inputs1, targets, "inputs1", "targets")?;
 
         let margin = array!(margin);
-        let diff = inputs1.subtract(inputs2)?;
+        let diff = inputs1.subtract(inputs2, stream)?;
         let loss = maximum(
             array!(0.0),
-            targets.multiply(diff)?.negative()?.add(margin)?,
+            targets
+                .multiply(diff, stream)?
+                .negative(stream)?
+                .add(margin, stream)?,
+            stream,
         )?;
-        reduction.reduce(loss)
+        reduction.reduce(loss, stream)
     }
 }
 
@@ -886,23 +977,28 @@ mod tests {
 
     #[test]
     fn test_cross_entropy() {
+        let stream = crate::test_stream();
         // No weights, no label smoothing
         let logits = array!([[0.0, f32::NEG_INFINITY], [f32::NEG_INFINITY, 0.0]]);
         let indices = array!([0, 1]);
         let expected = array!([0.0, 0.0]);
         let loss = CrossEntropy::new()
             .unwrap()
-            .apply(&logits, indices)
+            .apply(&logits, indices, stream)
             .unwrap();
-        assert_array_eq!(loss, expected);
+        assert_array_eq!(loss, expected, stream = stream);
 
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(logits, probs).unwrap();
-        assert!(is_nan(&loss).unwrap().all(None).unwrap().item::<bool>());
+        let loss = cross_entropy.apply(logits, probs, stream).unwrap();
+        assert!(is_nan(&loss, stream)
+            .unwrap()
+            .all(None, stream)
+            .unwrap()
+            .item::<bool>(&stream));
 
         // With weights, no label smoothing
         let logits = array!([[2.0, -1.0], [-1.0, 2.0]]);
@@ -914,8 +1010,8 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(&logits, indices).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(&logits, indices, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
@@ -923,8 +1019,8 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(logits, probs).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(logits, probs, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         // No weights, with label smoothing
         let logits = array!([[2.0, -1.0], [-1.0, 2.0]]);
@@ -935,8 +1031,8 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(&logits, indices).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(&logits, indices, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
@@ -944,8 +1040,8 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(logits, probs).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(logits, probs, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         // With weights and label smoothing
         let logits = array!([[2.0, -1.0], [-1.0, 2.0]]);
@@ -958,8 +1054,8 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(&logits, indices).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(&logits, indices, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
@@ -968,12 +1064,13 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = cross_entropy.apply(logits, probs).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = cross_entropy.apply(logits, probs, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
     }
 
     #[test]
     fn test_binary_cross_entropy_with_logits_as_inputs() {
+        let stream = crate::test_stream();
         let logits = array!([0.105361, 0.223144, 1.20397, 0.916291]);
         let targets = array!([0.0, 0.0, 1.0, 1.0]);
 
@@ -982,27 +1079,33 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = binary_cross_entropy.apply(&logits, &targets).unwrap();
+        let loss_none = binary_cross_entropy
+            .apply(&logits, &targets, stream)
+            .unwrap();
         let expected_none = array!([0.747215, 0.810930, 0.262365, 0.336472]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = binary_cross_entropy.apply(&logits, &targets).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = binary_cross_entropy
+            .apply(&logits, &targets, stream)
+            .unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss = binary_cross_entropy.apply(&logits, &targets).unwrap();
-        let expected = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = binary_cross_entropy
+            .apply(&logits, &targets, stream)
+            .unwrap();
+        let expected = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
 
         // With weights, no label smoothing
         let weights = array!([1.0, 2.0, 1.0, 2.0]);
@@ -1012,12 +1115,15 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss = binary_cross_entropy.apply(&logits, &targets).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = binary_cross_entropy
+            .apply(&logits, &targets, stream)
+            .unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
     }
 
     #[test]
     fn test_binary_cross_entropy_with_probs_as_inputs() {
+        let stream = crate::test_stream();
         let probs = array!([0.5, 0.6, 0.7, 0.8]);
         let targets = array!([0.0, 0.0, 1.0, 1.0]);
 
@@ -1027,9 +1133,11 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = binary_cross_entropy.apply(&probs, &targets).unwrap();
+        let loss_none = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
         let expected_none = array!([0.693147, 0.916291, 0.356675, 0.223144]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
@@ -1037,9 +1145,11 @@ mod tests {
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = binary_cross_entropy.apply(&probs, &targets).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
@@ -1047,13 +1157,16 @@ mod tests {
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss = binary_cross_entropy.apply(&probs, &targets).unwrap();
-        let expected = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
+        let expected = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
     }
 
     #[test]
     fn test_binary_cross_entropy_with_tiny_probs_as_inputs() {
+        let stream = crate::test_stream();
         let tiny_prob = 1e-59;
         let probs = array!([0.0, tiny_prob, 1.0 - tiny_prob, 1.0]);
         let targets = array!([0.0, 0.0, 1.0, 1.0]);
@@ -1064,9 +1177,11 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = binary_cross_entropy.apply(&probs, &targets).unwrap();
+        let loss_none = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
         let expected_none = array!([0.0, tiny_prob, tiny_prob, 0.0]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
@@ -1074,9 +1189,11 @@ mod tests {
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = binary_cross_entropy.apply(&probs, &targets).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let binary_cross_entropy = BinaryCrossEntropyBuilder::new()
@@ -1084,153 +1201,167 @@ mod tests {
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss = binary_cross_entropy.apply(&probs, &targets).unwrap();
-        let expected = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss, expected);
+        let loss = binary_cross_entropy
+            .apply(&probs, &targets, stream)
+            .unwrap();
+        let expected = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss, expected, stream = stream);
     }
 
     #[test]
     fn test_l1_loss() {
+        let stream = crate::test_stream();
         let predictions = array!([0.5, 0.2, 0.9, 0.0]);
         let targets = array!([0.5, 0.2, 0.9, 0.0]);
 
         let expected_none = array!([0.0, 0.0, 0.0, 0.0]);
-        let expected_sum = expected_none.sum(None).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
 
         let l1_loss = L1LossBuilder::new()
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_none, expected_none);
+        let loss_none = l1_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         let l1_loss = L1LossBuilder::new()
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = l1_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
 
         let l1_loss = L1LossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = l1_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
     }
 
     #[test]
     fn test_mse_loss() {
+        let stream = crate::test_stream();
         let predictions = array!([0.5, 0.2, 0.9, 0.0]);
         let targets = array!([0.7, 0.1, 0.8, 0.2]);
 
         let expected_none = array!([0.04, 0.01, 0.01, 0.04]);
-        let expected_mean = expected_none.mean(None).unwrap();
-        let expected_sum = expected_none.sum(None).unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
 
         let mse_loss = MseLossBuilder::new()
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = mse_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_none, expected_none);
+        let loss_none = mse_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         let mse_loss = MseLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = mse_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = mse_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         let mse_loss = MseLossBuilder::new()
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = mse_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = mse_loss.apply(&predictions, &targets, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
     }
 
     #[test]
     fn test_smooth_l1_loss() {
+        let stream = crate::test_stream();
         let predictions = array!([1.5, 2.5, 0.5, 3.5]);
         let targets = array!([1.0, 2.0, 0.5, 2.5]);
         let beta = 1.0;
 
         let expected_none = array!([0.125, 0.125, 0.0, 0.5]);
-        let expected_sum = expected_none.sum(None).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
 
         let smooth_l1_loss = SmoothL1LossBuilder::new()
             .beta(beta)
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = smooth_l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_none, expected_none);
+        let loss_none = smooth_l1_loss
+            .apply(&predictions, &targets, stream)
+            .unwrap();
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         let smooth_l1_loss = SmoothL1LossBuilder::new()
             .beta(beta)
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = smooth_l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = smooth_l1_loss
+            .apply(&predictions, &targets, stream)
+            .unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
 
         let smooth_l1_loss = SmoothL1LossBuilder::new()
             .beta(beta)
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = smooth_l1_loss.apply(&predictions, &targets).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = smooth_l1_loss
+            .apply(&predictions, &targets, stream)
+            .unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
     }
 
     #[test]
     fn test_smooth_l1_loss_negative_diff() {
+        let stream = crate::test_stream();
         let a = array!([1.5, 6.0, 0.5, 2.5]);
         let b = array!([1.0, 2.0, 0.5, 3.5]);
 
         let loss = SmoothL1Loss::new();
 
-        let ab = loss.apply(&a, &b).unwrap();
-        let ba = loss.apply(&b, &a).unwrap();
-        assert_array_eq!(ab, ba);
+        let ab = loss.apply(&a, &b, stream).unwrap();
+        let ba = loss.apply(&b, &a, stream).unwrap();
+        assert_array_eq!(ab, ba, stream = stream);
     }
 
     #[test]
     fn test_nll_loss() {
+        let stream = crate::test_stream();
         let logits = array!([[0.0, f32::NEG_INFINITY], [f32::NEG_INFINITY, 0.0]]);
         let targets = array!([0, 1]);
 
         let expected_none = array!([0.0, 0.0]);
-        let expected_sum = expected_none.sum(None).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
 
         let nll_loss = NllLossBuilder::new()
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = nll_loss.apply(&logits, &targets).unwrap();
-        assert_array_eq!(loss_none, expected_none);
+        let loss_none = nll_loss.apply(&logits, &targets, stream).unwrap();
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         let nll_loss = NllLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = nll_loss.apply(&logits, &targets).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = nll_loss.apply(&logits, &targets, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         let nll_loss = NllLossBuilder::new()
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = nll_loss.apply(&logits, &targets).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = nll_loss.apply(&logits, &targets, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
     }
 
     #[test]
     fn test_gaussian_nll_loss() {
+        let stream = crate::test_stream();
         let inputs = array!([[0.1, 0.2], [0.3, 0.4]]);
         let targets = array!([[0.2, 0.1], [0.1, 0.2]]);
         let vars = array!([[0.1, 0.2], [0.3, 0.4]]);
@@ -1241,9 +1372,11 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
+        let loss_none = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
         let expected_none = array!([[-1.101293, -0.779719], [-0.535320, -0.408145]]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean', full=False
         let gaussian_nll_loss = GaussianNllLossBuilder::new()
@@ -1251,9 +1384,11 @@ mod tests {
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum', full=False
         let gaussian_nll_loss = GaussianNllLossBuilder::new()
@@ -1261,9 +1396,11 @@ mod tests {
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
-        let expected_sum = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
 
         // Test with reduction='none', full=True
         let gaussian_nll_loss = GaussianNllLossBuilder::new()
@@ -1271,9 +1408,11 @@ mod tests {
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none_full = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
+        let loss_none_full = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
         let expected_none_full = array!([[-0.182354, 0.139220], [0.383619, 0.510793]]);
-        assert_array_eq!(loss_none_full, expected_none_full);
+        assert_array_eq!(loss_none_full, expected_none_full, stream = stream);
 
         // Test with reduction='mean', full=True
         let gaussian_nll_loss = GaussianNllLossBuilder::new()
@@ -1281,9 +1420,11 @@ mod tests {
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean_full = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
-        let expected_mean_full = expected_none_full.mean(None).unwrap();
-        assert_array_eq!(loss_mean_full, expected_mean_full);
+        let loss_mean_full = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
+        let expected_mean_full = expected_none_full.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean_full, expected_mean_full, stream = stream);
 
         // Test with reduction='sum', full=True
         let gaussian_nll_loss = GaussianNllLossBuilder::new()
@@ -1291,46 +1432,50 @@ mod tests {
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum_full = gaussian_nll_loss.apply(&inputs, &targets, &vars).unwrap();
-        let expected_sum_full = expected_none_full.sum(None).unwrap();
-        assert_array_eq!(loss_sum_full, expected_sum_full);
+        let loss_sum_full = gaussian_nll_loss
+            .apply(&inputs, &targets, &vars, stream)
+            .unwrap();
+        let expected_sum_full = expected_none_full.sum(None, stream).unwrap();
+        assert_array_eq!(loss_sum_full, expected_sum_full, stream = stream);
     }
 
     #[test]
     fn test_kl_div_loss() {
-        let p_logits = array!([[0.5, 0.5], [0.8, 0.2]]).log().unwrap();
-        let q_logits = array!([[0.5, 0.5], [0.2, 0.8]]).log().unwrap();
+        let stream = crate::test_stream();
+        let p_logits = array!([[0.5, 0.5], [0.8, 0.2]]).log(stream).unwrap();
+        let q_logits = array!([[0.5, 0.5], [0.2, 0.8]]).log(stream).unwrap();
 
         // Test with reduction 'none'
         let kl_div_loss = KlDivLossBuilder::new()
             .reduction(LossReduction::None)
             .build()
             .unwrap();
-        let loss_none = kl_div_loss.apply(&p_logits, &q_logits).unwrap();
+        let loss_none = kl_div_loss.apply(&p_logits, &q_logits, stream).unwrap();
         let expected_none = array!([0.0, 0.831777]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let kl_div_loss = KlDivLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss_mean = kl_div_loss.apply(&p_logits, &q_logits).unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let loss_mean = kl_div_loss.apply(&p_logits, &q_logits, stream).unwrap();
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let kl_div_loss = KlDivLossBuilder::new()
             .reduction(LossReduction::Sum)
             .build()
             .unwrap();
-        let loss_sum = kl_div_loss.apply(&p_logits, &q_logits).unwrap();
-        let expected_sum = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let loss_sum = kl_div_loss.apply(&p_logits, &q_logits, stream).unwrap();
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
     }
 
     #[test]
     fn test_triplet_loss() {
+        let stream = crate::test_stream();
         let anchors = array!([[1, 2, 3], [1, 2, 3]]);
         let positives = array!([[4, 5, 6], [0, -1, 2]]);
         let negatives = array!([[7, 8, 9], [3, 2, 3]]);
@@ -1341,10 +1486,10 @@ mod tests {
             .build()
             .unwrap();
         let loss_none = triplet_loss
-            .apply(&anchors, &positives, &negatives)
+            .apply(&anchors, &positives, &negatives, stream)
             .unwrap();
         let expected_none = array!([0.0, 2.31662]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let triplet_loss = TripletLossBuilder::new()
@@ -1352,10 +1497,10 @@ mod tests {
             .build()
             .unwrap();
         let loss_mean = triplet_loss
-            .apply(&anchors, &positives, &negatives)
+            .apply(&anchors, &positives, &negatives, stream)
             .unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let triplet_loss = TripletLossBuilder::new()
@@ -1363,50 +1508,54 @@ mod tests {
             .build()
             .unwrap();
         let loss_sum = triplet_loss
-            .apply(&anchors, &positives, &negatives)
+            .apply(&anchors, &positives, &negatives, stream)
             .unwrap();
-        let expected_sum = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
     }
 
     #[test]
     fn test_hinge_loss() {
+        let stream = crate::test_stream();
         let inputs = array!([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
         let targets = array!([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
         let hinge_loss = HingeLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss = hinge_loss.apply(&inputs, &targets).unwrap();
-        assert_eq!(loss.item::<f32>(), 1.0);
+        let loss = hinge_loss.apply(&inputs, &targets, stream).unwrap();
+        assert_eq!(loss.item::<f32>(&stream), 1.0);
     }
 
     #[test]
     fn test_huber_loss() {
+        let stream = crate::test_stream();
         let inputs = array!([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
         let targets = array!([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
         let huber_loss = HuberLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss = huber_loss.apply(&inputs, &targets).unwrap();
-        assert_eq!(loss.item::<f32>(), 0.5);
+        let loss = huber_loss.apply(&inputs, &targets, stream).unwrap();
+        assert_eq!(loss.item::<f32>(&stream), 0.5);
     }
 
     #[test]
     fn test_log_cosh_loss() {
+        let stream = crate::test_stream();
         let inputs = array!([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
         let targets = array!([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
         let log_cosh_loss = LogCoshLossBuilder::new()
             .reduction(LossReduction::Mean)
             .build()
             .unwrap();
-        let loss = log_cosh_loss.apply(&inputs, &targets).unwrap();
-        assert_float_eq!(loss.item::<f32>(), 0.433781, abs <= 1e-6);
+        let loss = log_cosh_loss.apply(&inputs, &targets, stream).unwrap();
+        assert_float_eq!(loss.item::<f32>(&stream), 0.433781, abs <= 1e-6);
     }
 
     #[test]
     fn test_cosine_similarity_loss() {
+        let stream = crate::test_stream();
         let embeddings1 = array!([[0.5, 0.5, 0.2, 0.9], [0.1, 0.3, 0.5, 0.5]]);
         let embeddings2 = array!([[0.6, 0.4, 0.3, 0.8], [0.2, 0.5, 0.6, 0.4]]);
 
@@ -1416,10 +1565,10 @@ mod tests {
             .build()
             .unwrap();
         let loss_none = cosine_similarity_loss
-            .apply(&embeddings1, &embeddings2)
+            .apply(&embeddings1, &embeddings2, stream)
             .unwrap();
         let expected_none = array!([0.985344, 0.961074]);
-        assert_array_eq!(loss_none, expected_none);
+        assert_array_eq!(loss_none, expected_none, stream = stream);
 
         // Test with reduction 'mean'
         let cosine_similarity_loss = CosineSimilarityLossBuilder::new()
@@ -1427,10 +1576,10 @@ mod tests {
             .build()
             .unwrap();
         let loss_mean = cosine_similarity_loss
-            .apply(&embeddings1, &embeddings2)
+            .apply(&embeddings1, &embeddings2, stream)
             .unwrap();
-        let expected_mean = expected_none.mean(None).unwrap();
-        assert_array_eq!(loss_mean, expected_mean);
+        let expected_mean = expected_none.mean(None, stream).unwrap();
+        assert_array_eq!(loss_mean, expected_mean, stream = stream);
 
         // Test with reduction 'sum'
         let cosine_similarity_loss = CosineSimilarityLossBuilder::new()
@@ -1438,14 +1587,15 @@ mod tests {
             .build()
             .unwrap();
         let loss_sum = cosine_similarity_loss
-            .apply(&embeddings1, &embeddings2)
+            .apply(&embeddings1, &embeddings2, stream)
             .unwrap();
-        let expected_sum = expected_none.sum(None).unwrap();
-        assert_array_eq!(loss_sum, expected_sum);
+        let expected_sum = expected_none.sum(None, stream).unwrap();
+        assert_array_eq!(loss_sum, expected_sum, stream = stream);
     }
 
     #[test]
     fn test_margin_ranking_loss() {
+        let stream = crate::test_stream();
         let inputs1 = array!([-0.573409, -0.765166, -0.0638]);
         let inputs2 = array!([0.75596, 0.225763, 0.256995]);
         let targets = array!([1, 1, -1]);
@@ -1456,10 +1606,10 @@ mod tests {
             .build()
             .unwrap();
         let loss = margin_ranking_loss
-            .apply(&inputs1, &inputs2, &targets)
+            .apply(&inputs1, &inputs2, &targets, stream)
             .unwrap();
         let expected = array!([1.329369, 0.990929, 0.0]);
-        assert_array_eq!(loss, expected);
+        assert_array_eq!(loss, expected, stream = stream);
 
         // Test with margin
         let margin_ranking_loss = MarginRankingLossBuilder::new()
@@ -1468,9 +1618,9 @@ mod tests {
             .build()
             .unwrap();
         let loss = margin_ranking_loss
-            .apply(&inputs1, &inputs2, &targets)
+            .apply(&inputs1, &inputs2, &targets, stream)
             .unwrap();
         let expected = array!([1.829369, 1.490929, 0.179205]);
-        assert_array_eq!(loss, expected);
+        assert_array_eq!(loss, expected, stream = stream);
     }
 }

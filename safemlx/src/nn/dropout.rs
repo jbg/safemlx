@@ -1,6 +1,6 @@
 use crate::module::Module;
 use crate::Array;
-use crate::{array, error::Exception, ops::multiply, random::bernoulli};
+use crate::{array, error::Exception, ops::multiply, random::bernoulli, random::RandomState};
 use safemlx_internal_macros::{Buildable, Builder};
 use safemlx_macros::ModuleParameters;
 
@@ -30,6 +30,7 @@ fn build_dropout(builder: DropoutBuilder) -> Result<Dropout, DropoutBuildError> 
     Ok(Dropout {
         one_minus_p: 1.0 - p,
         training: Dropout::DEFAULT_TRAINING,
+        rng: RandomState::new().expect("failed to initialize dropout random state"),
     })
 }
 
@@ -49,6 +50,9 @@ pub struct Dropout {
     /// Whether the layer is in training mode. Default to [`Dropout::DEFAULT_TRAINING`] if not
     /// specified.
     pub training: bool,
+
+    /// Random state used while training.
+    rng: RandomState,
 }
 
 impl Dropout {
@@ -63,14 +67,19 @@ impl Module<&Array> for Dropout {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         if self.one_minus_p == 1.0 || !self.training {
             return Ok(x.clone());
         }
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, x.shape(), None)?;
-        multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
+        let key = self.rng.next_key(stream)?;
+        let mask = bernoulli(&p1, x.shape(), &key, stream)?;
+        multiply(
+            multiply(array!(1.0 / self.one_minus_p), mask, stream)?,
+            x,
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -102,6 +111,7 @@ fn build_dropout2d(builder: Dropout2dBuilder) -> Result<Dropout2d, DropoutBuildE
     Ok(Dropout2d {
         one_minus_p: 1.0 - p,
         training: Dropout2d::DEFAULT_TRAINING,
+        rng: RandomState::new().expect("failed to initialize dropout random state"),
     })
 }
 
@@ -133,6 +143,9 @@ pub struct Dropout2d {
     /// Whether the layer is in training mode. Default to [`Dropout2d::DEFAULT_TRAINING`] if not
     /// specified. Default to [`Dropout2d::DEFAULT_TRAINING`] if not specified.
     pub training: bool,
+
+    /// Random state used while training.
+    rng: RandomState,
 }
 
 impl Dropout2d {
@@ -147,7 +160,7 @@ impl Module<&Array> for Dropout2d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let ndim = x.ndim();
 
         if ndim != 3 && ndim != 4 {
@@ -168,9 +181,14 @@ impl Module<&Array> for Dropout2d {
         mask_shape[len - 3] = 1;
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, &mask_shape, None)?;
+        let key = self.rng.next_key(stream)?;
+        let mask = bernoulli(&p1, &mask_shape, &key, stream)?;
 
-        multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
+        multiply(
+            multiply(array!(1.0 / self.one_minus_p), mask, stream)?,
+            x,
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -202,6 +220,7 @@ fn build_dropout3d(builder: Dropout3dBuilder) -> Result<Dropout3d, DropoutBuildE
     Ok(Dropout3d {
         one_minus_p: 1.0 - p,
         training: Dropout3d::DEFAULT_TRAINING,
+        rng: RandomState::new().expect("failed to initialize dropout random state"),
     })
 }
 
@@ -229,6 +248,9 @@ pub struct Dropout3d {
     /// Whether the layer is in training mode. Default to [`Dropout3d::DEFAULT_TRAINING`] if not
     /// specified.
     pub training: bool,
+
+    /// Random state used while training.
+    rng: RandomState,
 }
 
 impl Dropout3d {
@@ -243,7 +265,7 @@ impl Module<&Array> for Dropout3d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let ndim = x.ndim();
 
         if ndim != 4 && ndim != 5 {
@@ -265,9 +287,14 @@ impl Module<&Array> for Dropout3d {
         mask_shape[len - 4] = 1;
 
         let p1 = array!(self.one_minus_p);
-        let mask = bernoulli(&p1, &mask_shape, None)?;
+        let key = self.rng.next_key(stream)?;
+        let mask = bernoulli(&p1, &mask_shape, &key, stream)?;
 
-        multiply(multiply(array!(1.0 / self.one_minus_p), mask)?, x)
+        multiply(
+            multiply(array!(1.0 / self.one_minus_p), mask, stream)?,
+            x,
+            stream,
+        )
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -286,30 +313,34 @@ mod tests {
 
     #[test]
     fn test_dropout() {
-        crate::random::seed(959).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let mut state = crate::random::RandomState::with_seed(959).unwrap();
+        let key = state.next_key(stream).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.511_429_2,
             abs <= 0.010_228_584
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             130.925_87,
             abs <= 2.618_517_4
         );
-        let result = Dropout::new().forward(&a).unwrap();
+        let mut dropout = Dropout::new();
+        dropout.rng = state;
+        let result = dropout.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.477_913_62,
             abs <= 0.009_558_273
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             122.345_89,
             abs <= 2.446_917_8
         );
@@ -317,30 +348,34 @@ mod tests {
 
     #[test]
     fn test_dropout2d() {
-        crate::random::seed(695).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let mut state = crate::random::RandomState::with_seed(695).unwrap();
+        let key = state.next_key(stream).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.457_839_9,
             abs <= 0.009_156_798
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             117.207_016,
             abs <= 2.344_140_3
         );
-        let result = Dropout2d::new().forward(&a).unwrap();
+        let mut dropout = Dropout2d::new();
+        dropout.rng = state;
+        let result = dropout.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.368_284_34,
             abs <= 0.007_365_687
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             94.280_79,
             abs <= 1.885_615_8
         );
@@ -348,30 +383,34 @@ mod tests {
 
     #[test]
     fn test_dropout3d() {
-        crate::random::seed(23).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], None).unwrap();
+        let stream = crate::test_stream();
+        let mut state = crate::random::RandomState::with_seed(23).unwrap();
+        let key = state.next_key(stream).unwrap();
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 8, 4], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 8, 4]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.500_606_2,
             abs <= 0.010_012_124
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             256.310_36,
             abs <= 5.126_207_4
         );
-        let result = Dropout3d::new().forward(&a).unwrap();
+        let mut dropout = Dropout3d::new();
+        dropout.rng = state;
+        let result = dropout.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 8, 4]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.237_284_15,
             abs <= 0.004_745_683
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             121.489_49,
             abs <= 2.429_789_8
         );

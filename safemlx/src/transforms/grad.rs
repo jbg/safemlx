@@ -4,7 +4,7 @@ use crate::{
     Array,
 };
 
-use super::{value_and_gradient, ClosureValueAndGrad};
+use super::{transform_guard, value_and_gradient, ClosureValueAndGrad};
 
 #[inline]
 fn build_gradient_inner<'a>(
@@ -12,6 +12,7 @@ fn build_gradient_inner<'a>(
     argnums: &'a [i32],
 ) -> impl FnMut(&[Array]) -> Result<Vec<Array>> + 'a {
     move |arrays: &[Array]| -> Result<Vec<Array>> {
+        let _transform_guard = transform_guard::enter();
         let cvg = ClosureValueAndGrad::try_from_op(|res| unsafe {
             safemlx_sys::mlx_value_and_grad(res, closure.as_ptr(), argnums.as_ptr(), argnums.len())
         })?;
@@ -27,7 +28,6 @@ fn build_gradient<'a, F>(
 where
     F: FnMut(&[Array]) -> Vec<Array> + 'a,
 {
-    let argnums = argnums.into_option().unwrap_or(&[0]);
     let closure = Closure::new(f);
     build_gradient_inner(closure, argnums)
 }
@@ -237,8 +237,11 @@ mod tests {
     // The unit tests below are adapted from the mlx c++ codebase
     #[test]
     fn test_grad() {
+        let stream = crate::test_stream();
         let x = &[Array::from_f32(1.0)];
-        let fun = |argin: &[Array]| -> Vec<Array> { vec![&argin[0] + 1.0] };
+        let fun = move |argin: &[Array]| -> Vec<Array> {
+            vec![argin[0].add(Array::from_f32(1.0), stream).unwrap()]
+        };
         let argnums = &[0];
 
         // TODO: how to make this more "functional"?
@@ -246,13 +249,13 @@ mod tests {
             move |args: &[Array]| -> Vec<Array> { grad_with_argnums(fun, argnums)(args).unwrap() };
         let (z, d2fdx2) = value_and_grad_with_argnums(grad_fn, argnums)(x).unwrap();
 
-        assert_eq!(z[0].item::<f32>(), 1.0);
-        assert_eq!(d2fdx2[0].item::<f32>(), 0.0);
+        assert_eq!(z[0].clone().item::<f32>(&stream), 1.0);
+        assert_eq!(d2fdx2[0].clone().item::<f32>(&stream), 0.0);
 
         let grad_fn = move |args: &[Array]| -> Vec<Array> { grad(fun)(args).unwrap() };
         let (z, d2fdx2) = value_and_grad(grad_fn)(x).unwrap();
 
-        assert_eq!(z[0].item::<f32>(), 1.0);
-        assert_eq!(d2fdx2[0].item::<f32>(), 0.0);
+        assert_eq!(z[0].clone().item::<f32>(&stream), 1.0);
+        assert_eq!(d2fdx2[0].clone().item::<f32>(&stream), 0.0);
     }
 }

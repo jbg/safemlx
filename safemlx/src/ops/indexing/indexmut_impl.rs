@@ -6,9 +6,9 @@ use crate::{
     constants::DEFAULT_STACK_VEC_LEN,
     error::Result,
     ops::{
-        broadcast_arrays_device, broadcast_to_device,
+        broadcast_arrays, broadcast_to,
         indexing::{count_non_new_axis_operations, expand_ellipsis_operations},
-        reshape_device,
+        reshape,
     },
     utils::{resolve_index_signed_unchecked, VectorArray},
     Array, Stream,
@@ -87,7 +87,7 @@ fn update_slice(
     // If no non-None indices return the broadcasted update
     let non_new_axis_operation_count = count_non_new_axis_operations(&operations);
     if non_new_axis_operation_count == 0 {
-        return Ok(Some(broadcast_to_device(&update, src.shape(), &stream)?));
+        return Ok(Some(broadcast_to(&update, src.shape(), &stream)?));
     }
 
     // Process entries
@@ -147,7 +147,7 @@ fn update_slice(
     }
 
     if update.shape() != &update_reshape[..] {
-        update = Cow::Owned(reshape_device(update, &update_reshape, &stream)?);
+        update = Cow::Owned(reshape(update, &update_reshape, &stream)?);
     }
 
     Ok(Some(src.slice_update_device(
@@ -166,7 +166,7 @@ fn remove_leading_singleton_dimensions(
         if new_shape.is_empty() {
             new_shape = vec![1];
         }
-        Ok(Cow::Owned(a.reshape_device(&new_shape, stream)?))
+        Ok(Cow::Owned(a.reshape(&new_shape, stream)?))
     } else {
         Ok(Cow::Borrowed(a))
     }
@@ -199,7 +199,7 @@ fn scatter_args<'a>(
             Slice(range_index) => scatter_args_slice(src, range_index, update, stream),
             ExpandDims => Ok(ScatterArgs {
                 indices: smallvec![],
-                update: broadcast_to_device(update, src.shape(), &stream)?,
+                update: broadcast_to(update, src.shape(), &stream)?,
                 axes: smallvec![],
             }),
             Ellipsis => panic!("Unable to update array with ellipsis argument"),
@@ -229,7 +229,7 @@ fn scatter_args_index<'a>(
             index,
             src.dim(0)
         )))],
-        update: broadcast_to_device(&update, &shape, &stream)?,
+        update: broadcast_to(&update, &shape, &stream)?,
         axes: smallvec![0],
     })
 }
@@ -252,10 +252,10 @@ fn scatter_args_array<'a>(
         .chain(src.shape().iter().skip(1))
         .cloned()
         .collect();
-    let update = broadcast_to_device(&update, &update_shape, &stream)?;
+    let update = broadcast_to(&update, &update_shape, &stream)?;
 
     update_shape.insert(a.ndim(), 1);
-    let update = update.reshape_device(&update_shape, &stream)?;
+    let update = update.reshape(&update_shape, &stream)?;
 
     Ok(ScatterArgs {
         indices: smallvec![a],
@@ -278,7 +278,7 @@ fn scatter_args_slice<'a>(
 
         return Ok(ScatterArgs {
             indices: smallvec![],
-            update: broadcast_to_device(&update, src.shape(), &stream)?,
+            update: broadcast_to(&update, src.shape(), &stream)?,
             axes: smallvec![],
         });
     }
@@ -296,7 +296,7 @@ fn scatter_args_slice<'a>(
         let update_broadcast_shape: SmallVec<[i32; DEFAULT_STACK_VEC_LEN]> = (1..end - start)
             .chain(src.shape().iter().skip(1).cloned())
             .collect();
-        let update = broadcast_to_device(&update, &update_broadcast_shape, &stream)?;
+        let update = broadcast_to(&update, &update_broadcast_shape, &stream)?;
 
         let indices = Array::from_slice(&[start], &[1]);
         Ok(ScatterArgs {
@@ -333,7 +333,7 @@ fn scatter_args_nd<'a>(
     if non_new_axis_operation_count == 0 {
         return Ok(ScatterArgs {
             indices: smallvec![],
-            update: broadcast_to_device(&update, shape, &stream)?,
+            update: broadcast_to(&update, shape, &stream)?,
             axes: smallvec![],
         });
     }
@@ -426,7 +426,7 @@ fn scatter_args_nd<'a>(
                 new_shape[start + j] = $indices.dim(j as i32);
             }
 
-            array_indices.push($indices.reshape_device(&new_shape, &stream)?);
+            array_indices.push($indices.reshape(&new_shape, &stream)?);
             array_number = array_number.saturating_add(1);
 
             if !arrays_first && array_number == count_arrays {
@@ -458,7 +458,7 @@ fn scatter_args_nd<'a>(
 
                 // If it's a simple slice, we only need to add the start index
                 if array_number >= count_arrays && count_strided_slices <= 0 && stride == 1 {
-                    let index = Array::from_int(start).reshape_device(&index_shape, &stream)?;
+                    let index = Array::from_int(start).reshape(&index_shape, &stream)?;
                     let slice_shape_entry = end - start;
                     slice_shapes.push(slice_shape_entry);
                     array_indices.push(index);
@@ -475,7 +475,7 @@ fn scatter_args_nd<'a>(
                         slice_number
                     };
                     index_shape[location as usize] = index.size() as i32;
-                    array_indices.push(index.reshape_device(&index_shape, &stream)?);
+                    array_indices.push(index.reshape(&index_shape, &stream)?);
 
                     slice_number = slice_number.saturating_add(1);
                     count_strided_slices = count_strided_slices.saturating_sub(1);
@@ -498,7 +498,7 @@ fn scatter_args_nd<'a>(
     }
 
     // Broadcast the update to the indices and slices
-    let array_indices = broadcast_arrays_device(&array_indices, &stream)?;
+    let array_indices = broadcast_arrays(&array_indices, &stream)?;
     let update_shape_broadcast: Vec<_> = array_indices[0]
         .shape()
         .iter()
@@ -506,7 +506,7 @@ fn scatter_args_nd<'a>(
         .chain(src.shape().iter().skip(non_new_axis_operation_count))
         .cloned()
         .collect();
-    let update = broadcast_to_device(&update, &update_shape_broadcast, &stream)?;
+    let update = broadcast_to(&update, &update_shape_broadcast, &stream)?;
 
     // Reshape the update with the size-1 dims for the int and array indices
     let update_reshape: Vec<_> = array_indices[0]
@@ -517,7 +517,7 @@ fn scatter_args_nd<'a>(
         .cloned()
         .collect();
 
-    let update = update.reshape_device(&update_reshape, &stream)?;
+    let update = update.reshape(&update_reshape, &stream)?;
 
     let array_indices_len = array_indices.len();
 
@@ -551,7 +551,7 @@ fn strided_range_to_vec(start: i32, exclusive_end: i32, stride: i32) -> Vec<i32>
     vec
 }
 
-unsafe fn scatter_device(
+unsafe fn scatter(
     a: &Array,
     indices: &[impl AsRef<Array>],
     updates: &Array,
@@ -591,7 +591,7 @@ impl Array {
             axes,
         } = scatter_args(self, operations, update, &stream)?;
         if !indices.is_empty() {
-            let result = unsafe { scatter_device(self, &indices, &update, &axes, stream)? };
+            let result = unsafe { scatter(self, &indices, &update, &axes, stream)? };
             drop(indices);
             *self = result;
         } else {
@@ -1304,26 +1304,32 @@ mod tests {
 
     #[test]
     fn test_array_mutate_single_index() {
+        let stream = crate::test_stream();
         let mut a = Array::from_iter(0i32..12, &[3, 4]);
         let new_value = Array::from_int(77);
-        a.index_mut(1, new_value);
+        a.index_mut_device(1, new_value, stream);
 
         let expected = Array::from_slice(&[0, 1, 2, 3, 77, 77, 77, 77, 8, 9, 10, 11], &[3, 4]);
-        assert_array_all_close!(a, expected);
+        assert_array_all_close!(a, expected, stream = stream);
     }
 
     #[test]
     fn test_array_mutate_broadcast_multi_index() {
+        let stream = crate::test_stream();
         let mut a = Array::from_iter(0i32..20, &[2, 2, 5]);
 
         // broadcast to a row
-        a.index_mut((1, 0), Array::from_int(77));
+        a.index_mut_device((1, 0), Array::from_int(77), stream);
 
         // assign to a row
-        a.index_mut((0, 0), Array::from_slice(&[55i32, 66, 77, 88, 99], &[5]));
+        a.index_mut_device(
+            (0, 0),
+            Array::from_slice(&[55i32, 66, 77, 88, 99], &[5]),
+            stream,
+        );
 
         // single element
-        a.index_mut((0, 1, 3), Array::from_int(123));
+        a.index_mut_device((0, 1, 3), Array::from_int(123), stream);
 
         let expected = Array::from_slice(
             &[
@@ -1331,15 +1337,16 @@ mod tests {
             ],
             &[2, 2, 5],
         );
-        assert_array_all_close!(a, expected);
+        assert_array_all_close!(a, expected, stream = stream);
     }
 
     #[test]
     fn test_array_mutate_broadcast_slice() {
+        let stream = crate::test_stream();
         let mut a = Array::from_iter(0i32..20, &[2, 2, 5]);
 
         // writing using slices -- this ends up covering two elements
-        a.index_mut((0..1, 1..2, 2..4), Array::from_int(88));
+        a.index_mut_device((0..1, 1..2, 2..4), Array::from_int(88), stream);
 
         let expected = Array::from_slice(
             &[
@@ -1347,64 +1354,67 @@ mod tests {
             ],
             &[2, 2, 5],
         );
-        assert_array_all_close!(a, expected);
+        assert_array_all_close!(a, expected, stream = stream);
     }
 
     #[test]
     fn test_array_mutate_advanced() {
+        let stream = crate::test_stream();
         let mut a = Array::from_iter(0i32..35, &[5, 7]);
 
         let i1 = Array::from_slice(&[0, 2, 4], &[3]);
         let i2 = Array::from_slice(&[0, 1, 2], &[3]);
 
-        a.index_mut((i1, i2), Array::from_slice(&[100, 200, 300], &[3]));
+        a.index_mut_device((i1, i2), Array::from_slice(&[100, 200, 300], &[3]), stream);
 
-        assert_eq!(a.index((0, 0)).item::<i32>(), 100i32);
-        assert_eq!(a.index((2, 1)).item::<i32>(), 200i32);
-        assert_eq!(a.index((4, 2)).item::<i32>(), 300i32);
+        assert_eq!(a.index_device((0, 0), stream).item::<i32>(&stream), 100i32);
+        assert_eq!(a.index_device((2, 1), stream).item::<i32>(&stream), 200i32);
+        assert_eq!(a.index_device((4, 2), stream).item::<i32>(&stream), 300i32);
     }
 
     #[test]
     fn test_full_index_write_single() {
-        fn check<I>(index: I, expected_sum: i32)
+        fn check<I>(index: I, expected_sum: i32, stream: &crate::Stream)
         where
             for<'a> I: ArrayIndex<'a>,
         {
             let mut a = Array::from_iter(0..60, &[3, 4, 5]);
 
-            a.index_mut(index, Array::from_int(1));
-            let sum = a.sum(None).unwrap().item::<i32>();
+            a.index_mut_device(index, Array::from_int(1), stream);
+            let sum = a.sum(None, stream).unwrap().item::<i32>(&stream);
             assert_eq!(sum, expected_sum);
         }
+        let stream = crate::test_stream();
 
         // a[...]
         // not valid
 
         // a[None]
-        check(NewAxis, 60);
+        check(NewAxis, 60, stream);
 
         // a[0]
-        check(0, 1600);
+        check(0, 1600, stream);
 
         // a[1:3]
-        check(1..3, 230);
+        check(1..3, 230, stream);
 
         // i = mx.array([2, 1])
         let i = Array::from_slice(&[2, 1], &[2]);
 
         // a[i]
-        check(i, 230);
+        check(i, 230, stream);
     }
 
     #[test]
     fn test_full_index_write_no_array() {
+        let stream = crate::test_stream();
         macro_rules! check {
             (($( $i:expr ),*), $sum:expr ) => {
                 {
                     let mut a = Array::from_iter(0..360, &[2, 3, 4, 5, 3]);
 
-                    a.index_mut(($($i),*), Array::from_int(1));
-                    let sum = a.sum(None).unwrap().item::<i32>();
+                    a.index_mut_device(($($i),*), Array::from_int(1), stream);
+                    let sum = a.sum(None, stream).unwrap().item::<i32>(&stream);
                     assert_eq!(sum, $sum);
                 }
             };
@@ -1444,6 +1454,7 @@ mod tests {
 
     #[test]
     fn test_full_index_write_array() {
+        let stream = crate::test_stream();
         // these have an Array as a source of indices and go through the gather path
 
         macro_rules! check {
@@ -1451,8 +1462,8 @@ mod tests {
                 {
                     let mut a = Array::from_iter(0..540, &[3, 3, 4, 5, 3]);
 
-                    a.index_mut(($($i),*), Array::from_int(1));
-                    let sum = a.sum(None).unwrap().item::<i32>();
+                    a.index_mut_device(($($i),*), Array::from_int(1), stream);
+                    let sum = a.sum(None, stream).unwrap().item::<i32>(&stream);
                     assert_eq!(sum, $sum);
                 }
             };
@@ -1499,10 +1510,11 @@ mod tests {
 
     #[test]
     fn test_slice_update_with_broadcast() {
-        let mut xs = zeros::<f32>(&[4, 3, 2]).unwrap();
-        let x = ones::<f32>(&[4, 2]).unwrap();
+        let stream = crate::test_stream();
+        let mut xs = zeros::<f32>(&[4, 3, 2], stream).unwrap();
+        let x = ones::<f32>(&[4, 2], stream).unwrap();
 
-        let result = xs.try_index_mut((.., 0, ..), x);
+        let result = xs.try_index_mut_device((.., 0, ..), x, stream);
         assert!(
             result.is_ok(),
             "Failed to update slice with broadcast: {result:?}"

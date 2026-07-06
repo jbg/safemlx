@@ -6,7 +6,7 @@ use crate::{
 };
 
 ///Type of device.
-#[derive(num_enum::IntoPrimitive, Debug, Clone, Copy)]
+#[derive(num_enum::IntoPrimitive, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DeviceType {
     /// CPU device
@@ -34,21 +34,6 @@ impl Device {
         Device { c_device }
     }
 
-    /// Try to get the default device.
-    pub fn try_default() -> Result<Self> {
-        Device::try_from_op(|res| unsafe { safemlx_sys::mlx_get_default_device(res) })
-    }
-
-    /// Create a default CPU device.
-    pub fn cpu() -> Device {
-        Device::new(DeviceType::Cpu, 0)
-    }
-
-    /// Create a default GPU device.
-    pub fn gpu() -> Device {
-        Device::new(DeviceType::Gpu, 0)
-    }
-
     /// Get the device index
     pub fn get_index(&self) -> Result<i32> {
         i32::try_from_op(|res| unsafe { safemlx_sys::mlx_device_get_index(res, self.c_device) })
@@ -59,20 +44,6 @@ impl Device {
         DeviceType::try_from_op(|res| unsafe {
             safemlx_sys::mlx_device_get_type(res, self.c_device)
         })
-    }
-
-    /// Set the default device.
-    ///
-    /// # Example:
-    ///
-    /// ```rust
-    /// use safemlx::{Device, DeviceType};
-    /// Device::set_default(&Device::new(DeviceType::Cpu, 1));
-    /// ```
-    ///
-    /// By default, this is `gpu()`.
-    pub fn set_default(device: &Device) {
-        unsafe { safemlx_sys::mlx_set_default_device(device.c_device) };
     }
 
     fn describe(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -100,12 +71,6 @@ impl Drop for Device {
     }
 }
 
-impl Default for Device {
-    fn default() -> Self {
-        Self::try_default().unwrap()
-    }
-}
-
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.describe(f)
@@ -124,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_fmt() {
-        let device = Device::default();
+        let device = Device::new(DeviceType::Gpu, 0);
         let description = format!("{device}");
         assert_eq!(description, "Device(gpu, 0)");
     }

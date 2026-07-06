@@ -390,18 +390,21 @@ impl Guarded for crate::Stream {
     type Guard = MaybeUninitStream;
 }
 
+#[cfg(not(feature = "safetensors"))]
 pub(crate) struct MaybeUninitSafeTensors {
     pub(crate) c_data: safemlx_sys::mlx_map_string_to_array,
     pub(crate) c_metadata: safemlx_sys::mlx_map_string_to_string,
     pub(crate) init_success: bool,
 }
 
+#[cfg(not(feature = "safetensors"))]
 impl Default for MaybeUninitSafeTensors {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(not(feature = "safetensors"))]
 impl MaybeUninitSafeTensors {
     pub fn new() -> Self {
         unsafe {
@@ -414,6 +417,7 @@ impl MaybeUninitSafeTensors {
     }
 }
 
+#[cfg(not(feature = "safetensors"))]
 impl Drop for MaybeUninitSafeTensors {
     fn drop(&mut self) {
         if !self.init_success {
@@ -425,6 +429,7 @@ impl Drop for MaybeUninitSafeTensors {
     }
 }
 
+#[cfg(not(feature = "safetensors"))]
 impl Guard<crate::utils::io::SafeTensors> for MaybeUninitSafeTensors {
     type MutRawPtr = (
         *mut safemlx_sys::mlx_map_string_to_array,
@@ -448,6 +453,7 @@ impl Guard<crate::utils::io::SafeTensors> for MaybeUninitSafeTensors {
     }
 }
 
+#[cfg(not(feature = "safetensors"))]
 impl Guarded for crate::utils::io::SafeTensors {
     type Guard = MaybeUninitSafeTensors;
 }

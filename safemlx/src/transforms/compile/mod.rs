@@ -19,10 +19,12 @@
 //! # Basic usage
 //!
 //! ```rust
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile, error::Exception};
 //!
 //! let fun = |(x, y): (&Array, &Array)| -> Result<Array, Exception> {
-//!    safemlx::exp!(x.negative()?)?.add(y)
+//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!    safemlx::exp!(x.negative(&stream)?, stream=&stream)?.add(y, &stream)
 //! };
 //!
 //! let x = array!(1.0);
@@ -50,10 +52,12 @@
 //! should typically compile functions that you plan to use more than once.
 //!
 //! ```rust
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile};
 //!
 //! let fun = |(x, y): (&Array, &Array)| {
-//!    safemlx::exp!(x.negative()?)?.add(y)
+//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!    safemlx::exp!(x.negative(&stream)?, stream=&stream)?.add(y, &stream)
 //! };
 //!
 //! let x = array!(1.0);
@@ -116,12 +120,14 @@
 //! pass the state as an mutable reference.
 //!
 //! ```rust
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile_with_state};
 //! let mut state = vec![];
 //!
 //! let fun = |state: &mut Vec<Array>, (x, y): (&Array, &Array)| {
-//!     let z = x + y;
-//!     let result = safemlx::exp!(&z);
+//!     let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!     let z = x.add(y, &stream)?;
+//!     let result = safemlx::exp!(&z, stream=&stream);
 //!     state.push(z);
 //!     result
 //! };
@@ -145,8 +151,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use super::{Closure, Guarded, VectorArray};
-use crate::Array;
+use super::{transform_guard, Closure, Guarded, VectorArray};
+use crate::{error::Result, Array};
 
 #[allow(clippy::module_inception)]
 mod compile;
@@ -158,26 +164,32 @@ pub use compile_with_state::*;
 /// Globally enable the compilation of functions.
 ///
 /// Default is enabled.
-pub fn enable_compile() {
+pub fn enable_compile() -> Result<()> {
+    let _transform_guard = transform_guard::enter();
     unsafe {
         safemlx_sys::mlx_enable_compile();
     }
+    Ok(())
 }
 
 /// Globally disable the compilation of functions.
 ///
 /// Default is enabled.
-pub fn disable_compile() {
+pub fn disable_compile() -> Result<()> {
+    let _transform_guard = transform_guard::enter();
     unsafe {
         safemlx_sys::mlx_disable_compile();
     }
+    Ok(())
 }
 
 /// Clear the memory cache.
-pub fn clear_cache() {
+pub fn clear_cache() -> Result<()> {
+    let _transform_guard = transform_guard::enter();
     unsafe {
         safemlx_sys::mlx_detail_compile_clear_cache();
     }
+    Ok(())
 }
 
 /// A compiled function that can be called.
@@ -196,6 +208,7 @@ struct CompiledState<F> {
 
 impl<F> Drop for CompiledState<F> {
     fn drop(&mut self) {
+        let _transform_guard = transform_guard::enter();
         unsafe {
             // remove the compiled structure from the back end
             safemlx_sys::mlx_detail_compile_erase(self.id);

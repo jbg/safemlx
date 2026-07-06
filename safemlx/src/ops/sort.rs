@@ -1,6 +1,6 @@
 //! Implements bindings for the sorting ops.
 
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::{error::Result, utils::guard::Guarded, Array, Stream};
 
@@ -14,15 +14,15 @@ use crate::{error::Result, utils::guard::Guarded, Array, Stream};
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let axis = 0;
-/// let result = sort_axis(&a, axis);
+/// let result = sort_axis(&a, axis, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn sort_axis_device(
+pub fn sort_axis(
     a: impl AsRef<Array>,
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -41,14 +41,14 @@ pub fn sort_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
-/// let result = sort(&a);
+/// let result = sort(&a, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn sort_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
+pub fn sort(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_sort(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -64,15 +64,15 @@ pub fn sort_device(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>)
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let axis = 0;
-/// let result = argsort_axis(&a, axis);
+/// let result = argsort_axis(&a, axis, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn argsort_axis_device(
+pub fn argsort_axis(
     a: impl AsRef<Array>,
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -92,17 +92,14 @@ pub fn argsort_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
-/// let result = argsort(&a);
+/// let result = argsort(&a, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn argsort_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn argsort(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_argsort(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -124,16 +121,16 @@ pub fn argsort_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let kth = 1;
 /// let axis = 0;
-/// let result = partition_axis(&a, kth, axis);
+/// let result = partition_axis(&a, kth, axis, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn partition_axis_device(
+pub fn partition_axis(
     a: impl AsRef<Array>,
     kth: i32,
     axis: i32,
@@ -165,15 +162,15 @@ pub fn partition_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let kth = 1;
-/// let result = partition(&a, kth);
+/// let result = partition(&a, kth, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn partition_device(
+pub fn partition(
     a: impl AsRef<Array>,
     kth: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -199,16 +196,16 @@ pub fn partition_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let kth = 1;
 /// let axis = 0;
-/// let result = argpartition_axis(&a, kth, axis);
+/// let result = argpartition_axis(&a, kth, axis, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn argpartition_axis_device(
+pub fn argpartition_axis(
     a: impl AsRef<Array>,
     kth: i32,
     axis: i32,
@@ -241,15 +238,15 @@ pub fn argpartition_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
 /// let kth = 1;
-/// let result = argpartition(&a, kth);
+/// let result = argpartition(&a, kth, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn argpartition_device(
+pub fn argpartition(
     a: impl AsRef<Array>,
     kth: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -265,35 +262,39 @@ mod tests {
 
     #[test]
     fn test_sort_with_invalid_axis() {
+        let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3, 4, 5], &[5]);
         let axis = 1;
-        let result = super::sort_axis(&a, axis);
+        let result = super::sort_axis(&a, axis, stream);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_partition_with_invalid_axis() {
+        let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3, 4, 5], &[5]);
         let kth = 2;
         let axis = 1;
-        let result = super::partition_axis(&a, kth, axis);
+        let result = super::partition_axis(&a, kth, axis, stream);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_partition_with_invalid_kth() {
+        let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3, 4, 5], &[5]);
         let kth = 5;
         let axis = 0;
-        let result = super::partition_axis(&a, kth, axis);
+        let result = super::partition_axis(&a, kth, axis, stream);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_partition_all_with_invalid_kth() {
+        let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3, 4, 5], &[5]);
         let kth = 5;
-        let result = super::partition(&a, kth);
+        let result = super::partition(&a, kth, stream);
         assert!(result.is_err());
     }
 }

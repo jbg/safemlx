@@ -9,11 +9,14 @@ use crate::utils::SingleOrPair;
 /// Marker trait for pooling operations.
 pub trait Pooling
 where
-    Self: Fn(&Array, &[i32]) -> Result<Array, Exception> + DynClone,
+    Self: Fn(&Array, &[i32], &crate::Stream) -> Result<Array, Exception> + DynClone,
 {
 }
 
-impl<T> Pooling for T where T: Fn(&Array, &[i32]) -> Result<Array, Exception> + DynClone {}
+impl<T> Pooling for T where
+    T: Fn(&Array, &[i32], &crate::Stream) -> Result<Array, Exception> + DynClone
+{
+}
 
 /// Abstract pooling layer.
 ///
@@ -80,7 +83,7 @@ impl Module<&Array> for Pool {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let shape = x.shape();
         let rest = &shape[1..shape.len() - 1];
 
@@ -118,8 +121,8 @@ impl Module<&Array> for Pool {
             .collect::<Vec<_>>();
 
         // TODO: double check if as_strided would ever panic
-        let strided = as_strided(x, &final_shape, &final_strides, None)?;
-        (self.pooling_op)(&strided, &self.axes)
+        let strided = as_strided(x, &final_shape, &final_strides, None, stream)?;
+        (self.pooling_op)(&strided, &self.axes, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -131,8 +134,8 @@ macro_rules! impl_module {
             type Output = Array;
             type Error = Exception;
 
-            fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
-                self.inner.forward(x)
+            fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+                self.inner.forward(x, stream)
             }
 
             fn training_mode(&mut self, mode: bool) {
@@ -165,7 +168,7 @@ impl MaxPool1d {
     /// - `kernel_size`: The size of the pooling window.
     /// - `stride`: The stride of the pooling window.
     pub fn new(kernel_size: i32, stride: i64) -> Self {
-        let op = |x: &Array, axes: &[i32]| x.max_axes(axes, None);
+        let op = |x: &Array, axes: &[i32], stream: &crate::Stream| x.max_axes(axes, None, stream);
         let inner = Pool::new(vec![kernel_size], vec![stride], op);
         Self { inner }
     }
@@ -204,7 +207,7 @@ impl MaxPool2d {
         let stride = stride.into();
         let stride = vec![stride.first(), stride.second()];
 
-        let op = |x: &Array, axes: &[i32]| x.max_axes(axes, None);
+        let op = |x: &Array, axes: &[i32], stream: &crate::Stream| x.max_axes(axes, None, stream);
         let inner = Pool::new(kernel_size, stride, op);
         Self { inner }
     }
@@ -235,7 +238,7 @@ impl AvgPool1d {
     /// - `kernel_size`: The size of the pooling window.
     /// - `stride`: The stride of the pooling window.
     pub fn new(kernel_size: i32, stride: i64) -> Self {
-        let op = |x: &Array, axes: &[i32]| x.mean_axes(axes, None);
+        let op = |x: &Array, axes: &[i32], stream: &crate::Stream| x.mean_axes(axes, None, stream);
         let inner = Pool::new(vec![kernel_size], vec![stride], op);
         Self { inner }
     }
@@ -274,7 +277,7 @@ impl AvgPool2d {
         let stride = stride.into();
         let stride = vec![stride.first(), stride.second()];
 
-        let op = |x: &Array, axes: &[i32]| x.mean_axes(axes, None);
+        let op = |x: &Array, axes: &[i32], stream: &crate::Stream| x.mean_axes(axes, None, stream);
         let inner = Pool::new(kernel_size, stride, op);
         Self { inner }
     }
@@ -297,77 +300,108 @@ mod tests {
 
     #[test]
     fn test_max_pooling_1d_stride_1() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..4, &[1, 4, 1]);
         let mut pool = MaxPool1d::new(2, 1);
-        let output = pool.forward(&input).unwrap();
-        assert_array_eq!(output, array!([1, 2, 3], shape = [1, 3, 1]));
+        let output = pool.forward(&input, stream).unwrap();
+        assert_array_eq!(
+            output,
+            array!([1, 2, 3], shape = [1, 3, 1]),
+            stream = stream
+        );
     }
 
     #[test]
     fn test_max_pooling_1d_stride_2() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..8, &[2, 4, 1]);
         let mut pool = MaxPool1d::new(2, 2);
-        let output = pool.forward(&input).unwrap();
-        assert_array_eq!(output, array!([1, 3, 5, 7], shape = [2, 2, 1]));
+        let output = pool.forward(&input, stream).unwrap();
+        assert_array_eq!(
+            output,
+            array!([1, 3, 5, 7], shape = [2, 2, 1]),
+            stream = stream
+        );
     }
 
     #[test]
     fn test_max_pooling_2d_stride_1() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..16, &[1, 4, 4, 1]);
         let mut pool = MaxPool2d::new(2, 1);
-        let output = pool.forward(&input).unwrap();
+        let output = pool.forward(&input, stream).unwrap();
         assert_array_eq!(
             output,
-            array!([5, 6, 7, 9, 10, 11, 13, 14, 15], shape = [1, 3, 3, 1])
+            array!([5, 6, 7, 9, 10, 11, 13, 14, 15], shape = [1, 3, 3, 1]),
+            stream = stream
         );
     }
 
     #[test]
     fn test_max_pooling_2d_stride_2() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..32, &[2, 4, 4, 1]);
         let mut pool = MaxPool2d::new(2, 2);
-        let output = pool.forward(&input).unwrap();
+        let output = pool.forward(&input, stream).unwrap();
         assert_array_eq!(
             output,
-            array!([5, 7, 13, 15, 21, 23, 29, 31], shape = [2, 2, 2, 1])
+            array!([5, 7, 13, 15, 21, 23, 29, 31], shape = [2, 2, 2, 1]),
+            stream = stream
         );
     }
 
     #[test]
     fn test_avg_pooling_1d_stride_1() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..4, &[1, 4, 1]);
         let mut pool = AvgPool1d::new(2, 1);
-        let output = pool.forward(&input).unwrap();
-        assert_array_eq!(output, array!([0.5, 1.5, 2.5], shape = [1, 3, 1]));
+        let output = pool.forward(&input, stream).unwrap();
+        assert_array_eq!(
+            output,
+            array!([0.5, 1.5, 2.5], shape = [1, 3, 1]),
+            stream = stream
+        );
     }
 
     #[test]
     fn test_avg_pooling_1d_stride_2() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..8, &[2, 4, 1]);
         let mut pool = AvgPool1d::new(2, 2);
-        let output = pool.forward(&input).unwrap();
-        assert_array_eq!(output, array!([0.5, 2.5, 4.5, 6.5], shape = [2, 2, 1]));
+        let output = pool.forward(&input, stream).unwrap();
+        assert_array_eq!(
+            output,
+            array!([0.5, 2.5, 4.5, 6.5], shape = [2, 2, 1]),
+            stream = stream
+        );
     }
 
     #[test]
     fn test_avg_pooling_2d_stride_1() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..16, &[1, 4, 4, 1]);
         let mut pool = AvgPool2d::new(2, 1);
-        let output = pool.forward(&input).unwrap();
+        let output = pool.forward(&input, stream).unwrap();
         assert_array_eq!(
             output,
             array!(
                 [2.5, 3.5, 4.5, 6.5, 7.5, 8.5, 10.5, 11.5, 12.5],
                 shape = [1, 3, 3, 1]
-            )
+            ),
+            stream = stream
         );
     }
 
     #[test]
     fn test_avg_pooling_2d_stride_2() {
+        let stream = crate::test_stream();
         let input = Array::from_iter(0..16, &[1, 4, 4, 1]);
         let mut pool = AvgPool2d::new(2, 2);
-        let output = pool.forward(&input).unwrap();
-        assert_array_eq!(output, array!([2.5, 4.5, 10.5, 12.5], shape = [1, 2, 2, 1]));
+        let output = pool.forward(&input, stream).unwrap();
+        assert_array_eq!(
+            output,
+            array!([2.5, 4.5, 10.5, 12.5], shape = [1, 2, 2, 1]),
+            stream = stream
+        );
     }
 }

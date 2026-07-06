@@ -1,8 +1,7 @@
 use crate::module::{Module, Param};
 use crate::{
     error::Exception,
-    ops::{conv_transpose1d, conv_transpose2d, conv_transpose3d, zeros},
-    random::uniform,
+    ops::{conv_transpose1d, conv_transpose2d, conv_transpose3d},
     Array,
 };
 use safemlx_internal_macros::{Buildable, Builder};
@@ -56,14 +55,13 @@ fn build_conv_transpose_1d(builder: ConvTranspose1dBuilder) -> Result<ConvTransp
     let stride = builder.stride;
 
     let scale = f32::sqrt(1.0f32 / (input_channels * kernel_size) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[output_channels, kernel_size, input_channels],
-        None,
-    )?;
+    );
     let bias = if bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -124,7 +122,7 @@ impl Module<&Array> for ConvTranspose1d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = conv_transpose1d(
             x,
             self.weight.as_ref(),
@@ -133,9 +131,10 @@ impl Module<&Array> for ConvTranspose1d {
             None,
             self.output_padding,
             None,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }
@@ -189,7 +188,7 @@ fn build_conv_transpose_2d(builder: ConvTranspose2dBuilder) -> Result<ConvTransp
     let stride = builder.stride.into();
 
     let scale = f32::sqrt(1.0 / (input_channels * kernel_size.0 * kernel_size.1) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[
@@ -198,10 +197,9 @@ fn build_conv_transpose_2d(builder: ConvTranspose2dBuilder) -> Result<ConvTransp
             kernel_size.1,
             input_channels,
         ],
-        None,
-    )?;
+    );
     let bias = if bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -263,7 +261,7 @@ impl Module<&Array> for ConvTranspose2d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = conv_transpose2d(
             x,
             self.weight.as_ref(),
@@ -272,9 +270,10 @@ impl Module<&Array> for ConvTranspose2d {
             None,
             self.output_padding,
             None,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }
@@ -329,7 +328,7 @@ fn build_conv_transpose_3d(builder: ConvTranspose3dBuilder) -> Result<ConvTransp
 
     let scale =
         f32::sqrt(1.0 / (input_channels * kernel_size.0 * kernel_size.1 * kernel_size.2) as f32);
-    let weight = uniform::<_, f32>(
+    let weight = super::init::uniform(
         -scale,
         scale,
         &[
@@ -339,10 +338,9 @@ fn build_conv_transpose_3d(builder: ConvTranspose3dBuilder) -> Result<ConvTransp
             kernel_size.2,
             input_channels,
         ],
-        None,
-    )?;
+    );
     let bias = if bias {
-        Some(zeros::<f32>(&[output_channels])?)
+        Some(super::init::zeros(&[output_channels]))
     } else {
         None
     };
@@ -404,7 +402,7 @@ impl Module<&Array> for ConvTranspose3d {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let mut y = conv_transpose3d(
             x,
             self.weight.as_ref(),
@@ -413,9 +411,10 @@ impl Module<&Array> for ConvTranspose3d {
             None,
             self.output_padding,
             None,
+            stream,
         )?;
         if let Some(bias) = &self.bias.value {
-            y += bias;
+            y = y.add(bias, stream)?;
         }
         Ok(y)
     }

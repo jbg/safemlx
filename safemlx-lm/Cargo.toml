@@ -8,12 +8,12 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Rust MLX language model runtime used by Goose"
+description = "Rust MLX language model runtime"
 readme = "README.md"
 
 [dependencies]
 # Local dependencies
-safemlx.workspace = true
+safemlx = { workspace = true, features = ["safetensors"] }
 safemlx-lm-utils.workspace = true
 
 # External dependencies

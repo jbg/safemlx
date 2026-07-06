@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use safemlx::ops::indexing::{IndexOp, NewAxis};
+use safemlx::{
+    ops::indexing::{NewAxis, TryIndexOp},
+    ExecutionContext, Stream,
+};
 use safemlx_lm::{
     error::Error,
     models::{LoadedModel, ModelCache},
@@ -19,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     let prompt = args
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "what is goose?".to_string());
+        .unwrap_or_else(|| "what is MLX?".to_string());
     let temp = args
         .get(2)
         .and_then(|value| value.parse::<f32>().ok())
@@ -27,7 +30,9 @@ fn main() -> anyhow::Result<()> {
 
     print_config_summary(&model_dir)?;
 
-    let mut model = match LoadedModel::load(&model_dir) {
+    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let stream = ctx.stream();
+    let mut model = match LoadedModel::load(&model_dir, stream) {
         Ok(model) => model,
         Err(Error::StrictLoadValidation { missing, unused }) => {
             print_strict_report(&missing, &unused);
@@ -47,27 +52,27 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| {
             args.get(1)
                 .cloned()
-                .unwrap_or_else(|| "what is goose?".to_string())
+                .unwrap_or_else(|| "what is MLX?".to_string())
         });
     println!("\n=== prompt ===\n{rendered}\n");
     println!("temperature: {temp}");
 
     let ids = model.encode(&rendered, false)?;
-    let tokens = safemlx::Array::from(ids.as_slice()).index(NewAxis);
+    let tokens = safemlx::Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?;
     let eos = model.eos_token_ids().to_vec();
     let mut cache = model.new_cache();
-    print_first_token_distribution(&mut model, &mut cache, &tokens)?;
+    print_first_token_distribution(&mut model, &mut cache, &tokens, stream)?;
     cache = model.new_cache();
     let mut output_ids = Vec::new();
 
     {
-        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens);
+        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens, stream);
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
                 None => break,
             };
-            let id = token.item::<u32>();
+            let id = token.item::<u32>(stream);
             output_ids.push(id);
             if eos.contains(&id) {
                 break;
@@ -95,12 +100,13 @@ fn print_first_token_distribution(
     model: &mut LoadedModel,
     cache: &mut ModelCache,
     tokens: &safemlx::Array,
+    stream: &Stream,
 ) -> anyhow::Result<()> {
-    let mut generator = model.generate_with_cache(cache, 0.0, tokens);
+    let mut generator = model.generate_with_cache(cache, 0.0, tokens, stream);
     let Some(first) = generator.next() else {
         return Ok(());
     };
-    let first_id = first?.item::<u32>();
+    let first_id = first?.item::<u32>(stream);
     drop(generator);
     println!(
         "first greedy id: {first_id} {:?}",

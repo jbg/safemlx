@@ -6,10 +6,9 @@ use crate::{
     module::{Module, Param},
     ops::{
         addmm,
-        indexing::{Ellipsis, IndexOp},
-        matmul, sigmoid, split, stack_axis, tanh, tanh_device,
+        indexing::{Ellipsis, TryIndexOp},
+        matmul, sigmoid, split, stack_axis, tanh,
     },
-    random::uniform,
     Array, Stream,
 };
 use safemlx_internal_macros::{generate_builder, Buildable, Builder};
@@ -86,13 +85,13 @@ fn build_rnn(builder: RnnBuilder) -> Result<Rnn, Exception> {
     let hidden_size = builder.hidden_size;
     let non_linearity = builder
         .non_linearity
-        .unwrap_or_else(|| Arc::new(|x, d| tanh_device(x, d)));
+        .unwrap_or_else(|| Arc::new(|x, d| tanh(x, d)));
 
     let scale = 1.0 / (input_size as f32).sqrt();
-    let wxh = uniform::<_, f32>(-scale, scale, &[hidden_size, input_size], None)?;
-    let whh = uniform::<_, f32>(-scale, scale, &[hidden_size, hidden_size], None)?;
+    let wxh = super::init::uniform(-scale, scale, &[hidden_size, input_size]);
+    let whh = super::init::uniform(-scale, scale, &[hidden_size, hidden_size]);
     let bias = if builder.bias {
-        Some(uniform::<_, f32>(-scale, scale, &[hidden_size], None)?)
+        Some(super::init::uniform(-scale, scale, &[hidden_size]))
     } else {
         None
     };
@@ -123,31 +122,39 @@ impl Rnn {
     pub const DEFAULT_NONLINEARITY: Option<Arc<NonLinearity>> = None;
 
     /// Apply a single step of the RNN.
-    pub fn step(&mut self, x: &Array, hidden: Option<&Array>) -> Result<Array, Exception> {
+    pub fn step(
+        &mut self,
+        x: &Array,
+        hidden: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let wxh_t = self.wxh.transpose(stream)?;
         let x = if let Some(bias) = &self.bias.value {
-            addmm(bias, x, self.wxh.t(), None, None)?
+            addmm(bias, x, &wxh_t, None, None, stream)?
         } else {
-            matmul(x, self.wxh.t())?
+            matmul(x, &wxh_t, stream)?
         };
 
+        let whh_t = self.whh.transpose(stream)?;
         let mut all_hidden = Vec::new();
         for index in 0..x.dim(-2) {
             let hidden = match hidden {
                 Some(hidden_) => addmm(
-                    x.index((Ellipsis, index, 0..)),
+                    x.try_index_device((Ellipsis, index, 0..), stream)?,
                     hidden_,
-                    self.whh.t(),
+                    &whh_t,
                     None,
                     None,
+                    stream,
                 )?,
-                None => x.index((Ellipsis, index, 0..)),
+                None => x.try_index_device((Ellipsis, index, 0..), stream)?,
             };
 
-            let hidden = (self.non_linearity)(&hidden, &Stream::default())?;
+            let hidden = (self.non_linearity)(&hidden, stream)?;
             all_hidden.push(hidden);
         }
 
-        stack_axis(&all_hidden[..], -2)
+        stack_axis(&all_hidden[..], -2, stream)
     }
 }
 
@@ -206,9 +213,9 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Array, Exception> {
+    fn forward(&mut self, input: Input, stream: &crate::Stream) -> Result<Array, Exception> {
         let input = input.into();
-        self.step(input.x, input.hidden)
+        self.step(input.x, input.hidden, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -273,11 +280,11 @@ fn build_gru(builder: GruBuilder) -> Result<Gru, Exception> {
     let hidden_size = builder.hidden_size;
 
     let scale = 1.0 / f32::sqrt(hidden_size as f32);
-    let wx = uniform::<_, f32>(-scale, scale, &[3 * hidden_size, input_size], None)?;
-    let wh = uniform::<_, f32>(-scale, scale, &[3 * hidden_size, hidden_size], None)?;
+    let wx = super::init::uniform(-scale, scale, &[3 * hidden_size, input_size]);
+    let wh = super::init::uniform(-scale, scale, &[3 * hidden_size, hidden_size]);
     let (bias, bhn) = if builder.bias {
-        let bias = uniform::<_, f32>(-scale, scale, &[3 * hidden_size], None)?;
-        let bhn = uniform::<_, f32>(-scale, scale, &[hidden_size], None)?;
+        let bias = super::init::uniform(-scale, scale, &[3 * hidden_size]);
+        let bhn = super::init::uniform(-scale, scale, &[hidden_size]);
         (Some(bias), Some(bhn))
     } else {
         (None, None)
@@ -297,61 +304,70 @@ impl Gru {
     pub const DEFAULT_BIAS: bool = true;
 
     /// Apply a single step of the GRU.
-    pub fn step(&mut self, x: &Array, hidden: Option<&Array>) -> Result<Array, Exception> {
+    pub fn step(
+        &mut self,
+        x: &Array,
+        hidden: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let wx_t = self.wx.transpose(stream)?;
         let x = if let Some(b) = &self.bias.value {
-            addmm(b, x, self.wx.t(), None, None)?
+            addmm(b, x, &wx_t, None, None, stream)?
         } else {
-            matmul(x, self.wx.t())?
+            matmul(x, &wx_t, stream)?
         };
 
-        let x_rz = x.index((Ellipsis, ..(-self.hidden_size)));
-        let x_n = x.index((Ellipsis, (-self.hidden_size)..));
+        let x_rz = x.try_index_device((Ellipsis, ..(-self.hidden_size)), stream)?;
+        let x_n = x.try_index_device((Ellipsis, (-self.hidden_size)..), stream)?;
 
         let mut all_hidden = Vec::new();
 
         for index in 0..x.dim(-2) {
-            let mut rz = x_rz.index((Ellipsis, index, ..));
+            let mut rz = x_rz.try_index_device((Ellipsis, index, ..), stream)?;
             let mut h_proj_n = None;
             if let Some(hidden_) = hidden {
-                let h_proj = matmul(hidden_, self.wh.t())?;
-                let h_proj_rz = h_proj.index((Ellipsis, ..(-self.hidden_size)));
-                h_proj_n = Some(h_proj.index((Ellipsis, (-self.hidden_size)..)));
+                let wh_t = self.wh.transpose(stream)?;
+                let h_proj = matmul(hidden_, &wh_t, stream)?;
+                let h_proj_rz =
+                    h_proj.try_index_device((Ellipsis, ..(-self.hidden_size)), stream)?;
+                h_proj_n =
+                    Some(h_proj.try_index_device((Ellipsis, (-self.hidden_size)..), stream)?);
 
                 if let Some(bhn) = &self.bhn.value {
                     h_proj_n = h_proj_n
-                        .map(|h_proj_n| h_proj_n.add(bhn))
+                        .map(|h_proj_n| h_proj_n.add(bhn, stream))
                         // This is not matrix transpose, but from `Option<Result<_>>` to `Result<Option<_>>`
                         .transpose()?;
                 }
 
-                rz = rz.add(h_proj_rz)?;
+                rz = rz.add(h_proj_rz, stream)?;
             }
 
-            rz = sigmoid(&rz)?;
+            rz = sigmoid(&rz, stream)?;
 
-            let parts = split(&rz, 2, -1)?;
+            let parts = split(&rz, 2, -1, stream)?;
             let r = &parts[0];
             let z = &parts[1];
 
-            let mut n = x_n.index((Ellipsis, index, 0..));
+            let mut n = x_n.try_index_device((Ellipsis, index, 0..), stream)?;
 
             if let Some(h_proj_n) = h_proj_n {
-                n = n.add(r.multiply(h_proj_n)?)?;
+                n = n.add(r.multiply(h_proj_n, stream)?, stream)?;
             }
-            n = tanh(&n)?;
+            n = tanh(&n, stream)?;
 
             let hidden = match hidden {
                 Some(hidden) => array!(1.0)
-                    .subtract(z)?
-                    .multiply(&n)?
-                    .add(z.multiply(hidden)?)?,
-                None => array!(1.0).subtract(z)?.multiply(&n)?,
+                    .subtract(z, stream)?
+                    .multiply(&n, stream)?
+                    .add(z.multiply(hidden, stream)?, stream)?,
+                None => array!(1.0).subtract(z, stream)?.multiply(&n, stream)?,
             };
 
             all_hidden.push(hidden);
         }
 
-        stack_axis(&all_hidden[..], -2)
+        stack_axis(&all_hidden[..], -2, stream)
     }
 }
 
@@ -368,9 +384,9 @@ where
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Array, Exception> {
+    fn forward(&mut self, input: Input, stream: &crate::Stream) -> Result<Array, Exception> {
         let input = input.into();
-        self.step(input.x, input.hidden)
+        self.step(input.x, input.hidden, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -417,10 +433,10 @@ fn build_lstm(builder: LstmBuilder) -> Result<Lstm, Exception> {
     let input_size = builder.input_size;
     let hidden_size = builder.hidden_size;
     let scale = 1.0 / f32::sqrt(hidden_size as f32);
-    let wx = uniform::<_, f32>(-scale, scale, &[4 * hidden_size, input_size], None)?;
-    let wh = uniform::<_, f32>(-scale, scale, &[4 * hidden_size, hidden_size], None)?;
+    let wx = super::init::uniform(-scale, scale, &[4 * hidden_size, input_size]);
+    let wh = super::init::uniform(-scale, scale, &[4 * hidden_size, hidden_size]);
     let bias = if builder.bias {
-        Some(uniform::<_, f32>(-scale, scale, &[4 * hidden_size], None)?)
+        Some(super::init::uniform(-scale, scale, &[4 * hidden_size]))
     } else {
         None
     };
@@ -521,43 +537,48 @@ impl Lstm {
         x: &Array,
         hidden: Option<&Array>,
         cell: Option<&Array>,
+        stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
+        let wx_t = self.wx.transpose(stream)?;
         let x = if let Some(b) = &self.bias.value {
-            addmm(b, x, self.wx.t(), None, None)?
+            addmm(b, x, &wx_t, None, None, stream)?
         } else {
-            matmul(x, self.wx.t())?
+            matmul(x, &wx_t, stream)?
         };
 
+        let wh_t = self.wh.transpose(stream)?;
         let mut all_hidden = Vec::new();
         let mut all_cell = Vec::new();
 
         for index in 0..x.dim(-2) {
-            let mut ifgo = x.index((Ellipsis, index, 0..));
+            let mut ifgo = x.try_index_device((Ellipsis, index, 0..), stream)?;
             if let Some(hidden) = hidden {
-                ifgo = addmm(&ifgo, hidden, self.wh.t(), None, None)?;
+                ifgo = addmm(&ifgo, hidden, &wh_t, None, None, stream)?;
             }
 
-            let pieces = split(&ifgo, 4, -1)?;
+            let pieces = split(&ifgo, 4, -1, stream)?;
 
-            let i = sigmoid(&pieces[0])?;
-            let f = sigmoid(&pieces[1])?;
-            let g = tanh(&pieces[2])?;
-            let o = sigmoid(&pieces[3])?;
+            let i = sigmoid(&pieces[0], stream)?;
+            let f = sigmoid(&pieces[1], stream)?;
+            let g = tanh(&pieces[2], stream)?;
+            let o = sigmoid(&pieces[3], stream)?;
 
             let cell = match cell {
-                Some(cell) => f.multiply(cell)?.add(i.multiply(&g)?)?,
-                None => i.multiply(&g)?,
+                Some(cell) => f
+                    .multiply(cell, stream)?
+                    .add(i.multiply(&g, stream)?, stream)?,
+                None => i.multiply(&g, stream)?,
             };
 
-            let hidden = o.multiply(tanh(&cell)?)?;
+            let hidden = o.multiply(tanh(&cell, stream)?, stream)?;
 
             all_hidden.push(hidden);
             all_cell.push(cell);
         }
 
         Ok((
-            stack_axis(&all_hidden[..], -2)?,
-            stack_axis(&all_cell[..], -2)?,
+            stack_axis(&all_hidden[..], -2, stream)?,
+            stack_axis(&all_cell[..], -2, stream)?,
         ))
     }
 }
@@ -569,9 +590,13 @@ where
     type Output = (Array, Array);
     type Error = Exception;
 
-    fn forward(&mut self, input: Input) -> Result<(Array, Array), Exception> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<(Array, Array), Exception> {
         let input = input.into();
-        self.step(input.x, input.hidden, input.cell)
+        self.step(input.x, input.hidden, input.cell, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -580,86 +605,109 @@ where
 // The uint tests below are ported from the python codebase
 #[cfg(test)]
 mod tests {
-    use crate::{builder::Builder, ops::maximum_device, random::normal};
+    use crate::{
+        builder::Builder,
+        ops::{indexing::IndexOp, maximum},
+        random::normal,
+    };
 
     use super::*;
 
     #[test]
     fn test_rnn() {
+        let stream = crate::test_stream();
+        let mut random_state = crate::random::RandomState::with_seed(0).unwrap();
         let mut layer = Rnn::new(5, 12).unwrap();
-        let inp = normal::<f32>(&[2, 25, 5], None, None, None).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[2, 25, 5], None, None, &key, stream).unwrap();
 
-        let h_out = layer.forward(RnnInput::from(&inp)).unwrap();
+        let h_out = layer.forward(RnnInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
 
-        let nonlinearity = |x: &Array, d: &Stream| maximum_device(x, array!(0.0), d);
+        let nonlinearity = |x: &Array, d: &Stream| maximum(x, array!(0.0), d);
         let mut layer = RnnBuilder::new(5, 12)
             .bias(false)
             .non_linearity(Arc::new(nonlinearity) as Arc<NonLinearity>)
             .build()
             .unwrap();
 
-        let h_out = layer.forward(RnnInput::from(&inp)).unwrap();
+        let h_out = layer.forward(RnnInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
 
-        let inp = normal::<f32>(&[44, 5], None, None, None).unwrap();
-        let h_out = layer.forward(RnnInput::from(&inp)).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[44, 5], None, None, &key, stream).unwrap();
+        let h_out = layer.forward(RnnInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
 
-        let hidden = h_out.index((-1, ..));
-        let h_out = layer.forward(RnnInput::from((&inp, &hidden))).unwrap();
+        let hidden = h_out.index_device((-1, ..), stream);
+        let h_out = layer
+            .forward(RnnInput::from((&inp, &hidden)), stream)
+            .unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
     }
 
     #[test]
     fn test_gru() {
+        let stream = crate::test_stream();
+        let mut random_state = crate::random::RandomState::with_seed(0).unwrap();
         let mut layer = Gru::new(5, 12).unwrap();
-        let inp = normal::<f32>(&[2, 25, 5], None, None, None).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[2, 25, 5], None, None, &key, stream).unwrap();
 
-        let h_out = layer.forward(GruInput::from(&inp)).unwrap();
+        let h_out = layer.forward(GruInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
 
-        let hidden = h_out.index((.., -1, ..));
-        let h_out = layer.forward(GruInput::from((&inp, &hidden))).unwrap();
+        let hidden = h_out.index_device((.., -1, ..), stream);
+        let h_out = layer
+            .forward(GruInput::from((&inp, &hidden)), stream)
+            .unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
 
-        let inp = normal::<f32>(&[44, 5], None, None, None).unwrap();
-        let h_out = layer.forward(GruInput::from(&inp)).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[44, 5], None, None, &key, stream).unwrap();
+        let h_out = layer.forward(GruInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
 
-        let hidden = h_out.index((-1, ..));
-        let h_out = layer.forward(GruInput::from((&inp, &hidden))).unwrap();
+        let hidden = h_out.index_device((-1, ..), stream);
+        let h_out = layer
+            .forward(GruInput::from((&inp, &hidden)), stream)
+            .unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
     }
 
     #[test]
     fn test_lstm() {
+        let stream = crate::test_stream();
+        let mut random_state = crate::random::RandomState::with_seed(0).unwrap();
         let mut layer = Lstm::new(5, 12).unwrap();
-        let inp = normal::<f32>(&[2, 25, 5], None, None, None).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[2, 25, 5], None, None, &key, stream).unwrap();
 
-        let (h_out, c_out) = layer.forward(LstmInput::from(&inp)).unwrap();
+        let (h_out, c_out) = layer.forward(LstmInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
         assert_eq!(c_out.shape(), &[2, 25, 12]);
 
         let (h_out, c_out) = layer
             .step(
                 &inp,
-                Some(&h_out.index((.., -1, ..))),
-                Some(&c_out.index((.., -1, ..))),
+                Some(&h_out.index_device((.., -1, ..), stream)),
+                Some(&c_out.index_device((.., -1, ..), stream)),
+                stream,
             )
             .unwrap();
         assert_eq!(h_out.shape(), &[2, 25, 12]);
         assert_eq!(c_out.shape(), &[2, 25, 12]);
 
-        let inp = normal::<f32>(&[44, 5], None, None, None).unwrap();
-        let (h_out, c_out) = layer.forward(LstmInput::from(&inp)).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let inp = normal::<f32>(&[44, 5], None, None, &key, stream).unwrap();
+        let (h_out, c_out) = layer.forward(LstmInput::from(&inp), stream).unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
         assert_eq!(c_out.shape(), &[44, 12]);
 
-        let hidden = h_out.index((-1, ..));
-        let cell = c_out.index((-1, ..));
+        let hidden = h_out.index_device((-1, ..), stream);
+        let cell = c_out.index_device((-1, ..), stream);
         let (h_out, c_out) = layer
-            .forward(LstmInput::from((&inp, &hidden, &cell)))
+            .forward(LstmInput::from((&inp, &hidden, &cell)), stream)
             .unwrap();
         assert_eq!(h_out.shape(), &[44, 12]);
         assert_eq!(c_out.shape(), &[44, 12]);

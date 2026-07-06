@@ -1,12 +1,10 @@
 use std::f32::consts::PI;
 
 use crate::module::{Module, Param};
-use crate::ops::logsumexp_axis;
 use crate::{
     array,
     error::{Exception, Result},
-    ops::{abs, exp, maximum, minimum, multiply, which},
-    transforms::compile::compile,
+    ops::{abs, erf, exp, logsumexp_axis, maximum, minimum, multiply, sqrt, tanh, which},
     Array,
 };
 use safemlx_internal_macros::{generate_builder, Buildable, Builder};
@@ -20,10 +18,11 @@ use safemlx_macros::ModuleParameters;
 /// This is:
 ///
 /// ```rust, ignore
-/// sigmoid(x)
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// sigmoid(x, &stream)
 /// ```
-pub fn sigmoid(x: impl AsRef<Array>) -> Result<Array> {
-    crate::ops::sigmoid(x.as_ref())
+pub fn sigmoid(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    crate::ops::sigmoid(x.as_ref(), stream)
 }
 
 /// Applies the Rectified Linear Unit.
@@ -33,8 +32,8 @@ pub fn sigmoid(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// maximum(x, 0)
 /// ```
-pub fn relu(x: impl AsRef<Array>) -> Result<Array> {
-    crate::ops::maximum(x.as_ref(), &array!(0))
+pub fn relu(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    crate::ops::maximum(x.as_ref(), &array!(0), stream)
 }
 
 /// Applies the Leaky Rectified Linear Unit.
@@ -46,11 +45,18 @@ pub fn relu(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// maximum(neg_slope * x, x)
 /// ```
-pub fn leaky_relu(x: impl AsRef<Array>, neg_slope: impl Into<Option<f32>>) -> Result<Array> {
+pub fn leaky_relu(
+    x: impl AsRef<Array>,
+    neg_slope: impl Into<Option<f32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
     let neg_slope = array!(neg_slope.into().unwrap_or(0.01));
-    // We have to use this indirection, otherwise the compiler cannot
-    // infer the lifetime of the value returned by the closure properly
-    compiled_leaky_relu(x.as_ref(), &neg_slope)
+    maximum(
+        &multiply(&neg_slope, x.as_ref(), stream)?,
+        x.as_ref(),
+        stream,
+    )
 }
 
 /// Applies the Log Softmax function.
@@ -60,10 +66,15 @@ pub fn leaky_relu(x: impl AsRef<Array>, neg_slope: impl Into<Option<f32>>) -> Re
 /// ```rust, ignore
 /// x - logsumexp_axis(x, axis, true)
 /// ```
-pub fn log_softmax(x: impl AsRef<Array>, axis: impl Into<Option<i32>>) -> Result<Array> {
+pub fn log_softmax(
+    x: impl AsRef<Array>,
+    axis: impl Into<Option<i32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
     let x = x.as_ref();
     let axis = axis.into().unwrap_or(-1);
-    x.subtract(logsumexp_axis(x, axis, true)?)
+    x.subtract(logsumexp_axis(x, axis, true, stream)?, stream)
 }
 
 /// Applies the Exponential Linear Unit.
@@ -78,11 +89,20 @@ pub fn log_softmax(x: impl AsRef<Array>, axis: impl Into<Option<i32>>) -> Result
 ///
 /// - `x`: The input array
 /// - `alpha`: Default to 1.0 if not provided
-pub fn elu(x: impl AsRef<Array>, alpha: impl Into<Option<f32>>) -> Result<Array> {
+pub fn elu(
+    x: impl AsRef<Array>,
+    alpha: impl Into<Option<f32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let x = x.as_ref();
     let alpha = array!(alpha.into().unwrap_or(1.0));
-    // We have to use this indirection, otherwise the compiler cannot
-    // infer the lifetime of the value returned by the closure properly
-    compiled_elu(x.as_ref(), &alpha)
+    which(
+        &x.gt(&array!(0.0), stream)?,
+        x,
+        alpha.multiply(exp(x, stream)?.subtract(array!(1.0), stream)?, stream)?,
+        stream,
+    )
 }
 
 /// Applies the Rectified Linear Unit 6.
@@ -92,8 +112,13 @@ pub fn elu(x: impl AsRef<Array>, alpha: impl Into<Option<f32>>) -> Result<Array>
 /// ```rust, ignore
 /// minimum(maximum(x, 0), 6)
 /// ```
-pub fn relu6(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_relu6(x.as_ref())
+pub fn relu6(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    minimum(
+        maximum(x.as_ref(), &array!(0.0), stream)?,
+        &array!(6.0),
+        stream,
+    )
 }
 
 /// Applies the Exponential Linear Unit.
@@ -103,8 +128,8 @@ pub fn relu6(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// logaddexp(x, 0)
 /// ```
-pub fn softplus(x: impl AsRef<Array>) -> Result<Array> {
-    crate::ops::logaddexp(x.as_ref(), &array!(0))
+pub fn softplus(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    crate::ops::logaddexp(x.as_ref(), &array!(0), stream)
 }
 
 /// Applies the Softsign function.
@@ -114,8 +139,10 @@ pub fn softplus(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// x / (1 + abs(x))
 /// ```
-pub fn softsign(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_softsign(x.as_ref())
+pub fn softsign(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    x.as_ref()
+        .divide(array!(1.0).add(abs(x.as_ref(), stream)?, stream)?, stream)
 }
 
 /// Applies the Continuously Differentiable Exponential Linear Unit.
@@ -125,11 +152,25 @@ pub fn softsign(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// maximum(x, 0) + alpha * (exp(minimum(x, 0) / alpha) - 1)
 /// ```
-pub fn celu(x: impl AsRef<Array>, alpha: impl Into<Option<f32>>) -> Result<Array> {
+pub fn celu(
+    x: impl AsRef<Array>,
+    alpha: impl Into<Option<f32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let x = x.as_ref();
     let alpha = array!(alpha.into().unwrap_or(1.0));
-    // We have to use this indirection, otherwise the compiler cannot
-    // infer the lifetime of the value returned by the closure properly
-    compiled_celu(x.as_ref(), &alpha)
+    maximum(x, &array!(0.0), stream)?.add(
+        alpha.multiply(
+            exp(
+                &minimum(x, &array!(0.0), stream)?.divide(&alpha, stream)?,
+                stream,
+            )?
+            .subtract(array!(1.0), stream)?,
+            stream,
+        )?,
+        stream,
+    )
 }
 
 /// Applies the Sigmoid Linear Unit. Also known as Swish.
@@ -137,10 +178,12 @@ pub fn celu(x: impl AsRef<Array>, alpha: impl Into<Option<f32>>) -> Result<Array
 /// This is:
 ///
 /// ```rust, ignore
-/// x * sigmoid(x)
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// x * sigmoid(x, &stream)
 /// ```
-pub fn silu(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_silu(x.as_ref())
+pub fn silu(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    x.as_ref().multiply(sigmoid(x.as_ref(), stream)?, stream)
 }
 
 /// Applies the Log Sigmoid function.
@@ -150,8 +193,9 @@ pub fn silu(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// -softplus(-x)
 /// ```
-pub fn log_sigmoid(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_log_sigmoid(x.as_ref())
+pub fn log_sigmoid(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    softplus(&x.as_ref().negative(stream)?, stream)?.negative(stream)
 }
 
 /// Applies the Gaussian Error Linear Units function.
@@ -161,8 +205,17 @@ pub fn log_sigmoid(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// x * (1 + erf(x / 2.sqrt())) / 2
 /// ```
-pub fn gelu(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_gelu(x.as_ref())
+pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    x.as_ref()
+        .multiply(
+            array!(1).add(
+                erf(&x.as_ref().divide(array!(2f32.sqrt()), stream)?, stream)?,
+                stream,
+            )?,
+            stream,
+        )?
+        .divide(array!(2.0), stream)
 }
 
 /// An approximation to Gaussian Error Linear Unit.
@@ -172,8 +225,25 @@ pub fn gelu(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// 0.5 * x * (1 + tanh(sqrt(2 / PI) * (x + 0.044715 * x ** 3)))
 /// ```
-pub fn gelu_approximate(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_gelu_approximate(x.as_ref())
+pub fn gelu_approximate(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    let x = x.as_ref();
+    array!(0.5).multiply(x, stream)?.multiply(
+        array!(1.0).add(
+            tanh(
+                &sqrt(&array!(2.0 / PI), stream)?.multiply(
+                    x.add(
+                        array!(0.044715).multiply(x.power(&array!(3), stream)?, stream)?,
+                        stream,
+                    )?,
+                    stream,
+                )?,
+                stream,
+            )?,
+            stream,
+        )?,
+        stream,
+    )
 }
 
 /// A fast approximation to Gaussian Error Linear Unit.
@@ -183,18 +253,30 @@ pub fn gelu_approximate(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// x * sigmoid(1.773 * x)
 /// ```
-pub fn gelu_fast_approximate(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_gelu_fast_approximate(x.as_ref())
+pub fn gelu_fast_approximate(
+    x: impl AsRef<Array>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    x.as_ref().multiply(
+        sigmoid(&array!(1.773).multiply(x.as_ref(), stream)?, stream)?,
+        stream,
+    )
 }
 
 /// Applies the gated linear unit function.
 ///
 /// This function splits the `axis` dimension of the input into two halves
 /// (`a` and `b`) and applies `a * sigmoid(b)`.
-pub fn glu(x: impl AsRef<Array>, axis: impl Into<Option<i32>>) -> Result<Array> {
-    let split = x.as_ref().split(2, axis)?;
+pub fn glu(
+    x: impl AsRef<Array>,
+    axis: impl Into<Option<i32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let split = x.as_ref().split(2, axis, stream)?;
     let (a, b) = (&split[0], &split[1]);
-    Ok(a * sigmoid(b)?)
+    a.multiply(sigmoid(b, stream)?, stream)
 }
 
 /// Applies the Step Activation Function.
@@ -207,9 +289,19 @@ pub fn glu(x: impl AsRef<Array>, axis: impl Into<Option<i32>>) -> Result<Array> 
 /// ```rust, ignore
 /// r#where(x.gt(threshold), 1, 0)
 /// ```
-pub fn step(x: impl AsRef<Array>, threshold: impl Into<Option<f32>>) -> Result<Array> {
+pub fn step(
+    x: impl AsRef<Array>,
+    threshold: impl Into<Option<f32>>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
     let threshold = array!(threshold.into().unwrap_or(0.0));
-    crate::ops::r#where(&x.as_ref().gt(threshold)?, &array!(1), &array!(0))
+    crate::ops::r#where(
+        &x.as_ref().gt(threshold, stream)?,
+        &array!(1),
+        &array!(0),
+        stream,
+    )
 }
 
 /// Applies the Scaled Exponential Linear Unit.
@@ -219,8 +311,9 @@ pub fn step(x: impl AsRef<Array>, threshold: impl Into<Option<f32>>) -> Result<A
 /// ```rust, ignore
 /// elu(x, 1.67326) * 1.0507
 /// ```
-pub fn selu(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_selu(x.as_ref())
+pub fn selu(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    elu(x.as_ref(), 1.67326, stream)?.multiply(array!(1.0507), stream)
 }
 
 /// Applies the element-wise parametric ReLU.
@@ -230,8 +323,18 @@ pub fn selu(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// maximum(0, x) + alpha * minimum(0, x)
 /// ```
-pub fn prelu(x: impl AsRef<Array>, alpha: impl AsRef<Array>) -> Result<Array> {
-    compiled_prelu(x.as_ref(), alpha.as_ref())
+pub fn prelu(
+    x: impl AsRef<Array>,
+    alpha: impl AsRef<Array>,
+    stream: impl AsRef<crate::Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    maximum(&array!(0.0), x.as_ref(), stream)?.add(
+        alpha
+            .as_ref()
+            .multiply(minimum(&array!(0.0), x.as_ref(), stream)?, stream)?,
+        stream,
+    )
 }
 
 /// Applies the Mish function, element-wise.
@@ -243,10 +346,13 @@ pub fn prelu(x: impl AsRef<Array>, alpha: impl AsRef<Array>) -> Result<Array> {
 /// This is:
 ///
 /// ```rust, ignore
-/// x * tanh(softplus(x))
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// x * tanh(softplus(x, &stream))
 /// ```
-pub fn mish(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_mish(x.as_ref())
+pub fn mish(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    x.as_ref()
+        .multiply(tanh(&softplus(x.as_ref(), stream)?, stream)?, stream)
 }
 
 /// Applies the hardswish function, element-wise.
@@ -256,8 +362,12 @@ pub fn mish(x: impl AsRef<Array>) -> Result<Array> {
 /// ```rust, ignore
 /// x * minimum(maximum(x + 3, 0), 6) / 6
 /// ```
-pub fn hard_swish(x: impl AsRef<Array>) -> Result<Array> {
-    compiled_hard_swish(x.as_ref())
+pub fn hard_swish(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
+    let stream = stream.as_ref();
+    let max_x_plus_3 = maximum(&x.as_ref().add(array!(3.0), stream)?, &array!(0.0), stream)?;
+    x.as_ref()
+        .multiply(minimum(&max_x_plus_3, &array!(6.0), stream)?, stream)?
+        .divide(&array!(6.0), stream)
 }
 
 generate_builder! {
@@ -285,8 +395,8 @@ impl Module<&Array> for Glu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        glu(x, self.axis)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        glu(x, self.axis, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -300,7 +410,8 @@ impl Module<&Array> for Glu {
 /// This is:
 ///
 /// ```rust, ignore
-/// sigmoid(x)
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// sigmoid(x, &stream)
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]
 #[module(root = crate)]
@@ -310,8 +421,8 @@ impl Module<&Array> for Sigmoid {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        sigmoid(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        sigmoid(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -326,7 +437,8 @@ impl Module<&Array> for Sigmoid {
 /// This is:
 ///
 /// ```rust, ignore
-/// x * tanh(softplus(x))
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// x * tanh(softplus(x, &stream))
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]
 #[module(root = crate)]
@@ -336,8 +448,8 @@ impl Module<&Array> for Mish {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        mish(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        mish(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -358,8 +470,8 @@ impl Module<&Array> for Relu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        relu(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        relu(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -393,8 +505,8 @@ impl Module<&Array> for LeakyRelu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        leaky_relu(x, self.neg_slope)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        leaky_relu(x, self.neg_slope, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -415,8 +527,8 @@ impl Module<&Array> for Relu6 {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        relu6(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        relu6(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -450,8 +562,8 @@ impl Module<&Array> for Softmax {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        crate::ops::softmax_axis(x, self.axis, None)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        crate::ops::softmax_axis(x, self.axis, None, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -472,8 +584,8 @@ impl Module<&Array> for Softplus {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        softplus(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        softplus(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -494,8 +606,8 @@ impl Module<&Array> for Softsign {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        softsign(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        softsign(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -530,8 +642,8 @@ impl Module<&Array> for Celu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        celu(x, self.alpha)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        celu(x, self.alpha, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -542,7 +654,8 @@ impl Module<&Array> for Celu {
 /// This is:
 ///
 /// ```rust, ignore
-/// x * sigmoid(x)
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// x * sigmoid(x, &stream)
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]
 #[module(root = crate)]
@@ -552,8 +665,8 @@ impl Module<&Array> for Silu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        silu(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        silu(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -587,8 +700,8 @@ impl Module<&Array> for LogSoftmax {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        log_softmax(x, self.axis)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        log_softmax(x, self.axis, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -609,8 +722,8 @@ impl Module<&Array> for LogSigmoid {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        log_sigmoid(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        log_sigmoid(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -655,7 +768,8 @@ pub struct PreluBuilder {
 fn build_prelu(builder: PreluBuilder) -> Result<Prelu> {
     let count = builder.count;
     let value = builder.value;
-    let weight = Param::new(crate::ops::full::<f32>(&[count], &array!(value))?);
+    let values = vec![value; count as usize];
+    let weight = Param::new(Array::from_slice(&values, &[count]));
     Ok(Prelu { weight })
 }
 
@@ -671,8 +785,8 @@ impl Module<&Array> for Prelu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        prelu(x, &self.weight)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        prelu(x, &self.weight, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -715,11 +829,11 @@ impl Module<&Array> for Gelu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
         match self.approximate {
-            GeluApprox::None => gelu(x),
-            GeluApprox::Precise => gelu_approximate(x),
-            GeluApprox::Fast => gelu_fast_approximate(x),
+            GeluApprox::None => gelu(x, stream),
+            GeluApprox::Precise => gelu_approximate(x, stream),
+            GeluApprox::Fast => gelu_fast_approximate(x, stream),
         }
     }
 
@@ -735,8 +849,8 @@ impl Module<&Array> for Tanh {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        crate::ops::tanh(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        crate::ops::tanh(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -757,8 +871,8 @@ impl Module<&Array> for HardSwish {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        hard_swish(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        hard_swish(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -795,8 +909,8 @@ impl Module<&Array> for Step {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        step(x, self.threshold)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        step(x, self.threshold, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
@@ -817,144 +931,11 @@ impl Module<&Array> for Selu {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        selu(x)
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array> {
+        selu(x, stream)
     }
 
     fn training_mode(&mut self, _: bool) {}
-}
-
-/* -------------------------------------------------------------------------- */
-/*                        Compiled activation functions                       */
-/* -------------------------------------------------------------------------- */
-
-#[inline]
-fn compiled_leaky_relu(x: &Array, neg_slope: &Array) -> Result<Array> {
-    let f = |(x_, neg_slope_): (&Array, &Array)| {
-        // This will not panic because a scalar can always be broadcasted to any shape
-        let a = multiply(neg_slope_, x_)?;
-        maximum(&a, x_)
-    };
-    let mut compiled = compile(f, true);
-    compiled((x, neg_slope))
-}
-
-#[inline]
-fn compiled_elu(x: &Array, alpha: &Array) -> Result<Array> {
-    let f = |(x_, alpha_): (&Array, &Array)| {
-        which(&x_.gt(&array!(0.0))?, x_, alpha_ * (exp(x_)? - array!(1.0)))
-    };
-    let mut compiled = compile(f, true);
-    compiled((x, alpha))
-}
-
-#[inline]
-fn compiled_relu6(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| minimum(maximum(x_, &array!(0.0))?, &array!(6.0));
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_softsign(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| x_.divide(array!(1.0) + abs(x_)?);
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_celu(x: &Array, alpha: &Array) -> Result<Array> {
-    let f = |(x_, alpha_): (&Array, &Array)| {
-        maximum(x_, &array!(0.0))?
-            .add(alpha_.multiply(exp(&(minimum(x_, &array!(0.0))? / alpha_))? - array!(1.0))?)
-    };
-    let mut compiled = compile(f, true);
-    compiled((x, alpha))
-}
-
-#[inline]
-fn compiled_silu(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| x_.multiply(sigmoid(x_)?);
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_log_sigmoid(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| Ok(-softplus(&(-x_))?);
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_gelu(x: &Array) -> Result<Array> {
-    use crate::ops::erf;
-    let f = |x_: &Array| {
-        x_.multiply(array!(1) + erf(&(x_ / array!(2f32.sqrt())))?)?
-            .divide(array!(2.0))
-    };
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_gelu_approximate(x: &Array) -> Result<Array> {
-    use crate::ops::{sqrt, tanh};
-
-    let f = move |x_: &Array| {
-        // 0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x ** 3)))
-        array!(0.5).multiply(x_)?.multiply(
-            array!(1.0).add(tanh(
-                &(sqrt(&array!(2.0 / PI))?
-                    .multiply(x_ + array!(0.044715).multiply(x_.power(&array!(3))?)?)?),
-            )?)?,
-        )
-    };
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_gelu_fast_approximate(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| x_.multiply(sigmoid(&(array!(1.773) * x_))?);
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_selu(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| elu(x_, 1.67326)?.multiply(array!(1.0507));
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_prelu(x: &Array, alpha: &Array) -> Result<Array> {
-    let f = |(x_, alpha_): (&Array, &Array)| {
-        maximum(&array!(0.0), x_)?.add(alpha_ * minimum(&array!(0.0), x_)?)
-    };
-    let mut compiled = compile(f, true);
-    compiled((x, alpha))
-}
-
-#[inline]
-fn compiled_mish(x: &Array) -> Result<Array> {
-    use crate::ops::tanh;
-
-    let f = |x_: &Array| x_.multiply(tanh(&softplus(x_)?)?);
-    let mut compiled = compile(f, true);
-    compiled(x)
-}
-
-#[inline]
-fn compiled_hard_swish(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| {
-        let max_x_plus_3 = maximum(&(x_ + array!(3.0)), &array!(0.0))?;
-        x_.multiply(minimum(&max_x_plus_3, &array!(6.0))?)?
-            .divide(&array!(6.0))
-    };
-    let mut compiled = compile(f, true);
-    compiled(x)
 }
 
 // The following tests are ported from the swift binding:
@@ -968,30 +949,31 @@ mod tests {
 
     #[test]
     fn test_glu() {
-        crate::random::seed(850).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(850, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.547_252_66,
             abs <= 0.010_945_053
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             140.096_68,
             abs <= 2.801_933_5
         );
-        let result = Glu::new().forward(&a).unwrap();
+        let result = Glu::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 8]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.333_276_75,
             abs <= 0.006_665_535
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             42.659_424,
             abs <= 0.853_188_46
         );
@@ -999,30 +981,31 @@ mod tests {
 
     #[test]
     fn test_sigmoid() {
-        crate::random::seed(589).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(589, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.529_697_9,
             abs <= 0.010_593_958
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             135.602_66,
             abs <= 2.712_053_3
         );
-        let result = Sigmoid.forward(&a).unwrap();
+        let result = Sigmoid.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.627_014,
             abs <= 0.012_540_28
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             160.515_58,
             abs <= 3.210_311_7
         );
@@ -1030,30 +1013,31 @@ mod tests {
 
     #[test]
     fn test_mish() {
-        crate::random::seed(122).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(122, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.501_719_8,
             abs <= 0.010_034_395
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             128.440_26,
             abs <= 2.568_805_2
         );
-        let result = Mish.forward(&a).unwrap();
+        let result = Mish.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.395_375_73,
             abs <= 0.007_907_514
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             101.216_19,
             abs <= 2.024_323_7
         );
@@ -1061,30 +1045,31 @@ mod tests {
 
     #[test]
     fn test_relu() {
-        crate::random::seed(400).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(400, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.478_322_74,
             abs <= 0.009_566_455
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             122.450_62,
             abs <= 2.449_012_5
         );
-        let result = Relu.forward(&a).unwrap();
+        let result = Relu.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.478_322_74,
             abs <= 0.009_566_455
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             122.450_62,
             abs <= 2.449_012_5
         );
@@ -1092,30 +1077,31 @@ mod tests {
 
     #[test]
     fn test_leaky_relu() {
-        crate::random::seed(93).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(93, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.499_930_68,
             abs <= 0.009_998_614
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             127.982_254,
             abs <= 2.559_645_2
         );
-        let result = LeakyRelu::new().forward(&a).unwrap();
+        let result = LeakyRelu::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.499_930_68,
             abs <= 0.009_998_614
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             127.982_254,
             abs <= 2.559_645_2
         );
@@ -1123,30 +1109,31 @@ mod tests {
 
     #[test]
     fn test_relu6() {
-        crate::random::seed(379).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(379, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.493_258_66,
             abs <= 0.009_865_173
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             126.274_216,
             abs <= 2.525_484_3
         );
-        let result = Relu6.forward(&a).unwrap();
+        let result = Relu6.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.493_258_66,
             abs <= 0.009_865_173
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             126.274_216,
             abs <= 2.525_484_3
         );
@@ -1154,30 +1141,31 @@ mod tests {
 
     #[test]
     fn test_softmax() {
-        crate::random::seed(853).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(853, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.514_396_3,
             abs <= 0.010_287_926_5
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             131.685_46,
             abs <= 2.633_709_2
         );
-        let result = Softmax::new().forward(&a).unwrap();
+        let result = Softmax::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.062_499_996,
             abs <= 0.001_25
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             15.999_999,
             abs <= 0.32
         );
@@ -1185,30 +1173,31 @@ mod tests {
 
     #[test]
     fn test_softplus() {
-        crate::random::seed(118).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(118, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.498_981_42,
             abs <= 0.009_979_628
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             127.739_24,
             abs <= 2.554_784_8
         );
-        let result = Softplus.forward(&a).unwrap();
+        let result = Softplus.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.982_857_76,
             abs <= 0.019_657_155
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             251.611_59,
             abs <= 5.032_232
         );
@@ -1216,30 +1205,31 @@ mod tests {
 
     #[test]
     fn test_softsign() {
-        crate::random::seed(37).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(37, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.506_551_27,
             abs <= 0.010_131_026
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             129.677_12,
             abs <= 2.593_542_6
         );
-        let result = Softsign.forward(&a).unwrap();
+        let result = Softsign.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.314_089_83,
             abs <= 0.006_281_797
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             80.407,
             abs <= 1.608_14
         );
@@ -1249,20 +1239,21 @@ mod tests {
     // mlx/python/tests/test_nn.py
     #[test]
     fn test_celu() {
+        let stream = crate::test_stream();
         let x = array!([1.0, -1.0, 0.0]);
-        let y = Celu::new().forward(&x).unwrap();
+        let y = Celu::new().forward(&x, stream).unwrap();
         let epsilon = array!(1e-4);
         let expected_y = array!([1.0, -0.6321, 0.0]);
         assert!(y
-            .subtract(&expected_y)
+            .subtract(&expected_y, stream)
             .unwrap()
-            .abs()
+            .abs(stream)
             .unwrap()
-            .lt(&epsilon)
+            .lt(&epsilon, stream)
             .unwrap()
-            .all(None)
+            .all(None, stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
         assert_eq!(y.shape(), &[3]);
         assert_eq!(y.dtype(), Dtype::Float32);
 
@@ -1270,49 +1261,50 @@ mod tests {
             .alpha(1.1)
             .build()
             .unwrap()
-            .forward(&x)
+            .forward(&x, stream)
             .unwrap();
         let expected_y = array!([1.0, -0.6568, 0.0]);
         assert!(y
-            .subtract(&expected_y)
+            .subtract(&expected_y, stream)
             .unwrap()
-            .abs()
+            .abs(stream)
             .unwrap()
-            .lt(&epsilon)
+            .lt(&epsilon, stream)
             .unwrap()
-            .all(None)
+            .all(None, stream)
             .unwrap()
-            .item::<bool>());
+            .item::<bool>(&stream));
         assert_eq!(y.shape(), &[3]);
         assert_eq!(y.dtype(), Dtype::Float32);
     }
 
     #[test]
     fn test_silu() {
-        crate::random::seed(22).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(22, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.502_970_6,
             abs <= 0.010_059_412
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             128.760_47,
             abs <= 2.575_209_4
         );
-        let result = Silu.forward(&a).unwrap();
+        let result = Silu.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.331_970_93,
             abs <= 0.006_639_418_7
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             84.984_56,
             abs <= 1.699_691_2
         );
@@ -1320,30 +1312,31 @@ mod tests {
 
     #[test]
     fn test_log_softmax() {
-        crate::random::seed(199).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(199, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.527_843_7,
             abs <= 0.010_556_874
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             135.127_99,
             abs <= 2.702_559_7
         );
-        let result = LogSoftmax::new().forward(&a).unwrap();
+        let result = LogSoftmax::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             -2.810_954_6,
             abs <= 0.056_219_09
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             -719.604_4,
             abs <= 14.392_087
         );
@@ -1351,30 +1344,31 @@ mod tests {
 
     #[test]
     fn test_log_sigmoid() {
-        crate::random::seed(984).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(984, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.510_977_7,
             abs <= 0.010_219_553_5
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             130.810_29,
             abs <= 2.616_205_7
         );
-        let result = LogSigmoid.forward(&a).unwrap();
+        let result = LogSigmoid.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             -0.479_598_55,
             abs <= 0.009_591_971
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             -122.777_23,
             abs <= 2.455_544_5
         );
@@ -1382,30 +1376,31 @@ mod tests {
 
     #[test]
     fn test_prelu() {
-        crate::random::seed(993).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(993, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.496_651_44,
             abs <= 0.009_933_028
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             127.142_77,
             abs <= 2.542_855_3
         );
-        let result = Prelu::new().forward(&a).unwrap();
+        let result = Prelu::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.496_651_44,
             abs <= 0.009_933_028
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             127.142_77,
             abs <= 2.542_855_3
         );
@@ -1413,30 +1408,31 @@ mod tests {
 
     #[test]
     fn test_gelu() {
-        crate::random::seed(189).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(189, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.492_950_32,
             abs <= 0.009_859_007
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             126.195_28,
             abs <= 2.523_905_8
         );
-        let result = Gelu::new().forward(&a).unwrap();
+        let result = Gelu::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.365_638_38,
             abs <= 0.007_312_767_7
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             93.603_424,
             abs <= 1.872_068_5
         );
@@ -1444,30 +1440,31 @@ mod tests {
 
     #[test]
     fn test_tanh() {
-        crate::random::seed(735).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(735, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.474_122_7,
             abs <= 0.009_482_454_5
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             121.375_41,
             abs <= 2.427_508_4
         );
-        let result = Tanh.forward(&a).unwrap();
+        let result = Tanh.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.413_079_68,
             abs <= 0.008_261_594
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             105.748_4,
             abs <= 2.114_968
         );
@@ -1475,30 +1472,31 @@ mod tests {
 
     #[test]
     fn test_hardswish() {
-        crate::random::seed(126).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(126, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.491_892_46,
             abs <= 0.009_837_849
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             125.924_47,
             abs <= 2.518_489_4
         );
-        let result = HardSwish.forward(&a).unwrap();
+        let result = HardSwish.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.299_602_24,
             abs <= 0.005_992_044_7
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             76.698_17,
             abs <= 1.533_963_4
         );
@@ -1506,53 +1504,63 @@ mod tests {
 
     #[test]
     fn test_step() {
-        crate::random::seed(490).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(490, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.479_360_64,
             abs <= 0.009_587_212_5
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             122.716_324,
             abs <= 2.454_326_4
         );
-        let result = Step::new().forward(&a).unwrap();
+        let result = Step::new().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Int32);
-        assert_float_eq!(result.mean(None).unwrap().item::<f32>(), 1.0, abs <= 0.02);
-        assert_float_eq!(result.sum(None).unwrap().item::<f32>(), 256.0, abs <= 5.12);
+        assert_float_eq!(
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
+            1.0,
+            abs <= 0.02
+        );
+        assert_float_eq!(
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
+            256.0,
+            abs <= 5.12
+        );
     }
 
     #[test]
     fn test_selu() {
-        crate::random::seed(215).unwrap();
-        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(215, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.493_026_8,
             abs <= 0.009_860_536
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             126.214_86,
             abs <= 2.524_297_2
         );
-        let result = Selu.forward(&a).unwrap();
+        let result = Selu.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.518_023_2,
             abs <= 0.010_360_463_5
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             132.613_94,
             abs <= 2.652_278_7
         );

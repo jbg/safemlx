@@ -399,10 +399,11 @@ mod tests {
 
     #[test]
     fn test_exception() {
+        let stream = crate::test_stream();
         let a = array!([1.0, 2.0, 3.0]);
         let b = array!([4.0, 5.0]);
 
-        let result = a.add(&b);
+        let result = a.add(&b, stream);
         let error = result.expect_err("Expected error");
 
         // The full error message would also contain the full path to the original c++ file,
@@ -417,12 +418,16 @@ mod tests {
         let threads = (0..8)
             .map(|thread_index| {
                 std::thread::spawn(move || {
+                    let stream = crate::Stream::new_with_device(&crate::Device::new(
+                        crate::DeviceType::Gpu,
+                        0,
+                    ));
                     for iteration in 0..64 {
                         let lhs_len = 3 + thread_index;
                         let rhs_len = lhs_len + 1 + iteration % 3;
                         let lhs = Array::from_slice(&vec![0.0f32; lhs_len], &[lhs_len as i32]);
                         let rhs = Array::from_slice(&vec![0.0f32; rhs_len], &[rhs_len as i32]);
-                        let error = lhs.add(&rhs).expect_err("add should fail");
+                        let error = lhs.add(&rhs, &stream).expect_err("add should fail");
                         let expected = format!("Shapes ({lhs_len}) and ({rhs_len})");
                         assert!(
                             error.what().contains(&expected),

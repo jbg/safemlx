@@ -1,6 +1,6 @@
 use std::ffi::CStr;
 
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 
 use crate::{
     error::Result,
@@ -46,8 +46,7 @@ fn optional_dtype_none() -> safemlx_sys::mlx_optional_dtype {
 /// - `bits`: The number of bits occupied by each element of w in the returned quantized matrix.
 ///   (default: 4)
 #[generate_macro]
-#[default_device]
-pub fn quantize_device(
+pub fn quantize(
     w: impl AsRef<Array>,
     #[optional] group_size: impl Into<Option<i32>>,
     #[optional] bits: impl Into<Option<i32>>,
@@ -88,8 +87,7 @@ pub fn quantize_device(
 /// bits and is packed in an unsigned 32 bit integer.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn quantized_matmul_device<'a>(
+pub fn quantized_matmul<'a>(
     x: impl AsRef<Array>,
     w: impl AsRef<Array>,
     scales: impl AsRef<Array>,
@@ -128,8 +126,7 @@ pub fn quantized_matmul_device<'a>(
 /// For details, please see [this
 /// documentation](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.dequantize.html)
 #[generate_macro]
-#[default_device]
-pub fn dequantize_device<'a>(
+pub fn dequantize<'a>(
     w: impl AsRef<Array>,
     scales: impl AsRef<Array>,
     #[optional] biases: impl Into<Option<&'a Array>>,
@@ -178,8 +175,7 @@ pub fn dequantize_device<'a>(
 /// - `sorted_indices`: If true, indicates the indices are sorted (default: false)
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn gather_qmm_device<'b, 'lhs, 'rhs>(
+pub fn gather_qmm<'b, 'lhs, 'rhs>(
     x: impl AsRef<Array>,
     w: impl AsRef<Array>,
     scales: impl AsRef<Array>,
@@ -250,8 +246,7 @@ pub fn gather_qmm_device<'b, 'lhs, 'rhs>(
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
-#[default_device]
-pub fn qqmm_device<'a>(
+pub fn qqmm<'a>(
     x: impl AsRef<Array>,
     w: impl AsRef<Array>,
     #[optional] w_scales: impl Into<Option<&'a Array>>,
@@ -293,25 +288,39 @@ pub fn qqmm_device<'a>(
 #[cfg(test)]
 mod tests {
     use crate::{
+        array,
         ops::{dequantize, expand_dims, quantize, quantized_matmul},
-        random, Array,
+        random, Array, Stream,
     };
 
     #[test]
     fn test_quantize_dequantize() {
-        let x1 = Array::ones::<f32>(&[128, 1]).unwrap();
-        let x2 = expand_dims(Array::arange::<_, f32>(0, 512, None).unwrap(), 0).unwrap();
-        let x = x1 * x2;
+        let stream = crate::test_stream();
+        let x1 = Array::ones::<f32>(&[128, 1], stream).unwrap();
+        let x2 = expand_dims(
+            Array::arange::<_, f32>(0, 512, None, stream).unwrap(),
+            0,
+            stream,
+        )
+        .unwrap();
+        let x = x1.multiply(&x2, stream).unwrap();
 
         for i in [2, 4, 8].iter() {
             let el_per_int = 32 / i;
-            let (x_q, scales, biases) = quantize(&x, 128, *i).unwrap();
+            let (x_q, scales, biases) = quantize(&x, 128, *i, stream).unwrap();
             assert_eq!(x_q.shape(), [128, 512 / el_per_int]);
             assert_eq!(scales.shape(), [128, 4]);
             assert_eq!(biases.shape(), [128, 4]);
 
-            let x_hat = dequantize(&x_q, &scales, &biases, 128, *i).unwrap();
-            let max_diff = ((&x - &x_hat).abs().unwrap().max(None).unwrap()).item::<f32>();
+            let x_hat = dequantize(&x_q, &scales, &biases, 128, *i, stream).unwrap();
+            let max_diff = x
+                .subtract(&x_hat, stream)
+                .unwrap()
+                .abs(stream)
+                .unwrap()
+                .max(None, stream)
+                .unwrap()
+                .item::<f32>(&stream);
             assert!(max_diff <= 127.0 / (1 << i) as f32);
         }
     }
@@ -319,7 +328,8 @@ mod tests {
     // Test adapted from Python test `test_quantized.py/test_qmm`
     #[test]
     fn test_quantized_matmul() {
-        random::seed(0).unwrap();
+        let stream = crate::test_stream();
+        let mut random_state = random::RandomState::with_seed(0).unwrap();
 
         let group_size = 64;
         let bits = 4;
@@ -328,27 +338,44 @@ mod tests {
         let k = 128;
 
         let scale = 1.0 / (k as f32).sqrt();
-        let x = random::normal::<f32>(&[m, k], None, None, None).unwrap() * scale;
-        let w = random::normal::<f32>(&[k, n], None, None, None).unwrap() * scale;
+        let key = random_state.next_key(stream).unwrap();
+        let x = random::normal::<f32>(&[m, k], None, None, &key, stream)
+            .unwrap()
+            .multiply(array!(scale), stream)
+            .unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let w = random::normal::<f32>(&[k, n], None, None, &key, stream)
+            .unwrap()
+            .multiply(array!(scale), stream)
+            .unwrap();
 
-        let (w_q, scales, biases) = quantize(&w, group_size, bits).unwrap();
-        let w_hat = dequantize(&w_q, &scales, &biases, group_size, bits).unwrap();
+        let (w_q, scales, biases) = quantize(&w, group_size, bits, stream).unwrap();
+        let w_hat = dequantize(&w_q, &scales, &biases, group_size, bits, stream).unwrap();
 
         // Test with biases
-        let y_q = quantized_matmul(&x, &w_q, &scales, &biases, false, group_size, bits).unwrap();
-        let y_hat = x.matmul(&w_hat).unwrap();
+        let y_q =
+            quantized_matmul(&x, &w_q, &scales, &biases, false, group_size, bits, stream).unwrap();
+        let y_hat = x.matmul(&w_hat, stream).unwrap();
 
         assert_eq!(y_q.shape(), y_hat.shape());
-        let max_diff = ((&y_q - &y_hat).abs().unwrap().max(None).unwrap()).item::<f32>();
+        let max_diff = y_q
+            .subtract(&y_hat, stream)
+            .unwrap()
+            .abs(stream)
+            .unwrap()
+            .max(None, stream)
+            .unwrap()
+            .item::<f32>(&stream);
         assert!(max_diff < 1e-3, "max_diff: {}", max_diff);
     }
 
     // Test adapted from Python test `test_quantized.py/test_gather_qmm`
     #[test]
     fn test_gather_qmm() {
+        let stream = crate::test_stream();
         use crate::ops::{gather_mm, gather_qmm, swap_axes};
 
-        random::seed(0).unwrap();
+        let mut random_state = random::RandomState::with_seed(0).unwrap();
 
         let group_size = 64;
         let bits = 4;
@@ -359,11 +386,12 @@ mod tests {
             transpose: bool,
             group_size: i32,
             bits: i32,
+            stream: &Stream,
         ) -> (Array, Array, Array, Array) {
-            let (w_q, scales, biases) = quantize(w, group_size, bits).unwrap();
-            let mut w_hat = dequantize(&w_q, &scales, &biases, group_size, bits).unwrap();
+            let (w_q, scales, biases) = quantize(w, group_size, bits, stream).unwrap();
+            let mut w_hat = dequantize(&w_q, &scales, &biases, group_size, bits, stream).unwrap();
             if transpose {
-                w_hat = swap_axes(&w_hat, -1, -2).unwrap();
+                w_hat = swap_axes(&w_hat, -1, -2, stream).unwrap();
             }
             (w_hat, w_q, scales, biases)
         }
@@ -373,15 +401,18 @@ mod tests {
         let n = 64;
         let k = 64;
 
-        let x = random::normal::<f32>(&[1, m, k], None, None, None).unwrap();
-        let w = random::normal::<f32>(&[3, n, k], None, None, None).unwrap(); // transpose=true shape
-        let (w_hat, w_q, scales, biases) = quantize_with_transpose(&w, true, group_size, bits);
+        let key = random_state.next_key(stream).unwrap();
+        let x = random::normal::<f32>(&[1, m, k], None, None, &key, stream).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let w = random::normal::<f32>(&[3, n, k], None, None, &key, stream).unwrap(); // transpose=true shape
+        let (w_hat, w_q, scales, biases) =
+            quantize_with_transpose(&w, true, group_size, bits, stream);
 
         let lhs_indices = Array::from_slice(&[0u32], &[1]);
         let rhs_indices = Array::from_slice(&[2u32, 1], &[2]);
 
         // Compare gather_mm on dequantized weights vs gather_qmm
-        let c1 = gather_mm(&x, &w_hat, &lhs_indices, &rhs_indices, None).unwrap();
+        let c1 = gather_mm(&x, &w_hat, &lhs_indices, &rhs_indices, None, stream).unwrap();
         let c2 = gather_qmm(
             &x,
             &w_q,
@@ -393,18 +424,22 @@ mod tests {
             group_size,
             bits,
             None,
+            stream,
         )
         .unwrap();
         assert!(
-            c1.all_close(&c2, 1e-4, 1e-4, None).unwrap().item::<bool>(),
+            c1.all_close(&c2, 1e-4, 1e-4, None, stream)
+                .unwrap()
+                .item::<bool>(&stream),
             "gather_qmm test case 1 failed"
         );
 
         // Test case 2: batch_A=(5,), lhs_indices=(0, 2), batch_B=(3,), rhs_indices=(2, 1)
-        let x = random::normal::<f32>(&[5, m, k], None, None, None).unwrap();
+        let key = random_state.next_key(stream).unwrap();
+        let x = random::normal::<f32>(&[5, m, k], None, None, &key, stream).unwrap();
         let lhs_indices = Array::from_slice(&[0u32, 2], &[2]);
 
-        let c1 = gather_mm(&x, &w_hat, &lhs_indices, &rhs_indices, None).unwrap();
+        let c1 = gather_mm(&x, &w_hat, &lhs_indices, &rhs_indices, None, stream).unwrap();
         let c2 = gather_qmm(
             &x,
             &w_q,
@@ -416,10 +451,13 @@ mod tests {
             group_size,
             bits,
             None,
+            stream,
         )
         .unwrap();
         assert!(
-            c1.all_close(&c2, 1e-4, 1e-4, None).unwrap().item::<bool>(),
+            c1.all_close(&c2, 1e-4, 1e-4, None, stream)
+                .unwrap()
+                .item::<bool>(&stream),
             "gather_qmm test case 2 failed"
         );
     }

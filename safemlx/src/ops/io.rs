@@ -1,9 +1,9 @@
 use crate::error::IoError;
 use crate::utils::guard::Guarded;
+#[cfg(not(feature = "safetensors"))]
 use crate::utils::io::SafeTensors;
 use crate::utils::SUCCESS;
 use crate::{Array, Stream};
-use safemlx_internal_macros::default_device;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
@@ -22,8 +22,7 @@ impl Array {
     ///
     /// - path: path of file to load
     /// - stream: stream or device to evaluate on
-    #[default_device(device = "cpu")]
-    pub fn load_numpy_device(
+    pub fn load_numpy(
         path: impl AsRef<Path>,
         stream: impl AsRef<Stream>,
     ) -> Result<Array, IoError> {
@@ -45,10 +44,21 @@ impl Array {
     /// # Params
     ///
     /// - path: path of file to load
-    /// - stream: stream or device to evaluate on
     ///
-    #[default_device(device = "cpu")]
-    pub fn load_safetensors_device(
+    #[cfg(feature = "safetensors")]
+    pub fn load_safetensors(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, IoError> {
+        let (data, _) = load_safetensors_with_rust_parser(path.as_ref())?;
+        Ok(data)
+    }
+
+    /// Load dictionary of ``MLXArray`` from a `safetensors` file.
+    ///
+    /// # Params
+    ///
+    /// - path: path of file to load
+    /// - stream: stream or device to load on
+    #[cfg(not(feature = "safetensors"))]
+    pub fn load_safetensors(
         path: impl AsRef<Path>,
         stream: impl AsRef<Stream>,
     ) -> Result<HashMap<String, Array>, IoError> {
@@ -62,10 +72,23 @@ impl Array {
     /// # Params
     ///
     /// - path: path of file to load
-    /// - stream: stream or device to evaluate on
     #[allow(clippy::type_complexity)]
-    #[default_device(device = "cpu")]
-    pub fn load_safetensors_with_metadata_device(
+    #[cfg(feature = "safetensors")]
+    pub fn load_safetensors_with_metadata(
+        path: impl AsRef<Path>,
+    ) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
+        load_safetensors_with_rust_parser(path.as_ref())
+    }
+
+    /// Load dictionary of ``MLXArray`` and metadata `[String:String]` from a `safetensors` file.
+    ///
+    /// # Params
+    ///
+    /// - path: path of file to load
+    /// - stream: stream or device to load on
+    #[allow(clippy::type_complexity)]
+    #[cfg(not(feature = "safetensors"))]
+    pub fn load_safetensors_with_metadata(
         path: impl AsRef<Path>,
         stream: impl AsRef<Stream>,
     ) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
@@ -99,7 +122,6 @@ impl Array {
     /// - arrays: arrays to save
     /// - metadata: metadata to save
     /// - path: path of file to save
-    /// - stream: stream or device to evaluate on
     pub fn save_safetensors<'a, I, S, V>(
         arrays: I,
         metadata: impl Into<Option<&'a HashMap<String, String>>>,
@@ -116,9 +138,12 @@ impl Array {
 
         check_file_extension(path, "safetensors")?;
 
+        let entries = arrays.into_iter().collect::<Vec<_>>();
+        crate::transforms::eval(entries.iter().map(|(_, array)| array.as_ref()))?;
+
         let arrays = unsafe {
             let data = safemlx_sys::mlx_map_string_to_array_new();
-            for (key, array) in arrays.into_iter() {
+            for (key, array) in entries.iter() {
                 let key = CString::new(key.as_ref())?;
 
                 let status = safemlx_sys::mlx_map_string_to_array_insert(
@@ -187,22 +212,94 @@ impl Array {
     }
 }
 
+#[cfg(feature = "safetensors")]
+fn load_safetensors_with_rust_parser(
+    path: &Path,
+) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
+    if !path.is_file() {
+        return Err(IoError::NotFile);
+    }
+    check_file_extension(path, "safetensors")?;
+
+    let file = std::fs::File::open(path).map_err(|err| {
+        IoError::Exception(crate::error::Exception::custom(format!(
+            "failed to open safetensors file {}: {err}",
+            path.display()
+        )))
+    })?;
+    let bytes = unsafe {
+        memmap2::MmapOptions::new().map(&file).map_err(|err| {
+            IoError::Exception(crate::error::Exception::custom(format!(
+                "failed to map safetensors file {}: {err}",
+                path.display()
+            )))
+        })?
+    };
+    let metadata = safetensors::SafeTensors::read_metadata(&bytes)
+        .map_err(|err| {
+            IoError::Exception(crate::error::Exception::custom(format!(
+                "failed to parse safetensors metadata from {}: {err}",
+                path.display()
+            )))
+        })?
+        .1
+        .metadata()
+        .clone()
+        .unwrap_or_default();
+
+    let safetensors = safetensors::SafeTensors::deserialize(&bytes).map_err(|err| {
+        IoError::Exception(crate::error::Exception::custom(format!(
+            "failed to parse safetensors file {}: {err}",
+            path.display()
+        )))
+    })?;
+
+    let mut data = HashMap::new();
+    for name in safetensors.names() {
+        let tensor = safetensors.tensor(name).map_err(|err| {
+            IoError::Exception(crate::error::Exception::custom(format!(
+                "failed to read tensor {name} from {}: {err}",
+                path.display()
+            )))
+        })?;
+        let array = Array::try_from(tensor).map_err(|err| {
+            IoError::Exception(crate::error::Exception::custom(format!(
+                "failed to convert tensor {name} from {}: {err}",
+                path.display()
+            )))
+        })?;
+        data.insert(name.to_string(), array);
+    }
+
+    Ok((data, metadata))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Array;
 
     #[test]
     fn test_save_arrays() {
+        let stream = crate::test_stream();
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("test.safetensors");
 
         let mut arrays = std::collections::HashMap::new();
-        arrays.insert("foo".to_string(), Array::ones::<i32>(&[1, 2]).unwrap());
-        arrays.insert("bar".to_string(), Array::zeros::<i32>(&[2, 1]).unwrap());
+        arrays.insert(
+            "foo".to_string(),
+            Array::ones::<i32>(&[1, 2], stream).unwrap(),
+        );
+        arrays.insert(
+            "bar".to_string(),
+            Array::zeros::<i32>(&[2, 1], stream).unwrap(),
+        );
 
         Array::save_safetensors(&arrays, None, &path).unwrap();
 
+        #[cfg(feature = "safetensors")]
         let loaded_arrays = Array::load_safetensors(&path).unwrap();
+        #[cfg(not(feature = "safetensors"))]
+        let loaded_arrays = Array::load_safetensors(&path, stream).unwrap();
 
         // compare values
         let mut loaded_keys: Vec<_> = loaded_arrays.keys().cloned().collect();
@@ -215,21 +312,25 @@ mod tests {
             let loaded_array = loaded_arrays.get(&key).unwrap();
             let original_array = arrays.get(&key).unwrap();
             assert!(loaded_array
-                .all_close(original_array, None, None, None)
+                .all_close(original_array, None, None, None, stream)
                 .unwrap()
-                .item::<bool>());
+                .item::<bool>(&stream));
         }
     }
 
     #[test]
     fn test_save_array() {
+        let stream = crate::test_stream();
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("test.npy");
 
-        let a = Array::ones::<i32>(&[2, 4]).unwrap();
+        let a = Array::ones::<i32>(&[2, 4], stream).unwrap();
         a.save_numpy(&path).unwrap();
 
-        let b = Array::load_numpy(&path).unwrap();
-        assert!(a.all_close(&b, None, None, None).unwrap().item::<bool>());
+        let b = Array::load_numpy(&path, stream).unwrap();
+        assert!(a
+            .all_close(&b, None, None, None, stream)
+            .unwrap()
+            .item::<bool>(&stream));
     }
 }

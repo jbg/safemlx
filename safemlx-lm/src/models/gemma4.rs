@@ -9,9 +9,9 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, Param},
     nn,
-    ops::{indexing::IndexOp, mean_axis, rsqrt, tanh},
+    ops::{indexing::TryIndexOp, mean_axis, rsqrt, tanh},
     quantization::{MaybeQuantized, Quantizable as _},
-    Array,
+    Array, Stream,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -210,22 +210,26 @@ fn maybe_quantized_linear(
     output_dims: i32,
     group_size: i32,
     bits: i32,
+    stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     let linear = nn::LinearBuilder::new(input_dims, output_dims)
         .bias(false)
         .build()?;
     if quantized {
         Ok(MaybeQuantized::Quantized(
-            linear.try_into_quantized(group_size, bits)?,
+            linear.try_into_quantized(group_size, bits, stream)?,
         ))
     } else {
         Ok(MaybeQuantized::Original(linear))
     }
 }
 
-fn rms_norm_without_scale(x: &Array, eps: f32) -> Result<Array, Exception> {
-    let variance = mean_axis(&x.square()?, -1, true)?;
-    x.multiply(rsqrt(variance.add(Array::from_f32(eps))?)?)
+fn rms_norm_without_scale(x: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
+    let variance = mean_axis(&x.square(stream)?, -1, true, stream)?;
+    x.multiply(
+        rsqrt(variance.add(Array::from_f32(eps), stream)?, stream)?,
+        stream,
+    )
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -263,6 +267,7 @@ impl Attention {
         args: &ModelArgs,
         layer_type: LayerType,
         layer_idx: usize,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
@@ -289,6 +294,7 @@ impl Attention {
             n_heads * head_dim,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let k_proj = maybe_quantized_linear(
             args.quantized,
@@ -296,6 +302,7 @@ impl Attention {
             n_kv_heads * head_dim,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let v_proj_output_dims = if attention_k_eq_v {
             dim
@@ -308,6 +315,7 @@ impl Attention {
             v_proj_output_dims,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let o_proj = maybe_quantized_linear(
             args.quantized,
@@ -315,6 +323,7 @@ impl Attention {
             dim,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
 
         let q_norm = nn::RmsNormBuilder::new(head_dim)
@@ -331,6 +340,7 @@ impl Attention {
             false,
             &args.rope_scaling,
             args.max_position_embeddings,
+            stream,
         )?;
 
         Ok(Self {
@@ -376,7 +386,11 @@ where
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput {
             x,
             mask,
@@ -388,14 +402,16 @@ where
 
         let (B, L) = batch_seq(x);
 
-        let queries = self.q_proj.forward(x)?;
-        let mut queries =
-            self.q_norm
-                .forward(&reshape_attention_projection(queries, B, L, self.n_heads)?)?;
+        let queries = self.q_proj.forward(x, stream)?;
+        let mut queries = self.q_norm.forward(
+            &reshape_attention_projection(queries, B, L, self.n_heads, stream)?,
+            stream,
+        )?;
         let offset = position_offset;
-        queries = self
-            .rope
-            .forward(nn::RopeInputBuilder::new(&queries).offset(offset).build()?)?;
+        queries = self.rope.forward(
+            nn::RopeInputBuilder::new(&queries).offset(offset).build()?,
+            stream,
+        )?;
 
         let (keys, values) = if self.is_kv_shared_layer {
             shared_kv
@@ -404,23 +420,28 @@ where
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared Gemma 4 KV states"))?
         } else {
-            let keys = self.k_proj.forward(x)?;
+            let keys = self.k_proj.forward(x, stream)?;
             let values = if self.attention_k_eq_v {
                 keys.clone()
             } else {
-                self.v_proj.forward(x)?
+                self.v_proj.forward(x, stream)?
             };
-            let mut keys =
-                self.k_norm
-                    .forward(&reshape_attention_projection(keys, B, L, self.n_kv_heads)?)?;
-            let mut values =
-                rms_norm_without_scale(&values.reshape(&[B, L, self.n_kv_heads, -1])?, 1e-6)?
-                    .transpose_axes(&[0, 2, 1, 3])?;
-            keys = self
-                .rope
-                .forward(nn::RopeInputBuilder::new(&keys).offset(offset).build()?)?;
+            let mut keys = self.k_norm.forward(
+                &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
+                stream,
+            )?;
+            let mut values = rms_norm_without_scale(
+                &values.reshape(&[B, L, self.n_kv_heads, -1], stream)?,
+                1e-6,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+            keys = self.rope.forward(
+                nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
+                stream,
+            )?;
             if let Some(cache) = cache.as_mut() {
-                (keys, values) = cache.update_and_fetch(keys, values)?;
+                (keys, values) = cache.update_and_fetch(keys, values, stream)?;
             }
             if self.store_full_length_kv {
                 if let Some(shared_kv) = shared_kv.as_mut() {
@@ -444,9 +465,10 @@ where
             mask,
             B,
             L,
+            stream,
         )?;
 
-        self.o_proj.forward(&output)
+        self.o_proj.forward(&output, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -480,11 +502,16 @@ impl Mlp {
         quantized: bool,
         group_size: i32,
         bits: i32,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: maybe_quantized_linear(quantized, dim, hidden_dim, group_size, bits)?,
-            down_proj: maybe_quantized_linear(quantized, hidden_dim, dim, group_size, bits)?,
-            up_proj: maybe_quantized_linear(quantized, dim, hidden_dim, group_size, bits)?,
+            gate_proj: maybe_quantized_linear(
+                quantized, dim, hidden_dim, group_size, bits, stream,
+            )?,
+            down_proj: maybe_quantized_linear(
+                quantized, hidden_dim, dim, group_size, bits, stream,
+            )?,
+            up_proj: maybe_quantized_linear(quantized, dim, hidden_dim, group_size, bits, stream)?,
         })
     }
 }
@@ -493,10 +520,10 @@ impl Module<&Array> for Mlp {
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: &Array) -> Result<Self::Output, Self::Error> {
-        let down_proj_input = nn::gelu_approximate(self.gate_proj.forward(input)?)?
-            .multiply(self.up_proj.forward(input)?)?;
-        self.down_proj.forward(&down_proj_input)
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        let down_proj_input = nn::gelu_approximate(self.gate_proj.forward(input, stream)?, stream)?
+            .multiply(self.up_proj.forward(input, stream)?, stream)?;
+        self.down_proj.forward(&down_proj_input, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -530,20 +557,26 @@ impl Gemma4Embedding {
     ) -> Result<Self, Exception> {
         Ok(Self {
             weight: Param::new(if quantized {
-                Array::zeros::<u32>(&[vocab_size, hidden_size / (32 / bits)])?
+                Array::from_slice(
+                    &vec![0u32; (vocab_size * (hidden_size / (32 / bits))) as usize],
+                    &[vocab_size, hidden_size / (32 / bits)],
+                )
             } else {
                 nn::Embedding::new(vocab_size, hidden_size)?.weight.value
             }),
             scales: Param::new(if quantized {
-                Some(Array::ones::<f32>(&[vocab_size, hidden_size / group_size])?)
+                Some(Array::from_slice(
+                    &vec![1.0f32; (vocab_size * (hidden_size / group_size)) as usize],
+                    &[vocab_size, hidden_size / group_size],
+                ))
             } else {
                 None
             }),
             biases: Param::new(if quantized {
-                Some(Array::zeros::<f32>(&[
-                    vocab_size,
-                    hidden_size / group_size,
-                ])?)
+                Some(Array::from_slice(
+                    &vec![0.0f32; (vocab_size * (hidden_size / group_size)) as usize],
+                    &[vocab_size, hidden_size / group_size],
+                ))
             } else {
                 None
             }),
@@ -554,34 +587,41 @@ impl Gemma4Embedding {
         })
     }
 
-    pub fn forward(&mut self, input: &Array) -> Result<Array, Exception> {
+    pub fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         if !self.quantized {
-            return Ok(self.weight.index(input));
+            return self.weight.try_index_device(input, stream);
         }
         let original_shape = input.shape().to_vec();
-        let flat = input.flatten(None, None)?;
-        let weight = self.weight.index(&flat);
+        let flat = input.flatten(None, None, stream)?;
+        let weight = self.weight.try_index_device(&flat, stream)?;
         let scales = self
             .scales
             .as_ref()
             .as_ref()
             .expect("quantized embedding scales")
-            .index(&flat);
+            .try_index_device(&flat, stream)?;
         let biases = self
             .biases
             .as_ref()
             .as_ref()
             .expect("quantized embedding biases")
-            .index(&flat);
-        let out = safemlx::ops::dequantize(&weight, &scales, &biases, self.group_size, self.bits)?;
+            .try_index_device(&flat, stream)?;
+        let out = safemlx::ops::dequantize(
+            &weight,
+            &scales,
+            &biases,
+            self.group_size,
+            self.bits,
+            stream,
+        )?;
         let shape = original_shape
             .into_iter()
             .chain(std::iter::once(self.hidden_size))
             .collect::<Vec<_>>();
-        out.reshape(&shape)
+        out.reshape(&shape, stream)
     }
 
-    pub fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
+    pub fn as_linear(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         let weight = if self.quantized {
             let scales = self
                 .scales
@@ -593,11 +633,18 @@ impl Gemma4Embedding {
                 .as_ref()
                 .as_ref()
                 .expect("quantized embedding biases");
-            safemlx::ops::dequantize(&self.weight, scales, biases, self.group_size, self.bits)?
+            safemlx::ops::dequantize(
+                &self.weight,
+                scales,
+                biases,
+                self.group_size,
+                self.bits,
+                stream,
+            )?
         } else {
             self.weight.as_ref().clone()
         };
-        safemlx::ops::matmul(x, weight.t())
+        safemlx::ops::matmul(x, weight.transpose(stream)?, stream)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -641,15 +688,17 @@ impl TransformerBlock {
         args: &ModelArgs,
         layer_type: LayerType,
         layer_idx: usize,
+        stream: &Stream,
     ) -> Result<Self, Exception> {
         let layer_args = args.for_layer(layer_type);
-        let self_attn = Attention::new(&layer_args, layer_type, layer_idx)?;
+        let self_attn = Attention::new(&layer_args, layer_type, layer_idx, stream)?;
         let mlp = Mlp::new(
             args.hidden_size,
             args.intermediate_size,
             args.quantized,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
@@ -670,6 +719,7 @@ impl TransformerBlock {
                 args.hidden_size_per_layer_input,
                 args.quantization_group_size,
                 args.quantization_bits,
+                stream,
             )?)
         } else {
             None
@@ -681,6 +731,7 @@ impl TransformerBlock {
                 args.hidden_size,
                 args.quantization_group_size,
                 args.quantization_bits,
+                stream,
             )?)
         } else {
             None
@@ -699,7 +750,7 @@ impl TransformerBlock {
             hidden_size: layer_args.hidden_size,
             layer_type,
             sliding_window: args.sliding_window,
-            layer_scalar: Param::new(Array::ones::<f32>(&[1])?),
+            layer_scalar: Param::new(Array::from_slice(&[1.0f32], &[1])),
             self_attn,
             mlp,
             per_layer_input_gate,
@@ -714,8 +765,8 @@ impl TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn apply_layer_scalar(&self, x: Array) -> Result<Array, Exception> {
-        x.multiply(&*self.layer_scalar)
+    fn apply_layer_scalar(&self, x: Array, stream: &Stream) -> Result<Array, Exception> {
+        x.multiply(&*self.layer_scalar, stream)
     }
 }
 
@@ -726,7 +777,11 @@ where
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: AttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AttentionInput {
             x,
             mask,
@@ -745,6 +800,7 @@ where
                     Some(position_offset),
                     self.sliding_window,
                     None,
+                    stream,
                 )?)
             } else {
                 None
@@ -752,8 +808,9 @@ where
         } else {
             None
         };
+        let normed = self.input_layernorm.forward(x, stream)?;
         let self_attn_input = AttentionInput {
-            x: &self.input_layernorm.forward(x)?,
+            x: &normed,
             mask: generated_mask.as_ref().or(mask),
             cache,
             position_offset,
@@ -761,14 +818,13 @@ where
             shared_kv,
             disable_generated_mask,
         };
-        let r = self.self_attn.forward(self_attn_input)?;
-        let r = self.post_attention_layernorm.forward(&r)?;
-        let h = x.add(r)?;
-        let r = self
-            .mlp
-            .forward(&self.pre_feedforward_layernorm.forward(&h)?)?;
-        let r = self.post_feedforward_layernorm.forward(&r)?;
-        let mut h = h.add(r)?;
+        let r = self.self_attn.forward(self_attn_input, stream)?;
+        let r = self.post_attention_layernorm.forward(&r, stream)?;
+        let h = x.add(r, stream)?;
+        let pre_ff = self.pre_feedforward_layernorm.forward(&h, stream)?;
+        let r = self.mlp.forward(&pre_ff, stream)?;
+        let r = self.post_feedforward_layernorm.forward(&r, stream)?;
+        let mut h = h.add(r, stream)?;
         if let (Some(per_layer_input), Some(gate), Some(projection), Some(norm)) = (
             per_layer_input,
             self.per_layer_input_gate.as_mut(),
@@ -776,12 +832,13 @@ where
             self.post_per_layer_input_norm.as_mut(),
         ) {
             let residual = h.clone();
-            let r = nn::gelu_approximate(gate.forward(&h)?)?.multiply(per_layer_input)?;
-            let r = projection.forward(&r)?;
-            let r = norm.forward(&r)?;
-            h = residual.add(r)?;
+            let r = nn::gelu_approximate(gate.forward(&h, stream)?, stream)?
+                .multiply(per_layer_input, stream)?;
+            let r = projection.forward(&r, stream)?;
+            let r = norm.forward(&r, stream)?;
+            h = residual.add(r, stream)?;
         }
-        self.apply_layer_scalar(h)
+        self.apply_layer_scalar(h, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -826,7 +883,7 @@ pub struct Gemma4TextModel {
 }
 
 impl Gemma4TextModel {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let embed_tokens = Gemma4Embedding::new(
             args.vocab_size,
             args.hidden_size,
@@ -868,7 +925,12 @@ impl Gemma4TextModel {
         };
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                TransformerBlock::new(args, args.layer_type(index as usize), index as usize)
+                TransformerBlock::new(
+                    args,
+                    args.layer_type(index as usize),
+                    index as usize,
+                    stream,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(args.hidden_size)
@@ -892,6 +954,7 @@ impl Gemma4TextModel {
         &mut self,
         input_ids: &Array,
         inputs_embeds: &Array,
+        stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         let Some(embed_tokens_per_layer) = self.embed_tokens_per_layer.as_mut() else {
             return Ok(None);
@@ -904,28 +967,37 @@ impl Gemma4TextModel {
         };
         let ple_dim = self.hidden_size_per_layer_input;
         let token_identity = embed_tokens_per_layer
-            .forward(input_ids)?
-            .multiply(Array::from_f32((ple_dim as f32).sqrt()))?
-            .reshape(&[
-                input_ids.shape()[0],
-                input_ids.shape()[1],
-                self.num_hidden_layers,
-                ple_dim,
-            ])?;
+            .forward(input_ids, stream)?
+            .multiply(Array::from_f32((ple_dim as f32).sqrt()), stream)?
+            .reshape(
+                &[
+                    input_ids.shape()[0],
+                    input_ids.shape()[1],
+                    self.num_hidden_layers,
+                    ple_dim,
+                ],
+                stream,
+            )?;
         let projected = per_layer_model_projection
-            .forward(inputs_embeds)?
-            .multiply(Array::from_f32((self.hidden_size as f32).sqrt().recip()))?
-            .reshape(&[
-                inputs_embeds.shape()[0],
-                inputs_embeds.shape()[1],
-                self.num_hidden_layers,
-                ple_dim,
-            ])?;
-        let projected = per_layer_projection_norm.forward(&projected)?;
+            .forward(inputs_embeds, stream)?
+            .multiply(
+                Array::from_f32((self.hidden_size as f32).sqrt().recip()),
+                stream,
+            )?
+            .reshape(
+                &[
+                    inputs_embeds.shape()[0],
+                    inputs_embeds.shape()[1],
+                    self.num_hidden_layers,
+                    ple_dim,
+                ],
+                stream,
+            )?;
+        let projected = per_layer_projection_norm.forward(&projected, stream)?;
         Ok(Some(
             projected
-                .add(token_identity)?
-                .multiply(Array::from_f32(2.0_f32.powf(-0.5)))?,
+                .add(token_identity, stream)?
+                .multiply(Array::from_f32(2.0_f32.powf(-0.5)), stream)?,
         ))
     }
 }
@@ -940,6 +1012,7 @@ impl Gemma4TextModel {
     pub fn forward_with_state<C>(
         &mut self,
         input: ModelInput<'_, C>,
+        stream: &Stream,
     ) -> Result<Gemma4TextOutput, Exception>
     where
         C: KeyValueCache + Default,
@@ -951,9 +1024,9 @@ impl Gemma4TextModel {
         } = input;
         let mut h = self
             .embed_tokens
-            .forward(inputs)?
-            .multiply(Array::from_f32((self.hidden_size as f32).sqrt()))?;
-        let per_layer_inputs = self.per_layer_inputs(inputs, &h)?;
+            .forward(inputs, stream)?
+            .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?;
+        let per_layer_inputs = self.per_layer_inputs(inputs, &h, stream)?;
         let position_offset = cache
             .iter()
             .flatten()
@@ -968,6 +1041,7 @@ impl Gemma4TextModel {
                 Some(position_offset),
                 None,
                 None,
+                stream,
             )?),
             None => None,
         };
@@ -978,7 +1052,8 @@ impl Gemma4TextModel {
         for (index, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let layer_ple = per_layer_inputs
                 .as_ref()
-                .map(|inputs| inputs.index((.., .., index as i32, ..)));
+                .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
+                .transpose()?;
             let layer_input = AttentionInput {
                 x: &h,
                 mask: mask.as_ref(),
@@ -988,10 +1063,10 @@ impl Gemma4TextModel {
                 shared_kv: Some(&mut shared_kv),
                 disable_generated_mask: false,
             };
-            h = layer.forward(layer_input)?;
+            h = layer.forward(layer_input, stream)?;
         }
         let pre_norm_hidden = h.clone();
-        let hidden = self.norm.forward(&h)?;
+        let hidden = self.norm.forward(&h, stream)?;
         Ok(Gemma4TextOutput {
             hidden,
             pre_norm_hidden,
@@ -1007,8 +1082,12 @@ where
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        Ok(self.forward_with_state(input)?.hidden)
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(self.forward_with_state(input, stream)?.hidden)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1028,9 +1107,9 @@ pub struct Gemma4ForConditionalGeneration {
 }
 
 impl Gemma4ForConditionalGeneration {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            language_model: Gemma4TextModel::new(args)?,
+            language_model: Gemma4TextModel::new(args, stream)?,
         })
     }
 }
@@ -1047,8 +1126,8 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(args: ModelArgs) -> Result<Self, Exception> {
-        let model = Gemma4ForConditionalGeneration::new(&args)?;
+    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::build_maybe_quantized_lm_head(
                 args.hidden_size,
@@ -1076,15 +1155,23 @@ where
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: ModelInput<'_, C>) -> Result<Self::Output, Self::Error> {
-        let out = self.model.language_model.forward(input)?;
+    fn forward(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        let out = self.model.language_model.forward(input, stream)?;
         let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&out)?,
-            None => self.model.language_model.embed_tokens.as_linear(&out)?,
+            Some(lm_head) => lm_head.forward(&out, stream)?,
+            None => self
+                .model
+                .language_model
+                .embed_tokens
+                .as_linear(&out, stream)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
-            logits = tanh(&(logits.divide(Array::from_f32(softcap))?))?
-                .multiply(Array::from_f32(softcap))?;
+            logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
+                .multiply(Array::from_f32(softcap), stream)?;
         }
         Ok(logits)
     }
@@ -1137,10 +1224,10 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_gemma4_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+pub fn load_gemma4_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_gemma4_model_args(model_dir)?;
-    let mut model = Model::new(model_args)?;
+    let mut model = Model::new(model_args, stream)?;
     let weights_index = model_dir.join("model.safetensors.index.json");
     let config = StrictLoadConfig::default()
         .rewrite_prefix("language_model.model.", "model.language_model.")
@@ -1176,19 +1263,23 @@ impl Model {
     pub fn forward_with_state(
         &mut self,
         input: ModelInput<'_, ConcatKeyValueCache>,
+        stream: &Stream,
     ) -> Result<Gemma4StepOutput, Exception> {
-        let text_output = self.model.language_model.forward_with_state(input)?;
+        let text_output = self
+            .model
+            .language_model
+            .forward_with_state(input, stream)?;
         let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&text_output.hidden)?,
+            Some(lm_head) => lm_head.forward(&text_output.hidden, stream)?,
             None => self
                 .model
                 .language_model
                 .embed_tokens
-                .as_linear(&text_output.hidden)?,
+                .as_linear(&text_output.hidden, stream)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
-            logits = tanh(&(logits.divide(Array::from_f32(softcap))?))?
-                .multiply(Array::from_f32(softcap))?;
+            logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
+                .multiply(Array::from_f32(softcap), stream)?;
         }
         Ok(Gemma4StepOutput {
             logits,
@@ -1202,6 +1293,7 @@ impl Model {
         cache: &mut [Option<ConcatKeyValueCache>],
         accepted: usize,
         block_size: usize,
+        stream: &Stream,
     ) -> Result<(), Exception> {
         let rejected = block_size.saturating_sub(accepted + 1) as i32;
         if rejected == 0 {
@@ -1209,7 +1301,7 @@ impl Model {
         }
         for cache in cache.iter_mut().flatten() {
             let new_len = cache.offset().saturating_sub(rejected);
-            cache.truncate(new_len)?;
+            cache.truncate(new_len, stream)?;
         }
         Ok(())
     }
@@ -1229,36 +1321,47 @@ where
         &mut self,
         prompt_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
         let prompt_len = prompt_tokens.shape()[1];
         if prompt_len > 1 {
-            let prefix = prompt_tokens.index((.., ..prompt_len - 1));
-            self.forward(ModelInput {
-                inputs: &prefix,
+            let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
+            self.forward(
+                ModelInput {
+                    inputs: &prefix,
+                    mask: None,
+                    cache,
+                },
+                stream,
+            )?;
+        }
+        let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
+        let logits = self.forward(
+            ModelInput {
+                inputs: &last,
                 mask: None,
                 cache,
-            })?;
-        }
-        let last = prompt_tokens.index((.., prompt_len - 1..));
-        let logits = self.forward(ModelInput {
-            inputs: &last,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 
     fn decode_logits(
         &mut self,
         input_tokens: &Array,
         cache: &mut Vec<Option<C>>,
+        stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(ModelInput {
-            inputs: input_tokens,
-            mask: None,
-            cache,
-        })?;
-        Ok(logits.index((.., -1, ..)))
+        let logits = self.forward(
+            ModelInput {
+                inputs: input_tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )?;
+        logits.try_index_device((.., -1, ..), stream)
     }
 }
 

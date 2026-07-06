@@ -1,4 +1,4 @@
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 use smallvec::SmallVec;
 
 use crate::{
@@ -10,139 +10,104 @@ use crate::{
 
 impl Array {
     /// See [`expand_dims()`].
-    #[default_device]
-    pub fn expand_dims_device(&self, axis: i32, stream: impl AsRef<Stream>) -> Result<Array> {
-        expand_dims_device(self, axis, stream)
+    pub fn expand_dims(&self, axis: i32, stream: impl AsRef<Stream>) -> Result<Array> {
+        expand_dims(self, axis, stream)
     }
 
     /// See [`expand_dims_axes()`].
-    #[default_device]
-    pub fn expand_dims_axes_device(
-        &self,
-        axes: &[i32],
-        stream: impl AsRef<Stream>,
-    ) -> Result<Array> {
-        expand_dims_axes_device(self, axes, stream)
+    pub fn expand_dims_axes(&self, axes: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
+        expand_dims_axes(self, axes, stream)
     }
 
     /// See [`flatten`].
-    #[default_device]
-    pub fn flatten_device(
+    pub fn flatten(
         &self,
         start_axis: impl Into<Option<i32>>,
         end_axis: impl Into<Option<i32>>,
         stream: impl AsRef<Stream>,
     ) -> Result<Array> {
-        flatten_device(self, start_axis, end_axis, stream)
+        flatten(self, start_axis, end_axis, stream)
     }
 
     /// See [`reshape`].
-    #[default_device]
-    pub fn reshape_device(&self, shape: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
-        reshape_device(self, shape, stream)
+    pub fn reshape(&self, shape: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
+        reshape(self, shape, stream)
     }
 
     /// See [`squeeze_axes()`].
-    #[default_device]
-    pub fn squeeze_axes_device(&self, axes: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
-        squeeze_axes_device(self, axes, stream)
+    pub fn squeeze_axes(&self, axes: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
+        squeeze_axes(self, axes, stream)
     }
 
     /// See [`squeeze()`].
-    #[default_device]
-    pub fn squeeze_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
-        squeeze_device(self, stream)
+    pub fn squeeze(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        squeeze(self, stream)
     }
 
     /// See [`as_strided`]
-    #[default_device]
-    pub fn as_strided_device<'a>(
+    pub fn as_strided<'a>(
         &'a self,
         shape: impl IntoOption<&'a [i32]>,
         strides: impl IntoOption<&'a [i64]>,
         offset: impl Into<Option<usize>>,
         stream: impl AsRef<Stream>,
     ) -> Result<Array> {
-        as_strided_device(self, shape, strides, offset, stream)
+        as_strided(self, shape, strides, offset, stream)
     }
 
     /// See [`at_least_1d`]
-    #[default_device]
-    pub fn at_least_1d_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
-        at_least_1d_device(self, stream)
+    pub fn at_least_1d(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        at_least_1d(self, stream)
     }
 
     /// See [`at_least_2d`]
-    #[default_device]
-    pub fn at_least_2d_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
-        at_least_2d_device(self, stream)
+    pub fn at_least_2d(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        at_least_2d(self, stream)
     }
 
     /// See [`at_least_3d`]
-    #[default_device]
-    pub fn at_least_3d_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
-        at_least_3d_device(self, stream)
+    pub fn at_least_3d(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        at_least_3d(self, stream)
     }
 
     /// See [`move_axis`]
-    #[default_device]
-    pub fn move_axis_device(
-        &self,
-        src: i32,
-        dst: i32,
-        stream: impl AsRef<Stream>,
-    ) -> Result<Array> {
-        move_axis_device(self, src, dst, stream)
+    pub fn move_axis(&self, src: i32, dst: i32, stream: impl AsRef<Stream>) -> Result<Array> {
+        move_axis(self, src, dst, stream)
     }
 
     /// See [`split`]
-    #[default_device]
-    pub fn split_axis_device(
+    pub fn split_axis(
         &self,
         indices: &[i32],
         axis: impl Into<Option<i32>>,
         stream: impl AsRef<Stream>,
     ) -> Result<Vec<Array>> {
-        split_sections_device(self, indices, axis, stream)
+        split_sections(self, indices, axis, stream)
     }
 
     /// See [`split`]
-    #[default_device]
-    pub fn split_device(
+    pub fn split(
         &self,
         num_parts: i32,
         axis: impl Into<Option<i32>>,
         stream: impl AsRef<Stream>,
     ) -> Result<Vec<Array>> {
-        split_device(self, num_parts, axis, stream)
+        split(self, num_parts, axis, stream)
     }
 
     /// See [`swap_axes`]
-    #[default_device]
-    pub fn swap_axes_device(
-        &self,
-        axis1: i32,
-        axis2: i32,
-        stream: impl AsRef<Stream>,
-    ) -> Result<Array> {
-        swap_axes_device(self, axis1, axis2, stream)
+    pub fn swap_axes(&self, axis1: i32, axis2: i32, stream: impl AsRef<Stream>) -> Result<Array> {
+        swap_axes(self, axis1, axis2, stream)
     }
 
     /// See [`transpose_axes`]
-    #[default_device]
-    pub fn transpose_axes_device(&self, axes: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
-        transpose_axes_device(self, axes, stream)
+    pub fn transpose_axes(&self, axes: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
+        transpose_axes(self, axes, stream)
     }
 
     /// See [`transpose`]
-    #[default_device]
-    pub fn transpose_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
-        transpose_device(self, stream)
-    }
-
-    /// [`transpose_axes`] and unwrap the result.
-    pub fn t(&self) -> Array {
-        self.transpose().unwrap()
+    pub fn transpose(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        transpose(self, stream)
     }
 }
 
@@ -174,8 +139,7 @@ fn resolve_strides(
 ///
 /// - `arrays`: The arrays to broadcast.
 #[generate_macro]
-#[default_device]
-pub fn broadcast_arrays_device(
+pub fn broadcast_arrays(
     arrays: &[impl AsRef<Array>],
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Vec<Array>> {
@@ -190,14 +154,14 @@ pub fn broadcast_arrays_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_iter(0..10, &[10]);
-/// let y = as_strided(&x, &[3, 3], &[1, 1], 0);
+/// let y = as_strided(&x, &[3, 3], &[1, 1], 0, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn as_strided_device<'a>(
+pub fn as_strided<'a>(
     a: impl AsRef<Array>,
     #[optional] shape: impl IntoOption<&'a [i32]>,
     #[optional] strides: impl IntoOption<&'a [i64]>,
@@ -233,14 +197,14 @@ pub fn as_strided_device<'a>(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_f32(2.3);
-/// let result = broadcast_to(&x, &[1, 1]);
+/// let result = broadcast_to(&x, &[1, 1], &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn broadcast_to_device(
+pub fn broadcast_to(
     a: impl AsRef<Array>,
     shape: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -266,15 +230,15 @@ pub fn broadcast_to_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_iter(0..4, &[2, 2]);
 /// let y = Array::from_iter(4..8, &[2, 2]);
-/// let result = concatenate_axis(&[x, y], 0);
+/// let result = concatenate_axis(&[x, y], 0, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn concatenate_axis_device(
+pub fn concatenate_axis(
     arrays: &[impl AsRef<Array>],
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -287,8 +251,7 @@ pub fn concatenate_axis_device(
 
 /// Concatenate the arrays along the first axis. Returns an error if the shapes are invalid.
 #[generate_macro]
-#[default_device]
-pub fn concatenate_device(
+pub fn concatenate(
     arrays: &[impl AsRef<Array>],
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
@@ -308,14 +271,14 @@ pub fn concatenate_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
-/// let x = Array::zeros::<i32>(&[2, 2]).unwrap();
-/// let result = expand_dims_axes(&x, &[0]);
+/// let x = Array::zeros::<i32>(&[2, 2], &stream).unwrap();
+/// let result = expand_dims_axes(&x, &[0], &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn expand_dims_axes_device(
+pub fn expand_dims_axes(
     a: impl AsRef<Array>,
     axes: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -333,8 +296,7 @@ pub fn expand_dims_axes_device(
 
 /// Similar to [`expand_dims_axes`], but only takes a single axis.
 #[generate_macro]
-#[default_device]
-pub fn expand_dims_device(
+pub fn expand_dims(
     a: impl AsRef<Array>,
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -359,14 +321,14 @@ pub fn expand_dims_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
-/// let x = Array::zeros::<i32>(&[2, 2, 2]).unwrap();
-/// let y = flatten(&x, None, None);
+/// let x = Array::zeros::<i32>(&[2, 2, 2], &stream).unwrap();
+/// let y = flatten(&x, None, None, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn flatten_device(
+pub fn flatten(
     a: impl AsRef<Array>,
     #[optional] start_axis: impl Into<Option<i32>>,
     #[optional] end_axis: impl Into<Option<i32>>,
@@ -394,8 +356,7 @@ pub fn flatten_device(
 /// - `axis`: axis to unflatten
 /// - `shape`: shape to unflatten into
 #[generate_macro]
-#[default_device]
-pub fn unflatten_device(
+pub fn unflatten(
     a: impl AsRef<Array>,
     axis: i32,
     shape: &[i32],
@@ -423,14 +384,14 @@ pub fn unflatten_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
-/// let x = Array::zeros::<i32>(&[2, 2]).unwrap();
-/// let result = reshape(&x, &[4]);
+/// let x = Array::zeros::<i32>(&[2, 2], &stream).unwrap();
+/// let result = reshape(&x, &[4], &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn reshape_device(
+pub fn reshape(
     a: impl AsRef<Array>,
     shape: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -456,14 +417,14 @@ pub fn reshape_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
-/// let x = Array::zeros::<i32>(&[1, 2, 1, 3]).unwrap();
-/// let result = squeeze(&x);
+/// let x = Array::zeros::<i32>(&[1, 2, 1, 3], &stream).unwrap();
+/// let result = squeeze(&x, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn squeeze_axes_device(
+pub fn squeeze_axes(
     a: impl AsRef<Array>,
     axes: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -482,11 +443,7 @@ pub fn squeeze_axes_device(
 
 /// Similar to [`squeeze_axes`], but removes all length one axes.
 #[generate_macro]
-#[default_device]
-pub fn squeeze_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn squeeze(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     let a = a.as_ref();
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_squeeze(res, a.as_ptr(), stream.as_ref().as_ptr())
@@ -502,17 +459,14 @@ pub fn squeeze_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
-/// let out = at_least_1d(&x);
+/// let out = at_least_1d(&x, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn at_least_1d_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn at_least_1d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_atleast_1d(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -527,17 +481,14 @@ pub fn at_least_1d_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
-/// let out = at_least_2d(&x);
+/// let out = at_least_2d(&x, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn at_least_2d_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn at_least_2d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_atleast_2d(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -552,17 +503,14 @@ pub fn at_least_2d_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
-/// let out = at_least_3d(&x);
+/// let out = at_least_3d(&x, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn at_least_3d_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn at_least_3d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_atleast_3d(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -579,14 +527,14 @@ pub fn at_least_3d_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
-/// let a = Array::zeros::<i32>(&[2, 3, 4]).unwrap();
-/// let result = move_axis(&a, 0, 2);
+/// let a = Array::zeros::<i32>(&[2, 3, 4], &stream).unwrap();
+/// let result = move_axis(&a, 0, 2, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn move_axis_device(
+pub fn move_axis(
     a: impl AsRef<Array>,
     src: i32,
     dst: i32,
@@ -608,14 +556,14 @@ pub fn move_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..10, &[10]);
-/// let result = split_sections(&a, &[3, 7], 0);
+/// let result = split_sections(&a, &[3, 7], 0, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn split_sections_device(
+pub fn split_sections(
     a: impl AsRef<Array>,
     indices: &[i32],
     #[optional] axis: impl Into<Option<i32>>,
@@ -646,14 +594,14 @@ pub fn split_sections_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..10, &[10]);
-/// let result = split(&a, 2, 0);
+/// let result = split(&a, 2, 0, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn split_device(
+pub fn split(
     a: impl AsRef<Array>,
     num_parts: i32,
     #[optional] axis: impl Into<Option<i32>>,
@@ -758,14 +706,14 @@ impl PadMode {
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
-/// let result = pad(&a, 1, Array::from_int(0), None);
+/// let result = pad(&a, 1, Array::from_int(0), None, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn pad_device<'a>(
+pub fn pad<'a>(
     a: impl AsRef<Array>,
     #[optional] width: impl Into<PadWidth<'a>>,
     #[optional] value: impl Into<Option<Array>>,
@@ -778,10 +726,11 @@ pub fn pad_device<'a>(
     let axes: SmallVec<[i32; DEFAULT_STACK_VEC_LEN]> = (0..ndim).map(|i| i as i32).collect();
     let low_pads = width.low_pads(ndim);
     let high_pads = width.high_pads(ndim);
+    let stream = stream.as_ref();
     let value = value
         .into()
         .map(Ok)
-        .unwrap_or_else(|| Array::from_int(0).as_dtype(a.dtype()))?;
+        .unwrap_or_else(|| Array::from_int(0).as_dtype(a.dtype(), stream))?;
     let mode = mode.into().unwrap_or(PadMode::Constant);
 
     Array::try_from_op(|res| unsafe {
@@ -811,15 +760,15 @@ pub fn pad_device<'a>(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
 /// let b = Array::from_iter(4..8, &[2, 2]);
-/// let result = stack_axis(&[&a, &b], 0);
+/// let result = stack_axis(&[&a, &b], 0, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn stack_axis_device(
+pub fn stack_axis(
     arrays: &[impl AsRef<Array>],
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
@@ -839,15 +788,15 @@ pub fn stack_axis_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
 /// let b = Array::from_iter(4..8, &[2, 2]);
-/// let result = stack(&[&a, &b]);
+/// let result = stack(&[&a, &b], &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn stack_device(
+pub fn stack(
     arrays: &[impl AsRef<Array>],
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
@@ -868,14 +817,14 @@ pub fn stack_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..6, &[2, 3]);
-/// let result = swap_axes(&a, 0, 1);
+/// let result = swap_axes(&a, 0, 1, &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn swap_axes_device(
+pub fn swap_axes(
     a: impl AsRef<Array>,
     axis1: i32,
     axis2: i32,
@@ -902,14 +851,14 @@ pub fn swap_axes_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_slice(&[1, 2, 3], &[3]);
-/// let y = tile(&x, &[2]);
+/// let y = tile(&x, &[2], &stream);
 /// ```
 #[generate_macro]
-#[default_device]
-pub fn tile_device(
+pub fn tile(
     a: impl AsRef<Array>,
     reps: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -936,19 +885,19 @@ pub fn tile_device(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-/// let y1 = transpose_axes(&x, &[0, 1]).unwrap();
-/// let y2 = transpose(&x).unwrap();
+/// let y1 = transpose_axes(&x, &[0, 1], &stream).unwrap();
+/// let y2 = transpose(&x, &stream).unwrap();
 /// ```
 ///
 /// # See also
 ///
 /// - [`transpose`]
 #[generate_macro]
-#[default_device]
-pub fn transpose_axes_device(
+pub fn transpose_axes(
     a: impl AsRef<Array>,
     axes: &[i32],
     #[optional] stream: impl AsRef<Stream>,
@@ -966,11 +915,7 @@ pub fn transpose_axes_device(
 
 /// Transpose with all axes reversed
 #[generate_macro]
-#[default_device]
-pub fn transpose_device(
-    a: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
+pub fn transpose(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_transpose(res, a.as_ref().as_ptr(), stream.as_ref().as_ptr())
     })
@@ -980,253 +925,304 @@ pub fn transpose_device(
 // https://github.com/ml-explore/mlx/blob/main/tests/ops_tests.cpp
 #[cfg(test)]
 mod tests {
-    use crate::{array, Array, Dtype};
+    use crate::{array, ops::indexing::IndexOp, Array, Dtype};
 
     use super::*;
 
     #[test]
     fn test_squeeze() {
-        let a = Array::zeros::<i32>(&[2, 1, 2, 1, 2, 1]).unwrap();
+        let stream = crate::test_stream();
+        let a = Array::zeros::<i32>(&[2, 1, 2, 1, 2, 1], stream).unwrap();
         assert_eq!(
-            squeeze_axes(&a, &[1, 3, 5][..]).unwrap().shape(),
+            squeeze_axes(&a, &[1, 3, 5][..], stream).unwrap().shape(),
             &[2, 2, 2]
         );
         assert_eq!(
-            squeeze_axes(&a, &[-1, -3, -5][..]).unwrap().shape(),
+            squeeze_axes(&a, &[-1, -3, -5][..], stream).unwrap().shape(),
             &[2, 2, 2]
         );
         assert_eq!(
-            squeeze_axes(&a, &[1][..]).unwrap().shape(),
+            squeeze_axes(&a, &[1][..], stream).unwrap().shape(),
             &[2, 2, 1, 2, 1]
         );
         assert_eq!(
-            squeeze_axes(&a, &[-1][..]).unwrap().shape(),
+            squeeze_axes(&a, &[-1][..], stream).unwrap().shape(),
             &[2, 1, 2, 1, 2]
         );
 
-        assert!(squeeze_axes(&a, &[0][..]).is_err());
-        assert!(squeeze_axes(&a, &[2][..]).is_err());
-        assert!(squeeze_axes(&a, &[1, 3, 1][..]).is_err());
-        assert!(squeeze_axes(&a, &[1, 3, -3][..]).is_err());
+        assert!(squeeze_axes(&a, &[0][..], stream).is_err());
+        assert!(squeeze_axes(&a, &[2][..], stream).is_err());
+        assert!(squeeze_axes(&a, &[1, 3, 1][..], stream).is_err());
+        assert!(squeeze_axes(&a, &[1, 3, -3][..], stream).is_err());
     }
 
     #[test]
     fn test_expand_dims() {
-        let a = Array::zeros::<i32>(&[2, 2]).unwrap();
-        assert_eq!(expand_dims_axes(&a, &[0][..]).unwrap().shape(), &[1, 2, 2]);
-        assert_eq!(expand_dims_axes(&a, &[-1][..]).unwrap().shape(), &[2, 2, 1]);
-        assert_eq!(expand_dims_axes(&a, &[1][..]).unwrap().shape(), &[2, 1, 2]);
+        let stream = crate::test_stream();
+        let a = Array::zeros::<i32>(&[2, 2], stream).unwrap();
         assert_eq!(
-            expand_dims_axes(&a, &[0, 1, 2]).unwrap().shape(),
+            expand_dims_axes(&a, &[0][..], stream).unwrap().shape(),
+            &[1, 2, 2]
+        );
+        assert_eq!(
+            expand_dims_axes(&a, &[-1][..], stream).unwrap().shape(),
+            &[2, 2, 1]
+        );
+        assert_eq!(
+            expand_dims_axes(&a, &[1][..], stream).unwrap().shape(),
+            &[2, 1, 2]
+        );
+        assert_eq!(
+            expand_dims_axes(&a, &[0, 1, 2], stream).unwrap().shape(),
             &[1, 1, 1, 2, 2]
         );
         assert_eq!(
-            expand_dims_axes(&a, &[0, 1, 2, 5, 6, 7]).unwrap().shape(),
+            expand_dims_axes(&a, &[0, 1, 2, 5, 6, 7], stream)
+                .unwrap()
+                .shape(),
             &[1, 1, 1, 2, 2, 1, 1, 1]
         );
 
-        assert!(expand_dims_axes(&a, &[3]).is_err());
-        assert!(expand_dims_axes(&a, &[0, 1, 0]).is_err());
-        assert!(expand_dims_axes(&a, &[0, 1, -4]).is_err());
+        assert!(expand_dims_axes(&a, &[3], stream).is_err());
+        assert!(expand_dims_axes(&a, &[0, 1, 0], stream).is_err());
+        assert!(expand_dims_axes(&a, &[0, 1, -4], stream).is_err());
     }
 
     #[test]
     fn test_flatten() {
-        let x = Array::zeros::<i32>(&[2, 3, 4]).unwrap();
-        assert_eq!(flatten(&x, None, None).unwrap().shape(), &[2 * 3 * 4]);
+        let stream = crate::test_stream();
+        let x = Array::zeros::<i32>(&[2, 3, 4], stream).unwrap();
+        assert_eq!(
+            flatten(&x, None, None, stream).unwrap().shape(),
+            &[2 * 3 * 4]
+        );
 
-        assert_eq!(flatten(&x, 1, 1).unwrap().shape(), &[2, 3, 4]);
-        assert_eq!(flatten(&x, 1, 2).unwrap().shape(), &[2, 3 * 4]);
-        assert_eq!(flatten(&x, 1, 3).unwrap().shape(), &[2, 3 * 4]);
-        assert_eq!(flatten(&x, 1, -1).unwrap().shape(), &[2, 3 * 4]);
-        assert_eq!(flatten(&x, -2, -1).unwrap().shape(), &[2, 3 * 4]);
-        assert_eq!(flatten(&x, -3, -1).unwrap().shape(), &[2 * 3 * 4]);
-        assert_eq!(flatten(&x, -4, -1).unwrap().shape(), &[2 * 3 * 4]);
+        assert_eq!(flatten(&x, 1, 1, stream).unwrap().shape(), &[2, 3, 4]);
+        assert_eq!(flatten(&x, 1, 2, stream).unwrap().shape(), &[2, 3 * 4]);
+        assert_eq!(flatten(&x, 1, 3, stream).unwrap().shape(), &[2, 3 * 4]);
+        assert_eq!(flatten(&x, 1, -1, stream).unwrap().shape(), &[2, 3 * 4]);
+        assert_eq!(flatten(&x, -2, -1, stream).unwrap().shape(), &[2, 3 * 4]);
+        assert_eq!(flatten(&x, -3, -1, stream).unwrap().shape(), &[2 * 3 * 4]);
+        assert_eq!(flatten(&x, -4, -1, stream).unwrap().shape(), &[2 * 3 * 4]);
 
-        assert!(flatten(&x, 2, 1).is_err());
+        assert!(flatten(&x, 2, 1, stream).is_err());
 
-        assert!(flatten(&x, 5, 6).is_err());
+        assert!(flatten(&x, 5, 6, stream).is_err());
 
-        assert!(flatten(&x, -5, -4).is_err());
+        assert!(flatten(&x, -5, -4, stream).is_err());
 
         let x = Array::from_int(1);
-        assert_eq!(flatten(&x, -3, -1).unwrap().shape(), &[1]);
-        assert_eq!(flatten(&x, 0, 0).unwrap().shape(), &[1]);
+        assert_eq!(flatten(&x, -3, -1, stream).unwrap().shape(), &[1]);
+        assert_eq!(flatten(&x, 0, 0, stream).unwrap().shape(), &[1]);
     }
 
     #[test]
     fn test_unflatten() {
+        let stream = crate::test_stream();
         let a = array!([1, 2, 3, 4]);
-        let b = unflatten(&a, 0, &[2, -1]).unwrap();
+        let b = unflatten(&a, 0, &[2, -1], stream).unwrap();
         let expected = array!([[1, 2], [3, 4]]);
-        assert_eq!(b, expected);
+        assert!(crate::array::eval_equal_values(&b, &expected));
     }
 
     #[test]
     fn test_reshape() {
+        let stream = crate::test_stream();
         let x = Array::from_int(1);
-        assert!(reshape(&x, &[]).unwrap().shape().is_empty());
-        assert!(reshape(&x, &[2]).is_err());
-        let y = reshape(&x, &[1, 1, 1]).unwrap();
+        assert!(reshape(&x, &[], stream).unwrap().shape().is_empty());
+        assert!(reshape(&x, &[2], stream).is_err());
+        let y = reshape(&x, &[1, 1, 1], stream).unwrap();
         assert_eq!(y.shape(), &[1, 1, 1]);
-        let y = reshape(&x, &[-1, 1, 1]).unwrap();
+        let y = reshape(&x, &[-1, 1, 1], stream).unwrap();
         assert_eq!(y.shape(), &[1, 1, 1]);
-        let y = reshape(&x, &[1, 1, -1]).unwrap();
+        let y = reshape(&x, &[1, 1, -1], stream).unwrap();
         assert_eq!(y.shape(), &[1, 1, 1]);
-        assert!(reshape(&x, &[1, -1, -1]).is_err());
-        assert!(reshape(&x, &[2, -1]).is_err());
+        assert!(reshape(&x, &[1, -1, -1], stream).is_err());
+        assert!(reshape(&x, &[2, -1], stream).is_err());
 
-        let x = Array::zeros::<i32>(&[2, 2, 2]).unwrap();
-        let y = reshape(&x, &[8]).unwrap();
+        let x = Array::zeros::<i32>(&[2, 2, 2], stream).unwrap();
+        let y = reshape(&x, &[8], stream).unwrap();
         assert_eq!(y.shape(), &[8]);
-        assert!(reshape(&x, &[7]).is_err());
-        let y = reshape(&x, &[-1]).unwrap();
+        assert!(reshape(&x, &[7], stream).is_err());
+        let y = reshape(&x, &[-1], stream).unwrap();
         assert_eq!(y.shape(), &[8]);
-        let y = reshape(&x, &[-1, 2]).unwrap();
+        let y = reshape(&x, &[-1, 2], stream).unwrap();
         assert_eq!(y.shape(), &[4, 2]);
-        assert!(reshape(&x, &[-1, 7]).is_err());
+        assert!(reshape(&x, &[-1, 7], stream).is_err());
 
         let x = Array::from_slice::<i32>(&[], &[0]);
-        let y = reshape(&x, &[0, 0, 0]).unwrap();
+        let y = reshape(&x, &[0, 0, 0], stream).unwrap();
         assert_eq!(y.shape(), &[0, 0, 0]);
-        y.eval().unwrap();
         assert_eq!(y.size(), 0);
-        assert!(reshape(&x, &[]).is_err());
-        assert!(reshape(&x, &[1]).is_err());
-        let y = reshape(&x, &[1, 5, 0]).unwrap();
+        y.evaluated().unwrap();
+        assert!(reshape(&x, &[], stream).is_err());
+        assert!(reshape(&x, &[1], stream).is_err());
+        let y = reshape(&x, &[1, 5, 0], stream).unwrap();
         assert_eq!(y.shape(), &[1, 5, 0]);
     }
 
     #[test]
     fn test_as_strided() {
+        let stream = crate::test_stream();
         let x = Array::from_iter(0..10, &[10]);
-        let y = as_strided(&x, &[3, 3][..], &[1, 1][..], 0).unwrap();
+        let y = as_strided(&x, &[3, 3][..], &[1, 1][..], 0, stream).unwrap();
         let expected = Array::from_slice(&[0, 1, 2, 1, 2, 3, 2, 3, 4], &[3, 3]);
-        assert_eq!(y, expected);
+        let y = crate::ops::add(&y, array!(0), stream).unwrap();
+        assert_eq!(
+            crate::array::eval_vec::<i32>(&y),
+            crate::array::eval_vec::<i32>(&expected)
+        );
 
-        let y = as_strided(&x, &[3, 3][..], &[0, 3][..], 0).unwrap();
-        let expected = Array::from_slice(&[0, 3, 6, 0, 3, 6, 0, 3, 6], &[3, 3]);
-        assert_eq!(y, expected);
+        let y = as_strided(&x, &[3, 3][..], &[0, 3][..], 0, stream).unwrap();
+        assert_eq!(y.shape(), &[3, 3]);
+        assert_eq!(y.index_device((0, 0), stream).item::<i32>(&stream), 0);
+        assert_eq!(y.index_device((0, 1), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((0, 2), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((2, 0), stream).item::<i32>(&stream), 0);
+        assert_eq!(y.index_device((2, 1), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((2, 2), stream).item::<i32>(&stream), 6);
 
-        let x = x.reshape(&[2, 5]).unwrap();
-        let x = x.transpose_axes(&[1, 0][..]).unwrap();
-        let y = as_strided(&x, &[3, 3][..], &[2, 1][..], 1).unwrap();
-        let expected = Array::from_slice(&[5, 1, 6, 6, 2, 7, 7, 3, 8], &[3, 3]);
-        assert_eq!(y, expected);
+        let x = x.reshape(&[2, 5], stream).unwrap();
+        let x = x.transpose_axes(&[1, 0][..], stream).unwrap();
+        let y = as_strided(&x, &[3, 3][..], &[2, 1][..], 1, stream).unwrap();
+        assert_eq!(y.shape(), &[3, 3]);
+        assert_eq!(y.index_device((0, 0), stream).item::<i32>(&stream), 5);
+        assert_eq!(y.index_device((0, 1), stream).item::<i32>(&stream), 1);
+        assert_eq!(y.index_device((0, 2), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((1, 0), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((1, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(y.index_device((1, 2), stream).item::<i32>(&stream), 7);
+        assert_eq!(y.index_device((2, 0), stream).item::<i32>(&stream), 7);
+        assert_eq!(y.index_device((2, 1), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((2, 2), stream).item::<i32>(&stream), 8);
     }
 
     #[test]
     fn test_at_least_1d() {
+        let stream = crate::test_stream();
         let x = Array::from_int(1);
-        let out = at_least_1d(&x).unwrap();
+        let out = at_least_1d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 1);
         assert_eq!(out.shape(), &[1]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3]);
-        let out = at_least_1d(&x).unwrap();
+        let out = at_least_1d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 1);
         assert_eq!(out.shape(), &[3]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3, 1]);
-        let out = at_least_1d(&x).unwrap();
+        let out = at_least_1d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 2);
         assert_eq!(out.shape(), &[3, 1]);
     }
 
     #[test]
     fn test_at_least_2d() {
+        let stream = crate::test_stream();
         let x = Array::from_int(1);
-        let out = at_least_2d(&x).unwrap();
+        let out = at_least_2d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 2);
         assert_eq!(out.shape(), &[1, 1]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3]);
-        let out = at_least_2d(&x).unwrap();
+        let out = at_least_2d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 2);
         assert_eq!(out.shape(), &[1, 3]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3, 1]);
-        let out = at_least_2d(&x).unwrap();
+        let out = at_least_2d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 2);
         assert_eq!(out.shape(), &[3, 1]);
     }
 
     #[test]
     fn test_at_least_3d() {
+        let stream = crate::test_stream();
         let x = Array::from_int(1);
-        let out = at_least_3d(&x).unwrap();
+        let out = at_least_3d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 3);
         assert_eq!(out.shape(), &[1, 1, 1]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3]);
-        let out = at_least_3d(&x).unwrap();
+        let out = at_least_3d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 3);
         assert_eq!(out.shape(), &[1, 3, 1]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3, 1]);
-        let out = at_least_3d(&x).unwrap();
+        let out = at_least_3d(&x, stream).unwrap();
         assert_eq!(out.ndim(), 3);
         assert_eq!(out.shape(), &[3, 1, 1]);
     }
 
     #[test]
     fn test_move_axis() {
+        let stream = crate::test_stream();
         let a = Array::from_int(0);
-        assert!(move_axis(&a, 0, 0).is_err());
+        assert!(move_axis(&a, 0, 0, stream).is_err());
 
-        let a = Array::zeros::<i32>(&[2]).unwrap();
-        assert!(move_axis(&a, 0, 1).is_err());
-        assert_eq!(move_axis(&a, 0, 0).unwrap().shape(), &[2]);
-        assert_eq!(move_axis(&a, -1, -1).unwrap().shape(), &[2]);
+        let a = Array::zeros::<i32>(&[2], stream).unwrap();
+        assert!(move_axis(&a, 0, 1, stream).is_err());
+        assert_eq!(move_axis(&a, 0, 0, stream).unwrap().shape(), &[2]);
+        assert_eq!(move_axis(&a, -1, -1, stream).unwrap().shape(), &[2]);
 
-        let a = Array::zeros::<i32>(&[2, 3, 4]).unwrap();
-        assert!(move_axis(&a, 0, -4).is_err());
-        assert!(move_axis(&a, 0, 3).is_err());
-        assert!(move_axis(&a, 3, 0).is_err());
-        assert!(move_axis(&a, -4, 0).is_err());
-        assert_eq!(move_axis(&a, 0, 2).unwrap().shape(), &[3, 4, 2]);
-        assert_eq!(move_axis(&a, 0, 1).unwrap().shape(), &[3, 2, 4]);
-        assert_eq!(move_axis(&a, 0, -1).unwrap().shape(), &[3, 4, 2]);
-        assert_eq!(move_axis(&a, -2, 2).unwrap().shape(), &[2, 4, 3]);
+        let a = Array::zeros::<i32>(&[2, 3, 4], stream).unwrap();
+        assert!(move_axis(&a, 0, -4, stream).is_err());
+        assert!(move_axis(&a, 0, 3, stream).is_err());
+        assert!(move_axis(&a, 3, 0, stream).is_err());
+        assert!(move_axis(&a, -4, 0, stream).is_err());
+        assert_eq!(move_axis(&a, 0, 2, stream).unwrap().shape(), &[3, 4, 2]);
+        assert_eq!(move_axis(&a, 0, 1, stream).unwrap().shape(), &[3, 2, 4]);
+        assert_eq!(move_axis(&a, 0, -1, stream).unwrap().shape(), &[3, 4, 2]);
+        assert_eq!(move_axis(&a, -2, 2, stream).unwrap().shape(), &[2, 4, 3]);
     }
 
     #[test]
     fn test_split_equal() {
+        let stream = crate::test_stream();
         let x = Array::from_int(3);
-        assert!(split(&x, 0, 0).is_err());
+        assert!(split(&x, 0, 0, stream).is_err());
 
         let x = Array::from_slice(&[0, 1, 2], &[3]);
-        assert!(split(&x, 3, 1).is_err());
-        assert!(split(&x, -2, 1).is_err());
+        assert!(split(&x, 3, 1, stream).is_err());
+        assert!(split(&x, -2, 1, stream).is_err());
 
-        let out = split(&x, 3, 0).unwrap();
+        let out = split(&x, 3, 0, stream).unwrap();
         assert_eq!(out.len(), 3);
 
-        let mut out = split(&x, 3, -1).unwrap();
+        let mut out = split(&x, 3, -1, stream).unwrap();
         assert_eq!(out.len(), 3);
         for (i, a) in out.iter_mut().enumerate() {
             assert_eq!(a.shape(), &[1]);
             assert_eq!(a.dtype(), Dtype::Int32);
-            assert_eq!(a.item::<i32>(), i as i32);
+            assert_eq!(a.clone().item::<i32>(&stream), i as i32);
         }
 
         let x = Array::from_slice(&[0, 1, 2, 3, 4, 5], &[2, 3]);
-        let out = split(&x, 2, None).unwrap();
-        assert_eq!(out[0], Array::from_slice(&[0, 1, 2], &[1, 3]));
-        assert_eq!(out[1], Array::from_slice(&[3, 4, 5], &[1, 3]));
+        let out = split(&x, 2, None, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &out[0],
+            &Array::from_slice(&[0, 1, 2], &[1, 3])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &out[1],
+            &Array::from_slice(&[3, 4, 5], &[1, 3])
+        ));
 
-        let out = split(&x, 3, 1).unwrap();
-        assert_eq!(out[0], Array::from_slice(&[0, 3], &[2, 1]));
-        assert_eq!(out[1], Array::from_slice(&[1, 4], &[2, 1]));
-        assert_eq!(out[2], Array::from_slice(&[2, 5], &[2, 1]));
+        let out = split(&x, 3, 1, stream).unwrap();
+        let first = crate::ops::add(&out[0], array!(0), stream).unwrap();
+        assert_eq!(crate::array::eval_vec::<i32>(&first), &[0, 3]);
+        assert_eq!(out[1].index_device((0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(out[1].index_device((1, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(out[2].index_device((0, 0), stream).item::<i32>(&stream), 2);
+        assert_eq!(out[2].index_device((1, 0), stream).item::<i32>(&stream), 5);
 
-        let x = Array::zeros::<i32>(&[8, 12]).unwrap();
-        let out = split(&x, 2, None).unwrap();
+        let x = Array::zeros::<i32>(&[8, 12], stream).unwrap();
+        let out = split(&x, 2, None, stream).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].shape(), &[4, 12]);
         assert_eq!(out[1].shape(), &[4, 12]);
 
-        let out = split(&x, 3, 1).unwrap();
+        let out = split(&x, 3, 1, stream).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].shape(), &[8, 4]);
         assert_eq!(out[1].shape(), &[8, 4]);
@@ -1235,47 +1231,61 @@ mod tests {
 
     #[test]
     fn test_split() {
-        let x = Array::zeros::<i32>(&[8, 12]).unwrap();
+        let stream = crate::test_stream();
+        let x = Array::zeros::<i32>(&[8, 12], stream).unwrap();
 
-        let out = split_sections(&x, &[], None).unwrap();
+        let out = split_sections(&x, &[], None, stream).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shape(), x.shape());
 
-        let out = split_sections(&x, &[3, 7], None).unwrap();
+        let out = split_sections(&x, &[3, 7], None, stream).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].shape(), &[3, 12]);
         assert_eq!(out[1].shape(), &[4, 12]);
         assert_eq!(out[2].shape(), &[1, 12]);
 
-        let out = split_sections(&x, &[20], None).unwrap();
+        let out = split_sections(&x, &[20], None, stream).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].shape(), &[8, 12]);
         assert_eq!(out[1].shape(), &[0, 12]);
 
-        let out = split_sections(&x, &[-5], None).unwrap();
+        let out = split_sections(&x, &[-5], None, stream).unwrap();
         assert_eq!(out[0].shape(), &[3, 12]);
         assert_eq!(out[1].shape(), &[5, 12]);
 
-        let out = split_sections(&x, &[2, 8], Some(1)).unwrap();
+        let out = split_sections(&x, &[2, 8], Some(1), stream).unwrap();
         assert_eq!(out[0].shape(), &[8, 2]);
         assert_eq!(out[1].shape(), &[8, 6]);
         assert_eq!(out[2].shape(), &[8, 4]);
 
         let x = Array::from_iter(0i32..5, &[5]);
-        let out = split_sections(&x, &[2, 1, 2], None).unwrap();
-        assert_eq!(out[0], Array::from_slice(&[0, 1], &[2]));
-        assert_eq!(out[1], Array::from_slice::<i32>(&[], &[0]));
-        assert_eq!(out[2], Array::from_slice(&[1], &[1]));
-        assert_eq!(out[3], Array::from_slice(&[2, 3, 4], &[3]));
+        let out = split_sections(&x, &[2, 1, 2], None, stream).unwrap();
+        assert!(crate::array::eval_equal_values(
+            &out[0],
+            &Array::from_slice(&[0, 1], &[2])
+        ));
+        assert_eq!(out[1].shape(), &[0]);
+        assert!(crate::array::eval_equal_values(
+            &out[2],
+            &Array::from_slice(&[1], &[1])
+        ));
+        assert!(crate::array::eval_equal_values(
+            &out[3],
+            &Array::from_slice(&[2, 3, 4], &[3])
+        ));
     }
 
     #[test]
     fn test_pad() {
-        let x = Array::zeros::<f32>(&[1, 2, 3]).unwrap();
-        assert_eq!(pad(&x, 1, None, None).unwrap().shape(), &[3, 4, 5]);
-        assert_eq!(pad(&x, (0, 1), None, None).unwrap().shape(), &[2, 3, 4]);
+        let stream = crate::test_stream();
+        let x = Array::zeros::<f32>(&[1, 2, 3], stream).unwrap();
+        assert_eq!(pad(&x, 1, None, None, stream).unwrap().shape(), &[3, 4, 5]);
         assert_eq!(
-            pad(&x, &[(1, 1), (1, 2), (3, 1)], None, None)
+            pad(&x, (0, 1), None, None, stream).unwrap().shape(),
+            &[2, 3, 4]
+        );
+        assert_eq!(
+            pad(&x, &[(1, 1), (1, 2), (3, 1)], None, None, stream)
                 .unwrap()
                 .shape(),
             &[3, 5, 7]
@@ -1284,180 +1294,229 @@ mod tests {
 
     #[test]
     fn test_stack() {
+        let stream = crate::test_stream();
         let x = Array::from_slice::<f32>(&[], &[0]);
         let x = vec![x];
-        assert_eq!(stack_axis(&x, 0).unwrap().shape(), &[1, 0]);
-        assert_eq!(stack_axis(&x, 1).unwrap().shape(), &[0, 1]);
+        assert_eq!(stack_axis(&x, 0, stream).unwrap().shape(), &[1, 0]);
+        assert_eq!(stack_axis(&x, 1, stream).unwrap().shape(), &[0, 1]);
 
         let x = Array::from_slice(&[1, 2, 3], &[3]);
         let x = vec![x];
-        assert_eq!(stack_axis(&x, 0).unwrap().shape(), &[1, 3]);
-        assert_eq!(stack_axis(&x, 1).unwrap().shape(), &[3, 1]);
+        assert_eq!(stack_axis(&x, 0, stream).unwrap().shape(), &[1, 3]);
+        assert_eq!(stack_axis(&x, 1, stream).unwrap().shape(), &[3, 1]);
 
         let y = Array::from_slice(&[4, 5, 6], &[3]);
         let mut z = x;
         z.push(y);
-        assert_eq!(stack(&z).unwrap().shape(), &[2, 3]);
-        assert_eq!(stack_axis(&z, 1).unwrap().shape(), &[3, 2]);
-        assert_eq!(stack_axis(&z, -1).unwrap().shape(), &[3, 2]);
-        assert_eq!(stack_axis(&z, -2).unwrap().shape(), &[2, 3]);
+        assert_eq!(stack(&z, stream).unwrap().shape(), &[2, 3]);
+        assert_eq!(stack_axis(&z, 1, stream).unwrap().shape(), &[3, 2]);
+        assert_eq!(stack_axis(&z, -1, stream).unwrap().shape(), &[3, 2]);
+        assert_eq!(stack_axis(&z, -2, stream).unwrap().shape(), &[2, 3]);
 
         let empty: Vec<Array> = Vec::new();
-        assert!(stack_axis(&empty, 0).is_err());
+        assert!(stack_axis(&empty, 0, stream).is_err());
 
         let x = Array::from_slice(&[1, 2, 3], &[3])
-            .as_dtype(Dtype::Float16)
+            .as_dtype(Dtype::Float16, stream)
             .unwrap();
         let y = Array::from_slice(&[4, 5, 6], &[3])
-            .as_dtype(Dtype::Int32)
+            .as_dtype(Dtype::Int32, stream)
             .unwrap();
-        assert_eq!(stack_axis(&[x, y], 0).unwrap().dtype(), Dtype::Float16);
+        assert_eq!(
+            stack_axis(&[x, y], 0, stream).unwrap().dtype(),
+            Dtype::Float16
+        );
 
         let x = Array::from_slice(&[1, 2, 3], &[3])
-            .as_dtype(Dtype::Int32)
+            .as_dtype(Dtype::Int32, stream)
             .unwrap();
         let y = Array::from_slice(&[4, 5, 6, 7], &[4])
-            .as_dtype(Dtype::Int32)
+            .as_dtype(Dtype::Int32, stream)
             .unwrap();
-        assert!(stack_axis(&[x, y], 0).is_err());
+        assert!(stack_axis(&[x, y], 0, stream).is_err());
     }
 
     #[test]
     fn test_swap_axes() {
+        let stream = crate::test_stream();
         let a = Array::from_int(0);
-        assert!(swap_axes(&a, 0, 0).is_err());
+        assert!(swap_axes(&a, 0, 0, stream).is_err());
 
-        let a = Array::zeros::<i32>(&[2]).unwrap();
-        assert!(swap_axes(&a, 0, 1).is_err());
-        assert_eq!(swap_axes(&a, 0, 0).unwrap().shape(), &[2]);
-        assert_eq!(swap_axes(&a, -1, -1).unwrap().shape(), &[2]);
+        let a = Array::zeros::<i32>(&[2], stream).unwrap();
+        assert!(swap_axes(&a, 0, 1, stream).is_err());
+        assert_eq!(swap_axes(&a, 0, 0, stream).unwrap().shape(), &[2]);
+        assert_eq!(swap_axes(&a, -1, -1, stream).unwrap().shape(), &[2]);
 
-        let a = Array::zeros::<i32>(&[2, 3, 4]).unwrap();
-        assert!(swap_axes(&a, 0, -4).is_err());
-        assert!(swap_axes(&a, 0, 3).is_err());
-        assert!(swap_axes(&a, 3, 0).is_err());
-        assert!(swap_axes(&a, -4, 0).is_err());
-        assert_eq!(swap_axes(&a, 0, 2).unwrap().shape(), &[4, 3, 2]);
-        assert_eq!(swap_axes(&a, 0, 1).unwrap().shape(), &[3, 2, 4]);
-        assert_eq!(swap_axes(&a, 0, -1).unwrap().shape(), &[4, 3, 2]);
-        assert_eq!(swap_axes(&a, -2, 2).unwrap().shape(), &[2, 4, 3]);
+        let a = Array::zeros::<i32>(&[2, 3, 4], stream).unwrap();
+        assert!(swap_axes(&a, 0, -4, stream).is_err());
+        assert!(swap_axes(&a, 0, 3, stream).is_err());
+        assert!(swap_axes(&a, 3, 0, stream).is_err());
+        assert!(swap_axes(&a, -4, 0, stream).is_err());
+        assert_eq!(swap_axes(&a, 0, 2, stream).unwrap().shape(), &[4, 3, 2]);
+        assert_eq!(swap_axes(&a, 0, 1, stream).unwrap().shape(), &[3, 2, 4]);
+        assert_eq!(swap_axes(&a, 0, -1, stream).unwrap().shape(), &[4, 3, 2]);
+        assert_eq!(swap_axes(&a, -2, 2, stream).unwrap().shape(), &[2, 4, 3]);
     }
 
     #[test]
     fn test_tile() {
+        let stream = crate::test_stream();
         let x = Array::from_slice(&[1, 2, 3], &[3]);
-        let y = tile(&x, &[2]).unwrap();
+        let y = tile(&x, &[2], stream).unwrap();
         let expected = Array::from_slice(&[1, 2, 3, 1, 2, 3], &[6]);
-        assert_eq!(y, expected);
+        assert!(crate::array::eval_equal_values(&y, &expected));
 
         let x = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
-        let y = tile(&x, &[2]).unwrap();
+        let y = tile(&x, &[2], stream).unwrap();
         let expected = Array::from_slice(&[1, 2, 1, 2, 3, 4, 3, 4], &[2, 4]);
-        assert_eq!(y, expected);
+        assert!(crate::array::eval_equal_values(&y, &expected));
 
         let x = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
-        let y = tile(&x, &[4, 1]).unwrap();
+        let y = tile(&x, &[4, 1], stream).unwrap();
         let expected =
             Array::from_slice(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4], &[8, 2]);
-        assert_eq!(y, expected);
+        assert!(crate::array::eval_equal_values(&y, &expected));
 
         let x = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
-        let y = tile(&x, &[2, 2]).unwrap();
+        let y = tile(&x, &[2, 2], stream).unwrap();
         let expected =
             Array::from_slice(&[1, 2, 1, 2, 3, 4, 3, 4, 1, 2, 1, 2, 3, 4, 3, 4], &[4, 4]);
-        assert_eq!(y, expected);
+        assert!(crate::array::eval_equal_values(&y, &expected));
 
         let x = Array::from_slice(&[1, 2, 3], &[3]);
-        let y = tile(&x, &[2, 2, 2]).unwrap();
+        let y = tile(&x, &[2, 2, 2], stream).unwrap();
         let expected = Array::from_slice(
             &[
                 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3,
             ],
             &[2, 2, 6],
         );
-        assert_eq!(y, expected);
+        assert!(crate::array::eval_equal_values(&y, &expected));
     }
 
     #[test]
     fn test_transpose() {
+        let stream = crate::test_stream();
         let x = Array::from_int(1);
-        let y = transpose(&x).unwrap();
+        let y = transpose(&x, stream).unwrap();
         assert!(y.shape().is_empty());
-        assert_eq!(y.item::<i32>(), 1);
-        assert!(transpose_axes(&x, &[0][..]).is_err());
-        assert!(transpose_axes(&x, &[1][..]).is_err());
+        assert_eq!(y.item::<i32>(&stream), 1);
+        assert!(transpose_axes(&x, &[0][..], stream).is_err());
+        assert!(transpose_axes(&x, &[1][..], stream).is_err());
 
         let x = Array::from_slice(&[1], &[1]);
-        let y = transpose(&x).unwrap();
+        let y = transpose(&x, stream).unwrap();
         assert_eq!(y.shape(), &[1]);
-        assert_eq!(y.item::<i32>(), 1);
+        assert_eq!(y.item::<i32>(&stream), 1);
 
-        let y = transpose_axes(&x, &[-1][..]).unwrap();
+        let y = transpose_axes(&x, &[-1][..], stream).unwrap();
         assert_eq!(y.shape(), &[1]);
-        assert_eq!(y.item::<i32>(), 1);
+        assert_eq!(y.item::<i32>(&stream), 1);
 
-        assert!(transpose_axes(&x, &[1][..]).is_err());
-        assert!(transpose_axes(&x, &[0, 0][..]).is_err());
+        assert!(transpose_axes(&x, &[1][..], stream).is_err());
+        assert!(transpose_axes(&x, &[0, 0][..], stream).is_err());
 
         let x = Array::from_slice::<i32>(&[], &[0]);
-        let y = transpose(&x).unwrap();
+        let y = transpose(&x, stream).unwrap();
         assert_eq!(y.shape(), &[0]);
-        y.eval().unwrap();
         assert_eq!(y.size(), 0);
+        y.evaluated().unwrap();
 
         let x = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        let mut y = transpose(&x).unwrap();
+        let mut y = transpose(&x, stream).unwrap();
         assert_eq!(y.shape(), &[3, 2]);
-        y = transpose_axes(&x, &[-1, 0][..]).unwrap();
+        y = transpose_axes(&x, &[-1, 0][..], stream).unwrap();
         assert_eq!(y.shape(), &[3, 2]);
-        y = transpose_axes(&x, &[-1, -2][..]).unwrap();
+        y = transpose_axes(&x, &[-1, -2][..], stream).unwrap();
         assert_eq!(y.shape(), &[3, 2]);
-        y.eval().unwrap();
-        assert_eq!(y, Array::from_slice(&[1, 4, 2, 5, 3, 6], &[3, 2]));
+        assert_eq!(y.index_device((0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(y.index_device((0, 1), stream).item::<i32>(&stream), 4);
+        assert_eq!(y.index_device((1, 0), stream).item::<i32>(&stream), 2);
+        assert_eq!(y.index_device((1, 1), stream).item::<i32>(&stream), 5);
+        assert_eq!(y.index_device((2, 0), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((2, 1), stream).item::<i32>(&stream), 6);
+        y.evaluated().unwrap();
 
-        let y = transpose_axes(&x, &[0, 1][..]).unwrap();
+        let y = transpose_axes(&x, &[0, 1][..], stream).unwrap();
         assert_eq!(y.shape(), &[2, 3]);
-        assert_eq!(y, x);
+        assert!(crate::array::eval_equal_values(&y, &x));
 
-        let y = transpose_axes(&x, &[0, -1][..]).unwrap();
+        let y = transpose_axes(&x, &[0, -1][..], stream).unwrap();
         assert_eq!(y.shape(), &[2, 3]);
-        assert_eq!(y, x);
+        assert!(crate::array::eval_equal_values(&y, &x));
 
-        assert!(transpose_axes(&x, &[][..]).is_err());
-        assert!(transpose_axes(&x, &[0][..]).is_err());
-        assert!(transpose_axes(&x, &[0, 0][..]).is_err());
-        assert!(transpose_axes(&x, &[0, 0, 0][..]).is_err());
-        assert!(transpose_axes(&x, &[0, 1, 1][..]).is_err());
+        assert!(transpose_axes(&x, &[][..], stream).is_err());
+        assert!(transpose_axes(&x, &[0][..], stream).is_err());
+        assert!(transpose_axes(&x, &[0, 0][..], stream).is_err());
+        assert!(transpose_axes(&x, &[0, 0, 0][..], stream).is_err());
+        assert!(transpose_axes(&x, &[0, 1, 1][..], stream).is_err());
 
         let x = Array::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], &[2, 3, 2]);
-        let y = transpose(&x).unwrap();
+        let y = transpose(&x, stream).unwrap();
         assert_eq!(y.shape(), &[2, 3, 2]);
-        let expected = Array::from_slice(&[1, 7, 3, 9, 5, 11, 2, 8, 4, 10, 6, 12], &[2, 3, 2]);
-        assert_eq!(y, expected);
+        assert_eq!(y.index_device((0, 0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(y.index_device((0, 0, 1), stream).item::<i32>(&stream), 7);
+        assert_eq!(y.index_device((0, 1, 0), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((0, 1, 1), stream).item::<i32>(&stream), 9);
+        assert_eq!(y.index_device((0, 2, 0), stream).item::<i32>(&stream), 5);
+        assert_eq!(y.index_device((0, 2, 1), stream).item::<i32>(&stream), 11);
+        assert_eq!(y.index_device((1, 0, 0), stream).item::<i32>(&stream), 2);
+        assert_eq!(y.index_device((1, 0, 1), stream).item::<i32>(&stream), 8);
+        assert_eq!(y.index_device((1, 1, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(y.index_device((1, 1, 1), stream).item::<i32>(&stream), 10);
+        assert_eq!(y.index_device((1, 2, 0), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((1, 2, 1), stream).item::<i32>(&stream), 12);
 
-        let y = transpose_axes(&x, &[0, 1, 2][..]).unwrap();
+        let y = transpose_axes(&x, &[0, 1, 2][..], stream).unwrap();
         assert_eq!(y.shape(), &[2, 3, 2]);
-        assert_eq!(y, x);
+        assert!(crate::array::eval_equal_values(&y, &x));
 
-        let y = transpose_axes(&x, &[1, 0, 2][..]).unwrap();
+        let y = transpose_axes(&x, &[1, 0, 2][..], stream).unwrap();
         assert_eq!(y.shape(), &[3, 2, 2]);
-        let expected = Array::from_slice(&[1, 2, 7, 8, 3, 4, 9, 10, 5, 6, 11, 12], &[3, 2, 2]);
-        assert_eq!(y, expected);
+        assert_eq!(y.index_device((0, 0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(y.index_device((0, 0, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(y.index_device((0, 1, 0), stream).item::<i32>(&stream), 7);
+        assert_eq!(y.index_device((0, 1, 1), stream).item::<i32>(&stream), 8);
+        assert_eq!(y.index_device((1, 0, 0), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((1, 0, 1), stream).item::<i32>(&stream), 4);
+        assert_eq!(y.index_device((1, 1, 0), stream).item::<i32>(&stream), 9);
+        assert_eq!(y.index_device((1, 1, 1), stream).item::<i32>(&stream), 10);
+        assert_eq!(y.index_device((2, 0, 0), stream).item::<i32>(&stream), 5);
+        assert_eq!(y.index_device((2, 0, 1), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((2, 1, 0), stream).item::<i32>(&stream), 11);
+        assert_eq!(y.index_device((2, 1, 1), stream).item::<i32>(&stream), 12);
 
-        let y = transpose_axes(&x, &[0, 2, 1][..]).unwrap();
+        let y = transpose_axes(&x, &[0, 2, 1][..], stream).unwrap();
         assert_eq!(y.shape(), &[2, 2, 3]);
-        let expected = Array::from_slice(&[1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12], &[2, 2, 3]);
-        assert_eq!(y, expected);
+        assert_eq!(y.index_device((0, 0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(y.index_device((0, 0, 1), stream).item::<i32>(&stream), 3);
+        assert_eq!(y.index_device((0, 0, 2), stream).item::<i32>(&stream), 5);
+        assert_eq!(y.index_device((0, 1, 0), stream).item::<i32>(&stream), 2);
+        assert_eq!(y.index_device((0, 1, 1), stream).item::<i32>(&stream), 4);
+        assert_eq!(y.index_device((0, 1, 2), stream).item::<i32>(&stream), 6);
+        assert_eq!(y.index_device((1, 0, 0), stream).item::<i32>(&stream), 7);
+        assert_eq!(y.index_device((1, 0, 1), stream).item::<i32>(&stream), 9);
+        assert_eq!(y.index_device((1, 0, 2), stream).item::<i32>(&stream), 11);
+        assert_eq!(y.index_device((1, 1, 0), stream).item::<i32>(&stream), 8);
+        assert_eq!(y.index_device((1, 1, 1), stream).item::<i32>(&stream), 10);
+        assert_eq!(y.index_device((1, 1, 2), stream).item::<i32>(&stream), 12);
 
         let mut x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7], &[4, 2]);
-        x = reshape(transpose(&x).unwrap(), &[2, 2, 2]).unwrap();
-        let expected = Array::from_slice(&[0, 2, 4, 6, 1, 3, 5, 7], &[2, 2, 2]);
-        assert_eq!(x, expected);
+        x = reshape(transpose(&x, stream).unwrap(), &[2, 2, 2], stream).unwrap();
+        assert_eq!(x.shape(), &[2, 2, 2]);
+        assert_eq!(x.index_device((0, 0, 0), stream).item::<i32>(&stream), 0);
+        assert_eq!(x.index_device((0, 0, 1), stream).item::<i32>(&stream), 2);
+        assert_eq!(x.index_device((0, 1, 0), stream).item::<i32>(&stream), 4);
+        assert_eq!(x.index_device((0, 1, 1), stream).item::<i32>(&stream), 6);
+        assert_eq!(x.index_device((1, 0, 0), stream).item::<i32>(&stream), 1);
+        assert_eq!(x.index_device((1, 0, 1), stream).item::<i32>(&stream), 3);
+        assert_eq!(x.index_device((1, 1, 0), stream).item::<i32>(&stream), 5);
+        assert_eq!(x.index_device((1, 1, 1), stream).item::<i32>(&stream), 7);
 
         let mut x = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7], &[1, 4, 1, 2]);
         // assert!(x.flags().row_contiguous);
-        x = transpose_axes(&x, &[2, 1, 0, 3][..]).unwrap();
-        x.eval().unwrap();
+        x = transpose_axes(&x, &[2, 1, 0, 3][..], stream).unwrap();
+        x.evaluated().unwrap();
         // assert!(x.flags().row_contiguous);
     }
 }

@@ -8,7 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Utilities for MLX language model runtimes used by Goose"
+description = "Utilities for MLX language model runtimes"
 readme = "README.md"
 
 [dependencies]

@@ -3,19 +3,10 @@
 use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
-use crate::{error::Result, Array, ArrayElement, Stream};
+use crate::{error::Exception, error::Result, Array, ArrayElement, Stream};
 use mach_sys::mach_time;
-use parking_lot::Mutex;
-use safemlx_internal_macros::{default_device, generate_macro};
+use safemlx_internal_macros::generate_macro;
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::sync::OnceLock;
-
-static GLOBAL_STATE: OnceLock<Mutex<RandomState>> = OnceLock::new();
-
-thread_local! {
-    static TASK_LOCAL_STATE: RefCell<Option<RandomState>> = const { RefCell::new(None) };
-}
 
 /// Random state for reproducible random number generation.
 ///
@@ -31,19 +22,21 @@ thread_local! {
 /// # Example
 ///
 /// ```rust,no_run
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::random::RandomState;
 /// use safemlx::transforms::compile::compile_with_state;
 /// use safemlx::random::categorical;
 /// use safemlx::Array;
 ///
 /// let mut state = RandomState::with_seed(42).unwrap();
-/// let logits = Array::zeros::<f32>(&[1, 10]).unwrap();
+/// let logits = Array::zeros::<f32>(&[1, 10], &stream).unwrap();
 /// let mut compiled = compile_with_state(
 ///     |state: &mut RandomState, x: &Array| {
-///         let key = state.next_key()?;
-///         categorical(x, None, None, Some(&key))
+///         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+///         let key = state.next_key(&stream)?;
+///         categorical(x, None, None, Some(&key), &stream)
 ///     },
-///     None
+///     None,
 /// );
 /// let result = compiled(&mut state, &logits).unwrap();
 /// ```
@@ -77,15 +70,10 @@ impl RandomState {
     ///
     /// This splits the current state into two keys: one becomes the new state,
     /// and the other is returned for use in random operations.
-    pub fn next_key(&mut self) -> Result<Array> {
-        let next = split(&self.state, 2)?;
+    pub fn next_key(&mut self, stream: &Stream) -> Result<Array> {
+        let next = split(&self.state, 2, stream)?;
         self.state = next.0;
         Ok(next.1)
-    }
-
-    /// Internal method for backward compatibility.
-    fn next(&mut self) -> Result<Array> {
-        self.next_key()
     }
 
     /// Reseed the random state.
@@ -138,53 +126,11 @@ impl crate::utils::Updatable for RandomState {
     }
 }
 
-fn global_state() -> &'static Mutex<RandomState> {
-    GLOBAL_STATE.get_or_init(|| Mutex::new(RandomState::new().unwrap()))
-}
-
-/// Returns a key from the task-local state if it exists, otherwise
-/// returns `None`
-fn resolve_task_local_key() -> Option<Result<Array>> {
-    TASK_LOCAL_STATE.with_borrow_mut(|state| state.as_mut().map(|s| s.next()))
-}
-
-fn resolve_global_key() -> Result<Array> {
-    let mut state = global_state().lock();
-    state.next()
-}
-
-/// Use given key or generate a new one if `None`.
+/// Use the given key.
 fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
-    key.into().map_or_else(
-        || {
-            resolve_task_local_key()
-                .unwrap_or_else(resolve_global_key)
-                .map(Cow::Owned)
-        },
-        |k| Ok(Cow::Borrowed(k)),
-    )
-}
-
-/// Use the given random state for the scope of `f`
-pub fn with_random_state<F, T>(state: RandomState, f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    let prev_state = TASK_LOCAL_STATE.with_borrow_mut(|s| s.replace(state));
-
-    let result = f();
-
-    TASK_LOCAL_STATE.with_borrow_mut(|s| {
-        *s = prev_state;
-    });
-
-    result
-}
-
-/// Seed the random number generator.
-pub fn seed(seed: u64) -> Result<()> {
-    let mut state = global_state().lock();
-    state.seed(seed)
+    key.into()
+        .map(Cow::Borrowed)
+        .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))
 }
 
 /// Get a PRNG key from a seed.
@@ -197,17 +143,20 @@ pub fn key(seed: u64) -> Result<Array> {
 }
 
 /// Split a PRNG key into two keys and return a tuple.
-#[default_device]
-pub fn split_device(
+pub fn split(
     key: impl AsRef<Array>,
     num: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<(Array, Array)> {
+    let stream = stream.as_ref();
     let keys = Array::try_from_op(|res| unsafe {
-        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), num, stream.as_ref().as_ptr())
+        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), num, stream.as_ptr())
     })?;
 
-    Ok((keys.try_index(0)?, keys.try_index(1)?))
+    Ok((
+        keys.try_index_device(0, stream)?,
+        keys.try_index_device(1, stream)?,
+    ))
 }
 
 /// Generate uniformly distributed random numbers.
@@ -222,17 +171,17 @@ pub fn split_device(
 /// - `key` (optional): A PRNG key.
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // create an array of shape `[50]` type f32 values in the range [0, 10)
-/// let array = safemlx::random::uniform::<_, f32>(0, 10, &[50], &key);
+/// let array = safemlx::random::uniform::<_, f32>(0, 10, &[50], &key, &stream);
 ///
 /// // same, but in range [0.5, 1)
-/// let array = safemlx::random::uniform::<_, f32>(0.5f32, 1f32, &[50], &key);
+/// let array = safemlx::random::uniform::<_, f32>(0.5f32, 1f32, &[50], &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn uniform_device<'a, E: Into<Array>, T: ArrayElement>(
+pub fn uniform<'a, E: Into<Array>, T: ArrayElement>(
     lower: E,
     upper: E,
     #[optional] shape: impl IntoOption<&'a [i32]>,
@@ -242,6 +191,7 @@ pub fn uniform_device<'a, E: Into<Array>, T: ArrayElement>(
     let lb: Array = lower.into();
     let ub: Array = upper.into();
     let shape = shape.into_option().unwrap_or(&[]);
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -253,7 +203,7 @@ pub fn uniform_device<'a, E: Into<Array>, T: ArrayElement>(
             shape.len(),
             T::DTYPE.into(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -273,17 +223,17 @@ pub fn uniform_device<'a, E: Into<Array>, T: ArrayElement>(
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // generate a single f32 with normal distribution
-/// let value = safemlx::random::normal::<f32>(None, None, None, &key).unwrap().item::<f32>();
+/// let value = safemlx::random::normal::<f32>(None, None, None, &key, &stream).unwrap().item::<f32>(&stream);
 ///
 /// // generate an array of f32 with normal distribution in shape [10, 5]
-/// let array = safemlx::random::normal::<f32>(&[10, 5], None, None, &key);
+/// let array = safemlx::random::normal::<f32>(&[10, 5], None, None, &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn normal_device<'a, T: ArrayElement>(
+pub fn normal<'a, T: ArrayElement>(
     #[optional] shape: impl IntoOption<&'a [i32]>,
     #[optional] loc: impl Into<Option<f32>>,
     #[optional] scale: impl Into<Option<f32>>,
@@ -291,6 +241,7 @@ pub fn normal_device<'a, T: ArrayElement>(
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     let shape = shape.into_option().unwrap_or(&[]);
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -302,7 +253,7 @@ pub fn normal_device<'a, T: ArrayElement>(
             loc.into().unwrap_or(0.0),
             scale.into().unwrap_or(1.0),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -318,8 +269,8 @@ pub fn normal_device<'a, T: ArrayElement>(
 /// - `shape`: The output shape must be broadcast-compatible with `&mean.shape[..mean.shape.len()-1]` and `&covariance.shape[..covariance.shape.len()-2]`. If empty, the result shape is determined by broadcasting the batch shapes of `mean` and `covariance`.
 /// - `key`: PRNG key.
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device(device = "cpu")] // TODO: not supported on GPU yet
-pub fn multivariate_normal_device<'a, T: ArrayElement>(
+// TODO: not supported on GPU yet
+pub fn multivariate_normal<'a, T: ArrayElement>(
     mean: impl AsRef<Array>,
     covariance: impl AsRef<Array>,
     #[optional] shape: impl IntoOption<&'a [i32]>,
@@ -327,6 +278,7 @@ pub fn multivariate_normal_device<'a, T: ArrayElement>(
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     let shape = shape.into_option().unwrap_or(&[]);
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -338,7 +290,7 @@ pub fn multivariate_normal_device<'a, T: ArrayElement>(
             shape.len(),
             T::DTYPE.into(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -350,16 +302,16 @@ pub fn multivariate_normal_device<'a, T: ArrayElement>(
 /// scalars or arrays and must be roadcastable to `shape`.
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{array, random};
 ///
 /// let key = random::key(0).unwrap();
 ///
 /// // generate an array of Int values, one in the range [0, 20) and one in the range [10, 100)
-/// let array = random::randint::<_, i32>(array!([0, 20]), array!([10, 100]), None, &key);
+/// let array = random::randint::<_, i32>(array!([0, 20]), array!([10, 100]), None, &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn randint_device<'a, E: Into<Array>, T: ArrayElement>(
+pub fn randint<'a, E: Into<Array>, T: ArrayElement>(
     lower: E,
     upper: E,
     #[optional] shape: impl IntoOption<&'a [i32]>,
@@ -369,6 +321,7 @@ pub fn randint_device<'a, E: Into<Array>, T: ArrayElement>(
     let lb: Array = lower.into();
     let ub: Array = upper.into();
     let shape = shape.into_option().unwrap_or(lb.shape());
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -380,7 +333,7 @@ pub fn randint_device<'a, E: Into<Array>, T: ArrayElement>(
             shape.len(),
             T::DTYPE.into(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -392,23 +345,23 @@ pub fn randint_device<'a, E: Into<Array>, T: ArrayElement>(
 /// must be broadcastable to `shape`.
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{array, Array, random};
 ///
 /// let key = random::key(0).unwrap();
 ///
 /// // generate a single random Bool with p = 0.8
 /// let p: Array = 0.8.into();
-/// let value = random::bernoulli(&p, None, &key);
+/// let value = random::bernoulli(&p, None, &key, &stream);
 ///
 /// // generate an array of shape [50, 2] of random Bool with p = 0.8
-/// let array = random::bernoulli(&p, &[50, 2], &key);
+/// let array = random::bernoulli(&p, &[50, 2], &key, &stream);
 ///
 /// // generate an array of [3] Bool with the given p values
-/// let array = random::bernoulli(&array!([0.1, 0.5, 0.8]), None, &key);
+/// let array = random::bernoulli(&array!([0.1, 0.5, 0.8]), None, &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn bernoulli_device<'a>(
+pub fn bernoulli<'a>(
     #[optional] p: impl Into<Option<&'a Array>>,
     #[optional] shape: impl IntoOption<&'a [i32]>,
     #[optional] key: impl Into<Option<&'a Array>>,
@@ -418,6 +371,7 @@ pub fn bernoulli_device<'a>(
     let p = p.into().unwrap_or(&default_array);
 
     let shape = shape.into_option().unwrap_or(p.shape());
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -427,7 +381,7 @@ pub fn bernoulli_device<'a>(
             shape.as_ptr(),
             shape.len(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -439,17 +393,17 @@ pub fn bernoulli_device<'a>(
 /// can be scalars or arrays and must be broadcastable to `shape`.
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// use safemlx::{array, random};
 ///
 /// let key = random::key(0).unwrap();
 ///
 /// // generate an array of two Float values, one in the range 0 ..< 10
 /// // and one in the range 10 ..< 100
-/// let value = random::truncated_normal::<_, f32>(array!([0, 10]), array!([10, 100]), None, &key);
+/// let value = random::truncated_normal::<_, f32>(array!([0, 10]), array!([10, 100]), None, &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn truncated_normal_device<'a, E: Into<Array>, T: ArrayElement>(
+pub fn truncated_normal<'a, E: Into<Array>, T: ArrayElement>(
     lower: E,
     upper: E,
     #[optional] shape: impl IntoOption<&'a [i32]>,
@@ -459,6 +413,7 @@ pub fn truncated_normal_device<'a, E: Into<Array>, T: ArrayElement>(
     let lb: Array = lower.into();
     let ub: Array = upper.into();
     let shape = shape.into_option().unwrap_or(lb.shape());
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -470,7 +425,7 @@ pub fn truncated_normal_device<'a, E: Into<Array>, T: ArrayElement>(
             shape.len(),
             T::DTYPE.into(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -481,22 +436,23 @@ pub fn truncated_normal_device<'a, E: Into<Array>, T: ArrayElement>(
 /// which CDF `exp(-exp(-x))`.
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // generate a single Float with Gumbel distribution
-/// let value = safemlx::random::gumbel::<f32>(None, &key).unwrap().item::<f32>();
+/// let value = safemlx::random::gumbel::<f32>(None, &key, &stream).unwrap().item::<f32>(&stream);
 ///
 /// // generate an array of Float with Gumbel distribution in shape [10, 5]
-/// let array = safemlx::random::gumbel::<f32>(&[10, 5], &key);
+/// let array = safemlx::random::gumbel::<f32>(&[10, 5], &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn gumbel_device<'a, T: ArrayElement>(
+pub fn gumbel<'a, T: ArrayElement>(
     #[optional] shape: impl IntoOption<&'a [i32]>,
     #[optional] key: impl Into<Option<&'a Array>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     let shape = shape.into_option().unwrap_or(&[]);
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     Array::try_from_op(|res| unsafe {
@@ -506,7 +462,7 @@ pub fn gumbel_device<'a, T: ArrayElement>(
             shape.len(),
             T::DTYPE.into(),
             key.as_ptr(),
-            stream.as_ref().as_ptr(),
+            stream.as_ptr(),
         )
     })
 }
@@ -541,16 +497,16 @@ pub enum ShapeOrCount<'a> {
 /// # Example
 ///
 /// ```rust
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
-/// let logits = safemlx::Array::zeros::<u32>(&[5, 20]).unwrap();
+/// let logits = safemlx::Array::zeros::<u32>(&[5, 20], &stream).unwrap();
 ///
 /// // produces Array of u32 shape &[5]
-/// let result = safemlx::random::categorical(&logits, None, None, &key);
+/// let result = safemlx::random::categorical(&logits, None, None, &key, &stream);
 /// ```
 #[generate_macro(customize(root = "$crate::random"))]
-#[default_device]
-pub fn categorical_device<'a>(
+pub fn categorical<'a>(
     logits: impl AsRef<Array>,
     #[optional] axis: impl Into<Option<i32>>,
     #[optional] shape_or_count: impl Into<Option<ShapeOrCount<'a>>>,
@@ -558,6 +514,7 @@ pub fn categorical_device<'a>(
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     let axis = axis.into().unwrap_or(-1);
+    let stream = stream.as_ref();
     let key = resolve(key)?;
 
     match shape_or_count.into() {
@@ -569,7 +526,7 @@ pub fn categorical_device<'a>(
                 shape.as_ptr(),
                 shape.len(),
                 key.as_ptr(),
-                stream.as_ref().as_ptr(),
+                stream.as_ptr(),
             )
         }),
         Some(ShapeOrCount::Count(num_samples)) => Array::try_from_op(|res| unsafe {
@@ -579,7 +536,7 @@ pub fn categorical_device<'a>(
                 axis,
                 num_samples,
                 key.as_ptr(),
-                stream.as_ref().as_ptr(),
+                stream.as_ptr(),
             )
         }),
         None => Array::try_from_op(|res| unsafe {
@@ -588,7 +545,7 @@ pub fn categorical_device<'a>(
                 logits.as_ref().as_ptr(),
                 axis,
                 key.as_ptr(),
-                stream.as_ref().as_ptr(),
+                stream.as_ptr(),
             )
         }),
     }
@@ -601,217 +558,245 @@ mod tests {
     use float_eq::{assert_float_eq, float_eq};
 
     #[test]
-    fn test_global_rng() {
-        seed(3).unwrap();
-        let a = uniform::<_, f32>(0, 1, None, None).unwrap();
-        let b = uniform::<_, f32>(0, 1, None, None).unwrap();
+    fn test_explicit_random_state_is_deterministic() {
+        let stream = crate::test_stream();
+        let mut state = RandomState::with_seed(3).unwrap();
+        let a_key = state.next_key(stream).unwrap();
+        let b_key = state.next_key(stream).unwrap();
+        let a = uniform::<_, f32>(0, 1, None, &a_key, stream).unwrap();
+        let b = uniform::<_, f32>(0, 1, None, &b_key, stream).unwrap();
 
-        seed(3).unwrap();
-        let x = uniform::<_, f32>(0, 1, None, None).unwrap();
-        let y = uniform::<_, f32>(0, 1, None, None).unwrap();
+        let mut state = RandomState::with_seed(3).unwrap();
+        let x_key = state.next_key(stream).unwrap();
+        let y_key = state.next_key(stream).unwrap();
+        let x = uniform::<_, f32>(0, 1, None, &x_key, stream).unwrap();
+        let y = uniform::<_, f32>(0, 1, None, &y_key, stream).unwrap();
 
-        assert_array_eq!(a, x, 0.01);
-        assert_array_eq!(b, y, 0.01);
+        assert_array_eq!(a, x, 0.01, stream = stream);
+        assert_array_eq!(b, y, 0.01, stream = stream);
     }
 
     #[test]
     fn test_key() {
         let k1 = key(0).unwrap();
         let k2 = key(0).unwrap();
-        assert!(k1 == k2);
+        assert!(crate::array::eval_equal_values(&k1, &k2));
 
         let k2 = key(1).unwrap();
-        assert!(k1 != k2);
+        assert!(!crate::array::eval_equal_values(&k1, &k2));
     }
 
     #[test]
     fn test_split() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
 
-        let (k1, k2) = split(&key, 2).unwrap();
-        assert!(k1 != k2);
+        let (k1, k2) = split(&key, 2, stream).unwrap();
+        assert!(!crate::array::eval_equal_values(&k1, &k2));
 
-        let (r1, r2) = split(&key, 2).unwrap();
-        assert!(r1 == k1);
-        assert!(r2 == k2);
+        let (r1, r2) = split(&key, 2, stream).unwrap();
+        assert!(crate::array::eval_equal_values(&r1, &k1));
+        assert!(crate::array::eval_equal_values(&r2, &k2));
     }
 
     #[test]
-    fn test_uniform_no_seed() {
-        let value = uniform::<_, f32>(0, 10, &[3], None).unwrap();
-        assert_eq!(value.shape(), &[3]);
+    fn test_uniform_requires_key() {
+        let stream = crate::test_stream();
+        let value = uniform::<_, f32>(0, 10, &[3], None, stream);
+        assert!(value.is_err());
     }
 
     #[test]
     fn test_uniform_single() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = uniform::<_, f32>(0, 10, None, Some(&key)).unwrap();
-        float_eq!(value.item::<f32>(), 4.18, abs <= 0.01);
+        let value = uniform::<_, f32>(0, 10, None, &key, stream).unwrap();
+        float_eq!(value.item::<f32>(&stream), 4.18, abs <= 0.01);
     }
 
     #[test]
     fn test_uniform_multiple() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = uniform::<_, f32>(0, 10, &[3], Some(&key)).unwrap();
+        let value = uniform::<_, f32>(0, 10, &[3], &key, stream).unwrap();
         let expected = Array::from_slice(&[9.65, 3.14, 6.33], &[3]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_uniform_multiple_array() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = uniform::<_, f32>(&[0, 10], &[10, 100], &[2], Some(&key)).unwrap();
+        let value = uniform::<_, f32>(&[0, 10], &[10, 100], &[2], &key, stream).unwrap();
         let expected = Array::from_slice(&[2.16, 82.37], &[2]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_uniform_non_float() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = uniform::<_, i32>(&[0, 10], &[10, 100], &[2], Some(&key));
+        let value = uniform::<_, i32>(&[0, 10], &[10, 100], &[2], &key, stream);
         assert!(value.is_err());
     }
 
     #[test]
     fn test_normal() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = normal::<f32>(None, None, None, &key).unwrap();
-        float_eq!(value.item::<f32>(), -0.20, abs <= 0.01);
+        let value = normal::<f32>(None, None, None, &key, stream).unwrap();
+        float_eq!(value.item::<f32>(&stream), -0.20, abs <= 0.01);
     }
 
     #[test]
     fn test_normal_non_float() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = normal::<i32>(None, None, None, &key);
+        let value = normal::<i32>(None, None, None, &key, stream);
         assert!(value.is_err());
     }
 
     #[test]
     fn test_multivariate_normal() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
         let mean = Array::from_slice(&[0.0, 0.0], &[2]);
         let covariance = Array::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
 
-        let a = multivariate_normal::<f32>(&mean, &covariance, &[3], &key).unwrap();
+        let a = multivariate_normal::<f32>(&mean, &covariance, &[3], &key, stream).unwrap();
         assert!(a.shape() == [3, 2]);
     }
 
     #[test]
     fn test_randint_single() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = randint::<_, i32>(0, 100, None, Some(&key)).unwrap();
-        assert_eq!(value.item::<i32>(), 41);
+        let value = randint::<_, i32>(0, 100, None, &key, stream).unwrap();
+        assert_eq!(value.item::<i32>(&stream), 41);
     }
 
     #[test]
     fn test_randint_multiple() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
         let value =
-            randint::<_, i32>(array!([0, 10]), array!([10, 100]), None, Some(&key)).unwrap();
+            randint::<_, i32>(array!([0, 10]), array!([10, 100]), None, &key, stream).unwrap();
         let expected = Array::from_slice(&[2, 82], &[2]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_randint_non_int() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = randint::<_, f32>(array!([0, 10]), array!([10, 100]), None, Some(&key));
+        let value = randint::<_, f32>(array!([0, 10]), array!([10, 100]), None, &key, stream);
         assert!(value.is_err());
     }
 
     #[test]
     fn test_bernoulli_single() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = bernoulli(None, None, &key).unwrap();
-        assert!(value.item::<bool>());
+        let value = bernoulli(None, None, &key, stream).unwrap();
+        assert!(value.item::<bool>(&stream));
     }
 
     #[test]
     fn test_bernoulli_multiple() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = bernoulli(None, &[4], &key).unwrap();
+        let value = bernoulli(None, &[4], &key, stream).unwrap();
         let expected = Array::from_slice(&[false, true, false, true], &[4]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_bernoulli_p() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
         let p: Array = 0.8.into();
-        let value = bernoulli(&p, &[4], &key).unwrap();
+        let value = bernoulli(&p, &[4], &key, stream).unwrap();
         let expected = Array::from_slice(&[false, true, true, true], &[4]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_bernoulli_p_array() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = bernoulli(&array!([0.1, 0.5, 0.8]), None, &key).unwrap();
+        let value = bernoulli(&array!([0.1, 0.5, 0.8]), None, &key, stream).unwrap();
         let expected = Array::from_slice(&[false, true, true], &[3]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_truncated_normal_single() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = truncated_normal::<_, f32>(0, 10, None, &key).unwrap();
-        assert_array_eq!(value, Array::from_f32(0.55), 0.01);
+        let value = truncated_normal::<_, f32>(0, 10, None, &key, stream).unwrap();
+        assert_array_eq!(value, Array::from_f32(0.55), 0.01, stream = stream);
     }
 
     #[test]
     fn test_truncated_normal_multiple() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = truncated_normal::<_, f32>(0.0, 0.5, &[3], &key).unwrap();
+        let value = truncated_normal::<_, f32>(0.0, 0.5, &[3], &key, stream).unwrap();
         let expected = Array::from_slice(&[0.48, 0.15, 0.30], &[3]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_truncated_normal_multiple_array() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
         let value =
-            truncated_normal::<_, f32>(array!([0.0, 0.5]), array!([0.5, 1.0]), None, &key).unwrap();
+            truncated_normal::<_, f32>(array!([0.0, 0.5]), array!([0.5, 1.0]), None, &key, stream)
+                .unwrap();
         let expected = Array::from_slice(&[0.10, 0.88], &[2]);
 
-        assert_array_eq!(value, expected, 0.01);
+        assert_array_eq!(value, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_gumbel() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let value = gumbel::<f32>(None, &key).unwrap();
-        assert_array_eq!(value, Array::from_f32(0.13), 0.01);
+        let value = gumbel::<f32>(None, &key, stream).unwrap();
+        assert_array_eq!(value, Array::from_f32(0.13), 0.01, stream = stream);
     }
 
     #[test]
     fn test_logits() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let logits = Array::zeros::<u32>(&[5, 20]).unwrap();
-        let result = categorical(&logits, None, None, &key).unwrap();
+        let logits = Array::zeros::<u32>(&[5, 20], stream).unwrap();
+        let result = categorical(&logits, None, None, &key, stream).unwrap();
 
         assert_eq!(result.shape(), [5]);
 
         let expected = Array::from_slice(&[1, 1, 17, 17, 17], &[5]);
-        assert_array_eq!(result, expected, 0.01);
+        assert_array_eq!(result, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_logits_count() {
+        let stream = crate::test_stream();
         let key = key(0).unwrap();
-        let logits = Array::zeros::<u32>(&[5, 20]).unwrap();
-        let result = categorical(&logits, None, ShapeOrCount::Count(2), &key).unwrap();
+        let logits = Array::zeros::<u32>(&[5, 20], stream).unwrap();
+        let result = categorical(&logits, None, ShapeOrCount::Count(2), &key, stream).unwrap();
 
         assert_eq!(result.shape(), [5, 2]);
 
         let expected = Array::from_slice(&[16, 3, 14, 10, 17, 7, 6, 8, 12, 8], &[5, 2]);
-        assert_array_eq!(result, expected, 0.01);
+        assert_array_eq!(result, expected, 0.01, stream = stream);
     }
 
     #[test]
@@ -824,15 +809,19 @@ mod tests {
     fn test_random_state_with_seed_deterministic() {
         let s1 = RandomState::with_seed(42).unwrap();
         let s2 = RandomState::with_seed(42).unwrap();
-        assert!(s1.as_array() == s2.as_array());
+        assert!(crate::array::eval_equal_values(
+            s1.as_array(),
+            s2.as_array()
+        ));
     }
 
     #[test]
     fn test_random_state_next_key_advances() {
+        let stream = crate::test_stream();
         let mut state = RandomState::with_seed(0).unwrap();
-        let k1 = state.next_key().unwrap();
-        let k2 = state.next_key().unwrap();
-        assert!(k1 != k2);
+        let k1 = state.next_key(stream).unwrap();
+        let k2 = state.next_key(stream).unwrap();
+        assert!(!crate::array::eval_equal_values(&k1, &k2));
     }
 
     #[test]
@@ -840,7 +829,10 @@ mod tests {
         let original = RandomState::with_seed(99).unwrap();
         let arr = original.as_array().clone();
         let restored = RandomState::from_key(arr);
-        assert!(original.as_array() == restored.as_array());
+        assert!(crate::array::eval_equal_values(
+            original.as_array(),
+            restored.as_array()
+        ));
     }
 
     #[test]
@@ -859,18 +851,20 @@ mod tests {
 
     #[test]
     fn test_random_seed_same() {
+        let stream = crate::test_stream();
         // Same random seed should produce the same results
         let seed = 23;
         let mut results = Vec::new();
-        let f = || {
-            uniform::<_, f32>(0.0, 1.0, &[10, 10], None)?
-                .sum(None)?
-                .try_item::<f32>()
-        };
         for _ in 0..10 {
             let mut state = RandomState::new().unwrap();
             state.seed(seed).unwrap();
-            let result = with_random_state(state, f).unwrap();
+            let draw_key = state.next_key(stream).unwrap();
+            let result = uniform::<_, f32>(0.0, 1.0, &[10, 10], &draw_key, stream)
+                .unwrap()
+                .sum(None, stream)
+                .unwrap()
+                .try_item::<f32>(&stream)
+                .unwrap();
             results.push(result);
         }
 

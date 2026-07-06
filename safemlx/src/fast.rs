@@ -8,8 +8,8 @@ use std::{
 use crate::error::{Exception, Result};
 use crate::utils::guard::Guarded;
 use crate::utils::{IntoOption, VectorArray, SUCCESS};
-use crate::{Array, Dtype, Stream, StreamOrDevice};
-use safemlx_internal_macros::{default_device, generate_macro};
+use crate::{Array, Dtype, Stream};
+use safemlx_internal_macros::generate_macro;
 
 /// A compiled custom Metal kernel.
 ///
@@ -98,17 +98,6 @@ impl MetalKernel {
         })
     }
 
-    /// Apply the kernel on the default stream.
-    ///
-    /// Returns one [`Array`] for each output declared in `config`.
-    pub fn apply<I, A>(&self, inputs: I, config: &MetalKernelConfig) -> Result<Vec<Array>>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        self.apply_device(inputs, config, StreamOrDevice::default())
-    }
-
     /// Apply the kernel on `stream`.
     ///
     /// Returns one [`Array`] for each output declared in `config`.
@@ -143,15 +132,6 @@ impl MetalKernel {
         }
 
         Ok(outputs)
-    }
-
-    /// Apply the kernel on the default stream and require exactly one output.
-    pub fn apply_one<I, A>(&self, inputs: I, config: &MetalKernelConfig) -> Result<Array>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        self.apply_one_device(inputs, config, StreamOrDevice::default())
     }
 
     /// Apply the kernel on `stream` and require exactly one output.
@@ -263,15 +243,6 @@ impl StatefulMetalKernel {
         })
     }
 
-    /// Apply the kernel on the default stream.
-    pub fn apply<I, A>(&self, inputs: I, config: &MetalKernelConfig) -> Result<StatefulKernelOutput>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        self.apply_device(inputs, config, StreamOrDevice::default())
-    }
-
     /// Apply the kernel on `stream`.
     pub fn apply_device<I, A>(
         &self,
@@ -329,19 +300,6 @@ impl RecurrentScanKernel {
         Self { decode, prefill }
     }
 
-    /// Apply the single-token decode kernel on the default stream.
-    pub fn decode<I, A>(
-        &self,
-        inputs: I,
-        config: &MetalKernelConfig,
-    ) -> Result<StatefulKernelOutput>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        self.decode_device(inputs, config, StreamOrDevice::default())
-    }
-
     /// Apply the single-token decode kernel on `stream`.
     pub fn decode_device<I, A>(
         &self,
@@ -354,19 +312,6 @@ impl RecurrentScanKernel {
         A: AsRef<Array>,
     {
         self.decode.apply_device(inputs, config, stream)
-    }
-
-    /// Apply the full-sequence prefill kernel on the default stream.
-    pub fn prefill<I, A>(
-        &self,
-        inputs: I,
-        config: &MetalKernelConfig,
-    ) -> Result<StatefulKernelOutput>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        self.prefill_device(inputs, config, StreamOrDevice::default())
     }
 
     /// Apply the full-sequence prefill kernel on `stream`.
@@ -732,8 +677,7 @@ fn check_status(status: i32) -> Result<()> {
 /// Optimized implementation of `NN.RoPE`.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
-#[default_device]
-pub fn rope_device<'a>(
+pub fn rope<'a>(
     #[named] array: impl AsRef<Array>,
     #[named] dimensions: i32,
     #[named] traditional: bool,
@@ -783,8 +727,7 @@ pub fn rope_device<'a>(
 /// - `stream`: Stream to evaluate on
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
-#[default_device]
-pub fn rope_dynamic_device<'a>(
+pub fn rope_dynamic<'a>(
     #[named] array: impl AsRef<Array>,
     #[named] dimensions: i32,
     #[named] traditional: bool,
@@ -863,8 +806,7 @@ impl ScaledDotProductAttentionMask<'_> {
 ///
 /// > Note: For Grouped Query Attention and Multi-Query Attention, the input arrays for `key` and `value` should not be pre-tiled to match the `query` array.
 #[generate_macro(customize(root = "$crate::fast"))]
-#[default_device]
-pub fn scaled_dot_product_attention_device<'a>(
+pub fn scaled_dot_product_attention<'a>(
     queries: impl AsRef<Array>,
     keys: impl AsRef<Array>,
     values: impl AsRef<Array>,
@@ -907,8 +849,7 @@ pub fn scaled_dot_product_attention_device<'a>(
 /// - eps: A small additive constant for numerical stability
 /// - stream: stream or device to evaluate on
 #[generate_macro(customize(root = "$crate::fast"))]
-#[default_device]
-pub fn rms_norm_device(
+pub fn rms_norm(
     x: impl AsRef<Array>,
     weight: impl AsRef<Array>,
     eps: f32,
@@ -939,8 +880,7 @@ pub fn rms_norm_device(
 /// - eps: A small additive constant for numerical stability
 /// - stream: stream or device to evaluate on
 #[generate_macro(customize(root = "$crate::fast"))]
-#[default_device]
-pub fn layer_norm_device<'a>(
+pub fn layer_norm<'a>(
     #[named] x: impl AsRef<Array>,
     #[optional] weight: impl Into<Option<&'a Array>>,
     #[optional] bias: impl Into<Option<&'a Array>>,
@@ -970,6 +910,7 @@ mod tests {
     use crate::{
         ops::indexing::{ArrayIndexOp, IndexOp},
         random::normal,
+        Stream,
     };
     use float_eq::assert_float_eq;
     use pretty_assertions::assert_eq;
@@ -1022,12 +963,22 @@ mod tests {
             .with_output_arg(input.shape(), input.dtype());
 
         let outputs = kernel
-            .apply_device([&input], &config, StreamOrDevice::gpu())
+            .apply_device(
+                [&input],
+                &config,
+                Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
+            )
             .unwrap();
 
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(outputs[1].as_slice::<f32>(), &[2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(
+            crate::array::eval_vec::<f32>(&outputs[0]),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<f32>(&outputs[1]),
+            &[2.0, 4.0, 6.0, 8.0]
+        );
     }
 
     #[test]
@@ -1078,10 +1029,20 @@ mod tests {
             .with_output_arg([2], Dtype::Float32)
             .with_output_arg([2], Dtype::Float32);
         let decode = recurrent
-            .decode_device([&state, &token], &decode_config, StreamOrDevice::gpu())
+            .decode_device(
+                [&state, &token],
+                &decode_config,
+                Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
+            )
             .unwrap();
-        assert_eq!(decode.output_sequence.as_slice::<f32>(), &[11.0, 22.0]);
-        assert_eq!(decode.new_state.as_slice::<f32>(), &[11.0, 22.0]);
+        assert_eq!(
+            crate::array::eval_vec::<f32>(&decode.output_sequence),
+            &[11.0, 22.0]
+        );
+        assert_eq!(
+            crate::array::eval_vec::<f32>(&decode.new_state),
+            &[11.0, 22.0]
+        );
 
         let prefill_config = MetalKernelConfig::new()
             .with_template_arg_int("L", 3)
@@ -1091,32 +1052,40 @@ mod tests {
             .with_output_arg([3, 2], Dtype::Float32)
             .with_output_arg([2], Dtype::Float32);
         let prefill = recurrent
-            .prefill_device([&state, &sequence], &prefill_config, StreamOrDevice::gpu())
+            .prefill_device(
+                [&state, &sequence],
+                &prefill_config,
+                Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
+            )
             .unwrap();
         assert_eq!(
-            prefill.output_sequence.as_slice::<f32>(),
+            crate::array::eval_vec::<f32>(&prefill.output_sequence),
             &[11.0, 22.0, 14.0, 26.0, 19.0, 32.0]
         );
-        assert_eq!(prefill.new_state.as_slice::<f32>(), &[19.0, 32.0]);
+        assert_eq!(
+            crate::array::eval_vec::<f32>(&prefill.new_state),
+            &[19.0, 32.0]
+        );
     }
 
     #[test]
     fn test_rope() {
-        crate::random::seed(71).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(71, stream);
+        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), [2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
 
-        let result = rope(a, 8, false, 10000., 1.0, 0, None).unwrap();
+        let result = rope(a, 8, false, 10000., 1.0, 0, None, stream).unwrap();
         assert_eq!(result.shape(), [2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.456_253_77,
             abs <= 0.009_125_075
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             116.800_964,
             abs <= 2.336_019_3
         );
@@ -1126,45 +1095,52 @@ mod tests {
     // int offset and array offset, which in C/Rust are separate functions
     #[test]
     fn test_rope_dynamic() {
-        crate::random::seed(71).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(71, stream);
+        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), [2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
 
         // Test with array offset - should produce similar results to int offset of 3
         let offset = crate::Array::from_int(3);
-        let result = rope_dynamic(&a, 8, false, 10000., 1.0, &offset, None).unwrap();
+        let result = rope_dynamic(&a, 8, false, 10000., 1.0, &offset, None, stream).unwrap();
         assert_eq!(result.shape(), [2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
 
         // Compare with regular rope using int offset=3
-        let result_int_offset = rope(&a, 8, false, 10000., 1.0, 3, None).unwrap();
+        let result_int_offset = rope(&a, 8, false, 10000., 1.0, 3, None, stream).unwrap();
         assert_eq!(result_int_offset.shape(), [2, 8, 16]);
 
         // The results should be close
-        let diff = &result - &result_int_offset;
-        let max_diff = diff.abs().unwrap().max(None).unwrap().item::<f32>();
+        let diff = result.subtract(&result_int_offset, stream).unwrap();
+        let max_diff = diff
+            .abs(stream)
+            .unwrap()
+            .max(None, stream)
+            .unwrap()
+            .item::<f32>(&stream);
         assert!(max_diff < 1e-5, "Max difference was {}", max_diff);
     }
 
     #[test]
     fn test_rms_norm() {
-        crate::random::seed(103).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(103, stream);
+        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), [2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
 
-        let weight = Array::ones::<f32>(&[16]).unwrap();
-        let result = rms_norm(a, weight, 1e-5).unwrap();
+        let weight = Array::ones::<f32>(&[16], stream).unwrap();
+        let result = rms_norm(a, weight, 1e-5, stream).unwrap();
         assert_eq!(result.shape(), [2, 8, 16]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.872_938_75,
             abs <= 0.017_458_774
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             223.472_32,
             abs <= 4.469_446
         );
@@ -1172,24 +1148,25 @@ mod tests {
 
     #[test]
     pub fn test_layer_norm_affine() {
-        crate::random::seed(635).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(635, stream);
+        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), [2, 8, 16]);
         assert_eq!(a.dtype(), crate::Dtype::Float32);
 
-        let weight = Array::ones::<f32>(&[16]).unwrap();
-        let bias = Array::zeros::<f32>(&[16]).unwrap();
-        let result = layer_norm(a, &weight, &bias, 1e-5).unwrap();
-        let result = result.index((ArrayIndexOp::Ellipsis, 0));
+        let weight = Array::ones::<f32>(&[16], stream).unwrap();
+        let bias = Array::zeros::<f32>(&[16], stream).unwrap();
+        let result = layer_norm(a, &weight, &bias, 1e-5, stream).unwrap();
+        let result = result.index_device((ArrayIndexOp::Ellipsis, 0), stream);
         assert_eq!(result.shape(), [2, 8]);
         assert_eq!(result.dtype(), crate::Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.290_990_38,
             abs <= 0.005_819_807_8
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             4.655_846,
             abs <= 0.093_116_924
         );
@@ -1198,6 +1175,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn test_fast_sdpa() {
+        let stream = crate::test_stream();
         // This test just makes sure that `scaled_dot_product_attention` is callable
         // in the various cases, based on the Python test `test_fast_sdpa`.
 
@@ -1207,20 +1185,24 @@ mod tests {
             for dtype in [crate::Dtype::Float32, crate::Dtype::Float16] {
                 let B = 2;
                 let H = 24;
-                let q = normal::<f32>(&[B, H, seq_len, Dk], None, None, None)
+                let q_key = crate::test_key((seq_len + Dk) as u64, stream);
+                let k_key = crate::test_key((seq_len + Dk + 1) as u64, stream);
+                let v_key = crate::test_key((seq_len + Dk + 2) as u64, stream);
+                let q = normal::<f32>(&[B, H, seq_len, Dk], None, None, &q_key, stream)
                     .unwrap()
-                    .as_dtype(dtype)
+                    .as_dtype(dtype, stream)
                     .unwrap();
-                let k = normal::<f32>(&[B, H, seq_len, Dk], None, None, None)
+                let k = normal::<f32>(&[B, H, seq_len, Dk], None, None, &k_key, stream)
                     .unwrap()
-                    .as_dtype(dtype)
+                    .as_dtype(dtype, stream)
                     .unwrap();
-                let v = normal::<f32>(&[B, H, seq_len, Dk], None, None, None)
+                let v = normal::<f32>(&[B, H, seq_len, Dk], None, None, &v_key, stream)
                     .unwrap()
-                    .as_dtype(dtype)
+                    .as_dtype(dtype, stream)
                     .unwrap();
 
-                let result = scaled_dot_product_attention(q, k, v, scale, None, None).unwrap();
+                let result =
+                    scaled_dot_product_attention(q, k, v, scale, None, None, stream).unwrap();
                 assert_eq!(result.shape(), [B, H, seq_len, Dk]);
                 assert_eq!(result.dtype(), dtype);
             }
@@ -1230,21 +1212,29 @@ mod tests {
     // Test adapted from Python test `test_fast_sdpa.py/test_sdpa_attention_sinks`
     #[test]
     fn test_fast_sdpa_with_sinks() {
+        let stream = crate::test_stream();
         let b = 2;
         let n_q = 8;
         let t_q = 128;
         let t_kv = 128;
         let d = 64;
 
-        let q = normal::<f32>(&[b, n_q, t_q, d], None, None, None).unwrap();
-        let k = normal::<f32>(&[b, n_q, t_kv, d], None, None, None).unwrap();
-        let v = normal::<f32>(&[b, n_q, t_kv, d], None, None, None).unwrap();
+        let q_key = crate::test_key(0, stream);
+        let k_key = crate::test_key(1, stream);
+        let v_key = crate::test_key(2, stream);
+        let sinks_key = crate::test_key(3, stream);
+        let q = normal::<f32>(&[b, n_q, t_q, d], None, None, &q_key, stream).unwrap();
+        let k = normal::<f32>(&[b, n_q, t_kv, d], None, None, &k_key, stream).unwrap();
+        let v = normal::<f32>(&[b, n_q, t_kv, d], None, None, &v_key, stream).unwrap();
         let scale = (d as f32).powf(-0.5);
 
         // Test with sinks parameter
-        let sinks = normal::<f32>(&[n_q], None, None, None).unwrap() * 10.0;
+        let sinks = normal::<f32>(&[n_q], None, None, &sinks_key, stream)
+            .unwrap()
+            .multiply(Array::from_f32(10.0), stream)
+            .unwrap();
 
-        let result = scaled_dot_product_attention(&q, &k, &v, scale, None, &sinks).unwrap();
+        let result = scaled_dot_product_attention(&q, &k, &v, scale, None, &sinks, stream).unwrap();
         assert_eq!(result.shape(), &[b, n_q, t_q, d]);
     }
 }

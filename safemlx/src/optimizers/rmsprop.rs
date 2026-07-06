@@ -88,6 +88,7 @@ impl Optimizer for RmsProp {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let state = get_mut_or_insert_with(&mut self.state, key, || array!(0.0));
 
@@ -95,14 +96,14 @@ impl Optimizer for RmsProp {
         let alpha = &self.alpha;
         let eps = &self.epsilon;
 
-        let one_minus_alpha = array!(1.0).subtract(alpha)?;
-        let first_term = alpha.multiply(&*state)?;
-        let second_term = one_minus_alpha.multiply(square(gradient)?)?;
-        let v = first_term.add(&second_term)?;
+        let one_minus_alpha = array!(1.0).subtract(alpha, stream)?;
+        let first_term = alpha.multiply(&*state, stream)?;
+        let second_term = one_minus_alpha.multiply(square(gradient, stream)?, stream)?;
+        let v = first_term.add(&second_term, stream)?;
 
-        let num = lr.multiply(gradient)?;
-        let den = sqrt(&v)?.add(eps)?;
-        let new_param = parameter.subtract(num.divide(&den)?)?;
+        let num = lr.multiply(gradient, stream)?;
+        let den = sqrt(&v, stream)?.add(eps, stream)?;
+        let new_param = parameter.subtract(num.divide(&den, stream)?, stream)?;
 
         *parameter = new_param;
         *state = v;

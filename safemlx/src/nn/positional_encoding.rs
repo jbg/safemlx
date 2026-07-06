@@ -1,13 +1,10 @@
-use std::{cell::RefCell, collections::HashMap};
-
 use crate::{
     array,
     error::Exception,
     module::{Module, Param},
     ops::{
-        arange, concatenate_axis, exp,
+        arange, concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        log,
     },
     Array, Dtype,
 };
@@ -117,10 +114,14 @@ where
 
     type Output = Array;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let RopeInput { x, offset } = input.into();
         let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
+        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
         let x = crate::fast::rope(
             x,
             self.dimensions,
@@ -129,8 +130,9 @@ where
             self.scale,
             offset,
             None,
+            stream,
         )?;
-        x.reshape(shape)
+        x.reshape(shape, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -211,16 +213,21 @@ fn build_sinpe(builder: SinpeBuilder) -> Result<SinusoidalPositionalEncoding, Ex
     } = builder;
 
     let half_dim = dimensions / 2;
-    let one_zero = array!(1.0)
-        .subtract(Array::from_iter(0..half_dim, &[half_dim]).divide(array!(half_dim - 1))?)?;
-    let min_frequency = log(array!(min_frequency))?;
-    let max_frequency = log(array!(max_frequency))?;
-
-    // SAFETY: max_frequency and min_frequency are scalars and operations with scalars won't throw
-    let mut sigmas = exp(&one_zero * (&max_frequency - &min_frequency) + &min_frequency)?;
+    let min_frequency = min_frequency.ln();
+    let max_frequency = max_frequency.ln();
+    let denom = (half_dim - 1) as f32;
+    let mut sigma_values = Vec::with_capacity(half_dim as usize);
+    for index in 0..half_dim {
+        let one_zero = 1.0 - (index as f32 / denom);
+        sigma_values.push((one_zero * (max_frequency - min_frequency) + min_frequency).exp());
+    }
+    let mut sigmas = Array::from_slice(&sigma_values, &[half_dim]);
     if full_turns {
-        // SAFETY: scalar array operation won't throw
-        sigmas *= array!(2.0 * std::f32::consts::PI);
+        let sigma_values = sigma_values
+            .into_iter()
+            .map(|value| value * 2.0 * std::f32::consts::PI)
+            .collect::<Vec<_>>();
+        sigmas = Array::from_slice(&sigma_values, &[half_dim]);
     }
 
     let scale = scale.unwrap_or_else(|| (2.0 / dimensions as f32).sqrt());
@@ -236,23 +243,22 @@ impl Module<&Array> for Sinpe {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Self::Output, Self::Error> {
         let mut y = x
-            .expand_dims_axes(&[-1])
-            .and_then(|x| x.multiply(&self.sigmas))?;
+            .expand_dims_axes(&[-1], stream)
+            .and_then(|x| x.multiply(&self.sigmas, stream))?;
 
-        let cosy = y.cos()?;
-        let siny = y.sin()?;
+        let cosy = y.cos(stream)?;
+        let siny = y.sin(stream)?;
 
         if self.cosine_first {
-            y = concatenate_axis(&[cosy, siny], -1)?;
+            y = concatenate_axis(&[cosy, siny], -1, stream)?;
         } else {
-            y = concatenate_axis(&[siny, cosy], -1)?;
+            y = concatenate_axis(&[siny, cosy], -1, stream)?;
         }
 
         if self.scale != 1.0 {
-            // SAFETY: multiplication with scalar won't throw
-            y *= self.scale;
+            y = y.multiply(array!(self.scale), stream)?;
         }
 
         Ok(y)
@@ -270,45 +276,33 @@ struct AlibiKey {
     dtype: Dtype,
 }
 
-thread_local! {
-    static ALIBI_CACHE: RefCell<HashMap<AlibiKey, Array>> = RefCell::new(HashMap::new());
-}
-
 /// Attention with Linear Biases
 #[derive(Debug, Clone, ModuleParameters)]
 #[module(root = crate)]
 pub struct Alibi;
 
 impl Alibi {
-    fn slope(num_heads: i32) -> Result<Array, Exception> {
+    fn slope(num_heads: i32, stream: &crate::Stream) -> Result<Array, Exception> {
         let x = 2.0_f32.powi(8).powf(1.0 / num_heads as f32);
         array!(x)
-            .power(&arange::<_, f32>(1, num_heads + 1, None)?)?
-            .expand_dims_axes(&[-1, -2])
+            .power(&arange::<_, f32>(1, num_heads + 1, None, stream)?, stream)?
+            .expand_dims_axes(&[-1, -2], stream)
     }
 
-    fn matrix(key: AlibiKey) -> Result<Array, Exception> {
-        if let Some(value) = ALIBI_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
-            return Ok(value);
-        }
-
-        let x1 = arange::<_, f32>(key.offset, key.q_seq_len, None)?;
-        let x2 = arange::<_, f32>(0, key.k_seq_len, None)?;
+    fn matrix(key: AlibiKey, stream: &crate::Stream) -> Result<Array, Exception> {
+        let x1 = arange::<_, f32>(key.offset, key.q_seq_len, None, stream)?;
+        let x2 = arange::<_, f32>(0, key.k_seq_len, None, stream)?;
         let distance_matrix = x1
-            .try_index((.., NewAxis))?
-            .subtract(x2.try_index((NewAxis, ..))?)?
-            .expand_dims_axes(&[0, 1])?
-            .abs()?
-            .negative()?;
+            .try_index_device((.., NewAxis), stream)?
+            .subtract(x2.try_index_device((NewAxis, ..), stream)?, stream)?
+            .expand_dims_axes(&[0, 1], stream)?
+            .abs(stream)?
+            .negative(stream)?;
 
-        let slope = Self::slope(key.num_heads)?;
-        let mask = distance_matrix.multiply(&slope)?.as_dtype(key.dtype)?;
-
-        ALIBI_CACHE.with(|cache| {
-            cache.borrow_mut().insert(key, mask.clone());
-        });
-
-        Ok(mask)
+        let slope = Self::slope(key.num_heads, stream)?;
+        distance_matrix
+            .multiply(&slope, stream)?
+            .as_dtype(key.dtype, stream)
     }
 }
 
@@ -393,7 +387,11 @@ where
     type Output = Array;
     type Error = Exception;
 
-    fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
+    fn forward(
+        &mut self,
+        input: Input,
+        stream: &crate::Stream,
+    ) -> Result<Self::Output, Self::Error> {
         let AlibiInput {
             attention_scores,
             offset,
@@ -408,12 +406,12 @@ where
             dtype: attention_scores.dtype(),
         };
 
-        let mut alibi_mask = Self::matrix(key)?;
+        let mut alibi_mask = Self::matrix(key, stream)?;
         if let Some(mask) = mask {
-            alibi_mask = alibi_mask.add(mask)?;
+            alibi_mask = alibi_mask.add(mask, stream)?;
         }
 
-        attention_scores.add(alibi_mask)
+        attention_scores.add(alibi_mask, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -431,32 +429,33 @@ mod tests {
     // mlx-swift/Tests/MLXTests/IntegrationTests.swift
     #[test]
     fn test_rope() {
-        crate::random::seed(71).unwrap();
-        let a = uniform::<_, f32>(0, 1, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(71, stream);
+        let a = uniform::<_, f32>(0, 1, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.5082664489746094,
             abs <= 0.010165328979492188
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             130.1162109375,
             abs <= 2.60232421875
         );
 
         let mut rope = Rope::new(8);
-        let result = rope.forward(&a).unwrap();
+        let result = rope.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.4562537670135498,
             abs <= 0.009125075340270997
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             116.80096435546875,
             abs <= 2.3360192871093752
         );
@@ -466,32 +465,33 @@ mod tests {
     // mlx-swift/Tests/MLXTests/IntegrationTests.swift
     #[test]
     fn test_sinpe() {
-        crate::random::seed(226).unwrap();
-        let a = uniform::<_, f32>(0, 1, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(226, stream);
+        let a = uniform::<_, f32>(0, 1, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.5026599168777466,
             abs <= 0.010053198337554931
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             128.68093872070312,
             abs <= 2.5736187744140624
         );
 
         let mut sinpe = crate::nn::Sinpe::new(8).unwrap();
-        let result = sinpe.forward(&a).unwrap();
+        let result = sinpe.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16, 8]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.2705308198928833,
             abs <= 0.005410616397857666
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             554.047119140625,
             abs <= 11.0809423828125
         );
@@ -501,17 +501,19 @@ mod tests {
     // mlx/python/tests/test_nn.py
     #[test]
     fn test_alibi() {
+        let stream = crate::test_stream();
         let mut alibi = crate::nn::Alibi;
         let shape = [1, 8, 20, 20];
-        let x = uniform::<_, f32>(0, 1, &shape, None).unwrap();
+        let key = crate::test_key(0, stream);
+        let x = uniform::<_, f32>(0, 1, &shape, &key, stream).unwrap();
         let input = AlibiInput::from(&x);
-        let y = alibi.forward(input).unwrap();
+        let y = alibi.forward(input, stream).unwrap();
         assert_eq!(y.shape(), shape);
         assert_eq!(y.dtype(), Dtype::Float32);
 
-        let x2 = x.as_dtype(Dtype::Float16).unwrap();
+        let x2 = x.as_dtype(Dtype::Float16, stream).unwrap();
         let input = AlibiInput::from(&x2);
-        let y = alibi.forward(input).unwrap();
+        let y = alibi.forward(input, stream).unwrap();
         assert_eq!(y.dtype(), Dtype::Float16);
     }
 }

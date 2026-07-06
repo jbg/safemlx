@@ -780,6 +780,7 @@ fn gather_nd<'a>(
     stream: impl AsRef<Stream>,
 ) -> Result<(usize, Array)> {
     use ArrayIndexOp::*;
+    let stream = stream.as_ref();
 
     let mut max_dims = 0;
     let mut slice_count = 0;
@@ -844,12 +845,12 @@ fn gather_nd<'a>(
                 if is_slice[i] {
                     let mut new_shape = vec![1; max_dims + slice_count];
                     new_shape[max_dims + slice_index] = item.dim(0);
-                    *item = GatherIndexItem::Owned(item.reshape(&new_shape)?);
+                    *item = GatherIndexItem::Owned(item.reshape(&new_shape, stream)?);
                     slice_index += 1;
                 } else {
                     let mut new_shape = item.shape().to_vec();
                     new_shape.extend((0..slice_count).map(|_| 1));
-                    *item = GatherIndexItem::Owned(item.reshape(&new_shape)?);
+                    *item = GatherIndexItem::Owned(item.reshape(&new_shape, stream)?);
                 }
             }
         }
@@ -858,7 +859,7 @@ fn gather_nd<'a>(
         for (i, item) in gather_indices[..slice_count].iter_mut().enumerate() {
             let mut new_shape = vec![1; max_dims + slice_count];
             new_shape[i] = item.dim(0);
-            *item = GatherIndexItem::Owned(item.reshape(&new_shape)?);
+            *item = GatherIndexItem::Owned(item.reshape(&new_shape, stream)?);
         }
     }
 
@@ -888,7 +889,7 @@ fn gather_nd<'a>(
         .chain(gathered_shape[(max_dims + slice_count + operation_len)..].iter())
         .copied()
         .collect();
-    let result = gathered.reshape(&output_shape)?;
+    let result = gathered.reshape(&output_shape, stream)?;
 
     Ok((max_dims, result))
 }
@@ -896,7 +897,7 @@ fn gather_nd<'a>(
 #[inline]
 fn get_item_index(src: &Array, index: i32, axis: i32, stream: impl AsRef<Stream>) -> Result<Array> {
     let index = resolve_index_unchecked(index, src.dim(axis) as usize) as i32;
-    src.take_axis_device(array!(index), axis, stream)
+    src.take_axis(array!(index), axis, stream)
 }
 
 #[inline]
@@ -906,7 +907,7 @@ fn get_item_array(
     axis: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    src.take_axis_device(indices, axis, stream)
+    src.take_axis(indices, axis, stream)
 }
 
 #[inline]
@@ -933,13 +934,14 @@ fn get_item<'a>(
 ) -> Result<Array> {
     use ArrayIndexOp::*;
 
+    let stream = stream.as_ref();
     match index.index_op() {
-        Ellipsis => Ok(src.deep_clone()),
+        Ellipsis => src.clone().deep_clone(),
         TakeIndex { index } => get_item_index(src, index, 0, stream),
         TakeArray { indices } => get_item_array(src, &indices, 0, stream),
         TakeArrayRef { indices } => get_item_array(src, indices, 0, stream),
         Slice(range) => get_item_slice(src, range, stream),
-        ExpandDims => src.expand_dims_device(0, stream),
+        ExpandDims => src.expand_dims(0, stream),
     }
 }
 
@@ -951,6 +953,7 @@ fn get_item_nd(
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
     use ArrayIndexOp::*;
+    let stream = stream.as_ref();
 
     let mut src = Cow::Borrowed(src);
 
@@ -1110,7 +1113,7 @@ fn get_item_nd(
         }
         new_shape.extend(src.shape()[(axis_ as usize)..].iter().cloned());
 
-        src = Cow::Owned(src.reshape(&new_shape)?);
+        src = Cow::Owned(src.reshape(&new_shape, stream)?);
     }
 
     Ok(src.into_owned())
@@ -1130,57 +1133,61 @@ mod tests {
 
     #[test]
     fn test_array_index_negative_int() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..8, &[8]);
 
-        let s = a.index(-1);
+        let s = a.index_device(-1, stream);
 
         assert_eq!(s.ndim(), 0);
-        assert_eq!(s.item::<i32>(), 7);
+        assert_eq!(s.item::<i32>(&stream), 7);
 
-        let s = a.index(-8);
+        let s = a.index_device(-8, stream);
 
         assert_eq!(s.ndim(), 0);
-        assert_eq!(s.item::<i32>(), 0);
+        assert_eq!(s.item::<i32>(&stream), 0);
     }
 
     #[test]
     fn test_array_index_new_axis() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0..60, &[3, 4, 5]);
-        let s = a.index(NewAxis);
+        let s = a.index_device(NewAxis, stream);
 
         assert_eq!(s.ndim(), 4);
         assert_eq!(s.shape(), &[1, 3, 4, 5]);
 
         let expected = Array::from_iter(0..60, &[1, 3, 4, 5]);
-        assert_array_eq!(s, expected, 0.01);
+        assert_array_eq!(s, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_index_ellipsis() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..8, &[2, 2, 2]);
 
-        let s1 = a.index((.., .., 0));
+        let s1 = a.index_device((.., .., 0), stream);
         let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
-        assert_array_eq!(s1, expected, 0.01);
+        assert_array_eq!(s1, expected, 0.01, stream = stream);
 
-        let s2 = a.index((Ellipsis, 0));
+        let s2 = a.index_device((Ellipsis, 0), stream);
 
         let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
-        assert_array_eq!(s2, expected, 0.01);
+        assert_array_eq!(s2, expected, 0.01, stream = stream);
 
-        let s3 = a.index(Ellipsis);
+        let s3 = a.index_device(Ellipsis, stream);
 
         let expected = Array::from_iter(0i32..8, &[2, 2, 2]);
-        assert_array_eq!(s3, expected, 0.01);
+        assert_array_eq!(s3, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_index_stride() {
+        let stream = crate::test_stream();
         let arr = Array::from_iter(0..10, &[10]);
-        let s = arr.index((2..8).stride_by(2));
+        let s = arr.index_device((2..8).stride_by(2), stream);
 
         let expected = Array::from_slice(&[2, 4, 6], &[3]);
-        assert_array_eq!(s, expected, 0.01);
+        assert_array_eq!(s, expected, 0.01, stream = stream);
     }
 
     // The unit tests below are ported from the swift binding.
@@ -1188,53 +1195,56 @@ mod tests {
 
     #[test]
     fn test_array_subscript_int() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..512, &[8, 8, 8]);
 
-        let s = a.index(1);
+        let s = a.index_device(1, stream);
 
         assert_eq!(s.ndim(), 2);
         assert_eq!(s.shape(), &[8, 8]);
 
         let expected = Array::from_iter(64..128, &[8, 8]);
-        assert_array_eq!(s, expected, 0.01);
+        assert_array_eq!(s, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_subscript_int_array() {
+        let stream = crate::test_stream();
         // squeeze output dimensions as needed
         let a = Array::from_iter(0i32..512, &[8, 8, 8]);
 
-        let s1 = a.index((1, 2));
+        let s1 = a.index_device((1, 2), stream);
 
         assert_eq!(s1.ndim(), 1);
         assert_eq!(s1.shape(), &[8]);
 
         let expected = Array::from_iter(80..88, &[8]);
-        assert_array_eq!(s1, expected, 0.01);
+        assert_array_eq!(s1, expected, 0.01, stream = stream);
 
-        let s2 = a.index((1, 2, 3));
+        let s2 = a.index_device((1, 2, 3), stream);
 
         assert_eq!(s2.ndim(), 0);
         assert!(s2.shape().is_empty());
-        assert_eq!(s2.item::<i32>(), 64 + 2 * 8 + 3);
+        assert_eq!(s2.item::<i32>(&stream), 64 + 2 * 8 + 3);
     }
 
     #[test]
     fn test_array_subscript_int_array_2() {
+        let stream = crate::test_stream();
         // last dimension should not be squeezed
         let a = Array::from_iter(0i32..512, &[8, 8, 8, 1]);
 
-        let s = a.index(1);
+        let s = a.index_device(1, stream);
 
         assert_eq!(s.ndim(), 3);
         assert_eq!(s.shape(), &[8, 8, 1]);
 
-        let s1 = a.index((1, 2));
+        let s1 = a.index_device((1, 2), stream);
 
         assert_eq!(s1.ndim(), 2);
         assert_eq!(s1.shape(), &[8, 1]);
 
-        let s2 = a.index((1, 2, 3));
+        let s2 = a.index_device((1, 2, 3), stream);
 
         assert_eq!(s2.ndim(), 1);
         assert_eq!(s2.shape(), &[1]);
@@ -1242,35 +1252,37 @@ mod tests {
 
     #[test]
     fn test_array_subscript_from_end() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..12, &[3, 4]);
 
-        let s = a.index((-1, -2));
+        let s = a.index_device((-1, -2), stream);
 
         assert_eq!(s.ndim(), 0);
-        assert_eq!(s.item::<i32>(), 10);
+        assert_eq!(s.item::<i32>(&stream), 10);
     }
 
     #[test]
     fn test_array_subscript_range() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..512, &[8, 8, 8]);
 
-        let s1 = a.index(1..3);
+        let s1 = a.index_device(1..3, stream);
 
         assert_eq!(s1.ndim(), 3);
         assert_eq!(s1.shape(), &[2, 8, 8]);
         let expected = Array::from_iter(64..192, &[2, 8, 8]);
-        assert_array_eq!(s1, expected, 0.01);
+        assert_array_eq!(s1, expected, 0.01, stream = stream);
 
         // even though the first dimension is 1 we do not squeeze it
-        let s2 = a.index(1..=1);
+        let s2 = a.index_device(1..=1, stream);
 
         assert_eq!(s2.ndim(), 3);
         assert_eq!(s2.shape(), &[1, 8, 8]);
         let expected = Array::from_iter(64..128, &[1, 8, 8]);
-        assert_array_eq!(s2, expected, 0.01);
+        assert_array_eq!(s2, expected, 0.01, stream = stream);
 
         // multiple ranges, resolving RangeExpressions vs the dimensions
-        let s3 = a.index((1..2, ..3, 3..));
+        let s3 = a.index_device((1..2, ..3, 3..), stream);
 
         assert_eq!(s3.ndim(), 3);
         assert_eq!(s3.shape(), &[1, 3, 5]);
@@ -1278,9 +1290,9 @@ mod tests {
             &[67, 68, 69, 70, 71, 75, 76, 77, 78, 79, 83, 84, 85, 86, 87],
             &[1, 3, 5],
         );
-        assert_array_eq!(s3, expected, 0.01);
+        assert_array_eq!(s3, expected, 0.01, stream = stream);
 
-        let s4 = a.index((-2..-1, ..-3, -3..));
+        let s4 = a.index_device((-2..-1, ..-3, -3..), stream);
 
         assert_eq!(s4.ndim(), 3);
         assert_eq!(s4.shape(), &[1, 5, 3]);
@@ -1290,163 +1302,205 @@ mod tests {
             ],
             &[1, 5, 3],
         );
-        assert_array_eq!(s4, expected, 0.01);
+        assert_array_eq!(s4, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_subscript_advanced() {
+        let stream = crate::test_stream();
         // advanced subscript examples taken from
         // https://numpy.org/doc/stable/user/basics.indexing.html#integer-array-indexing
 
-        let a = Array::from_iter(0..35, &[5, 7]).as_type::<i32>().unwrap();
+        let a = Array::from_iter(0..35, &[5, 7])
+            .as_type::<i32>(stream)
+            .unwrap();
 
         let i1 = Array::from_slice(&[0, 2, 4], &[3]);
         let i2 = Array::from_slice(&[0, 1, 2], &[3]);
 
-        let s1 = a.index((i1, i2));
+        let s1 = a.index_device((i1, i2), stream);
 
         assert_eq!(s1.ndim(), 1);
         assert_eq!(s1.shape(), &[3]);
 
         let expected = Array::from_slice(&[0i32, 15, 30], &[3]);
-        assert_array_eq!(s1, expected, 0.01);
+        assert_array_eq!(s1, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_subscript_advanced_with_ref() {
-        let a = Array::from_iter(0..35, &[5, 7]).as_type::<i32>().unwrap();
+        let stream = crate::test_stream();
+        let a = Array::from_iter(0..35, &[5, 7])
+            .as_type::<i32>(stream)
+            .unwrap();
 
         let i1 = Array::from_slice(&[0, 2, 4], &[3]);
         let i2 = Array::from_slice(&[0, 1, 2], &[3]);
 
-        let s1 = a.index((i1, &i2));
+        let s1 = a.index_device((i1, &i2), stream);
 
         assert_eq!(s1.ndim(), 1);
         assert_eq!(s1.shape(), &[3]);
 
         let expected = Array::from_slice(&[0i32, 15, 30], &[3]);
-        assert_array_eq!(s1, expected, 0.01);
+        assert_array_eq!(s1, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_subscript_advanced_2() {
-        let a = Array::from_iter(0..12, &[6, 2]).as_type::<i32>().unwrap();
+        let stream = crate::test_stream();
+        let a = Array::from_iter(0..12, &[6, 2])
+            .as_type::<i32>(stream)
+            .unwrap();
 
         let i1 = Array::from_slice(&[0, 2, 4], &[3]);
-        let s2 = a.index(i1);
+        let s2 = a.index_device(i1, stream);
 
         let expected = Array::from_slice(&[0i32, 1, 4, 5, 8, 9], &[3, 2]);
-        assert_array_eq!(s2, expected, 0.01);
+        assert_array_eq!(s2, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_collection() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0i32..20, &[2, 2, 5]);
 
         // enumerate "rows"
         for i in 0..2 {
-            let row = a.index(i);
+            let row = a.index_device(i, stream);
             let expected = Array::from_iter((i * 10)..(i * 10 + 10), &[2, 5]);
-            assert_array_all_close!(row, expected);
+            assert_array_all_close!(row, expected, stream = stream);
         }
     }
 
     #[test]
     fn test_array_subscript_advanced_2d() {
-        let a = Array::from_iter(0..12, &[4, 3]).as_type::<i32>().unwrap();
+        let stream = crate::test_stream();
+        let a = Array::from_iter(0..12, &[4, 3])
+            .as_type::<i32>(stream)
+            .unwrap();
 
         let rows = Array::from_slice(&[0, 0, 3, 3], &[2, 2]);
         let cols = Array::from_slice(&[0, 2, 0, 2], &[2, 2]);
 
-        let s = a.index((rows, cols));
+        let s = a.index_device((rows, cols), stream);
 
         let expected = Array::from_slice(&[0, 2, 9, 11], &[2, 2]);
-        assert_array_eq!(s, expected, 0.01);
+        assert_array_eq!(s, expected, 0.01, stream = stream);
     }
 
     #[test]
     fn test_array_subscript_advanced_2d_2() {
-        let a = Array::from_iter(0..12, &[4, 3]).as_type::<i32>().unwrap();
+        let stream = crate::test_stream();
+        let a = Array::from_iter(0..12, &[4, 3])
+            .as_type::<i32>(stream)
+            .unwrap();
 
         let rows = Array::from_slice(&[0, 3], &[2, 1]);
         let cols = Array::from_slice(&[0, 2], &[2]);
 
-        let s = a.index((rows, cols));
+        let s = a.index_device((rows, cols), stream);
 
         let expected = Array::from_slice(&[0, 2, 9, 11], &[2, 2]);
-        assert_array_eq!(s, expected, 0.01);
+        assert_array_eq!(s, expected, 0.01, stream = stream);
     }
 
-    fn check(result: impl AsRef<Array>, shape: &[i32], expected_sum: i32) {
+    fn check(result: impl AsRef<Array>, shape: &[i32], expected_sum: i32, stream: &crate::Stream) {
         let result = result.as_ref();
         assert_eq!(result.shape(), shape);
 
-        let sum = result.sum(None).unwrap();
+        let sum = result.sum(None, stream).unwrap();
 
-        assert_eq!(sum.item::<i32>(), expected_sum);
+        assert_eq!(sum.item::<i32>(&stream), expected_sum);
     }
 
     #[test]
     fn test_full_index_read_single() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0..60, &[3, 4, 5]);
 
         // a[...]
-        check(a.index(Ellipsis), &[3, 4, 5], 1770);
+        check(a.index_device(Ellipsis, stream), &[3, 4, 5], 1770, stream);
 
         // a[None]
-        check(a.index(NewAxis), &[1, 3, 4, 5], 1770);
+        check(a.index_device(NewAxis, stream), &[1, 3, 4, 5], 1770, stream);
 
         // a[0]
-        check(a.index(0), &[4, 5], 190);
+        check(a.index_device(0, stream), &[4, 5], 190, stream);
 
         // a[1:3]
-        check(a.index(1..3), &[2, 4, 5], 1580);
+        check(a.index_device(1..3, stream), &[2, 4, 5], 1580, stream);
 
         // i = mx.array([2, 1])
         let i = Array::from_slice(&[2, 1], &[2]);
 
         // a[i]
-        check(a.index(i), &[2, 4, 5], 1580);
+        check(a.index_device(i, stream), &[2, 4, 5], 1580, stream);
     }
 
     #[test]
     fn test_full_index_read_no_array() {
+        let stream = crate::test_stream();
         let a = Array::from_iter(0..360, &[2, 3, 4, 5, 3]);
 
         // a[..., 0]
-        check(a.index((Ellipsis, 0)), &[2, 3, 4, 5], 21420);
+        check(
+            a.index_device((Ellipsis, 0), stream),
+            &[2, 3, 4, 5],
+            21420,
+            stream,
+        );
 
         // a[0, ...]
-        check(a.index((0, Ellipsis)), &[3, 4, 5, 3], 16110);
+        check(
+            a.index_device((0, Ellipsis), stream),
+            &[3, 4, 5, 3],
+            16110,
+            stream,
+        );
 
         // a[0, ..., 0]
-        check(a.index((0, Ellipsis, 0)), &[3, 4, 5], 5310);
+        check(
+            a.index_device((0, Ellipsis, 0), stream),
+            &[3, 4, 5],
+            5310,
+            stream,
+        );
 
         // a[..., ::2, :]
-        let result = a.index((Ellipsis, (..).stride_by(2), ..));
-        check(result, &[2, 3, 4, 3, 3], 38772);
+        let result = a.index_device((Ellipsis, (..).stride_by(2), ..), stream);
+        check(result, &[2, 3, 4, 3, 3], 38772, stream);
 
         // a[..., None, ::2, -1]
-        let result = a.index((Ellipsis, NewAxis, (..).stride_by(2), -1));
-        check(result, &[2, 3, 4, 1, 3], 12996);
+        let result = a.index_device((Ellipsis, NewAxis, (..).stride_by(2), -1), stream);
+        check(result, &[2, 3, 4, 1, 3], 12996, stream);
 
         // a[:, 2:, 0]
-        check(a.index((.., 2.., 0)), &[2, 1, 5, 3], 6510);
+        check(
+            a.index_device((.., 2.., 0), stream),
+            &[2, 1, 5, 3],
+            6510,
+            stream,
+        );
 
         // a[::-1, :2, 2:, ..., None, ::2]
-        let result = a.index((
-            (..).stride_by(-1),
-            ..2,
-            2..,
-            Ellipsis,
-            NewAxis,
-            (..).stride_by(2),
-        ));
-        check(result, &[2, 2, 2, 5, 1, 2], 13160);
+        let result = a.index_device(
+            (
+                (..).stride_by(-1),
+                ..2,
+                2..,
+                Ellipsis,
+                NewAxis,
+                (..).stride_by(2),
+            ),
+            stream,
+        );
+        check(result, &[2, 2, 2, 5, 1, 2], 13160, stream);
     }
 
     #[test]
     fn test_full_index_read_array() {
+        let stream = crate::test_stream();
         // these have an `Array` as a source of indices and go through the gather path
 
         // a = mx.arange(540).reshape(3, 3, 4, 5, 3)
@@ -1456,40 +1510,68 @@ mod tests {
         let i = Array::from_slice(&[2, 1], &[2]);
 
         // a[0, i]
-        check(a.index((0, &i)), &[2, 4, 5, 3], 14340);
+        check(
+            a.index_device((0, &i), stream),
+            &[2, 4, 5, 3],
+            14340,
+            stream,
+        );
 
         // a[..., i, 0]
-        check(a.index((Ellipsis, &i, 0)), &[3, 3, 4, 2], 19224);
+        check(
+            a.index_device((Ellipsis, &i, 0), stream),
+            &[3, 3, 4, 2],
+            19224,
+            stream,
+        );
 
         // a[i, 0, ...]
-        check(a.index((&i, 0, Ellipsis)), &[2, 4, 5, 3], 35940);
+        check(
+            a.index_device((&i, 0, Ellipsis), stream),
+            &[2, 4, 5, 3],
+            35940,
+            stream,
+        );
 
         // gatherFirst path
         // a[i, ..., i]
-        check(a.index((&i, Ellipsis, &i)), &[2, 3, 4, 5], 43200);
+        check(
+            a.index_device((&i, Ellipsis, &i), stream),
+            &[2, 3, 4, 5],
+            43200,
+            stream,
+        );
 
         // a[i, ..., ::2, :]
-        let result = a.index((&i, Ellipsis, (..).stride_by(2), ..));
-        check(result, &[2, 3, 4, 3, 3], 77652);
+        let result = a.index_device((&i, Ellipsis, (..).stride_by(2), ..), stream);
+        check(result, &[2, 3, 4, 3, 3], 77652, stream);
 
         // gatherFirst path
         // a[..., i, None, ::2, -1]
-        let result = a.index((Ellipsis, &i, NewAxis, (..).stride_by(2), -1));
-        check(result, &[2, 3, 3, 1, 3], 14607);
+        let result = a.index_device((Ellipsis, &i, NewAxis, (..).stride_by(2), -1), stream);
+        check(result, &[2, 3, 3, 1, 3], 14607, stream);
 
         // a[:, 2:, i]
-        check(a.index((.., 2.., &i)), &[3, 1, 2, 5, 3], 29655);
+        check(
+            a.index_device((.., 2.., &i), stream),
+            &[3, 1, 2, 5, 3],
+            29655,
+            stream,
+        );
 
         // a[::-1, :2, i, 2:, ..., None, ::2]
-        let result = a.index((
-            (..).stride_by(-1),
-            ..2,
-            i,
-            2..,
-            Ellipsis,
-            NewAxis,
-            (..).stride_by(2),
-        ));
-        check(result, &[3, 2, 2, 3, 1, 2], 17460);
+        let result = a.index_device(
+            (
+                (..).stride_by(-1),
+                ..2,
+                i,
+                2..,
+                Ellipsis,
+                NewAxis,
+                (..).stride_by(2),
+            ),
+            stream,
+        );
+        check(result, &[3, 2, 2, 3, 1, 2], 17460, stream);
     }
 }

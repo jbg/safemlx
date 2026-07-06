@@ -14,7 +14,7 @@ use crate::{
     error::{IoError, UnflattenError},
     module::{FlattenedModuleParam, ModuleParameters},
     utils::Updatable,
-    Array,
+    Array, Stream,
 };
 
 mod adadelta;
@@ -88,6 +88,7 @@ pub trait OptimizerState: Sized {
     }
 
     /// Load the optimizer state from a safetensors file.
+    #[cfg(feature = "safetensors")]
     fn load_safetensors(&mut self, path: impl AsRef<Path>) -> Result<(), IoError> {
         let loaded = Array::load_safetensors(path)?;
         let unflattened = Self::unflatten(loaded).map_err(Into::into)?;
@@ -195,6 +196,7 @@ pub trait Optimizer: Updatable {
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()>;
 
     /// Apply the gradients to the parameters of the model and update the model with the new
@@ -203,6 +205,7 @@ pub trait Optimizer: Updatable {
         &mut self,
         model: &mut M,
         gradients: impl Borrow<FlattenedModuleParam>,
+        stream: &Stream,
     ) -> crate::error::Result<()>
     where
         M: ModuleParameters,
@@ -211,7 +214,7 @@ pub trait Optimizer: Updatable {
 
         for (key, gradient) in gradients.borrow().iter() {
             if let Some(parameter) = parameters.get_mut(key) {
-                self.update_single(key, gradient, parameter)?;
+                self.update_single(key, gradient, parameter, stream)?;
             }
         }
 
@@ -227,28 +230,30 @@ pub type MaybeClippedGrads<'a> = HashMap<Rc<str>, Cow<'a, Array>>;
 /// This function ensures that the global norm of the gradients does not exceed
 /// `max_norm`. It scales down the gradients proportionally if their norm is
 /// greater than `max_norm`.
-pub fn clip_grad_norm(
-    gradients: &FlattenedModuleParam,
+pub fn clip_grad_norm<'a>(
+    gradients: &'a FlattenedModuleParam,
     max_norm: f32,
-) -> crate::error::Result<(MaybeClippedGrads<'_>, f32)> {
+    stream: &Stream,
+) -> crate::error::Result<(MaybeClippedGrads<'a>, f32)> {
     let total_norm: f32 = gradients
         .values()
-        .try_fold(array!(0.0), |acc, grad| acc.add(&grad.square()?.sum(None)?))?
-        .sqrt()?
-        .item();
+        .try_fold(array!(0.0), |acc, grad| {
+            let grad_norm = grad.square(stream)?.sum(None, stream)?;
+            acc.add(&grad_norm, stream)
+        })?
+        .sqrt(stream)?
+        .item(stream);
     let normalizer = array!(max_norm / (total_norm + 1e-6));
 
-    let clipped_gradients: HashMap<_, _> = gradients
-        .iter()
-        .map(|(key, grad)| {
-            let clipped_grad = if total_norm < max_norm {
-                Cow::Borrowed(grad)
-            } else {
-                Cow::Owned(grad * &normalizer)
-            };
-            (key.clone(), clipped_grad)
-        })
-        .collect();
+    let mut clipped_gradients = HashMap::with_capacity(gradients.len());
+    for (key, grad) in gradients {
+        let clipped_grad = if total_norm < max_norm {
+            Cow::Borrowed(grad)
+        } else {
+            Cow::Owned(grad.multiply(&normalizer, stream)?)
+        };
+        clipped_gradients.insert(key.clone(), clipped_grad);
+    }
     Ok((clipped_gradients, total_norm))
 }
 
@@ -256,12 +261,13 @@ pub fn clip_grad_norm(
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{array, module::FlattenedModuleParam, Array};
+    use crate::{array, module::FlattenedModuleParam};
 
     use super::clip_grad_norm;
 
     #[test]
     fn test_clip_grad_norm() {
+        let stream = crate::test_stream();
         // Test with small gradients that do not require clipping
         let mut small_grads: FlattenedModuleParam = HashMap::new();
         small_grads.insert("first.a".into(), array!([0.1, 0.2]));
@@ -270,9 +276,9 @@ mod tests {
 
         let max_norm = 10.0;
 
-        let (clipped_grads, _) = clip_grad_norm(&small_grads, max_norm).unwrap();
+        let (clipped_grads, _) = clip_grad_norm(&small_grads, max_norm, stream).unwrap();
         for (key, value) in small_grads.iter() {
-            assert_eq!(&*clipped_grads[key], value);
+            assert!(crate::array::eval_equal_values(&*clipped_grads[key], value));
         }
 
         // Test with large gradients that require clipping
@@ -283,25 +289,33 @@ mod tests {
 
         let max_norm = 1.0;
 
-        let (clipped_grads, total_norm) = clip_grad_norm(&large_grads, max_norm).unwrap();
+        let (clipped_grads, total_norm) = clip_grad_norm(&large_grads, max_norm, stream).unwrap();
         let clipped_values: Vec<_> = clipped_grads.values().map(|v| v.as_ref()).collect();
         let norm_of_clipped = clipped_values
             .into_iter()
-            .map(|g| g.square().unwrap().sum(None).unwrap())
-            .sum::<Array>()
-            .sqrt()
+            .try_fold(array!(0.0), |acc, g| {
+                let squared_sum = g.square(stream)?.sum(None, stream)?;
+                acc.add(&squared_sum, stream)
+            })
+            .unwrap()
+            .sqrt(stream)
             .unwrap();
 
-        float_eq::assert_float_eq!(norm_of_clipped.item::<f32>(), max_norm, abs <= 1e-6);
+        float_eq::assert_float_eq!(norm_of_clipped.item::<f32>(&stream), max_norm, abs <= 1e-6);
 
         // Ensures that the scaling was done correctly
         let scale = max_norm / total_norm;
         let expected_grads: FlattenedModuleParam = large_grads
             .iter()
-            .map(|(key, value)| (key.clone(), value * scale))
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value.multiply(array!(scale), stream).unwrap().into(),
+                )
+            })
             .collect();
         for (key, value) in expected_grads.iter() {
-            assert_eq!(&*clipped_grads[key], value);
+            assert!(crate::array::eval_equal_values(&*clipped_grads[key], value));
         }
     }
 }

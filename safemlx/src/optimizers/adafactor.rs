@@ -14,17 +14,23 @@ use crate::{
 
 use super::*;
 
-fn rms(inputs: &Array) -> crate::error::Result<Array> {
-    sqrt(&mean(&square(inputs)?, None)?)
+fn rms(inputs: &Array, stream: &Stream) -> crate::error::Result<Array> {
+    sqrt(&mean(&square(inputs, stream)?, None, stream)?, stream)
 }
 
 fn approvate_exp_moving_avg(
     exp_avg_sq_row: &Array,
     exp_avg_sq_col: &Array,
+    stream: &Stream,
 ) -> crate::error::Result<Array> {
-    let rfactor = rsqrt(&exp_avg_sq_row.divide(&mean_axes(exp_avg_sq_row, &[-1], true)?)?)?;
-    let cfactor = rsqrt(exp_avg_sq_col)?;
-    matmul(&rfactor.expand_dims(-1)?, &cfactor.expand_dims(0)?)
+    let row_mean = mean_axes(exp_avg_sq_row, &[-1], true, stream)?;
+    let rfactor = rsqrt(&exp_avg_sq_row.divide(&row_mean, stream)?, stream)?;
+    let cfactor = rsqrt(exp_avg_sq_col, stream)?;
+    matmul(
+        &rfactor.expand_dims(-1, stream)?,
+        &cfactor.expand_dims(0, stream)?,
+        stream,
+    )
 }
 
 /// Type alias for the epsilon values used in Adafactor builder
@@ -135,7 +141,7 @@ impl AdafactorState {
     /// Default value for `step`
     pub const DEFAULT_STEP: i32 = 0;
 
-    fn new(parameter: &Array, beta1_is_some: bool) -> crate::error::Result<Self> {
+    fn new(parameter: &Array, beta1_is_some: bool, stream: &Stream) -> crate::error::Result<Self> {
         let step = array!(Self::DEFAULT_STEP);
         let mut exp_avg_sq_row = None;
         let mut exp_avg_sq_col = None;
@@ -147,17 +153,17 @@ impl AdafactorState {
             let dtype = parameter.dtype();
 
             let row_shape = &shape[..shape.len() - 1];
-            exp_avg_sq_row = Some(zeros_dtype(row_shape, dtype)?);
+            exp_avg_sq_row = Some(zeros_dtype(row_shape, dtype, stream)?);
 
             let mut col_shape = shape[..shape.len() - 2].to_vec();
             col_shape.push(*shape.last().unwrap());
-            exp_avg_sq_col = Some(zeros_dtype(&col_shape, dtype)?);
+            exp_avg_sq_col = Some(zeros_dtype(&col_shape, dtype, stream)?);
         } else {
-            exp_avg_sq = Some(zeros_like(parameter)?);
+            exp_avg_sq = Some(zeros_like(parameter, stream)?);
         };
 
         if beta1_is_some {
-            exp_avg = Some(zeros_like(parameter)?);
+            exp_avg = Some(zeros_like(parameter, stream)?);
         }
 
         Ok(Self {
@@ -322,27 +328,29 @@ fn compute_lr(
     eps: &(Array, Array),
     step: &Array,
     parameter_rms: &Array,
+    stream: &Stream,
 ) -> crate::error::Result<Array> {
     let relative_step_size = if relative_step {
         let min_step = if warmup_init {
-            // SAFETY: `step` is a single-element array and won't panic.
-            array!(1e-6) * step
+            array!(1e-6).multiply(step, stream)?
         } else {
             array!(1e-2)
         };
-        // SAFETY: `step` is a single-element array and won't panic.
-        minimum(min_step, array!(1.0) / sqrt(step)?)?
+        minimum(
+            min_step,
+            array!(1.0).divide(sqrt(step, stream)?, stream)?,
+            stream,
+        )?
     } else {
-        // SAFETY: This is already checked in the `build` stage.
         array!(lr.expect("The learning rate should be set if the relative step is not enabled"))
     };
 
     let mut parameter_scale = array!(1.0);
     if scale_parameter {
-        parameter_scale = maximum(&eps.1, parameter_rms)?;
+        parameter_scale = maximum(&eps.1, parameter_rms, stream)?;
     }
 
-    parameter_scale.multiply(relative_step_size)
+    parameter_scale.multiply(relative_step_size, stream)
 }
 
 impl Optimizer for Adafactor {
@@ -361,19 +369,20 @@ impl Optimizer for Adafactor {
         key: &std::rc::Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
+        stream: &Stream,
     ) -> crate::error::Result<()> {
         let beta1_is_some = self.beta1.is_some();
         let state = get_mut_or_insert_with(&mut self.state, key, || {
-            AdafactorState::new(parameter, beta1_is_some)
+            AdafactorState::new(parameter, beta1_is_some, stream)
         })?;
 
-        state.step = state.step.add(array!(1))?;
+        state.step = state.step.add(array!(1), stream)?;
 
         let gradient_shape = gradient.shape();
         let factored = gradient_shape.len() >= 2;
         let step = &state.step;
 
-        let parameter_rms = rms(parameter)?;
+        let parameter_rms = rms(parameter, stream)?;
         let lr = compute_lr(
             self.relative_step,
             self.warmup_init,
@@ -382,60 +391,69 @@ impl Optimizer for Adafactor {
             &self.eps,
             step,
             &parameter_rms,
+            stream,
         )?;
-        let beta2 = array!(1.0).subtract(&step.power(&self.decay_rate)?)?;
+        let beta2 = array!(1.0).subtract(&step.power(&self.decay_rate, stream)?, stream)?;
 
-        let mut update: Cow<Array> = Cow::Owned(gradient.square()?.add(&self.eps.0)?);
+        let mut update: Cow<Array> = Cow::Owned(gradient.square(stream)?.add(&self.eps.0, stream)?);
 
-        let one_minus_beta2 = array!(1.0).subtract(&beta2)?;
+        let one_minus_beta2 = array!(1.0).subtract(&beta2, stream)?;
         if factored {
             // SAFETY: These fields are created in the `new` when ndim >= 2 and won't panic.
             let exp_avg_sq_row = state.exp_avg_sq_row.as_mut().unwrap();
             let exp_avg_sq_col = state.exp_avg_sq_col.as_mut().unwrap();
 
-            *exp_avg_sq_row = beta2
-                .multiply(&*exp_avg_sq_row)?
-                .add(&one_minus_beta2.multiply(&update.mean_axes(&[-1], None)?)?)?;
-            *exp_avg_sq_col = beta2
-                .multiply(&*exp_avg_sq_col)?
-                .add(&one_minus_beta2.multiply(&update.mean_axes(&[-2], None)?)?)?;
+            *exp_avg_sq_row = beta2.multiply(&*exp_avg_sq_row, stream)?.add(
+                &one_minus_beta2.multiply(&update.mean_axes(&[-1], None, stream)?, stream)?,
+                stream,
+            )?;
+            *exp_avg_sq_col = beta2.multiply(&*exp_avg_sq_col, stream)?.add(
+                &one_minus_beta2.multiply(&update.mean_axes(&[-2], None, stream)?, stream)?,
+                stream,
+            )?;
 
             update = Cow::Owned(approvate_exp_moving_avg(
                 &*exp_avg_sq_row,
                 &*exp_avg_sq_col,
+                stream,
             )?);
-            update = Cow::Owned(update.multiply(gradient)?);
+            update = Cow::Owned(update.multiply(gradient, stream)?);
         } else {
             // SAFETY: This field is created in the `new` when ndim < 2 and won't panic.
             let exp_avg_sq = state.exp_avg_sq.as_mut().unwrap();
 
             *exp_avg_sq = beta2
-                .multiply(&*exp_avg_sq)?
-                .add(&one_minus_beta2.multiply(&update)?)?;
-            update = Cow::Owned(rsqrt(&*exp_avg_sq)?.multiply(gradient)?);
+                .multiply(&*exp_avg_sq, stream)?
+                .add(&one_minus_beta2.multiply(&update, stream)?, stream)?;
+            update = Cow::Owned(rsqrt(&*exp_avg_sq, stream)?.multiply(gradient, stream)?);
         }
 
-        let update_rms = rms(&update)?;
-        let max = maximum(array!(1.0), update_rms.divide(&self.clip_threshold)?)?;
-        update = Cow::Owned(update.divide(max)?);
-        update = Cow::Owned(lr.multiply(update)?);
+        let update_rms = rms(&update, stream)?;
+        let max = maximum(
+            array!(1.0),
+            update_rms.divide(&self.clip_threshold, stream)?,
+            stream,
+        )?;
+        update = Cow::Owned(update.divide(max, stream)?);
+        update = Cow::Owned(lr.multiply(update, stream)?);
 
         if let Some(beta1) = &self.beta1 {
             // SAFETY: This field is created in the `new` when beta1 is set and won't panic.
             let exp_avg = state.exp_avg.as_mut().unwrap();
-            let one_minus_beta1 = array!(1.0).subtract(beta1)?;
+            let one_minus_beta1 = array!(1.0).subtract(beta1, stream)?;
             *exp_avg = beta1
-                .multiply(&*exp_avg)?
-                .add(&one_minus_beta1.multiply(&update)?)?;
+                .multiply(&*exp_avg, stream)?
+                .add(&one_minus_beta1.multiply(&update, stream)?, stream)?;
             update = Cow::Borrowed(&*exp_avg);
         }
 
         if self.weight_decay != 0.0 {
-            let rhs = parameter.multiply(array!(-self.weight_decay).multiply(lr)?)?;
-            *parameter = parameter.add(rhs)?;
+            let rhs =
+                parameter.multiply(array!(-self.weight_decay).multiply(lr, stream)?, stream)?;
+            *parameter = parameter.add(rhs, stream)?;
         }
 
-        *parameter = parameter.subtract(&update)?;
+        *parameter = parameter.subtract(&update, stream)?;
 
         Ok(())
     }

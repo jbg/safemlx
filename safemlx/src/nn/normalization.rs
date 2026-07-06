@@ -4,19 +4,26 @@ use crate::{
     array,
     error::Exception,
     module::{Module, Param},
-    ops::{ones, rsqrt, zeros},
+    ops::rsqrt,
     Array,
 };
 use safemlx_internal_macros::{Buildable, Builder};
 use safemlx_macros::ModuleParameters;
 
-fn instance_norm(x: &Array, axes: &[i32], eps: &Array) -> Result<Array, Exception> {
+fn instance_norm(
+    x: &Array,
+    axes: &[i32],
+    eps: &Array,
+    stream: &crate::Stream,
+) -> Result<Array, Exception> {
     // Compute stats
-    let mean = x.mean_axes(axes, true)?;
-    let variance = x.var_axes(axes, true, None)?;
+    let mean = x.mean_axes(axes, true, stream)?;
+    let variance = x.var_axes(axes, true, None, stream)?;
 
     // Normalize
-    let x = x.subtract(&mean)?.multiply(rsqrt(&variance.add(eps)?)?)?;
+    let x = x
+        .subtract(&mean, stream)?
+        .multiply(rsqrt(&variance.add(eps, stream)?, stream)?, stream)?;
 
     Ok(x)
 }
@@ -49,8 +56,8 @@ fn build_instance_norm(builder: InstanceNormBuilder) -> Result<InstanceNorm, Exc
 
     let (weight, bias) = if affine {
         (
-            Some(ones::<f32>(&[builder.dimensions])?),
-            Some(zeros::<f32>(&[builder.dimensions])?),
+            Some(super::init::ones(&[builder.dimensions])),
+            Some(super::init::zeros(&[builder.dimensions])),
         )
     } else {
         (None, None)
@@ -100,13 +107,13 @@ impl Module<&Array> for InstanceNorm {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let reduction_axes = (1..x.ndim() as i32 - 1).collect::<Vec<_>>();
 
-        let x = instance_norm(x, &reduction_axes, &self.eps)?;
+        let x = instance_norm(x, &reduction_axes, &self.eps, stream)?;
 
         if let (Some(weight), Some(bias)) = (self.weight.as_ref(), self.bias.as_ref()) {
-            weight.multiply(x)?.add(bias)
+            weight.multiply(x, stream)?.add(bias, stream)
         } else {
             Ok(x)
         }
@@ -143,8 +150,8 @@ fn build_layer_norm(builder: LayerNormBuilder) -> Result<LayerNorm, Exception> {
 
     let (weight, bias) = if affine {
         (
-            Some(ones::<f32>(&[builder.dimensions])?),
-            Some(zeros::<f32>(&[builder.dimensions])?),
+            Some(super::init::ones(&[builder.dimensions])),
+            Some(super::init::zeros(&[builder.dimensions])),
         )
     } else {
         (None, None)
@@ -194,11 +201,11 @@ impl Module<&Array> for LayerNorm {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let weight = self.weight.as_ref();
         let bias = self.bias.as_ref();
         let eps = self.eps;
-        crate::fast::layer_norm(x, weight, bias, eps)
+        crate::fast::layer_norm(x, weight, bias, eps, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -222,7 +229,7 @@ pub struct RmsNormBuilder {
 }
 
 fn build_rms_norm(builder: RmsNormBuilder) -> Result<RmsNorm, Exception> {
-    let weight = ones::<f32>(&[builder.dimensions])?;
+    let weight = super::init::ones(&[builder.dimensions]);
     let eps = builder.eps;
     Ok(RmsNorm {
         weight: Param::new(weight),
@@ -265,10 +272,10 @@ impl Module<&Array> for RmsNorm {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let weight = self.weight.as_ref();
         let eps = self.eps;
-        crate::fast::rms_norm(x, weight, eps)
+        crate::fast::rms_norm(x, weight, eps, stream)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -311,8 +318,8 @@ fn build_group_norm(builder: GroupNormBuilder) -> Result<GroupNorm, Exception> {
 
     let (weight, bias) = if affine {
         (
-            Some(ones::<f32>(&[builder.dimensions])?),
-            Some(zeros::<f32>(&[builder.dimensions])?),
+            Some(super::init::ones(&[builder.dimensions])),
+            Some(super::init::zeros(&[builder.dimensions])),
         )
     } else {
         (None, None)
@@ -368,48 +375,50 @@ impl GroupNorm {
     /// Default value for `pytorch_compatible`.
     pub const DEFAULT_PYTORCH_COMPATIBLE: bool = false;
 
-    fn pytorch_group_norm(&self, x: &Array) -> Result<Array, Exception> {
+    fn pytorch_group_norm(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
         let batch = x.dim(0);
         let dims = x.dim(-1);
         let rest = &x.shape()[1..x.ndim() - 1];
         let group_size = dims / self.group_count;
 
         // Split into groups
-        let x = x.reshape(&[batch, -1, self.group_count, group_size])?;
+        let x = x.reshape(&[batch, -1, self.group_count, group_size], stream)?;
         let x = x
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, self.group_count, -1])?;
+            .transpose_axes(&[0, 2, 1, 3], stream)?
+            .reshape(&[batch, self.group_count, -1], stream)?;
 
         // Normalize
-        let x = crate::fast::layer_norm(x, None, None, self.eps.item::<f32>())?;
+        let eps = self.eps.clone().item::<f32>(&stream);
+        let x = crate::fast::layer_norm(x, None, None, eps, stream)?;
 
-        let x = x.reshape(&[batch, self.group_count, -1, group_size])?;
+        let x = x.reshape(&[batch, self.group_count, -1, group_size], stream)?;
 
         let new_shape: Vec<_> = [batch]
             .into_iter()
             .chain(rest.iter().copied())
             .chain([dims])
             .collect();
-        x.transpose_axes(&[0, 2, 1, 3])?.reshape(&new_shape[..])
+        x.transpose_axes(&[0, 2, 1, 3], stream)?
+            .reshape(&new_shape[..], stream)
     }
 
-    fn group_norm(&self, x: &Array) -> Result<Array, Exception> {
+    fn group_norm(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
         let batch = x.dim(0);
         let dims = x.dim(-1);
         let rest = &x.shape()[1..x.ndim() - 1];
 
         // Split into groups
-        let x = x.reshape(&[batch, -1, self.group_count])?;
+        let x = x.reshape(&[batch, -1, self.group_count], stream)?;
 
         // Normalize
-        let x = instance_norm(&x, &[1], &self.eps)?;
+        let x = instance_norm(&x, &[1], &self.eps, stream)?;
 
         let new_shape: Vec<_> = [batch]
             .into_iter()
             .chain(rest.iter().copied())
             .chain([dims])
             .collect();
-        x.reshape(&new_shape[..])
+        x.reshape(&new_shape[..], stream)
     }
 }
 
@@ -417,15 +426,15 @@ impl Module<&Array> for GroupNorm {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let x = if self.pytorch_compatible {
-            self.pytorch_group_norm(x)?
+            self.pytorch_group_norm(x, stream)?
         } else {
-            self.group_norm(x)?
+            self.group_norm(x, stream)?
         };
 
         if let (Some(weight), Some(bias)) = (self.weight.as_ref(), self.bias.as_ref()) {
-            weight.multiply(&x)?.add(bias)
+            weight.multiply(&x, stream)?.add(bias, stream)
         } else {
             Ok(x)
         }
@@ -474,8 +483,8 @@ fn build_batch_norm(builder: BatchNormBuilder) -> Result<BatchNorm, Exception> {
 
     let (weight, bias) = if affine {
         (
-            Some(ones::<f32>(&[builder.feature_count])?),
-            Some(zeros::<f32>(&[builder.feature_count])?),
+            Some(super::init::ones(&[builder.feature_count])),
+            Some(super::init::zeros(&[builder.feature_count])),
         )
     } else {
         (None, None)
@@ -483,8 +492,8 @@ fn build_batch_norm(builder: BatchNormBuilder) -> Result<BatchNorm, Exception> {
 
     let (running_mean, running_var) = if track_running_stats {
         (
-            Some(zeros::<f32>(&[builder.feature_count])?),
-            Some(ones::<f32>(&[builder.feature_count])?),
+            Some(super::init::zeros(&[builder.feature_count])),
+            Some(super::init::ones(&[builder.feature_count])),
         )
     } else {
         (None, None)
@@ -556,11 +565,11 @@ impl BatchNorm {
     /// Enable training mode by default.
     pub const DEFAULT_TRAINING: bool = true;
 
-    fn stats(x: &Array) -> Result<(Array, Array), Exception> {
+    fn stats(x: &Array, stream: &crate::Stream) -> Result<(Array, Array), Exception> {
         let reduction_axes = (0..x.ndim() as i32 - 1).collect::<Vec<_>>();
 
-        let mean = x.mean_axes(&reduction_axes, None)?;
-        let variance = x.var_axes(&reduction_axes, None, None)?;
+        let mean = x.mean_axes(&reduction_axes, None, stream)?;
+        let variance = x.var_axes(&reduction_axes, None, None, stream)?;
 
         Ok((mean, variance))
     }
@@ -570,7 +579,7 @@ impl Module<&Array> for BatchNorm {
     type Error = Exception;
     type Output = Array;
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
+    fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         let ndim = x.ndim();
         if !(2..=4).contains(&ndim) {
             return Err(Exception::custom(
@@ -578,7 +587,7 @@ impl Module<&Array> for BatchNorm {
             ));
         }
 
-        let (mean, variance) = Self::stats(x)?;
+        let (mean, variance) = Self::stats(x, stream)?;
         let mut mean = Cow::Owned(mean);
         let mut variance = Cow::Owned(variance);
 
@@ -588,14 +597,14 @@ impl Module<&Array> for BatchNorm {
             if self.training {
                 let mu = &self.momentum;
                 // SAFETY: momentum is a single element array
-                let one_minus_mu = array!(1.0) - mu;
+                let one_minus_mu = array!(1.0).subtract(mu, stream)?;
 
                 *running_mean = one_minus_mu
-                    .multiply(&running_mean)?
-                    .add(mu.multiply(&mean)?)?;
+                    .multiply(&running_mean, stream)?
+                    .add(mu.multiply(&mean, stream)?, stream)?;
                 *running_var = one_minus_mu
-                    .multiply(&running_var)?
-                    .add(mu.multiply(&variance)?)?;
+                    .multiply(&running_var, stream)?
+                    .add(mu.multiply(&variance, stream)?, stream)?;
             } else {
                 mean = Cow::Borrowed(&*running_mean);
                 variance = Cow::Borrowed(&*running_var);
@@ -603,11 +612,11 @@ impl Module<&Array> for BatchNorm {
         }
 
         let x = x
-            .subtract(&mean)?
-            .multiply(rsqrt(&variance.add(&self.eps)?)?)?;
+            .subtract(&mean, stream)?
+            .multiply(rsqrt(&variance.add(&self.eps, stream)?, stream)?, stream)?;
 
         if let (Some(weight), Some(bias)) = (self.weight.as_ref(), self.bias.as_ref()) {
-            weight.multiply(&x)?.add(bias)
+            weight.multiply(&x, stream)?.add(bias, stream)
         } else {
             Ok(x)
         }
@@ -622,6 +631,7 @@ impl Module<&Array> for BatchNorm {
 mod tests {
     use crate::{
         ops::indexing::{Ellipsis, IndexOp},
+        random::uniform,
         Dtype,
     };
     use float_eq::assert_float_eq;
@@ -630,35 +640,36 @@ mod tests {
 
     #[test]
     fn test_instance_norm() {
-        crate::random::seed(435).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(435, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.500_064_6,
             abs <= 0.010_001_292
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             128.016_54,
             abs <= 2.560_330_9
         );
 
         let result = InstanceNorm::new(8)
             .unwrap()
-            .forward(&a)
+            .forward(&a, stream)
             .unwrap()
-            .index((0, 0));
+            .index_device((0, 0), stream);
         assert_eq!(result.shape(), &[16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.106_454_11,
             abs <= 0.002_129_082_3
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             1.703_265_8,
             abs <= 0.034_065_317
         );
@@ -666,35 +677,36 @@ mod tests {
 
     #[test]
     fn test_layer_norm() {
-        crate::random::seed(635).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(635, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.492_690_32,
             abs <= 0.009_853_806
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             126.128_72,
             abs <= 2.522_574_4
         );
 
         let result = LayerNorm::new(16)
             .unwrap()
-            .forward(&a)
+            .forward(&a, stream)
             .unwrap()
-            .index((Ellipsis, 0));
+            .index_device((Ellipsis, 0), stream);
         assert_eq!(result.shape(), &[2, 8]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.290_990_38,
             abs <= 0.005_819_807_8
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             4.655_846,
             abs <= 0.093_116_924
         );
@@ -702,31 +714,32 @@ mod tests {
 
     #[test]
     fn test_rms_norm() {
-        crate::random::seed(103).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(103, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.505_476_36,
             abs <= 0.010_109_527
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             129.401_95,
             abs <= 2.588_039
         );
 
-        let result = RmsNorm::new(16).unwrap().forward(&a).unwrap();
+        let result = RmsNorm::new(16).unwrap().forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.872_938_75,
             abs <= 0.017_458_774
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             223.472_32,
             abs <= 4.469_446
         );
@@ -734,35 +747,36 @@ mod tests {
 
     #[test]
     fn test_group_norm() {
-        crate::random::seed(855).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(855, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.486_665_87,
             abs <= 0.009_733_317
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             124.586_464,
             abs <= 2.491_729_3
         );
 
         let result = GroupNorm::new(4, 16)
             .unwrap()
-            .forward(&a)
+            .forward(&a, stream)
             .unwrap()
-            .index((0, 0));
+            .index_device((0, 0), stream);
         assert_eq!(result.shape(), &[16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             -0.054_606_52,
             abs <= 0.001_092_130_4
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             -0.873_704_3,
             abs <= 0.017_474_087
         );
@@ -770,35 +784,36 @@ mod tests {
 
     #[test]
     fn test_batch_norm() {
-        crate::random::seed(266).unwrap();
-        let a = crate::random::uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], None).unwrap();
+        let stream = crate::test_stream();
+        let key = crate::test_key(266, stream);
+        let a = uniform::<_, f32>(0.0, 1.0, &[2, 8, 16], &key, stream).unwrap();
         assert_eq!(a.shape(), &[2, 8, 16]);
         assert_eq!(a.dtype(), Dtype::Float32);
         assert_float_eq!(
-            a.mean(None).unwrap().item::<f32>(),
+            a.mean(None, stream).unwrap().item::<f32>(&stream),
             0.505_814_7,
             abs <= 0.010_116_293
         );
         assert_float_eq!(
-            a.sum(None).unwrap().item::<f32>(),
+            a.sum(None, stream).unwrap().item::<f32>(&stream),
             129.488_56,
             abs <= 2.589_771
         );
 
         let result = BatchNorm::new(16)
             .unwrap()
-            .forward(&a)
+            .forward(&a, stream)
             .unwrap()
-            .index((0, 0));
+            .index_device((0, 0), stream);
         assert_eq!(result.shape(), &[16]);
         assert_eq!(result.dtype(), Dtype::Float32);
         assert_float_eq!(
-            result.mean(None).unwrap().item::<f32>(),
+            result.mean(None, stream).unwrap().item::<f32>(&stream),
             0.439_785_24,
             abs <= 0.008_795_705
         );
         assert_float_eq!(
-            result.sum(None).unwrap().item::<f32>(),
+            result.sum(None, stream).unwrap().item::<f32>(&stream),
             7.036_564,
             abs <= 0.140_731_28
         );
