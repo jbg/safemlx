@@ -4,7 +4,7 @@ use safemlx::{
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, Param},
+    module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
         argpartition_axis, full, gt,
@@ -403,6 +403,7 @@ struct WeightMap {
 pub fn load_gemma4_assistant_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
+    weights_stream: &Stream,
 ) -> Result<Gemma4AssistantDraftModel, Error> {
     let model_dir = model_dir.as_ref();
     let file = std::fs::File::open(model_dir.join("config.json"))?;
@@ -424,6 +425,7 @@ pub fn load_gemma4_assistant_model(
             load_safetensors_strict(
                 &mut model,
                 model_dir.join(weight_file),
+                weights_stream,
                 &load_config,
                 &mut report,
             )?;
@@ -432,10 +434,12 @@ pub fn load_gemma4_assistant_model(
         load_safetensors_strict(
             &mut model,
             model_dir.join("model.safetensors"),
+            weights_stream,
             &load_config,
             &mut report,
         )?;
     }
     report.finish(&model, &load_config)?;
+    model.copy_to_stream(stream)?;
     Ok(model)
 }

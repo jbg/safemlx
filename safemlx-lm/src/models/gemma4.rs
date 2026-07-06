@@ -7,7 +7,7 @@ use safemlx::{
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, Param},
+    module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{indexing::TryIndexOp, mean_axis, rsqrt, tanh},
     quantization::{MaybeQuantized, Quantizable as _},
@@ -1236,7 +1236,11 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_gemma4_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
+pub fn load_gemma4_model(
+    model_dir: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_gemma4_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
@@ -1257,17 +1261,25 @@ pub fn load_gemma4_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
         for weight_file in weight_files {
             let weights_filename = model_dir.join(weight_file);
-            load_safetensors_strict(&mut model, weights_filename, &config, &mut report)?;
+            load_safetensors_strict(
+                &mut model,
+                weights_filename,
+                weights_stream,
+                &config,
+                &mut report,
+            )?;
         }
     } else {
         load_safetensors_strict(
             &mut model,
             model_dir.join("model.safetensors"),
+            weights_stream,
             &config,
             &mut report,
         )?;
     }
     report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
     Ok(model)
 }
 

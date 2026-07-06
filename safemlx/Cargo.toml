@@ -39,7 +39,6 @@ itertools.workspace = true
 # optional dependencies
 safetensors = { version = "0.6", optional = true }
 bytemuck = { version = "1", optional = true, features = ["extern_crate_std"] }
-memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
@@ -53,4 +52,4 @@ accelerate = ["safemlx-sys/accelerate"]
 metal = ["safemlx-sys/metal"]
 
 # Enables conversion between `Array` and `safetensors::TensorView`
-safetensors = ["dep:safetensors", "dep:bytemuck", "dep:memmap2"]
+safetensors = ["dep:safetensors", "dep:bytemuck"]

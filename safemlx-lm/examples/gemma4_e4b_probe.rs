@@ -32,7 +32,9 @@ fn main() -> anyhow::Result<()> {
 
     let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let stream = ctx.stream();
-    let mut model = match LoadedModel::load(&model_dir, stream) {
+    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_stream = weights_ctx.stream();
+    let mut model = match LoadedModel::load(&model_dir, stream, weights_stream) {
         Ok(model) => model,
         Err(Error::StrictLoadValidation { missing, unused }) => {
             print_strict_report(&missing, &unused);

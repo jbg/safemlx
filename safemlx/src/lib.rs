@@ -118,7 +118,7 @@
 //!
 //! ```rust,ignore
 //! let mut model = Model::new();
-//! model.load_safetensors("model.safetensors").unwrap();
+//! model.load_safetensors("model.safetensors", stream).unwrap();
 //! ```
 //!
 //! ## When to Evaluate

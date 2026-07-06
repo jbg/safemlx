@@ -38,8 +38,10 @@ fn main() -> anyhow::Result<()> {
 
     let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let stream = ctx.stream();
+    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_stream = weights_ctx.stream();
     let load_start = Instant::now();
-    let mut model = LoadedModel::load(&model_dir, stream)?;
+    let mut model = LoadedModel::load(&model_dir, stream, weights_stream)?;
     let load_elapsed = load_start.elapsed();
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
 

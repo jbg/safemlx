@@ -10,7 +10,7 @@ use safemlx::{
     error::Exception,
     fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
-    module::{Module, Param},
+    module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
         argpartition_axis, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows,
@@ -1851,6 +1851,7 @@ pub struct WeightMap {
 pub fn load_qwen3_5_moe_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
+    weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let (args, image_token_id, video_token_id) = get_qwen3_5_moe_model_args(model_dir)?;
@@ -1866,6 +1867,7 @@ pub fn load_qwen3_5_moe_model(
             load_safetensors_strict(
                 &mut model,
                 model_dir.join(weight_file),
+                weights_stream,
                 &config,
                 &mut report,
             )?;
@@ -1874,11 +1876,13 @@ pub fn load_qwen3_5_moe_model(
         load_safetensors_strict(
             &mut model,
             model_dir.join("model.safetensors"),
+            weights_stream,
             &config,
             &mut report,
         )?;
     }
     report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
     Ok(model)
 }
 
@@ -2263,7 +2267,7 @@ mod tests {
         let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
-        load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
+        load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         report.finish(&target, &config).unwrap();
     }
 
@@ -2287,7 +2291,7 @@ mod tests {
         let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
-        load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
+        load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         let Err(Error::StrictLoadValidation { missing, unused }) = report.finish(&target, &config)
         else {
             panic!("strict load should reject missing text weights");
@@ -2319,7 +2323,7 @@ mod tests {
         let mut target = Model::new(args, None, None, stream).unwrap();
         let config = qwen3_5_moe_strict_load_config();
         let mut report = StrictLoadReport::default();
-        load_safetensors_strict(&mut target, &weights_path, &config, &mut report).unwrap();
+        load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         let Err(Error::StrictLoadValidation { missing, unused }) = report.finish(&target, &config)
         else {
             panic!("strict load should reject unexpected text weights");
@@ -2336,9 +2340,11 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
+        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let weights_stream = weights_ctx.stream();
         let model_dir = cached_test_model_dir();
         let tokenizer = load_qwen3_5_moe_tokenizer(&model_dir).unwrap();
-        let mut model = load_qwen3_5_moe_model(&model_dir, stream).unwrap();
+        let mut model = load_qwen3_5_moe_model(&model_dir, stream, weights_stream).unwrap();
         let cases = [
             (
                 "What is 84 * 3 / 2?",

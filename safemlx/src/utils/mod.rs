@@ -14,7 +14,6 @@ pub(crate) const SUCCESS: i32 = 0;
 pub(crate) const FAILURE: i32 = 1;
 
 pub(crate) mod guard;
-#[cfg(not(feature = "safetensors"))]
 pub(crate) mod io;
 pub(crate) mod runtime_lock;
 

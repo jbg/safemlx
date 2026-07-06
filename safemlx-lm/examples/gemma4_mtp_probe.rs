@@ -39,10 +39,12 @@ fn main() -> anyhow::Result<()> {
 
     let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let stream = ctx.stream();
-    let rendered = render_prompt(&target_dir, &prompt, stream)?;
+    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_stream = weights_ctx.stream();
+    let rendered = render_prompt(&target_dir, &prompt, stream, weights_stream)?;
     println!("\n=== rendered prompt ===\n{rendered}\n");
 
-    let greedy = run_greedy(&target_dir, &rendered, max_tokens, stream)?;
+    let greedy = run_greedy(&target_dir, &rendered, max_tokens, stream, weights_stream)?;
     println!("\n=== greedy ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -51,7 +53,14 @@ fn main() -> anyhow::Result<()> {
     );
     println!("{}", greedy.text);
 
-    let mtp = run_mtp(&target_dir, &assistant_dir, &rendered, max_tokens, stream)?;
+    let mtp = run_mtp(
+        &target_dir,
+        &assistant_dir,
+        &rendered,
+        max_tokens,
+        stream,
+        weights_stream,
+    )?;
     println!("\n=== mtp ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -71,8 +80,13 @@ struct ProbeResult {
     accept_lens: Vec<usize>,
 }
 
-fn render_prompt(target_dir: &PathBuf, prompt: &str, stream: &Stream) -> anyhow::Result<String> {
-    let mut loaded = LoadedModel::load(target_dir, stream)?;
+fn render_prompt(
+    target_dir: &PathBuf,
+    prompt: &str,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> anyhow::Result<String> {
+    let mut loaded = LoadedModel::load(target_dir, stream, weights_stream)?;
     Ok(loaded
         .apply_chat_template_json(
             vec![vec![serde_json::json!({
@@ -90,8 +104,9 @@ fn run_greedy(
     prompt: &str,
     max_tokens: usize,
     stream: &Stream,
+    weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let mut loaded = LoadedModel::load(target_dir, stream)?;
+    let mut loaded = LoadedModel::load(target_dir, stream, weights_stream)?;
     let prompt_tokens = loaded.encode_to_array(prompt, false, stream)?;
     let eos = loaded.eos_token_ids().to_vec();
     let mut cache = loaded.new_cache();
@@ -127,13 +142,14 @@ fn run_mtp(
     prompt: &str,
     max_tokens: usize,
     stream: &Stream,
+    weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let tokenizer_holder = LoadedModel::load(target_dir, stream)?;
+    let tokenizer_holder = LoadedModel::load(target_dir, stream, weights_stream)?;
     let prompt_ids = tokenizer_holder.encode(prompt, false)?;
     let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
 
-    let mut target = load_gemma4_model(target_dir, stream)?;
-    let mut assistant = load_gemma4_assistant_model(assistant_dir, stream)?;
+    let mut target = load_gemma4_model(target_dir, stream, weights_stream)?;
+    let mut assistant = load_gemma4_assistant_model(assistant_dir, stream, weights_stream)?;
     let (generated, stats) = generate_gemma4_mtp(
         &mut target,
         &mut assistant,

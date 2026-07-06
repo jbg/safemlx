@@ -1,6 +1,5 @@
 use crate::error::IoError;
 use crate::utils::guard::Guarded;
-#[cfg(not(feature = "safetensors"))]
 use crate::utils::io::SafeTensors;
 use crate::utils::SUCCESS;
 use crate::{Array, Stream};
@@ -44,20 +43,7 @@ impl Array {
     /// # Params
     ///
     /// - path: path of file to load
-    ///
-    #[cfg(feature = "safetensors")]
-    pub fn load_safetensors(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, IoError> {
-        let (data, _) = load_safetensors_with_rust_parser(path.as_ref())?;
-        Ok(data)
-    }
-
-    /// Load dictionary of ``MLXArray`` from a `safetensors` file.
-    ///
-    /// # Params
-    ///
-    /// - path: path of file to load
     /// - stream: stream or device to load on
-    #[cfg(not(feature = "safetensors"))]
     pub fn load_safetensors(
         path: impl AsRef<Path>,
         stream: impl AsRef<Stream>,
@@ -72,22 +58,8 @@ impl Array {
     /// # Params
     ///
     /// - path: path of file to load
-    #[allow(clippy::type_complexity)]
-    #[cfg(feature = "safetensors")]
-    pub fn load_safetensors_with_metadata(
-        path: impl AsRef<Path>,
-    ) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
-        load_safetensors_with_rust_parser(path.as_ref())
-    }
-
-    /// Load dictionary of ``MLXArray`` and metadata `[String:String]` from a `safetensors` file.
-    ///
-    /// # Params
-    ///
-    /// - path: path of file to load
     /// - stream: stream or device to load on
     #[allow(clippy::type_complexity)]
-    #[cfg(not(feature = "safetensors"))]
     pub fn load_safetensors_with_metadata(
         path: impl AsRef<Path>,
         stream: impl AsRef<Stream>,
@@ -212,68 +184,6 @@ impl Array {
     }
 }
 
-#[cfg(feature = "safetensors")]
-fn load_safetensors_with_rust_parser(
-    path: &Path,
-) -> Result<(HashMap<String, Array>, HashMap<String, String>), IoError> {
-    if !path.is_file() {
-        return Err(IoError::NotFile);
-    }
-    check_file_extension(path, "safetensors")?;
-
-    let file = std::fs::File::open(path).map_err(|err| {
-        IoError::Exception(crate::error::Exception::custom(format!(
-            "failed to open safetensors file {}: {err}",
-            path.display()
-        )))
-    })?;
-    let bytes = unsafe {
-        memmap2::MmapOptions::new().map(&file).map_err(|err| {
-            IoError::Exception(crate::error::Exception::custom(format!(
-                "failed to map safetensors file {}: {err}",
-                path.display()
-            )))
-        })?
-    };
-    let metadata = safetensors::SafeTensors::read_metadata(&bytes)
-        .map_err(|err| {
-            IoError::Exception(crate::error::Exception::custom(format!(
-                "failed to parse safetensors metadata from {}: {err}",
-                path.display()
-            )))
-        })?
-        .1
-        .metadata()
-        .clone()
-        .unwrap_or_default();
-
-    let safetensors = safetensors::SafeTensors::deserialize(&bytes).map_err(|err| {
-        IoError::Exception(crate::error::Exception::custom(format!(
-            "failed to parse safetensors file {}: {err}",
-            path.display()
-        )))
-    })?;
-
-    let mut data = HashMap::new();
-    for name in safetensors.names() {
-        let tensor = safetensors.tensor(name).map_err(|err| {
-            IoError::Exception(crate::error::Exception::custom(format!(
-                "failed to read tensor {name} from {}: {err}",
-                path.display()
-            )))
-        })?;
-        let array = Array::try_from(tensor).map_err(|err| {
-            IoError::Exception(crate::error::Exception::custom(format!(
-                "failed to convert tensor {name} from {}: {err}",
-                path.display()
-            )))
-        })?;
-        data.insert(name.to_string(), array);
-    }
-
-    Ok((data, metadata))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::Array;
@@ -296,9 +206,6 @@ mod tests {
 
         Array::save_safetensors(&arrays, None, &path).unwrap();
 
-        #[cfg(feature = "safetensors")]
-        let loaded_arrays = Array::load_safetensors(&path).unwrap();
-        #[cfg(not(feature = "safetensors"))]
         let loaded_arrays = Array::load_safetensors(&path, stream).unwrap();
 
         // compare values

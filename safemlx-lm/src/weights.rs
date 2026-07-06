@@ -1,9 +1,6 @@
 use std::{collections::HashSet, path::Path};
 
-use safemlx::{
-    module::{ModuleParameters, ModuleParametersExt},
-    Array,
-};
+use safemlx::{module::ModuleParameters, Array, Stream};
 
 use crate::error::Error;
 
@@ -172,13 +169,14 @@ impl StrictLoadReport {
     }
 }
 
-pub fn load_safetensors_strict<M: ModuleParametersExt>(
+pub fn load_safetensors_strict<M: ModuleParameters>(
     model: &mut M,
     path: impl AsRef<Path>,
+    stream: &Stream,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    let loaded = Array::load_safetensors(path)?;
+    let loaded = Array::load_safetensors(path, stream)?;
     let mut params = model.parameters_mut().flatten();
 
     for (key, value) in loaded {
@@ -207,6 +205,5 @@ pub fn load_safetensors_strict<M: ModuleParametersExt>(
         }
     }
 
-    model.eval()?;
     Ok(())
 }

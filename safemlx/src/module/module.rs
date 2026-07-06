@@ -264,9 +264,12 @@ pub trait ModuleParametersExt: ModuleParameters {
     }
 
     /// Load module parameters from a `safetensors` file.
-    #[cfg(feature = "safetensors")]
-    fn load_safetensors(&mut self, path: impl AsRef<Path>) -> Result<(), IoError> {
-        let loaded = Array::load_safetensors(path)?;
+    fn load_safetensors(
+        &mut self,
+        path: impl AsRef<Path>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<(), IoError> {
+        let loaded = Array::load_safetensors(path, stream)?;
 
         // Load the parameters
         let mut params = self.parameters_mut().flatten();
@@ -276,10 +279,17 @@ pub trait ModuleParametersExt: ModuleParameters {
             }
         }
 
-        // Loading is lazy, eval after loading
-        self.eval()?;
-
         Ok(())
+    }
+
+    /// Copy all module parameters onto the given stream and evaluate them.
+    fn copy_to_stream(&mut self, stream: impl AsRef<Stream>) -> Result<(), Exception> {
+        let stream = stream.as_ref();
+        let mut params = self.parameters_mut().flatten();
+        for param in params.values_mut() {
+            **param = param.copy(stream)?;
+        }
+        self.eval()
     }
 
     /// Save module parameters to a file in `safetensors` format.

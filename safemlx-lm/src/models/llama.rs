@@ -460,7 +460,11 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-pub fn load_llama_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
+pub fn load_llama_model(
+    model_dir: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_llama_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
@@ -474,13 +478,14 @@ pub fn load_llama_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
         for weight_file in weight_files {
             let weights_filename = model_dir.join(weight_file);
-            model.load_safetensors(weights_filename)?;
+            model.load_safetensors(weights_filename, weights_stream)?;
         }
     } else {
         // Single weight file
         let weights_filename = model_dir.join("model.safetensors");
-        model.load_safetensors(weights_filename)?;
+        model.load_safetensors(weights_filename, weights_stream)?;
     }
+    model.copy_to_stream(stream)?;
 
     Ok(model)
 }
@@ -603,7 +608,7 @@ mod tests {
 
         // Print some safetensor keys
         let weights_path = std::path::Path::new(model_dir).join("model.safetensors");
-        let loaded = safemlx::Array::load_safetensors(&weights_path).unwrap();
+        let loaded = safemlx::Array::load_safetensors(&weights_path, stream).unwrap();
         let mut weight_keys: Vec<_> = loaded.keys().map(|k| k.to_string()).collect();
         weight_keys.sort();
         println!("=== Safetensor weight keys (first 20) ===");
@@ -651,7 +656,11 @@ mod tests {
         let tokenizer = load_llama_tokenizer(CACHED_TEST_MODEL_DIR.as_str()).unwrap();
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut model = load_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream).unwrap();
+        let weights_ctx =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let weights_stream = weights_ctx.stream();
+        let mut model =
+            load_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream).unwrap();
 
         let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
         let encoding = tokenizer.encode(prompt, false).unwrap();

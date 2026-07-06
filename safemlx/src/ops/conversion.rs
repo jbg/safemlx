@@ -3,6 +3,13 @@ use safemlx_internal_macros::generate_macro;
 use crate::{error::Result, utils::guard::Guarded, Array, ArrayElement, Dtype, Stream};
 
 impl Array {
+    /// Copy the array onto the given stream.
+    pub fn copy(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_copy(res, self.as_ptr(), stream.as_ref().as_ptr())
+        })
+    }
+
     /// Convert an array to FP8 (E4M3) format.
     ///
     /// The input array must be a floating point type (float32, float16, or bfloat16).
@@ -76,6 +83,12 @@ impl Array {
             safemlx_sys::mlx_view(res, self.as_ptr(), dtype.into(), stream.as_ref().as_ptr())
         })
     }
+}
+
+/// See [`Array::copy`].
+#[generate_macro]
+pub fn copy(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
+    a.as_ref().copy(stream)
 }
 
 /// Convert an array to FP8 (E4M3) format.

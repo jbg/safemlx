@@ -323,7 +323,11 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    pub fn load(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Self, Error> {
+    pub fn load(
+        model_dir: impl AsRef<Path>,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
         let model_type = effective_model_type(&metadata);
@@ -331,12 +335,22 @@ impl LoadedModel {
         let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
         let model = match kind {
-            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(model_dir, stream)?),
-            ModelKind::Llama => Model::Llama(llama::load_llama_model(model_dir, stream)?),
-            ModelKind::Qwen3 => Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream)?),
-            ModelKind::Qwen35Moe => {
-                Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(model_dir, stream)?)
+            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(
+                model_dir,
+                stream,
+                weights_stream,
+            )?),
+            ModelKind::Llama => {
+                Model::Llama(llama::load_llama_model(model_dir, stream, weights_stream)?)
             }
+            ModelKind::Qwen3 => {
+                Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream, weights_stream)?)
+            }
+            ModelKind::Qwen35Moe => Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
+                model_dir,
+                stream,
+                weights_stream,
+            )?),
         };
         let eos_token_ids = metadata
             .eos_token_id
@@ -484,15 +498,33 @@ impl LoadedModel {
     }
 }
 
-pub fn load_model(model_dir: impl AsRef<Path>, stream: &Stream) -> Result<Model, Error> {
+pub fn load_model(
+    model_dir: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
-        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(model_dir, stream)?)),
-        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(model_dir, stream)?)),
-        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream)?)),
+        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
+        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
+        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
-            model_dir, stream,
+            model_dir,
+            stream,
+            weights_stream,
         )?)),
     }
 }

@@ -1,6 +1,6 @@
 use crate::error::{Exception, IoError};
 use crate::utils::SUCCESS;
-use crate::{Array, Stream};
+use crate::{Array, DeviceType, Stream};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::Path;
@@ -39,14 +39,16 @@ impl SafeTensors {
 
         let path_str = path.to_str().ok_or(IoError::InvalidUtf8)?;
         let filepath = CString::new(path_str)?;
+        let stream = stream.as_ref();
+        let device_type = stream.get_device()?.get_type()?;
+        if device_type != DeviceType::Cpu {
+            return Err(IoError::Exception(Exception::custom(
+                "native MLX safetensors loading requires a CPU stream",
+            )));
+        }
 
         SafeTensors::try_from_op(|(res_0, res_1)| unsafe {
-            safemlx_sys::mlx_load_safetensors(
-                res_0,
-                res_1,
-                filepath.as_ptr(),
-                stream.as_ref().as_ptr(),
-            )
+            safemlx_sys::mlx_load_safetensors(res_0, res_1, filepath.as_ptr(), stream.as_ptr())
         })
         .map_err(Into::into)
     }

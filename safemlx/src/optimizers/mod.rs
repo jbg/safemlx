@@ -88,9 +88,12 @@ pub trait OptimizerState: Sized {
     }
 
     /// Load the optimizer state from a safetensors file.
-    #[cfg(feature = "safetensors")]
-    fn load_safetensors(&mut self, path: impl AsRef<Path>) -> Result<(), IoError> {
-        let loaded = Array::load_safetensors(path)?;
+    fn load_safetensors(
+        &mut self,
+        path: impl AsRef<Path>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<(), IoError> {
+        let loaded = Array::load_safetensors(path, stream)?;
         let unflattened = Self::unflatten(loaded).map_err(Into::into)?;
 
         *self = unflattened;
