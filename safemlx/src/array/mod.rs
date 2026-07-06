@@ -26,12 +26,23 @@ pub type complex64 = Complex<f32>;
 
 /// An n-dimensional array.
 ///
-/// Arrays are lazy MLX graph values. They are not `Send`; materialize and copy
-/// data into ordinary Rust values before moving results across threads.
+/// Arrays are lazy MLX graph values. They may be moved or shared across
+/// threads; use explicit streams for operations and evaluate before host reads.
 #[repr(transparent)]
 pub struct Array {
     c_array: mlx_array,
 }
+
+// SAFETY: `Array` owns an MLX C++ array handle. MLX arrays are immutable graph
+// values from the Rust API's perspective; mutation is represented by producing
+// new arrays. Runtime entry points that touch known MLX global state are guarded
+// inside safemlx, and callers still provide explicit streams for execution.
+unsafe impl Send for Array {}
+
+// SAFETY: Shared references to `Array` expose only immutable graph/value
+// operations. Concurrent evaluation and host-read paths are covered by runtime
+// guards where MLX requires them, and stress-tested in safemlx-tests.
+unsafe impl Sync for Array {}
 
 /// An evaluated array with materialized storage available for host reads.
 pub struct EvaluatedArray<'a> {

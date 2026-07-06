@@ -10,5 +10,5 @@ license.workspace = true
 
 [dev-dependencies]
 safemlx-internal-macros.workspace = true
-safemlx.workspace = true
+safemlx = { workspace = true, features = ["safetensors"] }
 tempfile.workspace = true
