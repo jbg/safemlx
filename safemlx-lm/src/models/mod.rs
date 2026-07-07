@@ -1,3 +1,10 @@
+//! Model-family implementations and high-level model loading.
+//!
+//! Use [`crate::models::LoadedModel`] when you want to load a model directory
+//! together with its tokenizer and chat template. Use
+//! [`crate::models::load_model`] and [`crate::models::load_tokenizer`] when you
+//! want to manage those pieces separately.
+
 use std::path::Path;
 
 use safemlx::{
@@ -14,11 +21,17 @@ use tokenizers::Tokenizer;
 
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
+/// Shared building blocks used by multiple decoder-only model families.
 pub mod common;
+/// Gemma 4 text model support.
 pub mod gemma4;
+/// Gemma 4 assistant draft-model support.
 pub mod gemma4_assistant;
+/// Llama decoder-only model support.
 pub mod llama;
+/// Qwen3 decoder-only model support.
 pub mod qwen3;
+/// Qwen3.5 MoE text model support.
 pub mod qwen3_5_moe;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,10 +67,15 @@ impl TokenIdOrIds {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Supported model-family dispatch target.
 pub enum ModelKind {
+    /// Gemma 4 text architecture.
     Gemma4,
+    /// Llama decoder architecture.
     Llama,
+    /// Qwen3 decoder architecture.
     Qwen3,
+    /// Qwen3.5 mixture-of-experts architecture.
     Qwen35Moe,
 }
 
@@ -90,7 +108,10 @@ pub enum ModelConfigSupport {
     /// The config is supported by this crate's loader.
     Supported(SupportedModelConfig),
     /// The config is not supported, with a human-readable reason.
-    Unsupported { reason: String },
+    Unsupported {
+        /// Human-readable reason the config is unsupported.
+        reason: String,
+    },
 }
 
 impl ModelConfigSupport {
@@ -182,14 +203,20 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     }
 }
 
+/// Loaded model value for any architecture supported by this crate.
 pub enum Model {
+    /// Gemma 4 text model.
     Gemma4(gemma4::Model),
+    /// Llama model.
     Llama(llama::Model),
+    /// Qwen3 model.
     Qwen3(qwen3::Model),
+    /// Qwen3.5 MoE text model.
     Qwen35Moe(qwen3_5_moe::Model),
 }
 
 impl Model {
+    /// Returns the effective model type used for dispatch.
     pub fn model_type(&self) -> &str {
         match self {
             Self::Gemma4(model) => model.model_type(),
@@ -199,6 +226,10 @@ impl Model {
         }
     }
 
+    /// Creates a token iterator for models that use a plain key/value cache.
+    ///
+    /// Qwen3.5 MoE uses a heterogeneous cache and must be driven with
+    /// [`Model::generate_with_cache`] instead.
     pub fn generate<'a>(
         &'a mut self,
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
@@ -238,6 +269,7 @@ impl Model {
         }
     }
 
+    /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::Gemma4(_) | Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
@@ -245,6 +277,7 @@ impl Model {
         }
     }
 
+    /// Creates a token iterator using a cache returned by [`Model::new_cache`].
     pub fn generate_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
@@ -271,9 +304,13 @@ impl Model {
     }
 }
 
+/// Token iterator for models backed by a vector of concatenating KV caches.
 pub enum Generate<'a> {
+    /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
+    /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
 }
 
@@ -289,15 +326,23 @@ impl Iterator for Generate<'_> {
     }
 }
 
+/// Cache value matching a [`Model`] variant.
 pub enum ModelCache {
+    /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
+    /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35Moe(qwen3_5_moe::Cache),
 }
 
+/// Token iterator for any supported model variant.
 pub enum ModelGenerate<'a> {
+    /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
+    /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+    /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a>),
 }
 
@@ -314,6 +359,11 @@ impl Iterator for ModelGenerate<'_> {
     }
 }
 
+/// A model directory loaded together with its tokenizer and chat template.
+///
+/// This is the most convenient entry point for text generation: it owns the
+/// architecture-specific [`Model`], tokenizer, optional chat template, model id
+/// used by the template renderer, and EOS token ids parsed from config.
 pub struct LoadedModel {
     model: Model,
     tokenizer: ChatTokenizer,
@@ -323,6 +373,7 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// Loads a supported model directory, tokenizer, optional chat template, and weights.
     pub fn load(
         model_dir: impl AsRef<Path>,
         stream: &Stream,
@@ -371,18 +422,24 @@ impl LoadedModel {
         })
     }
 
+    /// Returns the effective runtime model type.
     pub fn model_type(&self) -> &str {
         self.model.model_type()
     }
 
+    /// Returns the model id passed to chat-template rendering.
     pub fn model_id_for_template(&self) -> &str {
         &self.model_id
     }
 
+    /// Returns whether a chat template is available for this model.
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
     }
 
+    /// Applies the loaded chat template to structured conversations.
+    ///
+    /// Returns `Ok(None)` when no chat template is available.
     pub fn apply_chat_template<'a, I, R, T>(
         &'a mut self,
         conversations: I,
@@ -413,6 +470,9 @@ impl LoadedModel {
         Ok(rendered.into_iter().next())
     }
 
+    /// Applies the loaded chat template to JSON-valued conversations.
+    ///
+    /// Returns `Ok(None)` when no chat template is available.
     pub fn apply_chat_template_json(
         &mut self,
         conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
@@ -433,6 +493,7 @@ impl LoadedModel {
         Ok(rendered.into_iter().next())
     }
 
+    /// Encodes text to tokenizer ids.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
         Ok(self
             .tokenizer
@@ -441,6 +502,7 @@ impl LoadedModel {
             .to_vec())
     }
 
+    /// Encodes text and returns a `[1, len]` token-id array on `stream`.
     pub fn encode_to_array(
         &self,
         text: &str,
@@ -451,20 +513,24 @@ impl LoadedModel {
         Ok(Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?)
     }
 
+    /// Decodes tokenizer ids back to text.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
         self.tokenizer
             .decode(ids, skip_special_tokens)
             .map_err(Into::into)
     }
 
+    /// Returns EOS token ids from the model config, if any.
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.eos_token_ids
     }
 
+    /// Returns true when `id` is one of the configured EOS token ids.
     pub fn is_eos_token(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
     }
 
+    /// Creates a token iterator for models that use a plain key/value cache.
     pub fn generate<'a>(
         &'a mut self,
         cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
@@ -477,10 +543,12 @@ impl LoadedModel {
             .generate(cache, temp, prompt_tokens, prng_key, stream)
     }
 
+    /// Creates an empty cache value appropriate for the loaded model.
     pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
     }
 
+    /// Creates a token iterator using a cache returned by [`LoadedModel::new_cache`].
     pub fn generate_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
@@ -493,11 +561,13 @@ impl LoadedModel {
             .generate_with_cache(cache, temp, prompt_tokens, prng_key, stream)
     }
 
+    /// Returns a mutable reference to the underlying architecture-specific model.
     pub fn model_mut(&mut self) -> &mut Model {
         &mut self.model
     }
 }
 
+/// Loads only the model weights and architecture from a model directory.
 pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -529,6 +599,7 @@ pub fn load_model(
     }
 }
 
+/// Loads only the tokenizer from a supported model directory.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let model_dir = model_dir.as_ref();
     let metadata = read_model_metadata(model_dir)?;

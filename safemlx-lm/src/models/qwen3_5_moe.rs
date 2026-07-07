@@ -1,3 +1,5 @@
+//! Qwen3.5 MoE text model implementation and loader.
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -41,8 +43,11 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Qwen3.5 MoE layer kind.
 pub enum LayerType {
+    /// Recurrent linear-attention layer.
     LinearAttention,
+    /// Full self-attention layer.
     FullAttention,
 }
 
@@ -78,20 +83,32 @@ const RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
 const RECURRENT_PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[derive(Debug, Clone, Default)]
+/// Profiling counters accumulated by Qwen3.5 MoE when profiling is enabled.
 pub struct PerfStats {
+    /// Time spent evaluating token embeddings.
     pub embed_s: f64,
+    /// Time spent evaluating full-attention layers.
     pub full_attention_s: f64,
+    /// Time spent evaluating linear-attention layers.
     pub linear_attention_s: f64,
+    /// Time spent evaluating MoE routing.
     pub moe_router_s: f64,
+    /// Time spent evaluating the shared expert.
     pub moe_shared_s: f64,
+    /// Time spent evaluating routed experts.
     pub moe_routed_s: f64,
+    /// Time spent combining MoE outputs.
     pub moe_combine_s: f64,
+    /// Time spent evaluating final normalization.
     pub final_norm_s: f64,
+    /// Time spent projecting hidden states to logits.
     pub lm_head_s: f64,
+    /// Time spent materializing the prefill state dependency.
     pub prefill_state_dependency_s: f64,
 }
 
 impl PerfStats {
+    /// Returns the sum of all profiled component durations.
     pub fn component_total_s(&self) -> f64 {
         self.embed_s
             + self.full_attention_s
@@ -141,12 +158,14 @@ thread_local! {
     static PERF_STATS: RefCell<Option<PerfStats>> = const { RefCell::new(None) };
 }
 
+/// Enables or disables per-thread Qwen3.5 MoE profiling.
 pub fn set_perf_profiling(enabled: bool) {
     PERF_STATS.with(|stats| {
         *stats.borrow_mut() = enabled.then(PerfStats::default);
     });
 }
 
+/// Resets per-thread Qwen3.5 MoE profiling counters.
 pub fn reset_perf_stats() {
     PERF_STATS.with(|stats| {
         if let Some(stats) = stats.borrow_mut().as_mut() {
@@ -155,6 +174,7 @@ pub fn reset_perf_stats() {
     });
 }
 
+/// Returns the current per-thread profiling counters, if profiling is enabled.
 pub fn perf_stats() -> Option<PerfStats> {
     PERF_STATS.with(|stats| stats.borrow().clone())
 }
@@ -181,63 +201,96 @@ fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exceptio
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Deserialized Qwen3.5 MoE text configuration used by this loader.
 pub struct ModelArgs {
     #[serde(default = "default_text_model_type")]
+    /// Effective text model type.
     pub model_type: String,
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Transformer hidden size.
     pub hidden_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    /// Number of full-attention query heads.
     pub num_attention_heads: i32,
+    /// Number of full-attention key/value heads.
     pub num_key_value_heads: i32,
     #[serde(default = "default_head_dim")]
+    /// Full-attention head dimension.
     pub head_dim: i32,
+    /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
     #[serde(default = "default_rms_norm_eps")]
+    /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
     #[serde(default = "default_true")]
+    /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     #[serde(default)]
+    /// Whether full-attention projections include bias terms.
     pub attention_bias: bool,
     #[serde(default = "default_hidden_act")]
+    /// Activation function name from the config.
     pub hidden_act: String,
     #[serde(default = "default_linear_conv_kernel_dim")]
+    /// Causal convolution kernel width in linear-attention layers.
     pub linear_conv_kernel_dim: i32,
     #[serde(default = "default_linear_key_head_dim")]
+    /// Key head dimension in linear-attention layers.
     pub linear_key_head_dim: i32,
     #[serde(default = "default_linear_value_head_dim")]
+    /// Value head dimension in linear-attention layers.
     pub linear_value_head_dim: i32,
     #[serde(default = "default_linear_num_key_heads")]
+    /// Number of key heads in linear-attention layers.
     pub linear_num_key_heads: i32,
     #[serde(default = "default_linear_num_value_heads")]
+    /// Number of value heads in linear-attention layers.
     pub linear_num_value_heads: i32,
     #[serde(default = "default_moe_intermediate_size")]
+    /// Routed-expert intermediate size.
     pub moe_intermediate_size: i32,
     #[serde(default = "default_shared_expert_intermediate_size")]
+    /// Shared-expert intermediate size.
     pub shared_expert_intermediate_size: i32,
     #[serde(default = "default_num_experts_per_tok")]
+    /// Number of experts selected per token.
     pub num_experts_per_tok: i32,
     #[serde(default = "default_num_experts")]
+    /// Total number of routed experts.
     pub num_experts: i32,
     #[serde(default)]
+    /// Whether top-k routing probabilities are normalized.
     pub norm_topk_prob: bool,
     #[serde(default)]
+    /// Layer-kind pattern.
     pub layer_types: Vec<LayerType>,
     #[serde(default)]
+    /// RoPE parameter overrides.
     pub rope_parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
+    /// RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, Value>>,
     #[serde(default)]
+    /// Optional FP8 quantization configuration.
     pub quantization_config: Option<QwenFp8QuantizationConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// FP8 quantization settings supported by the Qwen3.5 MoE loader.
 pub struct QwenFp8QuantizationConfig {
+    /// Quantization method, expected to be `fp8`.
     pub quant_method: String,
+    /// FP8 format, expected to be `e4m3`.
     pub fmt: String,
+    /// Activation quantization scheme, expected to be `dynamic`.
     pub activation_scheme: String,
     #[serde(default)]
+    /// FP8 weight block size.
     pub weight_block_size: Option<Vec<i32>>,
     #[serde(default)]
+    /// Module names excluded from quantization.
     pub modules_to_not_convert: Vec<String>,
 }
 
@@ -434,14 +487,20 @@ impl ModelArgs {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Linear layer that can hold dense or Qwen FP8 weights.
 pub struct QwenLinear {
+    /// Input feature dimension.
     pub input_dims: i32,
+    /// Output feature dimension.
     pub output_dims: i32,
     #[param]
+    /// Weight tensor.
     pub weight: Param<Array>,
     #[param]
+    /// Optional FP8 inverse scale tensor.
     pub weight_scale_inv: Param<Option<Array>>,
     #[param]
+    /// Optional bias tensor.
     pub bias: Param<Option<Array>>,
 }
 
@@ -814,11 +873,14 @@ fn default_layer_type(index: usize) -> LayerType {
 }
 
 #[derive(Debug, Clone)]
+/// Heterogeneous cache for Qwen3.5 MoE layers.
 pub struct Cache {
+    /// One cache entry per transformer layer.
     pub layers: Vec<LayerCache>,
 }
 
 impl Cache {
+    /// Creates an empty cache matching the layer pattern in `args`.
     pub fn new(args: &ModelArgs) -> Self {
         Self {
             layers: (0..args.num_hidden_layers)
@@ -883,26 +945,37 @@ impl Cache {
 }
 
 #[derive(Debug, Clone)]
+/// Per-layer cache for a Qwen3.5 MoE layer.
 pub enum LayerCache {
+    /// Full-attention key/value cache.
     FullAttention(ConcatKeyValueCache),
+    /// Linear-attention convolution and recurrent cache.
     LinearAttention(LinearAttentionCache),
 }
 
 #[derive(Debug, Clone, Default)]
+/// Cache state for recurrent linear-attention layers.
 pub struct LinearAttentionCache {
+    /// Cached causal-convolution state.
     pub conv_state: Option<Array>,
+    /// Cached recurrent attention state.
     pub recurrent_state: Option<Array>,
+    /// Number of tokens consumed by the layer.
     pub offset: i32,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Qwen3Next RMSNorm variant with learned offset scale.
 pub struct Qwen3NextRmsNorm {
     #[param]
+    /// Learned scale offset.
     pub weight: Param<Array>,
+    /// Numerical epsilon.
     pub eps: f32,
 }
 
 impl Qwen3NextRmsNorm {
+    /// Creates an unloaded RMSNorm layer.
     pub fn new(dim: i32, eps: f32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             weight: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
@@ -910,6 +983,7 @@ impl Qwen3NextRmsNorm {
         })
     }
 
+    /// Applies normalization.
     pub fn forward(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         let variance = safemlx::ops::mean_axis(&x.square(stream)?, -1, true, stream)?;
         let normalized = x.multiply(
@@ -920,17 +994,22 @@ impl Qwen3NextRmsNorm {
         normalized.multiply(scale, stream)
     }
 
+    /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Gated Qwen3Next RMSNorm used by linear attention.
 pub struct Qwen3NextRmsNormGated {
     #[param]
+    /// Learned scale.
     pub weight: Param<Array>,
+    /// Numerical epsilon.
     pub eps: f32,
 }
 
 impl Qwen3NextRmsNormGated {
+    /// Creates an unloaded gated RMSNorm layer.
     pub fn new(dim: i32, eps: f32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             weight: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
@@ -938,6 +1017,7 @@ impl Qwen3NextRmsNormGated {
         })
     }
 
+    /// Applies normalization and SiLU gate modulation.
     pub fn forward(&self, x: &Array, gate: &Array, stream: &Stream) -> Result<Array, Exception> {
         let variance = safemlx::ops::mean_axis(&x.square(stream)?, -1, true, stream)?;
         let normalized = x.multiply(
@@ -949,32 +1029,46 @@ impl Qwen3NextRmsNormGated {
             .multiply(silu(gate.clone(), stream)?, stream)
     }
 
+    /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Full self-attention layer in Qwen3.5 MoE.
 pub struct FullAttention {
+    /// Number of query heads.
     pub n_heads: i32,
+    /// Number of key/value heads.
     pub n_kv_heads: i32,
+    /// Per-head dimension.
     pub head_dim: i32,
+    /// Attention scaling factor.
     pub scale: f32,
     #[param]
+    /// Query projection.
     pub q_proj: QwenLinear,
     #[param]
+    /// Key projection.
     pub k_proj: QwenLinear,
     #[param]
+    /// Value projection.
     pub v_proj: QwenLinear,
     #[param]
+    /// Output projection.
     pub o_proj: QwenLinear,
     #[param]
+    /// Query normalization.
     pub q_norm: Qwen3NextRmsNorm,
     #[param]
+    /// Key normalization.
     pub k_norm: Qwen3NextRmsNorm,
     #[param]
+    /// Rotary position embedding module.
     pub rope: RopeVariant,
 }
 
 impl FullAttention {
+    /// Creates an unloaded full-attention layer.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let hidden = args.hidden_size;
         let n_heads = args.num_attention_heads;
@@ -1028,9 +1122,13 @@ impl FullAttention {
     }
 }
 
+/// Input for a Qwen3.5 full-attention layer.
 pub struct FullAttentionInput<'a> {
+    /// Hidden states.
     pub x: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional key/value cache.
     pub cache: Option<&'a mut ConcatKeyValueCache>,
 }
 
@@ -1113,12 +1211,15 @@ impl Module<FullAttentionInput<'_>> for FullAttention {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Depthwise one-dimensional convolution parameters.
 pub struct DepthwiseConv1d {
     #[param]
+    /// Convolution weights.
     pub weight: Param<Array>,
 }
 
 impl DepthwiseConv1d {
+    /// Creates an unloaded depthwise convolution.
     pub fn new(channels: i32, kernel_size: i32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], Dtype::Float32, stream)?,
@@ -1128,36 +1229,55 @@ impl DepthwiseConv1d {
 
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, ModuleParameters)]
+/// Recurrent linear-attention layer used by Qwen3.5 MoE.
 pub struct LinearAttention {
+    /// Number of value heads.
     pub num_v_heads: i32,
+    /// Number of key heads.
     pub num_k_heads: i32,
+    /// Key head dimension.
     pub head_k_dim: i32,
+    /// Value head dimension.
     pub head_v_dim: i32,
+    /// Total key dimension.
     pub key_dim: i32,
+    /// Total value dimension.
     pub value_dim: i32,
+    /// Convolution input dimension.
     pub conv_dim: i32,
+    /// Causal convolution kernel size.
     pub conv_kernel_size: i32,
     #[param]
+    /// Depthwise causal convolution.
     pub conv1d: DepthwiseConv1d,
     #[param]
+    /// Joint query/key/value projection.
     pub in_proj_qkv: QwenLinear,
     #[param]
+    /// Output gate projection.
     pub in_proj_z: QwenLinear,
     #[param]
+    /// Beta projection.
     pub in_proj_b: QwenLinear,
     #[param]
+    /// Delta projection.
     pub in_proj_a: QwenLinear,
     #[param]
+    /// Delta bias.
     pub dt_bias: Param<Array>,
     #[param]
+    /// Log transition parameter.
     pub A_log: Param<Array>,
     #[param]
+    /// Gated normalization.
     pub norm: Qwen3NextRmsNormGated,
     #[param]
+    /// Output projection.
     pub out_proj: QwenLinear,
 }
 
 impl LinearAttention {
+    /// Creates an unloaded linear-attention layer.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let num_v_heads = args.linear_num_value_heads;
         let num_k_heads = args.linear_num_key_heads;
@@ -1510,8 +1630,11 @@ impl LinearAttention {
     }
 }
 
+/// Input for a Qwen3.5 linear-attention layer.
 pub struct LinearAttentionInput<'a> {
+    /// Hidden states.
     pub x: &'a Array,
+    /// Optional linear-attention cache.
     pub cache: Option<&'a mut LinearAttentionCache>,
 }
 
@@ -1597,12 +1720,16 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Dense SwiGLU MLP used by the shared expert.
 pub struct Mlp {
     #[param]
+    /// Gate projection.
     pub gate_proj: QwenLinear,
     #[param]
+    /// Up projection.
     pub up_proj: QwenLinear,
     #[param]
+    /// Down projection.
     pub down_proj: QwenLinear,
 }
 
@@ -1635,22 +1762,32 @@ impl Mlp {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Routed expert bank for Qwen3.5 MoE.
 pub struct Experts {
+    /// Number of experts.
     pub num_experts: i32,
+    /// Model hidden dimension.
     pub hidden_dim: i32,
+    /// Expert intermediate dimension.
     pub intermediate_dim: i32,
+    /// Whether expert weights are stored as FP8.
     pub use_fp8: bool,
     #[param]
+    /// Packed gate and up projection weights for all experts.
     pub gate_up_proj: Param<Array>,
     #[param]
+    /// Optional FP8 inverse scales for gate/up projection weights.
     pub gate_up_proj_scale_inv: Param<Option<Array>>,
     #[param]
+    /// Down projection weights for all experts.
     pub down_proj: Param<Array>,
     #[param]
+    /// Optional FP8 inverse scales for down projection weights.
     pub down_proj_scale_inv: Param<Option<Array>>,
 }
 
 impl Experts {
+    /// Creates an unloaded routed expert bank.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let expert_weight_dtype = if args.uses_fp8() {
             Dtype::Uint8
@@ -1709,6 +1846,7 @@ impl Experts {
         })
     }
 
+    /// Evaluates routed experts for flattened token hidden states.
     pub fn forward(
         &mut self,
         hidden_states: &Array,
@@ -1752,6 +1890,7 @@ impl Experts {
         sum_axis(&weighted, -2, false, stream)
     }
 
+    /// Evaluates routed experts in chunks for long prefill inputs.
     pub fn forward_chunked(
         &mut self,
         hidden_states: &Array,
@@ -1842,19 +1981,26 @@ impl Experts {
         segment_sum_by_index(weighted, &plan.token_indices, num_tokens, stream)
     }
 
+    /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Top-k router for Qwen3.5 MoE experts.
 pub struct TopKRouter {
+    /// Number of experts selected per token.
     pub top_k: i32,
+    /// Total number of experts.
     pub num_experts: i32,
+    /// Whether top-k probabilities are normalized.
     pub norm_topk_prob: bool,
     #[param]
+    /// Router projection weight.
     pub weight: Param<Array>,
 }
 
 impl TopKRouter {
+    /// Creates an unloaded router.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             top_k: args.num_experts_per_tok,
@@ -1868,6 +2014,7 @@ impl TopKRouter {
         })
     }
 
+    /// Returns selected expert indices and routing weights.
     pub fn forward(
         &mut self,
         hidden_states: &Array,
@@ -1886,22 +2033,29 @@ impl TopKRouter {
         ))
     }
 
+    /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Sparse MoE block with routed experts plus a shared expert.
 pub struct SparseMoeBlock {
     #[param]
+    /// Top-k router.
     pub gate: TopKRouter,
     #[param]
+    /// Routed expert bank.
     pub experts: Experts,
     #[param]
+    /// Shared expert MLP.
     pub shared_expert: Mlp,
     #[param]
+    /// Gate applied to the shared expert output.
     pub shared_expert_gate: QwenLinear,
 }
 
 impl SparseMoeBlock {
+    /// Creates an unloaded sparse MoE block.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             gate: TopKRouter::new(args, stream)?,
@@ -1961,21 +2115,29 @@ impl Module<&Array> for SparseMoeBlock {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Qwen3.5 MoE transformer block.
 pub struct TransformerBlock {
+    /// Layer kind.
     pub layer_type: LayerType,
     #[param]
+    /// Full-attention layer when `layer_type` is [`LayerType::FullAttention`].
     pub self_attn: Option<FullAttention>,
     #[param]
+    /// Linear-attention layer when `layer_type` is [`LayerType::LinearAttention`].
     pub linear_attn: Option<LinearAttention>,
     #[param]
+    /// Sparse MoE feed-forward block.
     pub mlp: SparseMoeBlock,
     #[param]
+    /// Pre-attention normalization.
     pub input_layernorm: Qwen3NextRmsNorm,
     #[param]
+    /// Pre-MoE normalization.
     pub post_attention_layernorm: Qwen3NextRmsNorm,
 }
 
 impl TransformerBlock {
+    /// Creates an unloaded transformer block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         let layer_type = args.layer_type(layer_idx);
         Ok(Self {
@@ -2001,9 +2163,13 @@ impl TransformerBlock {
     }
 }
 
+/// Input for a Qwen3.5 transformer block.
 pub struct BlockInput<'a> {
+    /// Hidden states.
     pub x: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional layer cache.
     pub cache: Option<&'a mut LayerCache>,
 }
 
@@ -2086,18 +2252,25 @@ impl Module<BlockInput<'_>> for TransformerBlock {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Qwen3.5 MoE text transformer body without the language-model head.
 pub struct Qwen35MoeTextModel {
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
     #[param]
+    /// Token embedding table.
     pub embed_tokens: nn::Embedding,
     #[param]
+    /// Transformer blocks.
     pub layers: Vec<TransformerBlock>,
     #[param]
+    /// Final normalization.
     pub norm: Qwen3NextRmsNorm,
 }
 
 impl Qwen35MoeTextModel {
+    /// Creates an unloaded Qwen3.5 MoE text transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let embed_tokens =
             nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
@@ -2114,9 +2287,13 @@ impl Qwen35MoeTextModel {
     }
 }
 
+/// Input for a Qwen3.5 MoE text forward pass.
 pub struct ModelInput<'a> {
+    /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional heterogeneous cache.
     pub cache: Option<&'a mut Cache>,
 }
 
@@ -2219,17 +2396,24 @@ impl KeyValueCache for OffsetOnlyCache {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Qwen3.5 MoE causal language model.
 pub struct Model {
+    /// Model configuration.
     pub args: ModelArgs,
+    /// Optional image token id rejected by text-only generation.
     pub image_token_id: Option<i32>,
+    /// Optional video token id rejected by text-only generation.
     pub video_token_id: Option<i32>,
     #[param]
+    /// Text transformer body.
     pub model: Qwen35MoeTextModel,
     #[param]
+    /// Optional untied language-model head.
     pub lm_head: Option<nn::Linear>,
 }
 
 impl Model {
+    /// Creates an unloaded Qwen3.5 MoE causal language model.
     pub fn new(
         args: ModelArgs,
         image_token_id: Option<i32>,
@@ -2257,10 +2441,12 @@ impl Model {
         })
     }
 
+    /// Creates an empty heterogeneous cache for this model.
     pub fn new_cache(&self) -> Cache {
         Cache::new(&self.args)
     }
 
+    /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
     }
@@ -2337,11 +2523,13 @@ impl Module<ModelInput<'_>> for Model {
     }
 }
 
+/// Loads `tokenizer.json` from a Qwen3.5 MoE model directory.
 pub fn load_qwen3_5_moe_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
+/// Reads and normalizes Qwen3.5 MoE model arguments from `config.json`.
 pub fn get_qwen3_5_moe_model_args(
     model_dir: impl AsRef<Path>,
 ) -> Result<(ModelArgs, Option<i32>, Option<i32>), Error> {
@@ -2409,11 +2597,15 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Hugging Face safetensors index file.
 pub struct WeightMap {
+    /// Index metadata.
     pub metadata: HashMap<String, Value>,
+    /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
 }
 
+/// Loads a Qwen3.5 MoE model and safetensors weights from a model directory.
 pub fn load_qwen3_5_moe_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -2707,6 +2899,7 @@ impl CausalLm<Cache> for Model {
     }
 }
 
+/// Qwen3.5 MoE token generation iterator.
 pub type Generate<'a> = common::Generate<'a, Model, Cache>;
 
 #[cfg(test)]

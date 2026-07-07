@@ -5,7 +5,13 @@ use safemlx::{
     Array, Stream,
 };
 
+/// Strategy for choosing a token from model logits.
 pub trait Sampler {
+    /// Samples one token id from `logits`.
+    ///
+    /// Implementations may use `temp` and `prng_state`; stochastic samplers
+    /// should return an error when randomness is required but no PRNG state is
+    /// supplied.
     fn sample(
         &mut self,
         logits: &Array,
@@ -15,6 +21,10 @@ pub trait Sampler {
     ) -> Result<Array, Exception>;
 }
 
+/// Default sampler used by generation helpers.
+///
+/// A temperature of `0.0` uses greedy argmax sampling. Non-zero temperatures
+/// sample from a categorical distribution and require a PRNG key.
 pub struct DefaultSampler;
 
 impl Sampler for DefaultSampler {

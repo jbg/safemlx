@@ -1,3 +1,5 @@
+//! Shared tensor helpers used by model implementations.
+
 use safemlx::{
     arange,
     error::Exception,
@@ -12,7 +14,9 @@ use safemlx::{
 
 use crate::cache::KeyValueCache;
 
+/// Rotary position-embedding variants and initialization.
 pub mod rope;
+/// Tokenizer-related re-exports and helpers.
 pub mod tokenizer;
 
 #[allow(unused_macros)]
@@ -147,20 +151,31 @@ pub(crate) fn quantized_scaled_dot_product_attention(
     Ok(out)
 }
 
+/// Quantized key tensor and its dequantization parameters.
 pub struct QuantizedKeys {
+    /// Packed quantized keys.
     pub keys: Array,
+    /// Per-group quantization scales.
     pub scales: Array,
+    /// Per-group quantization biases.
     pub biases: Array,
 }
 
+/// Quantized value tensor and its dequantization parameters.
 pub struct QuantizedValues {
+    /// Packed quantized values.
     pub values: Array,
+    /// Per-group quantization scales.
     pub scales: Array,
+    /// Per-group quantization biases.
     pub biases: Array,
 }
 
+/// Either original or quantized attention keys.
 pub enum MaybeQuantizedKeys {
+    /// Floating-point keys.
     Original(Array),
+    /// Quantized keys plus scale metadata.
     Quantized(QuantizedKeys),
 }
 
@@ -176,8 +191,11 @@ impl From<QuantizedKeys> for MaybeQuantizedKeys {
     }
 }
 
+/// Either original or quantized attention values.
 pub enum MaybeQuantizedValues {
+    /// Floating-point values.
     Original(Array),
+    /// Quantized values plus scale metadata.
     Quantized(QuantizedValues),
 }
 

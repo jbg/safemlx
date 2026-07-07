@@ -16,17 +16,25 @@ use crate::{
     },
 };
 
+/// Statistics collected during Gemma 4 multi-token prediction generation.
 #[derive(Debug, Clone, Default)]
 pub struct MtpStats {
+    /// Number of target-model tokens evaluated.
     pub target_tokens: usize,
+    /// Number of assistant draft tokens proposed.
     pub draft_tokens: usize,
+    /// Number of draft tokens accepted by the target model.
     pub accepted_tokens: usize,
+    /// Number of speculative verification rounds.
     pub rounds: usize,
+    /// Accepted draft-token count for each verification round.
     pub accept_lens: Vec<usize>,
+    /// Wall-clock time spent in generation.
     pub elapsed: Duration,
 }
 
 impl MtpStats {
+    /// Returns `accepted_tokens / draft_tokens`, or `0.0` when no draft tokens were proposed.
     pub fn accept_rate(&self) -> f64 {
         if self.draft_tokens == 0 {
             0.0
@@ -36,6 +44,7 @@ impl MtpStats {
     }
 }
 
+/// Generates tokens with a Gemma 4 target model and Gemma 4 assistant drafter.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4_mtp(
     target: &mut Gemma4Model,

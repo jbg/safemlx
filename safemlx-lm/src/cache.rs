@@ -5,7 +5,9 @@ use safemlx::{
 };
 
 // TODO: somehow move quantized methods to a separate trait?
+/// A per-layer attention key/value cache.
 pub trait KeyValueCache {
+    /// Returns whether this cache stores quantized keys and values.
     fn is_quantized(&self) -> bool {
         false
     }
@@ -20,10 +22,13 @@ pub trait KeyValueCache {
         None
     }
 
+    /// Returns the current sequence offset represented by the cache.
     fn offset(&self) -> i32;
 
+    /// Returns the maximum retained sequence length for sliding-window caches.
     fn max_size(&self) -> Option<i32>;
 
+    /// Adds the newest keys and values and returns the full keys and values to attend over.
     fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -66,6 +71,7 @@ where
     }
 }
 
+/// A cache that appends all key/value states along the sequence axis.
 #[derive(Debug, Clone, Default)]
 pub struct ConcatKeyValueCache {
     keys: Option<Array>,
@@ -74,10 +80,12 @@ pub struct ConcatKeyValueCache {
 }
 
 impl ConcatKeyValueCache {
+    /// Creates an empty concatenating key/value cache.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Truncates the cache to `len` tokens.
     pub fn truncate(&mut self, len: i32, stream: &Stream) -> Result<(), Exception> {
         if let Some(keys) = self.keys.take() {
             self.keys = Some(keys.try_index_device((.., .., ..len, ..), stream)?);
@@ -89,6 +97,7 @@ impl ConcatKeyValueCache {
         Ok(())
     }
 
+    /// Returns the arrays currently retained by the cache.
     pub fn arrays(&self) -> impl Iterator<Item = &Array> {
         self.keys.iter().chain(self.values.iter())
     }
@@ -129,5 +138,5 @@ impl KeyValueCache for ConcatKeyValueCache {
     }
 }
 
-/// TODO: A generic KV Cache
+/// Placeholder for a future generic key/value cache implementation.
 pub struct DefaultKeyValueCache {}

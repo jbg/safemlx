@@ -1,3 +1,5 @@
+//! Gemma 4 text model implementation and loader.
+
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -31,59 +33,91 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+/// Deserialized Gemma 4 text configuration used by this loader.
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
+    /// Effective text model type.
     pub model_type: String,
+    /// Transformer hidden size.
     pub hidden_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    /// Dense MLP intermediate size.
     pub intermediate_size: i32,
+    /// Number of query attention heads.
     pub num_attention_heads: i32,
+    /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Number of key/value attention heads.
     pub num_key_value_heads: i32,
     #[serde(default)]
+    /// Optional number of key/value heads for global attention layers.
     pub num_global_key_value_heads: Option<i32>,
+    /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
     #[serde(default = "default_rope_theta")]
+    /// Default RoPE base frequency.
     pub rope_theta: f32,
+    /// Per-head attention dimension.
     pub head_dim: i32,
     #[serde(default)]
+    /// Optional per-head dimension for global attention layers.
     pub global_head_dim: Option<i32>,
     #[serde(default = "default_true")]
+    /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     #[serde(default)]
+    /// Whether attention projection layers include bias terms.
     pub attention_bias: bool,
     #[serde(default)]
+    /// Whether full-attention keys are reused as values.
     pub attention_k_eq_v: bool,
     #[serde(skip)]
+    /// Whether Gemma-specific quantized tensors are expected.
     pub quantized: bool,
     #[serde(skip)]
+    /// Quantization group size for quantized weights.
     pub quantization_group_size: i32,
     #[serde(skip)]
+    /// Quantization bit width for quantized weights.
     pub quantization_bits: i32,
     #[serde(default)]
+    /// Hidden size for per-layer input embeddings.
     pub hidden_size_per_layer_input: i32,
     #[serde(default)]
+    /// Optional vocabulary size for per-layer input embeddings.
     pub vocab_size_per_layer_input: Option<i32>,
     #[serde(default)]
+    /// Number of final layers that reuse shared key/value states.
     pub num_kv_shared_layers: i32,
     #[serde(default)]
+    /// Layer attention pattern.
     pub layer_types: Vec<LayerType>,
     #[serde(default)]
+    /// Sliding-window size for sliding-attention layers.
     pub sliding_window: Option<i32>,
     #[serde(default)]
+    /// Optional final-logit soft cap.
     pub final_logit_softcapping: Option<f32>,
     #[serde(default)]
+    /// Whether the config requests a Gemma MoE block.
     pub enable_moe_block: bool,
     #[serde(default)]
+    /// Number of experts when MoE is present.
     pub num_experts: Option<i32>,
     #[serde(default)]
+    /// Number of selected experts when MoE is present.
     pub top_k_experts: Option<i32>,
     #[serde(default)]
+    /// MoE intermediate size when MoE is present.
     pub moe_intermediate_size: Option<i32>,
     #[serde(default)]
+    /// Default RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     #[serde(default)]
+    /// Per-layer-type RoPE parameter overrides.
     pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
 }
 
@@ -100,8 +134,11 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Gemma 4 attention-layer kind.
 pub enum LayerType {
+    /// Sliding-window attention layer.
     SlidingAttention,
+    /// Full-context attention layer.
     FullAttention,
 }
 
@@ -241,36 +278,52 @@ fn rms_norm_without_scale(x: &Array, eps: f32, stream: &Stream) -> Result<Array,
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 attention layer.
 pub struct Attention {
+    /// Number of query heads.
     pub n_heads: i32,
+    /// Number of key/value heads.
     pub n_kv_heads: i32,
+    /// Attention scaling factor.
     pub scale: f32,
+    /// Whether key projections are reused as value projections.
     pub attention_k_eq_v: bool,
+    /// Layer attention pattern.
     pub layer_type: LayerType,
+    /// Whether this layer reads shared key/value states from another layer.
     pub is_kv_shared_layer: bool,
+    /// Whether this layer stores full-length key/value states for sharing.
     pub store_full_length_kv: bool,
 
     #[quantizable]
     #[param]
+    /// Query projection.
     pub q_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Key projection.
     pub k_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Optional value projection.
     pub v_proj: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
     #[param]
+    /// Output projection.
     pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
+    /// Query normalization.
     pub q_norm: nn::RmsNorm,
     #[param]
+    /// Key normalization.
     pub k_norm: nn::RmsNorm,
     #[param]
+    /// Rotary position embedding module.
     pub rope: RopeVariant,
 }
 
 impl Attention {
+    /// Creates an unloaded Gemma 4 attention layer.
     pub fn new(
         args: &ModelArgs,
         layer_type: LayerType,
@@ -365,19 +418,31 @@ impl Attention {
     }
 }
 
+/// Input for a Gemma 4 attention or transformer block.
 pub struct AttentionInput<'a, C> {
+    /// Hidden states with shape `[batch, sequence, hidden]`.
     pub x: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional mutable key/value cache.
     pub cache: Option<&'a mut C>,
+    /// RoPE/cache position offset.
     pub position_offset: i32,
+    /// Optional per-layer input embedding slice.
     pub per_layer_input: Option<&'a Array>,
+    /// Shared key/value states keyed by layer type.
     pub shared_kv: Option<&'a mut HashMap<LayerType, (Array, Array)>>,
+    /// Whether generated sliding-window masks should be suppressed.
     pub disable_generated_mask: bool,
 }
 
+/// Hidden states and shared KV state returned by the Gemma 4 text body.
 pub struct Gemma4TextOutput {
+    /// Final normalized hidden states.
     pub hidden: Array,
+    /// Hidden states before final normalization.
     pub pre_norm_hidden: Array,
+    /// Shared key/value states captured during the pass.
     pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
@@ -491,19 +556,24 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 feed-forward layer.
 pub struct Mlp {
     #[quantizable]
     #[param]
+    /// Gate projection.
     pub gate_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Down projection back to hidden size.
     pub down_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Up projection.
     pub up_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Mlp {
+    /// Creates an unloaded Gemma 4 MLP.
     pub fn new(
         dim: i32,
         hidden_dim: i32,
@@ -542,20 +612,29 @@ impl Module<&Array> for Mlp {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Gemma 4 embedding table with optional packed quantized storage.
 pub struct Gemma4Embedding {
     #[param]
+    /// Embedding weight tensor.
     pub weight: Param<Array>,
     #[param]
+    /// Optional quantization scales.
     pub scales: Param<Option<Array>>,
     #[param]
+    /// Optional quantization biases.
     pub biases: Param<Option<Array>>,
+    /// Whether the embedding is stored in quantized form.
     pub quantized: bool,
+    /// Output hidden size.
     pub hidden_size: i32,
+    /// Quantization group size.
     pub group_size: i32,
+    /// Quantization bit width.
     pub bits: i32,
 }
 
 impl Gemma4Embedding {
+    /// Creates an unloaded embedding table.
     pub fn unloaded(
         vocab_size: i32,
         hidden_size: i32,
@@ -600,6 +679,7 @@ impl Gemma4Embedding {
         })
     }
 
+    /// Creates an initialized embedding table.
     pub fn new(
         vocab_size: i32,
         hidden_size: i32,
@@ -639,6 +719,7 @@ impl Gemma4Embedding {
         })
     }
 
+    /// Embeds token ids.
     pub fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         if !self.quantized {
             return self.weight.try_index_device(input, stream);
@@ -673,6 +754,7 @@ impl Gemma4Embedding {
         out.reshape(&shape, stream)
     }
 
+    /// Applies the embedding table as a tied language-model head.
     pub fn as_linear(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         let weight = if self.quantized {
             let scales = self
@@ -699,43 +781,60 @@ impl Gemma4Embedding {
         safemlx::ops::matmul(x, weight.transpose(stream)?, stream)
     }
 
+    /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 transformer block.
 pub struct TransformerBlock {
+    /// Number of attention heads.
     pub num_attention_heads: i32,
+    /// Transformer hidden size.
     pub hidden_size: i32,
+    /// Layer attention pattern.
     pub layer_type: LayerType,
+    /// Sliding-window size, if any.
     pub sliding_window: Option<i32>,
 
     #[quantizable]
     #[param]
+    /// Self-attention layer.
     pub self_attn: Attention,
     #[quantizable]
     #[param]
+    /// Feed-forward layer.
     pub mlp: Mlp,
     #[quantizable]
     #[param]
+    /// Optional gate for per-layer input embeddings.
     pub per_layer_input_gate: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
     #[param]
+    /// Optional projection for per-layer input embeddings.
     pub per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
     #[param]
+    /// Optional normalization after per-layer input projection.
     pub post_per_layer_input_norm: Option<nn::RmsNorm>,
     #[param]
+    /// Pre-attention RMSNorm.
     pub input_layernorm: nn::RmsNorm,
     #[param]
+    /// Post-attention RMSNorm.
     pub post_attention_layernorm: nn::RmsNorm,
     #[param]
+    /// Pre-MLP RMSNorm.
     pub pre_feedforward_layernorm: nn::RmsNorm,
     #[param]
+    /// Post-MLP RMSNorm.
     pub post_feedforward_layernorm: nn::RmsNorm,
     #[param]
+    /// Learned scalar applied to the block output.
     pub layer_scalar: Param<Array>,
 }
 
 impl TransformerBlock {
+    /// Creates an unloaded transformer block.
     pub fn new(
         args: &ModelArgs,
         layer_type: LayerType,
@@ -910,28 +1009,40 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 text transformer body without the language-model head.
 pub struct Gemma4TextModel {
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    /// Transformer hidden size.
     pub hidden_size: i32,
+    /// Per-layer input hidden size.
     pub hidden_size_per_layer_input: i32,
     #[param]
+    /// Token embedding table.
     pub embed_tokens: Gemma4Embedding,
     #[param]
+    /// Optional per-layer token embedding table.
     pub embed_tokens_per_layer: Option<Gemma4Embedding>,
     #[quantizable]
     #[param]
+    /// Optional projection used to form per-layer inputs.
     pub per_layer_model_projection: Option<MaybeQuantized<nn::Linear>>,
     #[param]
+    /// Optional normalization for per-layer projection outputs.
     pub per_layer_projection_norm: Option<nn::RmsNorm>,
     #[quantizable]
     #[param]
+    /// Transformer blocks.
     pub layers: Vec<TransformerBlock>,
     #[param]
+    /// Final RMSNorm.
     pub norm: nn::RmsNorm,
 }
 
 impl Gemma4TextModel {
+    /// Creates an unloaded Gemma 4 text transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
@@ -1052,13 +1163,18 @@ impl Gemma4TextModel {
     }
 }
 
+/// Input for a Gemma 4 text forward pass.
 pub struct ModelInput<'a, C> {
+    /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Mutable per-layer key/value cache.
     pub cache: &'a mut Vec<Option<C>>,
 }
 
 impl Gemma4TextModel {
+    /// Runs the text body and returns final hidden states plus state used by assistant drafting.
     pub fn forward_with_state<C>(
         &mut self,
         input: ModelInput<'_, C>,
@@ -1150,13 +1266,16 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 conditional-generation wrapper.
 pub struct Gemma4ForConditionalGeneration {
     #[quantizable]
     #[param]
+    /// Text transformer body.
     pub language_model: Gemma4TextModel,
 }
 
 impl Gemma4ForConditionalGeneration {
+    /// Creates an unloaded conditional-generation wrapper.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             language_model: Gemma4TextModel::new(args, stream)?,
@@ -1165,17 +1284,22 @@ impl Gemma4ForConditionalGeneration {
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 causal language model.
 pub struct Model {
+    /// Model configuration.
     pub args: ModelArgs,
     #[quantizable]
     #[param]
+    /// Conditional-generation model body.
     pub model: Gemma4ForConditionalGeneration,
     #[quantizable]
     #[param]
+    /// Optional untied language-model head.
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
+    /// Creates an unloaded Gemma 4 causal language model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
@@ -1194,6 +1318,7 @@ impl Model {
         })
     }
 
+    /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
     }
@@ -1238,6 +1363,7 @@ where
     }
 }
 
+/// Loads `tokenizer.json` from a Gemma 4 model directory.
 pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
@@ -1252,6 +1378,7 @@ fn quantization_i32(config: &Option<Value>, key: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+/// Reads and normalizes Gemma 4 text model arguments from `config.json`.
 pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
@@ -1282,11 +1409,15 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Hugging Face safetensors index file.
 pub struct WeightMap {
+    /// Index metadata.
     pub metadata: HashMap<String, Value>,
+    /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
 }
 
+/// Loads a Gemma 4 model and safetensors weights from a model directory.
 pub fn load_gemma4_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -1341,6 +1472,7 @@ pub fn load_gemma4_model(
 }
 
 impl Model {
+    /// Runs a Gemma 4 forward pass and returns logits plus assistant-drafting state.
     pub fn forward_with_state(
         &mut self,
         input: ModelInput<'_, ConcatKeyValueCache>,
@@ -1369,6 +1501,7 @@ impl Model {
         })
     }
 
+    /// Rolls back speculative tokens that were rejected by target-model verification.
     pub fn rollback_speculative_cache(
         &mut self,
         cache: &mut [Option<ConcatKeyValueCache>],
@@ -1388,9 +1521,13 @@ impl Model {
     }
 }
 
+/// Output for a Gemma 4 target-model step used by assistant drafting.
 pub struct Gemma4StepOutput {
+    /// Logits for the step.
     pub logits: Array,
+    /// Pre-final-normalization hidden states.
     pub hidden: Array,
+    /// Shared key/value states for assistant drafting.
     pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
@@ -1446,6 +1583,7 @@ where
     }
 }
 
+/// Gemma 4 token generation iterator.
 pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;
 
 #[cfg(test)]

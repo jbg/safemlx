@@ -1,3 +1,5 @@
+//! Shared layers and generation machinery for decoder-only causal LMs.
+
 use std::marker::PhantomData;
 
 use safemlx::{
@@ -21,24 +23,30 @@ use crate::{
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
 
+/// Applies the SiLU activation function.
 pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
     x.multiply(sigmoid(&x, stream)?, stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// SwiGLU MLP with optionally quantized projections.
 pub struct SwiGluMlp {
     #[quantizable]
     #[param]
+    /// Gate projection.
     pub gate_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Down projection back to the model hidden size.
     pub down_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Up projection.
     pub up_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl SwiGluMlp {
+    /// Creates an initialized SwiGLU MLP.
     pub fn new(dim: i32, hidden_dim: i32, bias: bool) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: MaybeQuantized::Original(
@@ -53,6 +61,7 @@ impl SwiGluMlp {
         })
     }
 
+    /// Creates an unloaded SwiGLU MLP whose parameters can be populated from weights.
     pub fn unloaded(
         dim: i32,
         hidden_dim: i32,
@@ -103,16 +112,21 @@ impl Module<&Array> for SwiGluMlp {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Dense SwiGLU MLP without quantized projection wrappers.
 pub struct DenseSwiGluMlp {
     #[param]
+    /// Gate projection.
     pub gate_proj: nn::Linear,
     #[param]
+    /// Up projection.
     pub up_proj: nn::Linear,
     #[param]
+    /// Down projection back to the model hidden size.
     pub down_proj: nn::Linear,
 }
 
 impl DenseSwiGluMlp {
+    /// Creates an initialized dense SwiGLU MLP.
     pub fn new(dim: i32, hidden_dim: i32, bias: bool) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: nn::LinearBuilder::new(dim, hidden_dim).bias(bias).build()?,
@@ -121,6 +135,7 @@ impl DenseSwiGluMlp {
         })
     }
 
+    /// Creates an unloaded dense SwiGLU MLP whose parameters can be populated from weights.
     pub fn unloaded(
         dim: i32,
         hidden_dim: i32,
@@ -152,12 +167,14 @@ impl Module<&Array> for DenseSwiGluMlp {
     }
 }
 
+/// Builds an initialized untied language-model head.
 pub fn build_lm_head(hidden_size: i32, vocab_size: i32) -> Result<nn::Linear, Exception> {
     nn::LinearBuilder::new(hidden_size, vocab_size)
         .bias(false)
         .build()
 }
 
+/// Builds an unloaded untied language-model head.
 pub fn build_unloaded_lm_head(
     hidden_size: i32,
     vocab_size: i32,
@@ -166,6 +183,7 @@ pub fn build_unloaded_lm_head(
     nn::Linear::unloaded(hidden_size, vocab_size, false, Dtype::Float32, stream)
 }
 
+/// Builds an initialized language-model head wrapped for optional quantization.
 pub fn build_maybe_quantized_lm_head(
     hidden_size: i32,
     vocab_size: i32,
@@ -176,6 +194,7 @@ pub fn build_maybe_quantized_lm_head(
     )?))
 }
 
+/// Builds an unloaded language-model head wrapped for optional quantization.
 pub fn build_unloaded_maybe_quantized_lm_head(
     hidden_size: i32,
     vocab_size: i32,
@@ -188,6 +207,7 @@ pub fn build_unloaded_maybe_quantized_lm_head(
     )?))
 }
 
+/// Projects hidden states to logits, using tied embeddings when `lm_head` is absent.
 pub fn project_logits_maybe_quantized(
     lm_head: &mut Option<MaybeQuantized<nn::Linear>>,
     embed_tokens: &mut MaybeQuantized<nn::Embedding>,
@@ -205,6 +225,7 @@ pub fn project_logits_maybe_quantized(
     }
 }
 
+/// Projects hidden states to logits for dense, non-quantized heads.
 pub fn project_logits_dense(
     lm_head: &mut Option<nn::Linear>,
     embed_tokens: &nn::Embedding,
@@ -217,17 +238,23 @@ pub fn project_logits_dense(
     }
 }
 
+/// Common attention-layer input.
 pub struct AttentionInput<'a, C> {
+    /// Hidden states with shape `[batch, sequence, hidden]`.
     pub x: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional mutable key/value cache.
     pub cache: Option<&'a mut C>,
 }
 
+/// Returns the batch size and sequence length from a hidden-state tensor.
 pub fn batch_seq(x: &Array) -> (i32, i32) {
     let shape = x.shape();
     (shape[0], shape[1])
 }
 
+/// Reshapes a projected Q/K/V tensor to `[batch, heads, sequence, head_dim]`.
 pub fn reshape_attention_projection(
     projection: Array,
     batch: i32,
@@ -240,6 +267,7 @@ pub fn reshape_attention_projection(
         .transpose_axes(&[0, 2, 1, 3], stream)
 }
 
+/// Applies RoPE to queries and keys, then updates a cache when provided.
 pub fn apply_rope_and_update_cache<C>(
     rope: &mut RopeVariant,
     mut queries: Array,
@@ -271,6 +299,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs scaled dot-product attention and reshapes the output back to hidden states.
 pub fn finish_attention<C>(
     queries: Array,
     keys: Array,
@@ -290,6 +319,10 @@ where
         .reshape(&[batch, seq_len, -1], stream)
 }
 
+/// Samples a token id from logits.
+///
+/// A temperature of `0.0` uses greedy argmax; non-zero temperatures use
+/// categorical sampling and require `prng_state`.
 pub fn sample(
     logits: &Array,
     temp: f32,
@@ -309,7 +342,9 @@ pub fn sample(
     }
 }
 
+/// Minimal interface required by the generic token generator.
 pub trait CausalLm<C> {
+    /// Computes logits for an initial prompt and fills `cache`.
     fn prefill_logits(
         &mut self,
         prompt_tokens: &Array,
@@ -317,6 +352,7 @@ pub trait CausalLm<C> {
         stream: &Stream,
     ) -> Result<Array, Exception>;
 
+    /// Computes logits for one or more decode tokens using an existing cache.
     fn decode_logits(
         &mut self,
         input_tokens: &Array,
@@ -324,6 +360,7 @@ pub trait CausalLm<C> {
         stream: &Stream,
     ) -> Result<Array, Exception>;
 
+    /// Gives implementations a chance to adjust prefill logits before sampling.
     fn adjust_prefill_logits(
         &mut self,
         logits: Array,
@@ -334,11 +371,21 @@ pub trait CausalLm<C> {
     }
 }
 
+/// Current state of a generic generation iterator.
 pub enum GenerateState<'a> {
-    Prefill { prompt_tokens: &'a Array },
-    Decode { y: Array },
+    /// The iterator has not consumed the prompt yet.
+    Prefill {
+        /// Prompt token ids used for the initial prefill pass.
+        prompt_tokens: &'a Array,
+    },
+    /// The iterator is decoding from the previous sampled token.
+    Decode {
+        /// Previously sampled token id array.
+        y: Array,
+    },
 }
 
+/// Generic token iterator for a causal LM.
 pub struct Generate<'a, M, C>
 where
     M: CausalLm<C>,
@@ -356,6 +403,7 @@ impl<'a, M, C> Generate<'a, M, C>
 where
     M: CausalLm<C>,
 {
+    /// Creates a generation iterator over token-id arrays.
     pub fn new(
         model: &'a mut M,
         cache: &'a mut C,

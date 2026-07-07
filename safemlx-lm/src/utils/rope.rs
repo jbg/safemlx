@@ -1,3 +1,5 @@
+//! Rotary position embedding initialization and variants.
+
 use std::collections::HashMap;
 
 use safemlx::macros::ModuleParameters;
@@ -12,20 +14,27 @@ use safemlx::{
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq)]
+/// Borrowed scalar value from a RoPE scaling config.
 pub enum FloatOrStr<'a> {
+    /// Numeric floating-point value.
     Float(f32),
+    /// Borrowed string value.
     Str(&'a str),
 }
 
 // TODO: check if additional serde attributes are needed
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+/// Deserialized RoPE scaling-config value.
 pub enum FloatOrString {
+    /// Numeric floating-point value.
     Float(f32),
+    /// String value, used by config fields such as `rope_type`.
     String(String),
 }
 
 impl FloatOrString {
+    /// Borrows the value without allocating.
     pub fn borrowed(&self) -> FloatOrStr<'_> {
         match self {
             FloatOrString::Float(f) => FloatOrStr::Float(*f),
@@ -63,14 +72,18 @@ fn get_numeric_from_config(
 // TODO: support derive ModuleParameters for structs with non-param Array fields
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Llama3Rope {
+    /// Number of rotary dimensions.
     pub dimensions: i32,
+    /// Whether to use traditional pair ordering.
     pub traditional: bool,
+    /// Runtime scale factor passed to MLX RoPE.
     pub scale: f32,
     /// Pre-computed scaled frequencies. Not a module parameter.
     pub freqs: Array,
 }
 
 impl Llama3Rope {
+    /// Builds a Llama 3 RoPE module with frequency scaling.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dims: i32,
@@ -181,13 +194,18 @@ where
 /// full head shape expected by Gemma 4.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct ProportionalRope {
+    /// Head dimension passed to MLX RoPE.
     pub dimensions: i32,
+    /// Whether to use traditional pair ordering.
     pub traditional: bool,
+    /// Runtime scale factor passed to MLX RoPE.
     pub scale: f32,
+    /// Frequency vector with non-rotary dimensions represented by zeros.
     pub freqs: Array,
 }
 
 impl ProportionalRope {
+    /// Builds proportional RoPE for partial-rotary models.
     pub fn new(
         dims: i32,
         traditional: bool,
@@ -257,8 +275,11 @@ where
 /// either a standard RoPE or a Llama3 RoPE.
 #[derive(Debug, Clone)]
 pub enum RopeVariant {
+    /// Standard MLX RoPE.
     Default(nn::Rope),
+    /// Llama 3 scaled RoPE.
     Llama3(Llama3Rope),
+    /// Proportional RoPE used by Gemma 4.
     Proportional(ProportionalRope),
 }
 
@@ -359,6 +380,7 @@ where
     }
 }
 
+/// Creates the RoPE implementation requested by a model config.
 pub fn initialize_rope(
     dims: i32,
     base: f32, // rope_theta

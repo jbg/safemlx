@@ -7,6 +7,10 @@ use safemlx::{module::ModuleParameters, Array, Stream};
 
 use crate::error::Error;
 
+/// Options for strict checkpoint loading.
+///
+/// This configuration controls how checkpoint tensor names are matched to model
+/// parameters and which missing or unused names are accepted.
 #[derive(Debug, Clone, Default)]
 pub struct StrictLoadConfig {
     allowed_unused_prefixes: Vec<String>,
@@ -17,26 +21,31 @@ pub struct StrictLoadConfig {
 }
 
 impl StrictLoadConfig {
+    /// Allows unused checkpoint tensors whose names start with `prefix`.
     pub fn allow_unused_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.allowed_unused_prefixes.push(prefix.into());
         self
     }
 
+    /// Allows missing model parameters whose names end with `suffix`.
     pub fn allow_missing_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.allowed_missing_suffixes.push(suffix.into());
         self
     }
 
+    /// Allows missing model parameters whose names contain `needle`.
     pub fn allow_missing_contains(mut self, needle: impl Into<String>) -> Self {
         self.allowed_missing_contains.push(needle.into());
         self
     }
 
+    /// Adds a candidate key with `prefix` stripped from checkpoint tensor names.
     pub fn strip_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.key_prefixes_to_strip.push(prefix.into());
         self
     }
 
+    /// Rewrites a checkpoint key prefix before matching it to model parameters.
     pub fn rewrite_prefix(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
         self.key_prefix_rewrites.push((from.into(), to.into()));
         self
@@ -100,6 +109,7 @@ impl StrictLoadConfig {
     }
 }
 
+/// Accumulates strict checkpoint-loading diagnostics across one or more files.
 #[derive(Debug, Clone, Default)]
 pub struct StrictLoadReport {
     loaded: HashSet<String>,
@@ -128,6 +138,7 @@ impl StrictLoadReport {
         ));
     }
 
+    /// Validates the report against the model parameters and load configuration.
     pub fn finish<M: ModuleParameters>(
         self,
         model: &M,
@@ -160,6 +171,7 @@ impl StrictLoadReport {
     }
 }
 
+/// Loads a safetensors file into `model` and records strict-loading diagnostics.
 pub fn load_safetensors_strict<M: ModuleParameters>(
     model: &mut M,
     path: impl AsRef<Path>,

@@ -1,3 +1,5 @@
+//! Llama decoder-only model implementation.
+
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -30,28 +32,44 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+/// Deserialized Llama `config.json` fields used by this loader.
 pub struct ModelArgs {
+    /// Model type from the configuration.
     pub model_type: String,
+    /// Transformer hidden size.
     pub hidden_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    /// Intermediate size for the SwiGLU MLP.
     pub intermediate_size: i32,
+    /// Number of query attention heads.
     pub num_attention_heads: i32,
+    /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
+    /// Token vocabulary size.
     pub vocab_size: i32,
     #[serde(default)]
+    /// Number of key/value heads.
     pub num_key_value_heads: i32,
     #[serde(default)]
+    /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
     #[serde(default = "default_rope_theta")]
+    /// RoPE base frequency.
     pub rope_theta: f32,
     #[serde(default)]
+    /// Per-head attention dimension.
     pub head_dim: i32,
     #[serde(default = "default_true")]
+    /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     #[serde(default)]
+    /// Whether attention projection layers include bias terms.
     pub attention_bias: bool,
     #[serde(default)]
+    /// Whether MLP projection layers include bias terms.
     pub mlp_bias: bool,
+    /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
 }
 
@@ -64,28 +82,38 @@ fn default_rope_theta() -> f32 {
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Llama attention layer.
 pub struct Attention {
+    /// Number of query heads.
     pub n_heads: i32,
+    /// Number of key/value heads.
     pub n_kv_heads: i32,
+    /// Attention scaling factor.
     pub scale: f32,
 
     #[quantizable]
     #[param]
+    /// Query projection.
     pub q_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Key projection.
     pub k_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Value projection.
     pub v_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
+    /// Output projection.
     pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
+    /// Rotary position embedding module.
     pub rope: RopeVariant,
 }
 
 impl Attention {
+    /// Creates an unloaded attention layer from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
@@ -187,29 +215,38 @@ where
     }
 }
 
+/// Llama feed-forward block.
 pub type Mlp = SwiGluMlp;
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Llama decoder block.
 pub struct TransformerBlock {
+    /// Number of attention heads.
     pub num_attention_heads: i32,
+    /// Transformer hidden size.
     pub hidden_size: i32,
 
     #[quantizable]
     #[param]
+    /// Self-attention layer.
     pub self_attn: Attention,
 
     #[quantizable]
     #[param]
+    /// Feed-forward layer.
     pub mlp: Mlp,
 
     #[param]
+    /// Pre-attention RMSNorm.
     pub input_layernorm: nn::RmsNorm,
 
     #[param]
+    /// Pre-MLP RMSNorm.
     pub post_attention_layernorm: nn::RmsNorm,
 }
 
 impl TransformerBlock {
+    /// Creates an unloaded decoder block from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let num_attention_heads = args.num_attention_heads;
         let hidden_size = args.hidden_size;
@@ -275,23 +312,30 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Llama transformer body without the language-model head.
 pub struct LlamaModel {
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Number of decoder layers.
     pub num_hidden_layers: i32,
 
     #[quantizable]
     #[param]
+    /// Token embedding table.
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
 
     #[quantizable]
     #[param]
+    /// Decoder blocks.
     pub layers: Vec<TransformerBlock>,
 
     #[param]
+    /// Final RMSNorm.
     pub norm: nn::RmsNorm,
 }
 
 impl LlamaModel {
+    /// Creates an unloaded Llama transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
 
@@ -316,9 +360,13 @@ impl LlamaModel {
     }
 }
 
+/// Input for a Llama forward pass.
 pub struct ModelInput<'a, C> {
+    /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
+    /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Mutable per-layer key/value cache.
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -384,19 +432,24 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Llama causal language model.
 pub struct Model {
+    /// Model configuration.
     pub args: ModelArgs,
 
     #[quantizable]
     #[param]
+    /// Transformer body.
     pub model: LlamaModel,
 
     #[quantizable]
     #[param]
+    /// Optional untied language-model head.
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
+    /// Creates an unloaded Llama causal language model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = LlamaModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
@@ -416,6 +469,7 @@ impl Model {
         })
     }
 
+    /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
     }
@@ -451,11 +505,13 @@ where
     }
 }
 
+/// Loads `tokenizer.json` from a Llama model directory.
 pub fn load_llama_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
+/// Reads and normalizes Llama model arguments from `config.json`.
 pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let model_args_filename = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(model_args_filename)?;
@@ -474,11 +530,15 @@ pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Er
 }
 
 #[derive(Debug, Clone, Deserialize)]
+/// Hugging Face safetensors index file.
 pub struct WeightMap {
+    /// Index metadata.
     pub metadata: HashMap<String, Value>,
+    /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
 }
 
+/// Loads a Llama model and safetensors weights from a model directory.
 pub fn load_llama_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -548,6 +608,7 @@ where
     }
 }
 
+/// Llama token generation iterator.
 pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;
 
 #[cfg(test)]

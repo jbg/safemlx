@@ -1,3 +1,5 @@
+//! Gemma 4 assistant draft-model support for multi-token prediction.
+
 use std::{collections::HashMap, path::Path};
 
 use safemlx::{
@@ -23,20 +25,29 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+/// Configuration for a Gemma 4 assistant draft model.
 pub struct Gemma4AssistantConfig {
     #[serde(default = "default_model_type")]
+    /// Assistant model type.
     pub model_type: String,
+    /// Hidden size of the target Gemma 4 backbone.
     pub backbone_hidden_size: i32,
     #[serde(default)]
+    /// Whether ordered masked embeddings are used for logits.
     pub use_ordered_embeddings: bool,
     #[serde(default = "default_num_centroids")]
+    /// Number of token-ordering centroids.
     pub num_centroids: i32,
     #[serde(default = "default_centroid_top_k")]
+    /// Number of centroid groups considered for masked logits.
     pub centroid_intermediate_top_k: i32,
     #[serde(default = "default_true")]
+    /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     #[serde(default = "default_block_size")]
+    /// Maximum draft block size.
     pub block_size: usize,
+    /// Text model configuration for the assistant body.
     pub text_config: ModelArgs,
 }
 
@@ -61,12 +72,16 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Inner assistant transformer body.
 pub struct DraftInner {
     #[param]
+    /// Token embedding table.
     pub embed_tokens: Gemma4Embedding,
     #[param]
+    /// Assistant transformer blocks.
     pub layers: Vec<TransformerBlock>,
     #[param]
+    /// Final RMSNorm.
     pub norm: nn::RmsNorm,
 }
 
@@ -101,15 +116,23 @@ impl DraftInner {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Masked embedding head that evaluates only selected token groups.
 pub struct MaskedEmbedder {
+    /// Hidden size consumed by the head.
     pub hidden_size: i32,
+    /// Token vocabulary size.
     pub vocab_size: i32,
+    /// Number of centroid groups.
     pub num_centroids: i32,
+    /// Number of top centroid groups selected.
     pub top_k: i32,
+    /// Number of vocabulary entries per centroid.
     pub vocab_size_per_centroid: i32,
     #[param]
+    /// Centroid scoring projection.
     pub centroids: nn::Linear,
     #[param]
+    /// Token ordering table mapping centroid slots to token ids.
     pub token_ordering: Param<Array>,
 }
 
@@ -183,17 +206,24 @@ impl MaskedEmbedder {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Gemma 4 assistant model used to draft speculative tokens.
 pub struct Gemma4AssistantDraftModel {
+    /// Assistant configuration.
     pub config: Gemma4AssistantConfig,
     #[param]
+    /// Assistant transformer body.
     pub model: DraftInner,
     #[param]
+    /// Projection from target hidden state plus token embedding into assistant hidden size.
     pub pre_projection: nn::Linear,
     #[param]
+    /// Projection from assistant hidden size back to target hidden size.
     pub post_projection: nn::Linear,
     #[param]
+    /// Optional untied language-model head.
     pub lm_head: Option<nn::Linear>,
     #[param]
+    /// Optional masked embedding head.
     pub masked_embedding: Option<MaskedEmbedder>,
     shared_kv: Option<HashMap<LayerType, (Array, Array)>>,
     kv_offset: i32,
@@ -201,6 +231,7 @@ pub struct Gemma4AssistantDraftModel {
 }
 
 impl Gemma4AssistantDraftModel {
+    /// Creates an unloaded Gemma 4 assistant draft model.
     pub fn new(mut config: Gemma4AssistantConfig, stream: &Stream) -> Result<Self, Exception> {
         config.text_config.model_type = "gemma4".to_string();
         config.text_config.quantized = false;
@@ -255,16 +286,19 @@ impl Gemma4AssistantDraftModel {
         })
     }
 
+    /// Returns the configured draft block size.
     pub fn block_size(&self) -> usize {
         self.config.block_size
     }
 
+    /// Clears cached shared key/value state and acceptance history.
     pub fn reset(&mut self) {
         self.shared_kv = None;
         self.kv_offset = 0;
         self.accept_lens.clear();
     }
 
+    /// Sets target-model key/value state shared with the assistant.
     pub fn set_shared_kv(&mut self, shared_kv: HashMap<LayerType, (Array, Array)>, kv_offset: i32) {
         self.shared_kv = Some(shared_kv);
         self.kv_offset = kv_offset;
@@ -325,6 +359,7 @@ impl Gemma4AssistantDraftModel {
         Ok((last_hidden, logits))
     }
 
+    /// Drafts up to `block_size - 1` speculative tokens.
     #[allow(clippy::too_many_arguments)]
     pub fn draft_block(
         &mut self,
@@ -409,6 +444,7 @@ struct WeightMap {
     weight_map: HashMap<String, String>,
 }
 
+/// Loads a Gemma 4 assistant draft model from a model directory.
 pub fn load_gemma4_assistant_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
