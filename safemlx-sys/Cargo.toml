@@ -3,12 +3,13 @@ name = "safemlx-sys"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 description = "Low-level interface and binding generation for the mlx library"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-license.workspace = true
+license = "MIT"
 documentation = "https://github.com/jbg/safemlx"
 readme = "README.md"
 

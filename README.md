@@ -35,8 +35,7 @@ were Minghua Wu `<michael.wu1107@gmail.com>` and David Chavez
 `<david@dcvz.io>`.
 
 The vendored `safemlx-sys/src/mlx-c` source was imported from the upstream
-[`ml-explore/mlx-c`](https://github.com/ml-explore/mlx-c) submodule at commit
-`fba4470b89073180056c9ea46c443051375f7399`.
+[`ml-explore/mlx-c`](https://github.com/ml-explore/mlx-c) project.
 
 The `safemlx-lm` and `safemlx-lm-utils` crates are derived from the `mlx-lm`
 and `mlx-lm-utils` crates in

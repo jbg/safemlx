@@ -1,10 +1,12 @@
 [package]
 name = "safemlx-tests"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 
