@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use safemlx::{module::ModuleParameters, Array, Stream};
 
@@ -67,7 +70,7 @@ impl StrictLoadConfig {
                 .any(|needle| key.contains(needle))
     }
 
-    fn candidates(&self, key: &str) -> Vec<String> {
+    pub(crate) fn candidates(&self, key: &str) -> Vec<String> {
         let mut candidates = Vec::new();
         candidates.push(key.to_string());
 
@@ -177,6 +180,15 @@ pub fn load_safetensors_strict<M: ModuleParameters>(
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
     let loaded = Array::load_safetensors(path, stream)?;
+    load_arrays_strict(model, loaded, config, report)
+}
+
+pub(crate) fn load_arrays_strict<M: ModuleParameters>(
+    model: &mut M,
+    loaded: HashMap<String, Array>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
     let mut params = model.parameters_mut().flatten();
 
     for (key, value) in loaded {
