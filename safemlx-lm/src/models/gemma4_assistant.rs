@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
 use safemlx::{
-    builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParametersExt, Param},
@@ -12,7 +11,7 @@ use safemlx::{
         lt, matmul, which,
     },
     random::RandomState,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -73,12 +72,13 @@ pub struct DraftInner {
 
 impl DraftInner {
     fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embed_tokens = Gemma4Embedding::new(
+        let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
             args.hidden_size,
             false,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
@@ -90,9 +90,8 @@ impl DraftInner {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let norm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let norm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         Ok(Self {
             embed_tokens,
             layers,
@@ -115,7 +114,7 @@ pub struct MaskedEmbedder {
 }
 
 impl MaskedEmbedder {
-    fn new(config: &Gemma4AssistantConfig) -> Result<Self, Exception> {
+    fn new(config: &Gemma4AssistantConfig, stream: &Stream) -> Result<Self, Exception> {
         let hidden_size = config.text_config.hidden_size;
         let vocab_size = config.text_config.vocab_size;
         let num_centroids = config.num_centroids;
@@ -126,13 +125,14 @@ impl MaskedEmbedder {
             num_centroids,
             top_k: config.centroid_intermediate_top_k,
             vocab_size_per_centroid,
-            centroids: nn::LinearBuilder::new(hidden_size, num_centroids)
-                .bias(false)
-                .build()?,
-            token_ordering: Param::new(Array::from_slice(
-                &vec![0i32; vocab_size as usize],
-                &[vocab_size],
-            )),
+            centroids: nn::Linear::unloaded(
+                hidden_size,
+                num_centroids,
+                false,
+                Dtype::Float32,
+                stream,
+            )?,
+            token_ordering: Param::<Array>::unloaded(&[vocab_size], Dtype::Int32, stream)?,
         })
     }
 
@@ -212,25 +212,33 @@ impl Gemma4AssistantDraftModel {
 
         let text_config = &config.text_config;
         let model = DraftInner::new(text_config, stream)?;
-        let pre_projection =
-            nn::LinearBuilder::new(2 * config.backbone_hidden_size, text_config.hidden_size)
-                .bias(false)
-                .build()?;
-        let post_projection =
-            nn::LinearBuilder::new(text_config.hidden_size, config.backbone_hidden_size)
-                .bias(false)
-                .build()?;
+        let pre_projection = nn::Linear::unloaded(
+            2 * config.backbone_hidden_size,
+            text_config.hidden_size,
+            false,
+            Dtype::Float32,
+            stream,
+        )?;
+        let post_projection = nn::Linear::unloaded(
+            text_config.hidden_size,
+            config.backbone_hidden_size,
+            false,
+            Dtype::Float32,
+            stream,
+        )?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(
-                nn::LinearBuilder::new(text_config.hidden_size, text_config.vocab_size)
-                    .bias(false)
-                    .build()?,
-            )
+            Some(nn::Linear::unloaded(
+                text_config.hidden_size,
+                text_config.vocab_size,
+                false,
+                Dtype::Float32,
+                stream,
+            )?)
         };
         let masked_embedding = if config.use_ordered_embeddings {
-            Some(MaskedEmbedder::new(&config)?)
+            Some(MaskedEmbedder::new(&config, stream)?)
         } else {
             None
         };

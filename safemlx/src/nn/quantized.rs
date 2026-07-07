@@ -6,7 +6,7 @@ use crate::{
     ops::indexing::TryIndexOp,
     ops::{self, dequantize, quantized_matmul},
     quantization::Quantizable,
-    Array,
+    Array, Dtype, Stream,
 };
 use safemlx_macros::ModuleParameters;
 
@@ -167,6 +167,46 @@ impl QuantizedEmbedding {
 
     /// Default bits
     pub const DEFAULT_BITS: i32 = 4;
+
+    /// Creates a quantized embedding layer whose parameters carry only shape
+    /// metadata.
+    ///
+    /// This is intended for modules that will immediately load real
+    /// checkpoint weights before any forward pass.
+    pub fn unloaded(
+        embedding_count: i32,
+        dimensions: i32,
+        group_size: i32,
+        bits: i32,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let stream = stream.as_ref();
+        let packed_per_int = 32 / bits;
+        let inner = Embedding {
+            weight: Param::<Array>::unloaded(
+                &[embedding_count, dimensions / packed_per_int],
+                Dtype::Uint32,
+                stream,
+            )?,
+        };
+        let mut qe = Self {
+            group_size,
+            bits,
+            scales: Param::<Array>::unloaded(
+                &[embedding_count, dimensions / group_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            biases: Param::<Array>::unloaded(
+                &[embedding_count, dimensions / group_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            inner,
+        };
+        qe.freeze_parameters(true);
+        Ok(qe)
+    }
 
     /// Create a new quantized embedding using `stream` for quantization.
     pub fn new(
@@ -395,6 +435,52 @@ impl QuantizedLinear {
 
     /// Default bits
     pub const DEFAULT_BITS: i32 = 4;
+
+    /// Creates a quantized linear layer whose parameters carry only shape
+    /// metadata.
+    ///
+    /// This is intended for modules that will immediately load real
+    /// checkpoint weights before any forward pass.
+    pub fn unloaded(
+        input_dims: i32,
+        output_dims: i32,
+        group_size: i32,
+        bits: i32,
+        bias: bool,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let stream = stream.as_ref();
+        let packed_per_int = 32 / bits;
+        let inner = Linear {
+            weight: Param::<Array>::unloaded(
+                &[output_dims, input_dims / packed_per_int],
+                Dtype::Uint32,
+                stream,
+            )?,
+            bias: if bias {
+                Param::<Option<Array>>::unloaded_some(&[output_dims], Dtype::Float32, stream)?
+            } else {
+                Param::new(None)
+            },
+        };
+        let mut ql = Self {
+            group_size,
+            bits,
+            scales: Param::<Array>::unloaded(
+                &[output_dims, input_dims / group_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            biases: Param::<Array>::unloaded(
+                &[output_dims, input_dims / group_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            inner,
+        };
+        ql.freeze_parameters(true);
+        Ok(ql)
+    }
 
     /// Create a new quantized linear layer using `stream` for quantization.
     pub fn new(

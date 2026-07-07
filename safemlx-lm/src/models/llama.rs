@@ -4,14 +4,13 @@ use std::{
 };
 
 use safemlx::{
-    builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt},
     nn,
     ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -95,18 +94,34 @@ impl Attention {
         let head_dim = args.head_dim;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let q_proj = nn::LinearBuilder::new(dim, n_heads * head_dim)
-            .bias(args.attention_bias)
-            .build()?;
-        let k_proj = nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-            .bias(args.attention_bias)
-            .build()?;
-        let v_proj = nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-            .bias(args.attention_bias)
-            .build()?;
-        let o_proj = nn::LinearBuilder::new(n_heads * head_dim, dim)
-            .bias(args.attention_bias)
-            .build()?;
+        let q_proj = nn::Linear::unloaded(
+            dim,
+            n_heads * head_dim,
+            args.attention_bias,
+            Dtype::Float32,
+            stream,
+        )?;
+        let k_proj = nn::Linear::unloaded(
+            dim,
+            n_kv_heads * head_dim,
+            args.attention_bias,
+            Dtype::Float32,
+            stream,
+        )?;
+        let v_proj = nn::Linear::unloaded(
+            dim,
+            n_kv_heads * head_dim,
+            args.attention_bias,
+            Dtype::Float32,
+            stream,
+        )?;
+        let o_proj = nn::Linear::unloaded(
+            n_heads * head_dim,
+            dim,
+            args.attention_bias,
+            Dtype::Float32,
+            stream,
+        )?;
 
         let rope = initialize_rope(
             head_dim,
@@ -200,13 +215,16 @@ impl TransformerBlock {
         let hidden_size = args.hidden_size;
 
         let self_attn = Attention::new(args, stream)?;
-        let mlp = SwiGluMlp::new(args.hidden_size, args.intermediate_size, args.mlp_bias)?;
-        let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let post_attention_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let mlp = SwiGluMlp::unloaded(
+            args.hidden_size,
+            args.intermediate_size,
+            args.mlp_bias,
+            stream,
+        )?;
+        let input_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let post_attention_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
 
         Ok(Self {
             num_attention_heads,
@@ -280,13 +298,13 @@ impl LlamaModel {
         let vocab_size = args.vocab_size;
         let num_hidden_layers = args.num_hidden_layers;
 
-        let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
+        let embed_tokens =
+            nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
         let layers = (0..num_hidden_layers)
             .map(|_| TransformerBlock::new(args, stream))
             .collect::<Result<Vec<_>, _>>()?;
-        let norm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let norm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
 
         Ok(Self {
             vocab_size,
@@ -382,9 +400,10 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = LlamaModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_maybe_quantized_lm_head(
+            Some(common::build_unloaded_maybe_quantized_lm_head(
                 args.hidden_size,
                 args.vocab_size,
+                stream,
             )?)
         } else {
             None

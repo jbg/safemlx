@@ -13,7 +13,7 @@ use safemlx::{
     },
     quantization::MaybeQuantized,
     random::{self, RandomState},
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 
 use crate::{
@@ -50,6 +50,37 @@ impl SwiGluMlp {
             up_proj: MaybeQuantized::Original(
                 nn::LinearBuilder::new(dim, hidden_dim).bias(bias).build()?,
             ),
+        })
+    }
+
+    pub fn unloaded(
+        dim: i32,
+        hidden_dim: i32,
+        bias: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            gate_proj: MaybeQuantized::Original(nn::Linear::unloaded(
+                dim,
+                hidden_dim,
+                bias,
+                Dtype::Float32,
+                stream,
+            )?),
+            down_proj: MaybeQuantized::Original(nn::Linear::unloaded(
+                hidden_dim,
+                dim,
+                bias,
+                Dtype::Float32,
+                stream,
+            )?),
+            up_proj: MaybeQuantized::Original(nn::Linear::unloaded(
+                dim,
+                hidden_dim,
+                bias,
+                Dtype::Float32,
+                stream,
+            )?),
         })
     }
 }
@@ -89,6 +120,19 @@ impl DenseSwiGluMlp {
             down_proj: nn::LinearBuilder::new(hidden_dim, dim).bias(bias).build()?,
         })
     }
+
+    pub fn unloaded(
+        dim: i32,
+        hidden_dim: i32,
+        bias: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            gate_proj: nn::Linear::unloaded(dim, hidden_dim, bias, Dtype::Float32, stream)?,
+            up_proj: nn::Linear::unloaded(dim, hidden_dim, bias, Dtype::Float32, stream)?,
+            down_proj: nn::Linear::unloaded(hidden_dim, dim, bias, Dtype::Float32, stream)?,
+        })
+    }
 }
 
 impl Module<&Array> for DenseSwiGluMlp {
@@ -114,6 +158,14 @@ pub fn build_lm_head(hidden_size: i32, vocab_size: i32) -> Result<nn::Linear, Ex
         .build()
 }
 
+pub fn build_unloaded_lm_head(
+    hidden_size: i32,
+    vocab_size: i32,
+    stream: &Stream,
+) -> Result<nn::Linear, Exception> {
+    nn::Linear::unloaded(hidden_size, vocab_size, false, Dtype::Float32, stream)
+}
+
 pub fn build_maybe_quantized_lm_head(
     hidden_size: i32,
     vocab_size: i32,
@@ -121,6 +173,18 @@ pub fn build_maybe_quantized_lm_head(
     Ok(MaybeQuantized::Original(build_lm_head(
         hidden_size,
         vocab_size,
+    )?))
+}
+
+pub fn build_unloaded_maybe_quantized_lm_head(
+    hidden_size: i32,
+    vocab_size: i32,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    Ok(MaybeQuantized::Original(build_unloaded_lm_head(
+        hidden_size,
+        vocab_size,
+        stream,
     )?))
 }
 

@@ -5,7 +5,7 @@ use crate::{
     error::Exception,
     module::{Module, Param},
     ops::rsqrt,
-    Array,
+    Array, Dtype, Stream,
 };
 use safemlx_internal_macros::{Buildable, Builder};
 use safemlx_macros::ModuleParameters;
@@ -266,6 +266,22 @@ pub struct RmsNorm {
 impl RmsNorm {
     /// Default value for `eps`.
     pub const DEFAULT_EPS: f32 = 1e-5;
+
+    /// Creates an RMS norm layer whose weight carries only shape metadata.
+    ///
+    /// This is intended for modules that will immediately load real
+    /// checkpoint weights before any forward pass.
+    pub fn unloaded(
+        dimensions: i32,
+        eps: f32,
+        dtype: Dtype,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::<Array>::unloaded(&[dimensions], dtype, stream)?,
+            eps,
+        })
+    }
 }
 
 impl Module<&Array> for RmsNorm {

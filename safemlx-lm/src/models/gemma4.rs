@@ -10,8 +10,8 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{indexing::TryIndexOp, mean_axis, rsqrt, tanh},
-    quantization::{MaybeQuantized, Quantizable as _},
-    Array, Stream,
+    quantization::MaybeQuantized,
+    Array, Dtype, Stream,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -212,15 +212,23 @@ fn maybe_quantized_linear(
     bits: i32,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    let linear = nn::LinearBuilder::new(input_dims, output_dims)
-        .bias(false)
-        .build()?;
     if quantized {
-        Ok(MaybeQuantized::Quantized(
-            linear.try_into_quantized(group_size, bits, stream)?,
-        ))
+        Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
+            input_dims,
+            output_dims,
+            group_size,
+            bits,
+            false,
+            stream,
+        )?))
     } else {
-        Ok(MaybeQuantized::Original(linear))
+        Ok(MaybeQuantized::Original(nn::Linear::unloaded(
+            input_dims,
+            output_dims,
+            false,
+            Dtype::Float32,
+            stream,
+        )?))
     }
 }
 
@@ -326,12 +334,8 @@ impl Attention {
             stream,
         )?;
 
-        let q_norm = nn::RmsNormBuilder::new(head_dim)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let k_norm = nn::RmsNormBuilder::new(head_dim)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let q_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let k_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
 
         let rope_dims = partial_rotary_dims(head_dim, &args.rope_scaling);
         let rope = initialize_rope(
@@ -548,6 +552,50 @@ pub struct Gemma4Embedding {
 }
 
 impl Gemma4Embedding {
+    pub fn unloaded(
+        vocab_size: i32,
+        hidden_size: i32,
+        quantized: bool,
+        group_size: i32,
+        bits: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let packed_per_int = 32 / bits;
+        Ok(Self {
+            weight: if quantized {
+                Param::<Array>::unloaded(
+                    &[vocab_size, hidden_size / packed_per_int],
+                    Dtype::Uint32,
+                    stream,
+                )?
+            } else {
+                Param::<Array>::unloaded(&[vocab_size, hidden_size], Dtype::Float32, stream)?
+            },
+            scales: if quantized {
+                Param::<Option<Array>>::unloaded_some(
+                    &[vocab_size, hidden_size / group_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            biases: if quantized {
+                Param::<Option<Array>>::unloaded_some(
+                    &[vocab_size, hidden_size / group_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            quantized,
+            hidden_size,
+            group_size,
+            bits,
+        })
+    }
+
     pub fn new(
         vocab_size: i32,
         hidden_size: i32,
@@ -700,18 +748,14 @@ impl TransformerBlock {
             args.quantization_bits,
             stream,
         )?;
-        let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let post_attention_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let pre_feedforward_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let post_feedforward_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let input_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let post_attention_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let pre_feedforward_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let post_feedforward_layernorm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let per_layer_input_gate = if args.hidden_size_per_layer_input > 0 {
             Some(maybe_quantized_linear(
                 args.quantized,
@@ -737,11 +781,12 @@ impl TransformerBlock {
             None
         };
         let post_per_layer_input_norm = if args.hidden_size_per_layer_input > 0 {
-            Some(
-                nn::RmsNormBuilder::new(args.hidden_size)
-                    .eps(args.rms_norm_eps)
-                    .build()?,
-            )
+            Some(nn::RmsNorm::unloaded(
+                args.hidden_size,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?)
         } else {
             None
         };
@@ -884,42 +929,44 @@ pub struct Gemma4TextModel {
 
 impl Gemma4TextModel {
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embed_tokens = Gemma4Embedding::new(
+        let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
             args.hidden_size,
             args.quantized,
             args.quantization_group_size,
             args.quantization_bits,
+            stream,
         )?;
         let embed_tokens_per_layer = if args.hidden_size_per_layer_input > 0 {
-            Some(Gemma4Embedding::new(
+            Some(Gemma4Embedding::unloaded(
                 args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
                 args.num_hidden_layers * args.hidden_size_per_layer_input,
                 args.quantized,
                 args.quantization_group_size,
                 args.quantization_bits,
+                stream,
             )?)
         } else {
             None
         };
         let per_layer_model_projection = if args.hidden_size_per_layer_input > 0 {
-            Some(MaybeQuantized::Original(
-                nn::LinearBuilder::new(
-                    args.hidden_size,
-                    args.num_hidden_layers * args.hidden_size_per_layer_input,
-                )
-                .bias(false)
-                .build()?,
-            ))
+            Some(MaybeQuantized::Original(nn::Linear::unloaded(
+                args.hidden_size,
+                args.num_hidden_layers * args.hidden_size_per_layer_input,
+                false,
+                Dtype::Float32,
+                stream,
+            )?))
         } else {
             None
         };
         let per_layer_projection_norm = if args.hidden_size_per_layer_input > 0 {
-            Some(
-                nn::RmsNormBuilder::new(args.hidden_size_per_layer_input)
-                    .eps(args.rms_norm_eps)
-                    .build()?,
-            )
+            Some(nn::RmsNorm::unloaded(
+                args.hidden_size_per_layer_input,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?)
         } else {
             None
         };
@@ -933,9 +980,8 @@ impl Gemma4TextModel {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let norm = nn::RmsNormBuilder::new(args.hidden_size)
-            .eps(args.rms_norm_eps)
-            .build()?;
+        let norm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         Ok(Self {
             vocab_size: args.vocab_size,
             num_hidden_layers: args.num_hidden_layers,
@@ -1129,9 +1175,10 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_maybe_quantized_lm_head(
+            Some(common::build_unloaded_maybe_quantized_lm_head(
                 args.hidden_size,
                 args.vocab_size,
+                stream,
             )?)
         } else {
             None

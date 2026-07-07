@@ -1,6 +1,6 @@
 use safemlx::error::Exception;
 use safemlx::random::RandomState;
-use safemlx::{array, ops, transforms, Array, Stream};
+use safemlx::{array, ops, transforms, Array};
 use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
