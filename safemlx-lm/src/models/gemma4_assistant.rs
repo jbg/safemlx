@@ -342,6 +342,7 @@ impl Gemma4AssistantDraftModel {
                     per_layer_input: None,
                     shared_kv: Some(&mut kv_map),
                     disable_generated_mask: true,
+                    generated_sliding_window: None,
                 },
                 stream,
             )?;
