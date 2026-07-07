@@ -64,9 +64,13 @@ impl<'de> Deserialize<'de> for LayerType {
 thread_local! {
     static RECURRENT_DELTA_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
     static FP8_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static FP8_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static FP8_GROUPED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static FP8_GROUPED_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
+const FP8_LINEAR_OUT_TILE: i32 = 16;
+const FP8_TILED_ROW_THRESHOLD: i32 = 8;
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
 const RECURRENT_PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
@@ -499,9 +503,66 @@ fn fp8_linear(
     let input = input.reshape(&[rows, in_dim], stream)?;
     let scale_cols = scale.dim(-1);
 
-    let out = FP8_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+    let out = if rows <= FP8_TILED_ROW_THRESHOLD {
+        fp8_linear_tiled(
+            &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+        )?
+    } else {
+        fp8_linear_scalar(
+            &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+        )?
+    };
+
+    let mut output_shape = input_shape.to_vec();
+    if let Some(last) = output_shape.last_mut() {
+        *last = out_dim;
+    }
+    out.reshape(&output_shape, stream)
+}
+
+fn fp8_linear_tiled(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let out_grid = ceil_div(out_dim, FP8_LINEAR_OUT_TILE) * FP8_LINEAR_OUT_TILE;
+
+    FP8_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(fp8_linear_kernel()?);
+        }
+        let config = MetalKernelConfig::new()
+            .with_template_arg_int("IN_DIM", in_dim)
+            .with_template_arg_int("OUT_DIM", out_dim)
+            .with_template_arg_int("SCALE_COLS", scale_cols)
+            .with_grid([out_grid, rows * 16, 1])
+            .with_thread_group([16, 16, 1])
+            .with_output_arg([rows, out_dim], Dtype::Float32);
+        cell.borrow()
+            .as_ref()
+            .expect("FP8 linear kernel initialized")
+            .apply_one_device([input, weight, scale], &config, stream)
+    })
+}
+
+fn fp8_linear_scalar(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    FP8_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(fp8_linear_scalar_kernel()?);
         }
         let config = MetalKernelConfig::new()
             .with_template_arg_int("IN_DIM", in_dim)
@@ -512,20 +573,52 @@ fn fp8_linear(
             .with_output_arg([rows, out_dim], Dtype::Float32);
         cell.borrow()
             .as_ref()
-            .expect("FP8 linear kernel initialized")
-            .apply_one_device([&input, weight, scale], &config, stream)
-    })?;
-
-    let mut output_shape = input_shape.to_vec();
-    if let Some(last) = output_shape.last_mut() {
-        *last = out_dim;
-    }
-    out.reshape(&output_shape, stream)
+            .expect("scalar FP8 linear kernel initialized")
+            .apply_one_device([input, weight, scale], &config, stream)
+    })
 }
 
 fn fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
-        "qwen35_moe_fp8_linear",
+        "qwen35_moe_fp8_linear_k16",
+        ["input", "weight", "scale"],
+        ["out"],
+        concat!(
+            "uint out_col = thread_position_in_grid.x;",
+            "uint row = thread_position_in_grid.y / 16;",
+            "uint lane_k = thread_position_in_grid.y % 16;",
+            "uint local_col = thread_position_in_grid.x % 16;",
+            "uint input_base = row * IN_DIM;",
+            "threadgroup float partial[16][16];",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " for (uint k = lane_k; k < IN_DIM; k += 16) {",
+            "  uint8_t raw = weight[out_col * IN_DIM + k];",
+            "  float x = float(input[input_base + k]);",
+            "  uint scale_col = k / 128;",
+            "  float s = float(scale[(out_col / 128) * SCALE_COLS + scale_col]);",
+            "  acc += x * fp8_e4m3_to_float(raw) * s;",
+            "}",
+            "}",
+            "partial[lane_k][local_col] = acc;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "if (lane_k == 0 && out_col < OUT_DIM) {",
+            "  float sum = 0.0f;",
+            "  for (uint lane = 0; lane < 16; ++lane) {",
+            "    sum += partial[lane][local_col];",
+            "  }",
+            "  out[row * OUT_DIM + out_col] = sum;",
+            "}"
+        ),
+        FP8_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "qwen35_moe_fp8_linear_scalar",
         ["input", "weight", "scale"],
         ["out"],
         concat!(
@@ -561,9 +654,62 @@ fn grouped_fp8_linear(
     let in_dim = input.dim(-1);
     let out_dim = weight.dim(1);
     let scale_cols = scale.dim(-1);
+    if routes <= FP8_TILED_ROW_THRESHOLD {
+        return grouped_fp8_linear_tiled(
+            input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
+        );
+    }
+
+    grouped_fp8_linear_scalar(
+        input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
+    )
+}
+
+fn grouped_fp8_linear_tiled(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    group_ids: &Array,
+    routes: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let out_grid = ceil_div(out_dim, FP8_LINEAR_OUT_TILE) * FP8_LINEAR_OUT_TILE;
     FP8_GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_fp8_linear_kernel()?);
+        }
+        let config = MetalKernelConfig::new()
+            .with_template_arg_int("IN_DIM", in_dim)
+            .with_template_arg_int("OUT_DIM", out_dim)
+            .with_template_arg_int("SCALE_OUT", scale.dim(1))
+            .with_template_arg_int("SCALE_COLS", scale_cols)
+            .with_grid([out_grid, routes * 16, 1])
+            .with_thread_group([16, 16, 1])
+            .with_output_arg([routes, out_dim], Dtype::Float32);
+        cell.borrow()
+            .as_ref()
+            .expect("grouped FP8 linear kernel initialized")
+            .apply_one_device([input, weight, scale, group_ids], &config, stream)
+    })
+}
+
+fn grouped_fp8_linear_scalar(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    group_ids: &Array,
+    routes: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    FP8_GROUPED_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(grouped_fp8_linear_scalar_kernel()?);
         }
         let config = MetalKernelConfig::new()
             .with_template_arg_int("IN_DIM", in_dim)
@@ -575,14 +721,52 @@ fn grouped_fp8_linear(
             .with_output_arg([routes, out_dim], Dtype::Float32);
         cell.borrow()
             .as_ref()
-            .expect("grouped FP8 linear kernel initialized")
+            .expect("scalar grouped FP8 linear kernel initialized")
             .apply_one_device([input, weight, scale, group_ids], &config, stream)
     })
 }
 
 fn grouped_fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
-        "qwen35_moe_grouped_fp8_linear",
+        "qwen35_moe_grouped_fp8_linear_k16",
+        ["input", "weight", "scale", "group_ids"],
+        ["out"],
+        concat!(
+            "uint out_col = thread_position_in_grid.x;",
+            "uint route = thread_position_in_grid.y / 16;",
+            "uint lane_k = thread_position_in_grid.y % 16;",
+            "uint local_col = thread_position_in_grid.x % 16;",
+            "uint expert = uint(group_ids[route]);",
+            "uint input_base = route * IN_DIM;",
+            "threadgroup float partial[16][16];",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " for (uint k = lane_k; k < IN_DIM; k += 16) {",
+            "  uint weight_idx = (expert * OUT_DIM + out_col) * IN_DIM + k;",
+            "  uint scale_idx = (expert * SCALE_OUT + (out_col / 128)) * SCALE_COLS + (k / 128);",
+            "  float x = float(input[input_base + k]);",
+            "  acc += x * fp8_e4m3_to_float(weight[weight_idx]) * float(scale[scale_idx]);",
+            " }",
+            "}",
+            "partial[lane_k][local_col] = acc;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "if (lane_k == 0 && out_col < OUT_DIM) {",
+            "  float sum = 0.0f;",
+            "  for (uint lane = 0; lane < 16; ++lane) {",
+            "    sum += partial[lane][local_col];",
+            "  }",
+            "  out[route * OUT_DIM + out_col] = sum;",
+            "}"
+        ),
+        FP8_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn grouped_fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "qwen35_moe_grouped_fp8_linear_scalar",
         ["input", "weight", "scale", "group_ids"],
         ["out"],
         concat!(
