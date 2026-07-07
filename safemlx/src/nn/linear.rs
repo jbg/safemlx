@@ -1,6 +1,6 @@
 use std::iter::once;
 
-use crate::{error::Exception, quantization::Quantizable, Array};
+use crate::{error::Exception, quantization::Quantizable, Array, Dtype, Stream};
 use safemlx_internal_macros::{Buildable, Builder};
 
 use crate::{
@@ -67,6 +67,28 @@ pub struct Linear {
 impl Linear {
     /// Default value for `with_bias`
     pub const DEFAULT_BIAS: bool = true;
+
+    /// Creates a linear layer whose parameters carry only shape metadata.
+    ///
+    /// This is intended for modules that will immediately load real
+    /// checkpoint weights before any forward pass.
+    pub fn unloaded(
+        input_dims: i32,
+        output_dims: i32,
+        bias: bool,
+        dtype: Dtype,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let stream = stream.as_ref();
+        Ok(Self {
+            weight: Param::<Array>::unloaded(&[output_dims, input_dims], dtype, stream)?,
+            bias: if bias {
+                Param::<Option<Array>>::unloaded_some(&[output_dims], dtype, stream)?
+            } else {
+                Param::new(None)
+            },
+        })
+    }
 
     /// Returns the shape of the linear layer.
     pub fn shape(&self) -> (i32, i32) {

@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{nested::NestedValue, Array};
+use crate::{error::Exception, nested::NestedValue, ops::broadcast_to, Array, Dtype, Stream};
 
 use super::ModuleParameters;
 
@@ -58,6 +58,37 @@ impl<T> Param<T> {
 impl<T> From<T> for Param<T> {
     fn from(inner: T) -> Self {
         Self::new(inner)
+    }
+}
+
+impl Param<Array> {
+    /// Create a placeholder parameter with the expected shape but no
+    /// materialized tensor contents.
+    ///
+    /// This is useful for models that will immediately strict-load real
+    /// checkpoint weights, while still needing shape metadata for validation.
+    pub fn unloaded(
+        shape: &[i32],
+        dtype: Dtype,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let stream = stream.as_ref();
+        let scalar = Array::from_f32(0.0).as_dtype(dtype, stream)?;
+        Ok(Self::new(broadcast_to(scalar, shape, stream)?))
+    }
+}
+
+impl Param<Option<Array>> {
+    /// Create a present optional placeholder parameter with the expected shape
+    /// but no materialized tensor contents.
+    pub fn unloaded_some(
+        shape: &[i32],
+        dtype: Dtype,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        Ok(Self::new(Some(
+            Param::<Array>::unloaded(shape, dtype, stream)?.value,
+        )))
     }
 }
 

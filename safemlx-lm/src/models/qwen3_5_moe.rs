@@ -10,7 +10,7 @@ use safemlx::{
     error::Exception,
     fast::{MetalKernel, MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
         argpartition_axis, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows,
@@ -442,28 +442,32 @@ pub struct QwenLinear {
 }
 
 impl QwenLinear {
-    fn new(input_dims: i32, output_dims: i32, bias: bool, fp8: bool) -> Result<Self, Exception> {
+    fn new(
+        input_dims: i32,
+        output_dims: i32,
+        bias: bool,
+        fp8: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let weight_dtype = if fp8 { Dtype::Uint8 } else { Dtype::Float32 };
         Ok(Self {
             input_dims,
             output_dims,
-            weight: Param::new(Array::from_slice(
-                &vec![0.0f32; (output_dims * input_dims) as usize],
-                &[output_dims, input_dims],
-            )),
-            weight_scale_inv: Param::new(fp8.then(|| {
-                Array::from_slice(
-                    &vec![
-                        1.0f32;
-                        (ceil_div(output_dims, 128) * ceil_div(input_dims, 128)) as usize
-                    ],
+            weight: Param::<Array>::unloaded(&[output_dims, input_dims], weight_dtype, stream)?,
+            weight_scale_inv: if fp8 {
+                Param::<Option<Array>>::unloaded_some(
                     &[ceil_div(output_dims, 128), ceil_div(input_dims, 128)],
-                )
-            })),
-            bias: Param::new(
-                bias.then(|| {
-                    Array::from_slice(&vec![0.0f32; output_dims as usize], &[output_dims])
-                }),
-            ),
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            bias: if bias {
+                Param::<Option<Array>>::unloaded_some(&[output_dims], Dtype::Float32, stream)?
+            } else {
+                Param::new(None)
+            },
         })
     }
 
@@ -710,9 +714,9 @@ pub struct Qwen3NextRmsNorm {
 }
 
 impl Qwen3NextRmsNorm {
-    pub fn new(dim: i32, eps: f32) -> Result<Self, Exception> {
+    pub fn new(dim: i32, eps: f32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::from_slice(&vec![0.0f32; dim as usize], &[dim])),
+            weight: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
             eps,
         })
     }
@@ -738,9 +742,9 @@ pub struct Qwen3NextRmsNormGated {
 }
 
 impl Qwen3NextRmsNormGated {
-    pub fn new(dim: i32, eps: f32) -> Result<Self, Exception> {
+    pub fn new(dim: i32, eps: f32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::from_slice(&vec![1.0f32; dim as usize], &[dim])),
+            weight: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
             eps,
         })
     }
@@ -788,10 +792,28 @@ impl FullAttention {
         let n_kv_heads = args.num_key_value_heads;
         let head_dim = args.head_dim;
         let fp8 = args.uses_fp8();
-        let q_proj = QwenLinear::new(hidden, n_heads * head_dim * 2, args.attention_bias, fp8)?;
-        let k_proj = QwenLinear::new(hidden, n_kv_heads * head_dim, args.attention_bias, fp8)?;
-        let v_proj = QwenLinear::new(hidden, n_kv_heads * head_dim, args.attention_bias, fp8)?;
-        let o_proj = QwenLinear::new(n_heads * head_dim, hidden, args.attention_bias, fp8)?;
+        let q_proj = QwenLinear::new(
+            hidden,
+            n_heads * head_dim * 2,
+            args.attention_bias,
+            fp8,
+            stream,
+        )?;
+        let k_proj = QwenLinear::new(
+            hidden,
+            n_kv_heads * head_dim,
+            args.attention_bias,
+            fp8,
+            stream,
+        )?;
+        let v_proj = QwenLinear::new(
+            hidden,
+            n_kv_heads * head_dim,
+            args.attention_bias,
+            fp8,
+            stream,
+        )?;
+        let o_proj = QwenLinear::new(n_heads * head_dim, hidden, args.attention_bias, fp8, stream)?;
         let rope_config = args.rope_config();
         let rope = initialize_rope(
             args.rope_dims(),
@@ -810,8 +832,8 @@ impl FullAttention {
             k_proj,
             v_proj,
             o_proj,
-            q_norm: Qwen3NextRmsNorm::new(head_dim, args.rms_norm_eps)?,
-            k_norm: Qwen3NextRmsNorm::new(head_dim, args.rms_norm_eps)?,
+            q_norm: Qwen3NextRmsNorm::new(head_dim, args.rms_norm_eps, stream)?,
+            k_norm: Qwen3NextRmsNorm::new(head_dim, args.rms_norm_eps, stream)?,
             rope,
         })
     }
@@ -908,12 +930,9 @@ pub struct DepthwiseConv1d {
 }
 
 impl DepthwiseConv1d {
-    pub fn new(channels: i32, kernel_size: i32) -> Result<Self, Exception> {
+    pub fn new(channels: i32, kernel_size: i32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::new(Array::from_slice(
-                &vec![0.0f32; (channels * kernel_size) as usize],
-                &[channels, 1, kernel_size],
-            )),
+            weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], Dtype::Float32, stream)?,
         })
     }
 }
@@ -950,7 +969,7 @@ pub struct LinearAttention {
 }
 
 impl LinearAttention {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let num_v_heads = args.linear_num_value_heads;
         let num_k_heads = args.linear_num_key_heads;
         let head_k_dim = args.linear_key_head_dim;
@@ -968,16 +987,23 @@ impl LinearAttention {
             value_dim,
             conv_dim,
             conv_kernel_size: args.linear_conv_kernel_dim,
-            conv1d: DepthwiseConv1d::new(conv_dim, args.linear_conv_kernel_dim)?,
+            conv1d: DepthwiseConv1d::new(conv_dim, args.linear_conv_kernel_dim, stream)?,
             in_proj_qkv: QwenLinear::new(
                 args.hidden_size,
                 projection_size_qkv,
                 false,
                 args.uses_fp8(),
+                stream,
             )?,
-            in_proj_z: QwenLinear::new(args.hidden_size, value_dim, false, args.uses_fp8())?,
-            in_proj_b: QwenLinear::new(args.hidden_size, num_v_heads, false, false)?,
-            in_proj_a: QwenLinear::new(args.hidden_size, num_v_heads, false, false)?,
+            in_proj_z: QwenLinear::new(
+                args.hidden_size,
+                value_dim,
+                false,
+                args.uses_fp8(),
+                stream,
+            )?,
+            in_proj_b: QwenLinear::new(args.hidden_size, num_v_heads, false, false, stream)?,
+            in_proj_a: QwenLinear::new(args.hidden_size, num_v_heads, false, false, stream)?,
             dt_bias: Param::new(Array::from_slice(
                 &vec![1.0f32; num_v_heads as usize],
                 &[num_v_heads],
@@ -986,8 +1012,8 @@ impl LinearAttention {
                 &vec![0.0f32; num_v_heads as usize],
                 &[num_v_heads],
             )),
-            norm: Qwen3NextRmsNormGated::new(head_v_dim, args.rms_norm_eps)?,
-            out_proj: QwenLinear::new(value_dim, args.hidden_size, false, args.uses_fp8())?,
+            norm: Qwen3NextRmsNormGated::new(head_v_dim, args.rms_norm_eps, stream)?,
+            out_proj: QwenLinear::new(value_dim, args.hidden_size, false, args.uses_fp8(), stream)?,
         })
     }
 
@@ -1392,11 +1418,17 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    fn new(dim: i32, hidden_dim: i32, bias: bool, fp8: bool) -> Result<Self, Exception> {
+    fn new(
+        dim: i32,
+        hidden_dim: i32,
+        bias: bool,
+        fp8: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: QwenLinear::new(dim, hidden_dim, bias, fp8)?,
-            up_proj: QwenLinear::new(dim, hidden_dim, bias, fp8)?,
-            down_proj: QwenLinear::new(hidden_dim, dim, bias, fp8)?,
+            gate_proj: QwenLinear::new(dim, hidden_dim, bias, fp8, stream)?,
+            up_proj: QwenLinear::new(dim, hidden_dim, bias, fp8, stream)?,
+            down_proj: QwenLinear::new(hidden_dim, dim, bias, fp8, stream)?,
         })
     }
 
@@ -1430,66 +1462,61 @@ pub struct Experts {
 }
 
 impl Experts {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        let expert_weight_dtype = if args.uses_fp8() {
+            Dtype::Uint8
+        } else {
+            Dtype::Float32
+        };
         Ok(Self {
             num_experts: args.num_experts,
             hidden_dim: args.hidden_size,
             intermediate_dim: args.moe_intermediate_size,
             use_fp8: args.uses_fp8(),
-            gate_up_proj: Param::new(Array::from_slice(
-                &vec![
-                    0.0f32;
-                    (args.num_experts * 2 * args.moe_intermediate_size * args.hidden_size)
-                        as usize
-                ],
+            gate_up_proj: Param::<Array>::unloaded(
                 &[
                     args.num_experts,
                     2 * args.moe_intermediate_size,
                     args.hidden_size,
                 ],
-            )),
-            gate_up_proj_scale_inv: Param::new(args.uses_fp8().then(|| {
-                Array::from_slice(
-                    &vec![
-                        1.0f32;
-                        (args.num_experts
-                            * ceil_div(2 * args.moe_intermediate_size, 128)
-                            * ceil_div(args.hidden_size, 128)) as usize
-                    ],
+                expert_weight_dtype,
+                stream,
+            )?,
+            gate_up_proj_scale_inv: if args.uses_fp8() {
+                Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
                         ceil_div(2 * args.moe_intermediate_size, 128),
                         ceil_div(args.hidden_size, 128),
                     ],
-                )
-            })),
-            down_proj: Param::new(Array::from_slice(
-                &vec![
-                    0.0f32;
-                    (args.num_experts * args.hidden_size * args.moe_intermediate_size) as usize
-                ],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            down_proj: Param::<Array>::unloaded(
                 &[
                     args.num_experts,
                     args.hidden_size,
                     args.moe_intermediate_size,
                 ],
-            )),
-            down_proj_scale_inv: Param::new(args.uses_fp8().then(|| {
-                Array::from_slice(
-                    &vec![
-                        1.0f32;
-                        (args.num_experts
-                            * ceil_div(args.hidden_size, 128)
-                            * ceil_div(args.moe_intermediate_size, 128))
-                            as usize
-                    ],
+                expert_weight_dtype,
+                stream,
+            )?,
+            down_proj_scale_inv: if args.uses_fp8() {
+                Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
                         ceil_div(args.hidden_size, 128),
                         ceil_div(args.moe_intermediate_size, 128),
                     ],
-                )
-            })),
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
         })
     }
 
@@ -1639,15 +1666,16 @@ pub struct TopKRouter {
 }
 
 impl TopKRouter {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             top_k: args.num_experts_per_tok,
             num_experts: args.num_experts,
             norm_topk_prob: args.norm_topk_prob,
-            weight: Param::new(Array::from_slice(
-                &vec![0.0f32; (args.num_experts * args.hidden_size) as usize],
+            weight: Param::<Array>::unloaded(
                 &[args.num_experts, args.hidden_size],
-            )),
+                Dtype::Float32,
+                stream,
+            )?,
         })
     }
 
@@ -1685,17 +1713,18 @@ pub struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            gate: TopKRouter::new(args)?,
-            experts: Experts::new(args)?,
+            gate: TopKRouter::new(args, stream)?,
+            experts: Experts::new(args, stream)?,
             shared_expert: Mlp::new(
                 args.hidden_size,
                 args.shared_expert_intermediate_size,
                 false,
                 args.uses_fp8(),
+                stream,
             )?,
-            shared_expert_gate: QwenLinear::new(args.hidden_size, 1, false, false)?,
+            shared_expert_gate: QwenLinear::new(args.hidden_size, 1, false, false, stream)?,
         })
     }
 }
@@ -1768,13 +1797,17 @@ impl TransformerBlock {
                 None
             },
             linear_attn: if layer_type == LayerType::LinearAttention {
-                Some(LinearAttention::new(args)?)
+                Some(LinearAttention::new(args, stream)?)
             } else {
                 None
             },
-            mlp: SparseMoeBlock::new(args)?,
-            input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps)?,
-            post_attention_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps)?,
+            mlp: SparseMoeBlock::new(args, stream)?,
+            input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
+            post_attention_layernorm: Qwen3NextRmsNorm::new(
+                args.hidden_size,
+                args.rms_norm_eps,
+                stream,
+            )?,
         })
     }
 }
@@ -1877,7 +1910,8 @@ pub struct Qwen35MoeTextModel {
 
 impl Qwen35MoeTextModel {
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embed_tokens = nn::Embedding::new(args.vocab_size, args.hidden_size)?;
+        let embed_tokens =
+            nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
         let layers = (0..args.num_hidden_layers)
             .map(|idx| TransformerBlock::new(args, idx as usize, stream))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1886,7 +1920,7 @@ impl Qwen35MoeTextModel {
             num_hidden_layers: args.num_hidden_layers,
             embed_tokens,
             layers,
-            norm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps)?,
+            norm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
         })
     }
 }
@@ -2015,7 +2049,13 @@ impl Model {
     ) -> Result<Self, Exception> {
         let model = Qwen35MoeTextModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_lm_head(args.hidden_size, args.vocab_size)?)
+            Some(nn::Linear::unloaded(
+                args.hidden_size,
+                args.vocab_size,
+                false,
+                Dtype::Float32,
+                stream,
+            )?)
         } else {
             None
         };
@@ -2225,11 +2265,7 @@ pub fn load_qwen3_5_moe_model(
         )?;
     }
     report.finish(&model, &config)?;
-    if uses_fp8 {
-        copy_model_to_stream_incremental(&mut model, stream)?;
-    } else {
-        model.copy_to_stream(stream)?;
-    }
+    model.copy_to_stream(stream)?;
     Ok(model)
 }
 
@@ -2378,16 +2414,6 @@ fn transform_qwen3_5_moe_fp8_weights(
     }
 
     Ok(transformed)
-}
-
-fn copy_model_to_stream_incremental(model: &mut Model, stream: &Stream) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-    for param in params.values_mut() {
-        let copied = param.copy(stream)?;
-        eval([&copied])?;
-        **param = copied;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2745,7 +2771,7 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let mut attn = LinearAttention::new(&args).unwrap();
+        let mut attn = LinearAttention::new(&args, stream).unwrap();
         let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let out = attn
             .forward(LinearAttentionInput { x: &x, cache: None }, stream)
@@ -2760,7 +2786,7 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let mut moe = SparseMoeBlock::new(&args).unwrap();
+        let mut moe = SparseMoeBlock::new(&args, stream).unwrap();
         let gate_values = (0..args.num_experts)
             .flat_map(|expert| {
                 (0..args.hidden_size).map(move |hidden| ((expert + 1) * (hidden + 1)) as f32 * 0.01)

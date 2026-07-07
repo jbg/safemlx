@@ -5,7 +5,7 @@ use crate::module::Module;
 use crate::module::Param;
 use crate::ops::indexing::TryIndexOp;
 use crate::quantization::Quantizable;
-use crate::Array;
+use crate::{Array, Dtype, Stream};
 use safemlx_macros::ModuleParameters;
 
 use super::QuantizedEmbedding;
@@ -34,6 +34,21 @@ impl Embedding {
 
         Ok(Self {
             weight: Param::new(weight),
+        })
+    }
+
+    /// Creates an embedding layer whose weight carries only shape metadata.
+    ///
+    /// This is intended for modules that will immediately load real
+    /// checkpoint weights before any forward pass.
+    pub fn unloaded(
+        embedding_count: i32,
+        dimensions: i32,
+        dtype: Dtype,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::<Array>::unloaded(&[embedding_count, dimensions], dtype, stream)?,
         })
     }
 
