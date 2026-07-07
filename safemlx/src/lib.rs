@@ -30,8 +30,8 @@
 //!
 //! Operations in MLX are lazy. Array-producing operations are scheduled on an
 //! explicit stream, and the resulting arrays carry that execution choice. Use
-//! [`Array::eval`] to evaluate an existing array graph. Host readback methods
-//! such as [`Array::as_slice`] evaluate as needed; methods that perform
+//! [`Array::evaluated`] to evaluate an existing array graph. Host readback methods
+//! such as [`EvaluatedArray::as_slice`] require an evaluated array; methods that perform
 //! additional typed conversion, such as [`Array::item`], take a stream for that
 //! conversion.
 //!
@@ -57,10 +57,11 @@
 //!
 //! ## Function and Graph Transformations
 //!
-//! TODO: https://github.com/oxideai/mlx-rs/issues/214
-//!
-//! TODO: also document that all `Array` in the args for function
-//!       transformations
+//! Function transformations such as [`transforms::grad`],
+//! [`transforms::value_and_grad`], and [`transforms::compile::compile`]
+//! transform MLX computation graphs. Arrays that participate in a transformed
+//! computation should be passed as function inputs rather than captured from
+//! the surrounding environment; see [`transforms`] for details and examples.
 //!
 //! # Lazy Evaluation
 //!
@@ -71,7 +72,7 @@
 //!
 //! When you perform operations in MLX, no computation actually happens. Instead
 //! a compute graph is recorded. The actual computation only happens if an
-//! [`Array::eval`] is performed.
+//! [`Array::evaluated`] is performed.
 //!
 //! MLX uses lazy evaluation because it has some nice features, some of which we
 //! describe below.
@@ -170,10 +171,11 @@
 //! ```
 //!
 //! An important behavior to be aware of is when the graph will be implicitly
-//! evaluated. Anytime you `print` an array, or otherwise access its memory via
-//! [`Array::as_slice`], the graph will be evaluated. Saving arrays via
-//! [`Array::save_numpy`] or [`Array::save_safetensors`] (or any other MLX
-//! saving functions) will also evaluate the array.
+//! evaluated. Printing an array evaluates it, and host memory access requires
+//! first materializing an [`EvaluatedArray`] before calling methods such as
+//! [`EvaluatedArray::as_slice`]. Saving arrays via [`Array::save_numpy`] or
+//! [`Array::save_safetensors`] (or any other MLX saving functions) will also
+//! evaluate the array.
 //!
 //! Calling [`Array::item`] on a scalar array will also evaluate it. In the
 //! example above, printing the loss (`println!("{:?}", loss)`) or pushing the
@@ -242,10 +244,9 @@
 //!
 //! In the above, both the CPU and the GPU will perform the same add operation.
 //!
-//! TODO: The remaining python documentations states that the stream can be used
-//! to parallelize operations without worrying about racing conditions. We
-//! should check if this is true given that we've already observed data racing
-//! when executing unit tests in parallel.
+//! Streams control where operations are scheduled. Independent streams can be
+//! useful for organizing work, but code that shares arrays or touches host data
+//! should still evaluate explicitly at synchronization points.
 //!
 //! # Indexing Arrays
 //!

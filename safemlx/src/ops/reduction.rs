@@ -763,7 +763,7 @@ pub fn std_axes(
     })
 }
 
-/// Similar to [`std_axes`] but only reduces over a single axis.
+/// Similar to [`std_axes()`] but only reduces over a single axis.
 #[generate_macro]
 pub fn std_axis(
     a: impl AsRef<Array>,
@@ -787,7 +787,7 @@ pub fn std_axis(
     })
 }
 
-/// Similar to [`std_axes`] but reduces over all axes.
+/// Similar to [`std_axes()`] but reduces over all axes.
 #[generate_macro]
 pub fn std(
     a: impl AsRef<Array>,

@@ -712,7 +712,7 @@ pub fn r#where(
     })
 }
 
-/// Alias for [`r#where`]
+/// Alias for [`where()`].
 #[generate_macro]
 pub fn which(
     condition: impl AsRef<Array>,

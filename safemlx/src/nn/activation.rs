@@ -490,7 +490,7 @@ generate_builder! {
     #[buildable(root = crate)]
     #[builder(root = crate)]
     pub struct LeakyRelu {
-        /// The negative slope. Default to [`LeakyReLU::DEFAULT_NEG_SLOPE`] if not provided.
+        /// The negative slope. Default to [`LeakyRelu::DEFAULT_NEG_SLOPE`] if not provided.
         #[builder(optional, default = LeakyRelu::DEFAULT_NEG_SLOPE)]
         pub neg_slope: f32,
     }
@@ -595,7 +595,7 @@ impl Module<&Array> for Softplus {
 ///
 /// This is:
 ///
-/// ```rust, ignore
+/// ```text
 /// x / (array!(1) + abs(x)
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]

@@ -12,7 +12,7 @@
 //! 3. `fftn`/`fftn`: This function is a wrapper around `try_fftn` and unwraps the result. It
 //!    panics if the input is invalid.
 //!
-//! Each operation takes an explicit [`Stream`], which determines where the operation is scheduled.
+//! Each operation takes an explicit [`crate::Stream`], which determines where the operation is scheduled.
 //!
 //! # Examples
 //!

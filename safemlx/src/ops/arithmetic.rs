@@ -1228,7 +1228,7 @@ pub fn softmax_axes(
     })
 }
 
-/// Similar to [`softmax_axes`] but with a single axis.
+/// Similar to [`softmax_axes()`] but with a single axis.
 #[generate_macro]
 pub fn softmax_axis(
     a: impl AsRef<Array>,
@@ -1244,7 +1244,7 @@ pub fn softmax_axis(
     })
 }
 
-/// Similar to [`softmax_axes`] but with no axis specified.
+/// Similar to [`softmax_axes()`] but with no axis specified.
 #[generate_macro]
 pub fn softmax(
     a: impl AsRef<Array>,
@@ -1281,7 +1281,7 @@ pub fn subtract(
     a.as_ref().subtract(b, stream)
 }
 
-/// See [`Array::tan`].
+/// Computes the tangent of each element.
 #[generate_macro]
 pub fn tan(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Result<Array> {
     Array::try_from_op(|res| unsafe {
@@ -1454,7 +1454,7 @@ pub fn tensordot_axes(
     })
 }
 
-/// Similar to [`tensordot_axes`] but with a single axis.
+/// Similar to [`tensordot_axes()`] but with a single axis.
 #[generate_macro]
 pub fn tensordot_axis(
     a: impl AsRef<Array>,

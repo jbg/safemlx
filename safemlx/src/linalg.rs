@@ -485,7 +485,7 @@ pub fn eigvalsh(
 /// dimensions, the eigenvalues and eigenvectors are computed for each matrix in the last two
 /// dimensions.
 ///
-/// Unlike [`eigh`], this function computes eigenvalues for general (not necessarily symmetric
+/// Unlike [`eigh()`], this function computes eigenvalues for general (not necessarily symmetric
 /// or Hermitian) matrices. The eigenvalues and eigenvectors may be complex.
 ///
 /// # Params
@@ -519,7 +519,7 @@ pub fn eig(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Resu
 /// This function supports arrays with at least 2 dimensions. When the input has more than two
 /// dimensions, the eigenvalues are computed for each matrix in the last two dimensions.
 ///
-/// Unlike [`eigvalsh`], this function computes eigenvalues for general (not necessarily symmetric
+/// Unlike [`eigvalsh()`], this function computes eigenvalues for general (not necessarily symmetric
 /// or Hermitian) matrices. The eigenvalues may be complex.
 ///
 /// # Params

@@ -23,25 +23,27 @@
 //! argument to compute the gradient with respect to, use
 //! [`grad_with_argnums()`] or [`value_and_grad_with_argnums()`].
 //!
-//! TODO: update the example once https://github.com/oxideai/mlx-rs/pull/218 is merged
-//!
 //! ```rust,ignore
-//! use safemlx::{Array, error::Result, transforms::grad};
+//! use safemlx::{Array, error::Result, transforms::grad, square};
 //!
-//! fn f(x: &Array) -> Result<Array> {
-//!     x.square()
+//! fn f(x: &Array, stream: &safemlx::Stream) -> Result<Array> {
+//!     square!(x, stream=stream)
 //! }
 //!
-//! fn calculate_grad(func: impl Fn(&Array) -> Result<Array>, arg: &Array, stream: &safemlx::Stream) -> Result<Array> {
-//!     grad(&func)(arg)
+//! fn calculate_grad(
+//!     mut func: impl FnMut(&Array, &safemlx::Stream) -> Result<Array>,
+//!     arg: &Array,
+//!     stream: &safemlx::Stream,
+//! ) -> Result<Array> {
+//!     grad(move |x: &Array| func(x, stream))(arg)
 //! }
 //!
 //! let x = Array::from(1.5);
 //!
-//! let dfdx = calculate_grad(f, &x).unwrap();
+//! let dfdx = calculate_grad(f, &x, &stream).unwrap();
 //! assert_eq!(dfdx.item::<f32>(&stream), 2.0 * 1.5);
 //!
-//! let dfdx2 = calculate_grad(|args| calculate_grad(f, args), &x).unwrap();
+//! let dfdx2 = calculate_grad(|arg, stream| calculate_grad(f, arg, stream), &x, &stream).unwrap();
 //! assert_eq!(dfdx2.item::<f32>(&stream), 2.0);
 //! ```
 

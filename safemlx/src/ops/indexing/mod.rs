@@ -4,7 +4,8 @@
 //!
 //! Due to limitations in the `std::ops::Index` and `std::ops::IndexMut` traits (only references can
 //! be returned), the indexing is achieved with the [`IndexOp`] and [`IndexMutOp`] traits where
-//! arrays can be indexed with [`IndexOp::index()`] and [`IndexMutOp::index_mut()`] respectively.
+//! arrays can be indexed with [`IndexOp::index_device()`] and
+//! [`IndexMutOp::index_mut_device()`] respectively.
 //!
 //! The following types can be used as indices:
 //!
@@ -363,7 +364,7 @@ impl Array {
     /// The elements are taken from `indices` along the specified axis. If the axis is not specified
     /// the array is treated as a flattened 1-D array prior to performing the take.
     ///
-    /// See [`Array::take_all`] for the flattened array.
+    /// See [`Array::take`] for the flattened array.
     ///
     /// # Params
     ///
@@ -571,7 +572,7 @@ impl Array {
 
 /// Indices of the maximum values along the axis.
 ///
-/// See [`argmax_all`] for the flattened array.
+/// See [`argmax()`] for the flattened array.
 ///
 /// # Params
 ///
@@ -624,7 +625,7 @@ pub fn argmax(
 
 /// Indices of the minimum values along the axis.
 ///
-/// See [`argmin_all`] for the flattened array.
+/// See [`argmin()`] for the flattened array.
 ///
 /// # Params
 ///
@@ -757,7 +758,7 @@ pub fn take_axis(
     a.as_ref().take_axis(indices, axis, stream)
 }
 
-/// See [`Array::take_all`]
+/// See [`Array::take`].
 #[generate_macro(customize(root = "$crate::ops::indexing"))]
 pub fn take(
     a: impl AsRef<Array>,
@@ -771,7 +772,7 @@ pub fn take(
 ///
 /// The elements will not necessarily be in sorted order.
 ///
-/// See [`topk_all`] for the flattened array.
+/// See [`topk()`] for the flattened array.
 ///
 /// # Params
 ///

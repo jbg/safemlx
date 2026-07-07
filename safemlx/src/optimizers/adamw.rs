@@ -11,13 +11,14 @@ use crate::{
 use super::*;
 
 generate_builder! {
-    /// The AdamW optimizer [1].
+    /// The AdamW optimizer.
     ///
-    /// Following the above convention, in contrast with [1], we do not use bias
+    /// Following the above convention, in contrast with the original AdamW paper,
+    /// we do not use bias
     /// correction in the first and second moments for AdamW. We update the weights
     /// with a `weightDecay` lambda value:
     ///
-    /// [1]: Loshchilov, I. and Hutter, F., 2019. Decoupled weight decay regularization. ICLR 2019.
+    /// Reference: Loshchilov, I. and Hutter, F., 2019. Decoupled weight decay regularization. ICLR 2019.
     #[derive(Debug, Clone, Buildable)]
     #[buildable(root = crate)]
     #[builder(

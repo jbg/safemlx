@@ -38,9 +38,10 @@ pub struct Pool {
     /// Axes to pool over
     axes: Vec<i32>,
 
-    /// Pooling operation
+    /// Pooling operation.
     ///
-    /// TODO: We have Arc here just to make it `Clone` and `Send`. Is this necessary?
+    /// Stored as a trait object so concrete pooling layers can share the same
+    /// windowing logic while supplying different reductions.
     pooling_op: Box<dyn Pooling>,
 }
 
