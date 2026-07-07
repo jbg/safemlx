@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-lm"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -10,6 +10,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Rust MLX language model runtime"
 readme = "README.md"
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 # Local dependencies
