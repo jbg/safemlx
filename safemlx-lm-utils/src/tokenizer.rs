@@ -552,6 +552,10 @@ where
     // TODO: what does checking for "messages" key do in the python code?
     let mut rendered = Vec::new();
     for chat in conversations {
+        let empty_tools: &[serde_json::Value] = &[];
+        let empty_documents: &[Document] = &[];
+        let tools = tools.unwrap_or(empty_tools);
+        let documents = documents.unwrap_or(empty_documents);
         let messages = if chat.len() == 1 {
             serde_json::to_value(&chat[0].content)
                 .ok()
@@ -575,6 +579,7 @@ where
             documents => documents,
             add_generation_prompt => add_generation_prompt,
         })?;
+        rendered_chat = rendered_chat.trim_start_matches('\n').to_string();
 
         if continue_final_message {
             let Some(final_message) = chat

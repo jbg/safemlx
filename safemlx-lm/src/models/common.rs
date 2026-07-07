@@ -7,11 +7,13 @@ use safemlx::{
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::Module,
+    module::{Module, Param},
     nn,
     ops::{
-        indexing::{NewAxis, TryIndexOp},
-        sigmoid,
+        argpartition_axis, gather_grouped_rows, gather_route_values, grouped_matmul,
+        indexing::{take_along_axis, topk_axis, NewAxis, TryIndexOp},
+        matmul, maximum, r#where, segment_sum_by_index, sigmoid, softmax_axis, sum_axis,
+        topk_route_plan, GroupedRoutePlan,
     },
     quantization::MaybeQuantized,
     random::{self, RandomState},
@@ -26,6 +28,11 @@ use crate::{
 /// Applies the SiLU activation function.
 pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
     x.multiply(sigmoid(&x, stream)?, stream)
+}
+
+/// Applies the squared ReLU activation used by Nemotron-H dense and MoE MLPs.
+pub fn relu2(x: Array, stream: &Stream) -> Result<Array, Exception> {
+    maximum(&x, Array::from_f32(0.0), stream)?.square(stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -165,6 +172,260 @@ impl Module<&Array> for DenseSwiGluMlp {
         self.up_proj.training_mode(mode);
         self.down_proj.training_mode(mode);
     }
+}
+
+/// Router score transform used before top-k expert selection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TopKRouterScoreFunction {
+    /// Softmax scores, as used by Qwen MoE routers.
+    Softmax,
+    /// Sigmoid scores, as used by Nemotron/DeepSeek-style routers.
+    Sigmoid,
+}
+
+/// Configuration for a reusable top-k MoE router.
+#[derive(Debug, Clone, Copy)]
+pub struct TopKRouterConfig {
+    /// Number of selected experts per token.
+    pub top_k: i32,
+    /// Total number of routed experts.
+    pub num_experts: i32,
+    /// Hidden dimension consumed by the router projection.
+    pub hidden_size: i32,
+    /// Score transform to apply to router logits.
+    pub score_function: TopKRouterScoreFunction,
+    /// Whether selected top-k weights are normalized after gathering.
+    pub norm_topk_prob: bool,
+    /// Optional epsilon added to the normalization denominator.
+    pub normalization_epsilon: f32,
+    /// Final multiplier applied to gathered routing weights.
+    pub routed_scaling_factor: f32,
+    /// Number of routing groups.
+    pub n_group: i32,
+    /// Number of routing groups selected before expert top-k.
+    pub topk_group: i32,
+    /// Whether to allocate Nemotron-style expert score correction bias.
+    pub score_correction_bias: bool,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Reusable top-k router for sparse MoE layers.
+pub struct TopKRouter {
+    /// Number of selected experts per token.
+    pub top_k: i32,
+    /// Total number of routed experts.
+    pub num_experts: i32,
+    /// Router score transform.
+    pub score_function: TopKRouterScoreFunction,
+    /// Whether selected probabilities are normalized.
+    pub norm_topk_prob: bool,
+    /// Optional epsilon added to the normalization denominator.
+    pub normalization_epsilon: f32,
+    /// Final multiplier applied to routing weights.
+    pub routed_scaling_factor: f32,
+    /// Number of routing groups.
+    pub n_group: i32,
+    /// Number of selected routing groups.
+    pub topk_group: i32,
+    #[param]
+    /// Router projection weight.
+    pub weight: Param<Array>,
+    #[param]
+    /// Optional score correction bias used only when choosing experts.
+    pub e_score_correction_bias: Param<Option<Array>>,
+}
+
+impl TopKRouter {
+    /// Creates an unloaded router.
+    pub fn new(config: TopKRouterConfig, stream: &Stream) -> Result<Self, Exception> {
+        Ok(Self {
+            top_k: config.top_k,
+            num_experts: config.num_experts,
+            score_function: config.score_function,
+            norm_topk_prob: config.norm_topk_prob,
+            normalization_epsilon: config.normalization_epsilon,
+            routed_scaling_factor: config.routed_scaling_factor,
+            n_group: config.n_group,
+            topk_group: config.topk_group,
+            weight: Param::<Array>::unloaded(
+                &[config.num_experts, config.hidden_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            e_score_correction_bias: if config.score_correction_bias {
+                Param::<Option<Array>>::unloaded_some(
+                    &[config.num_experts],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+        })
+    }
+
+    /// Returns selected expert ids and per-route weights.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
+        let scores = match self.score_function {
+            TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
+            TopKRouterScoreFunction::Sigmoid => sigmoid(logits, stream)?,
+        };
+        let mut scores_for_choice = scores.clone();
+        if let Some(bias) = self.e_score_correction_bias.as_ref() {
+            scores_for_choice = scores_for_choice.add(bias, stream)?;
+        }
+
+        let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
+        let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        if self.norm_topk_prob {
+            let mut denominator = sum_axis(&top_k_weights, -1, true, stream)?;
+            if self.normalization_epsilon != 0.0 {
+                denominator =
+                    denominator.add(Array::from_f32(self.normalization_epsilon), stream)?;
+            }
+            top_k_weights = top_k_weights.divide(denominator, stream)?;
+        }
+        if self.routed_scaling_factor != 1.0 {
+            top_k_weights =
+                top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+        }
+        Ok((top_k_index, top_k_weights))
+    }
+
+    fn topk_indices(&self, scores_for_choice: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if self.n_group == 1 && self.topk_group == 1 {
+            return argpartition_axis(scores_for_choice, -self.top_k, -1, stream)?
+                .try_index_device((.., -self.top_k..), stream);
+        }
+        if self.n_group <= 0
+            || self.topk_group <= 0
+            || self.topk_group > self.n_group
+            || self.num_experts % self.n_group != 0
+        {
+            return Err(Exception::custom(
+                "invalid grouped MoE router configuration",
+            ));
+        }
+
+        let tokens = scores_for_choice.dim(0);
+        let experts_per_group = self.num_experts / self.n_group;
+        let grouped =
+            scores_for_choice.reshape(&[tokens, self.n_group, experts_per_group], stream)?;
+        let group_top = 2.min(experts_per_group);
+        let group_scores = sum_axis(
+            &topk_axis(grouped, group_top, -1, stream)?,
+            -1,
+            false,
+            stream,
+        )?;
+        let group_idx = argpartition_axis(&group_scores, -self.topk_group, -1, stream)?
+            .try_index_device((.., -self.topk_group..), stream)?;
+
+        let expert_group_ids: Vec<i32> = (0..self.num_experts)
+            .map(|expert| expert / experts_per_group)
+            .collect();
+        let expert_group_ids = Array::from_slice(&expert_group_ids, &[1, 1, self.num_experts]);
+        let selected_groups = group_idx.try_index_device((.., .., NewAxis), stream)?;
+        let group_mask = selected_groups.eq(expert_group_ids, stream)?;
+        let group_mask = sum_axis(
+            &group_mask.as_dtype(Dtype::Int32, stream)?,
+            1,
+            false,
+            stream,
+        )?
+        .gt(Array::from_int(0), stream)?;
+        let masked_scores = r#where(&group_mask, scores_for_choice, Array::from_f32(0.0), stream)?;
+        argpartition_axis(masked_scores, -self.top_k, -1, stream)?
+            .try_index_device((.., -self.top_k..), stream)
+    }
+
+    /// Sets training mode.
+    pub fn training_mode(&mut self, _mode: bool) {}
+}
+
+/// Applies route weights and reduces expert-major route outputs back to source tokens.
+pub fn weighted_route_sum(
+    current: Array,
+    top_k_weights: &Array,
+    plan: &GroupedRoutePlan,
+    num_tokens: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let weights = gather_route_values(top_k_weights, plan, stream)?
+        .try_index_device((.., NewAxis), stream)?;
+    let weighted = current.multiply(weights, stream)?;
+    segment_sum_by_index(weighted, &plan.token_indices, num_tokens, stream)
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Packed routed expert bank for ReLU2 experts with `up_proj` and `down_proj` weights.
+pub struct PackedRelu2Experts {
+    /// Number of routed experts.
+    pub num_experts: i32,
+    /// Model hidden size.
+    pub hidden_size: i32,
+    /// Expert intermediate size.
+    pub intermediate_size: i32,
+    #[param]
+    /// Packed expert up-projection weights, shaped `[experts, intermediate, hidden]`.
+    pub up_proj: Param<Array>,
+    #[param]
+    /// Packed expert down-projection weights, shaped `[experts, hidden, intermediate]`.
+    pub down_proj: Param<Array>,
+}
+
+impl PackedRelu2Experts {
+    /// Creates an unloaded packed expert bank.
+    pub fn new(
+        num_experts: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            up_proj: Param::<Array>::unloaded(
+                &[num_experts, intermediate_size, hidden_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            down_proj: Param::<Array>::unloaded(
+                &[num_experts, hidden_size, intermediate_size],
+                Dtype::Float32,
+                stream,
+            )?,
+        })
+    }
+
+    /// Evaluates routed experts and reduces route outputs back to tokens.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let up_weights = self.up_proj.as_ref().swap_axes(-1, -2, stream)?;
+        let hidden = grouped_matmul(&hidden, &up_weights, &plan.sorted_group_ids, true, stream)?;
+        let hidden = relu2(hidden, stream)?;
+        let down_weights = self.down_proj.as_ref().swap_axes(-1, -2, stream)?;
+        let current = grouped_matmul(&hidden, &down_weights, &plan.sorted_group_ids, true, stream)?;
+        weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    /// Sets training mode.
+    pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 /// Builds an initialized untied language-model head.

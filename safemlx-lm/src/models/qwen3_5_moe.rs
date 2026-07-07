@@ -1,11 +1,6 @@
 //! Qwen3.5 MoE text model implementation and loader.
 
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::Instant,
-};
+use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 
 use safemlx::{
     builder::Builder,
@@ -15,11 +10,9 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        argpartition_axis, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows,
-        gather_route_values, grouped_matmul,
-        indexing::{take_along_axis, NewAxis, TryIndexOp},
-        matmul, segment_sum_by_index, sigmoid, softmax_axis, stack_axis, sum_axis, topk_route_plan,
-        zeros,
+        broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, grouped_matmul,
+        indexing::{NewAxis, TryIndexOp},
+        matmul, sigmoid, stack_axis, sum_axis, topk_route_plan, zeros,
     },
     transforms::eval,
     Array, Dtype, Stream,
@@ -33,13 +26,16 @@ pub use super::common::sample;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    models::common::{self, project_logits_dense, silu, CausalLm},
+    models::common::{self, project_logits_dense, silu, CausalLm, TopKRouterScoreFunction},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
-    weights::{load_arrays_strict, load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
+    weights::{
+        load_arrays_strict, load_safetensors_strict, safetensors_files, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1975,67 +1971,15 @@ impl Experts {
                 stream,
             )?
         };
-        let weights = gather_route_values(top_k_weights, &plan, stream)?
-            .try_index_device((.., NewAxis), stream)?;
-        let weighted = current.multiply(weights, stream)?;
-        segment_sum_by_index(weighted, &plan.token_indices, num_tokens, stream)
+        common::weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
 
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
 /// Top-k router for Qwen3.5 MoE experts.
-pub struct TopKRouter {
-    /// Number of experts selected per token.
-    pub top_k: i32,
-    /// Total number of experts.
-    pub num_experts: i32,
-    /// Whether top-k probabilities are normalized.
-    pub norm_topk_prob: bool,
-    #[param]
-    /// Router projection weight.
-    pub weight: Param<Array>,
-}
-
-impl TopKRouter {
-    /// Creates an unloaded router.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        Ok(Self {
-            top_k: args.num_experts_per_tok,
-            num_experts: args.num_experts,
-            norm_topk_prob: args.norm_topk_prob,
-            weight: Param::<Array>::unloaded(
-                &[args.num_experts, args.hidden_size],
-                Dtype::Float32,
-                stream,
-            )?,
-        })
-    }
-
-    /// Returns selected expert indices and routing weights.
-    pub fn forward(
-        &mut self,
-        hidden_states: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let router_logits = matmul(hidden_states, self.weight.transpose(stream)?, stream)?;
-        let router_probs = softmax_axis(&router_logits, -1, true, stream)?;
-        let top_k_index = argpartition_axis(&router_probs, -self.top_k, -1, stream)?
-            .try_index_device((.., -self.top_k..), stream)?;
-        let mut top_k_weights = take_along_axis(&router_probs, &top_k_index, -1, stream)?;
-        top_k_weights =
-            top_k_weights.divide(sum_axis(&top_k_weights, -1, true, stream)?, stream)?;
-        Ok((
-            top_k_index,
-            top_k_weights.as_dtype(router_logits.dtype(), stream)?,
-        ))
-    }
-
-    /// Sets training mode.
-    pub fn training_mode(&mut self, _mode: bool) {}
-}
+pub type TopKRouter = common::TopKRouter;
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Sparse MoE block with routed experts plus a shared expert.
@@ -2058,7 +2002,21 @@ impl SparseMoeBlock {
     /// Creates an unloaded sparse MoE block.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            gate: TopKRouter::new(args, stream)?,
+            gate: TopKRouter::new(
+                common::TopKRouterConfig {
+                    top_k: args.num_experts_per_tok,
+                    num_experts: args.num_experts,
+                    hidden_size: args.hidden_size,
+                    score_function: TopKRouterScoreFunction::Softmax,
+                    norm_topk_prob: true,
+                    normalization_epsilon: 0.0,
+                    routed_scaling_factor: 1.0,
+                    n_group: 1,
+                    topk_group: 1,
+                    score_correction_bias: false,
+                },
+                stream,
+            )?,
             experts: Experts::new(args, stream)?,
             shared_expert: Mlp::new(
                 args.hidden_size,
@@ -2596,15 +2554,6 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
-/// Hugging Face safetensors index file.
-pub struct WeightMap {
-    /// Index metadata.
-    pub metadata: HashMap<String, Value>,
-    /// Mapping from tensor name to shard file name.
-    pub weight_map: HashMap<String, String>,
-}
-
 /// Loads a Qwen3.5 MoE model and safetensors weights from a model directory.
 pub fn load_qwen3_5_moe_model(
     model_dir: impl AsRef<Path>,
@@ -2620,26 +2569,10 @@ pub fn load_qwen3_5_moe_model(
     let mut model = Model::new(args, image_token_id, video_token_id, stream)?;
     let config = qwen3_5_moe_strict_load_config();
     let mut report = StrictLoadReport::default();
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    if weights_index.exists() {
-        let json = std::fs::read_to_string(weights_index)?;
-        let weight_map: WeightMap = serde_json::from_str(&json)?;
-        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-        for weight_file in weight_files {
-            load_qwen3_5_moe_safetensors_strict(
-                &mut model,
-                model_dir.join(weight_file),
-                weights_stream,
-                stream,
-                &config,
-                &mut report,
-                uses_fp8,
-            )?;
-        }
-    } else {
+    for weight_file in safetensors_files(model_dir)? {
         load_qwen3_5_moe_safetensors_strict(
             &mut model,
-            model_dir.join("model.safetensors"),
+            weight_file,
             weights_stream,
             stream,
             &config,

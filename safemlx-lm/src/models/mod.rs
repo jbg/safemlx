@@ -29,6 +29,8 @@ pub mod gemma4;
 pub mod gemma4_assistant;
 /// Llama decoder-only model support.
 pub mod llama;
+/// Nemotron-H hybrid Mamba2/attention/MoE config support.
+pub mod nemotron_h;
 /// Qwen3 decoder-only model support.
 pub mod qwen3;
 /// Qwen3.5 MoE text model support.
@@ -73,6 +75,8 @@ pub enum ModelKind {
     Gemma4,
     /// Llama decoder architecture.
     Llama,
+    /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
+    NemotronH,
     /// Qwen3 decoder architecture.
     Qwen3,
     /// Qwen3.5 mixture-of-experts architecture.
@@ -84,6 +88,7 @@ impl ModelKind {
         match model_type {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
+            "nemotron_h" => Ok(Self::NemotronH),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
@@ -193,6 +198,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
             })?;
             Ok(())
         }
+        ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::Qwen3 => {
             serde_json::from_value::<qwen3::ModelArgs>(config.clone()).map_err(|error| {
                 Error::UnsupportedArchitecture(format!("invalid qwen3 config: {error}"))
@@ -209,6 +215,8 @@ pub enum Model {
     Gemma4(gemma4::Model),
     /// Llama model.
     Llama(llama::Model),
+    /// Nemotron-H hybrid model.
+    NemotronH(nemotron_h::Model),
     /// Qwen3 model.
     Qwen3(qwen3::Model),
     /// Qwen3.5 MoE text model.
@@ -221,6 +229,7 @@ impl Model {
         match self {
             Self::Gemma4(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
+            Self::NemotronH(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
             Self::Qwen35Moe(model) => model.model_type(),
         }
@@ -266,6 +275,9 @@ impl Model {
             Self::Qwen35Moe(_) => {
                 panic!("qwen3_5_moe requires ModelCache; use generate_with_cache")
             }
+            Self::NemotronH(_) => {
+                panic!("nemotron_h requires ModelCache; use generate_with_cache")
+            }
         }
     }
 
@@ -273,6 +285,7 @@ impl Model {
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::Gemma4(_) | Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
+            Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
             Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
         }
     }
@@ -295,6 +308,9 @@ impl Model {
             ),
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
                 qwen3::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
+            ),
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => ModelGenerate::NemotronH(
+                nemotron_h::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
             ),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => ModelGenerate::Qwen35Moe(
                 qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
@@ -330,6 +346,8 @@ impl Iterator for Generate<'_> {
 pub enum ModelCache {
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
+    /// Heterogeneous Nemotron-H cache.
+    NemotronH(nemotron_h::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35Moe(qwen3_5_moe::Cache),
 }
@@ -342,6 +360,8 @@ pub enum ModelGenerate<'a> {
     Llama(llama::Generate<'a, ConcatKeyValueCache>),
     /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+    /// Nemotron-H generation iterator.
+    NemotronH(nemotron_h::Generate<'a>),
     /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a>),
 }
@@ -353,6 +373,7 @@ impl Iterator for ModelGenerate<'_> {
         match self {
             Self::Gemma4(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
+            Self::NemotronH(generate) => generate.next(),
             Self::Qwen3(generate) => generate.next(),
             Self::Qwen35Moe(generate) => generate.next(),
         }
@@ -394,6 +415,11 @@ impl LoadedModel {
             ModelKind::Llama => {
                 Model::Llama(llama::load_llama_model(model_dir, stream, weights_stream)?)
             }
+            ModelKind::NemotronH => Model::NemotronH(nemotron_h::load_nemotron_h_model(
+                model_dir,
+                stream,
+                weights_stream,
+            )?),
             ModelKind::Qwen3 => {
                 Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream, weights_stream)?)
             }
@@ -586,6 +612,11 @@ pub fn load_model(
             stream,
             weights_stream,
         )?)),
+        ModelKind::NemotronH => Ok(Model::NemotronH(nemotron_h::load_nemotron_h_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(
             model_dir,
             stream,
@@ -606,6 +637,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
+        ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
         ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
         ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
     }
@@ -646,6 +678,11 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
         }
     }
 
+    let jinja_path = model_dir.join("chat_template.jinja");
+    if jinja_path.exists() {
+        return Ok(Some(std::fs::read_to_string(jinja_path)?));
+    }
+
     let metadata = read_model_metadata(model_dir)?;
     if matches!(metadata.model_type.as_str(), "gemma4" | "gemma4_unified")
         || metadata.text_config.as_ref().is_some_and(|text_config| {
@@ -668,10 +705,15 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 
 #[cfg(test)]
 mod tests {
-    use super::{check_model_config, check_model_config_json, check_model_dir, load_tokenizer};
+    use super::{
+        check_model_config, check_model_config_json, check_model_dir, load_chat_template,
+        load_tokenizer,
+    };
+    use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
     use serde_json::json;
     use std::{
         fs,
+        process::Command,
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -711,6 +753,79 @@ mod tests {
         );
         let tokenizer = load_tokenizer(&dir).unwrap();
         assert_eq!(tokenizer.get_vocab_size(false), 0);
+    }
+
+    #[test]
+    fn load_chat_template_reads_standalone_jinja_file() {
+        let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+        fs::write(
+            dir.join("chat_template.jinja"),
+            "hello {{ messages[0].role }}",
+        )
+        .unwrap();
+
+        let template = load_chat_template(&dir).unwrap().unwrap();
+        assert_eq!(template, "hello {{ messages[0].role }}");
+    }
+
+    #[test]
+    #[ignore = "requires local Nemotron-H model files and Python transformers"]
+    fn nemotron_chat_template_matches_transformers_on_small_prompts() {
+        let model_dir = std::env::var("NEMOTRON_H_PARITY_MODEL_DIR")
+            .expect("set NEMOTRON_H_PARITY_MODEL_DIR to a local Nemotron-H snapshot");
+        let model_dir = std::path::PathBuf::from(model_dir);
+        let template = load_chat_template(&model_dir).unwrap().unwrap();
+        let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&model_dir).unwrap());
+        let conversations = vec![vec![
+            json!({"role": "system", "content": "You are concise."}),
+            json!({"role": "user", "content": "What is 2+2?"}),
+        ]];
+        let prompts = ["Hello, world!", "What is 84 * 3 / 2?"];
+        let local_prompt_ids = prompts
+            .iter()
+            .map(|prompt| tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec())
+            .collect::<Vec<_>>();
+
+        let rendered = tokenizer
+            .apply_chat_template_json(
+                template.clone(),
+                conversations.clone(),
+                None,
+                "nemotron_h",
+                true,
+            )
+            .unwrap()
+            .remove(0);
+        let script = r#"
+import json, sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)
+messages = json.loads(sys.argv[2])
+prompts = json.loads(sys.argv[3])
+rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+ids = [tok.encode(prompt, add_special_tokens=False) for prompt in prompts]
+print(json.dumps({"rendered": rendered, "ids": ids}))
+"#;
+        let python =
+            std::env::var("NEMOTRON_H_PARITY_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let output = Command::new(&python)
+            .arg("-c")
+            .arg(script)
+            .arg(&model_dir)
+            .arg(serde_json::to_string(&conversations[0]).unwrap())
+            .arg(serde_json::to_string(&prompts).unwrap())
+            .output()
+            .expect("failed to run Python transformers parity check");
+        assert!(
+            output.status.success(),
+            "transformers parity script failed with {python}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rendered, expected["rendered"].as_str().unwrap());
+        let expected_ids: Vec<Vec<u32>> = serde_json::from_value(expected["ids"].clone()).unwrap();
+        assert_eq!(local_prompt_ids, expected_ids);
+        assert!(template.contains("<|im_start|>assistant"));
     }
 
     #[test]
@@ -791,6 +906,43 @@ mod tests {
                 kind: super::ModelKind::Qwen35Moe,
                 model_type: "qwen3_5_moe".to_string(),
                 effective_model_type: "qwen3_5_moe_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_nemotron_h() {
+        let support = check_model_config(&json!({
+            "model_type": "nemotron_h",
+            "vocab_size": 131072,
+            "hidden_size": 2688,
+            "intermediate_size": 1856,
+            "num_hidden_layers": 6,
+            "hybrid_override_pattern": "MEMEM*",
+            "num_attention_heads": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "max_position_embeddings": 262144,
+            "mlp_hidden_act": "relu2",
+            "mamba_hidden_act": "silu",
+            "ssm_state_size": 128,
+            "mamba_num_heads": 64,
+            "mamba_head_dim": 64,
+            "conv_kernel": 4,
+            "chunk_size": 128,
+            "n_groups": 8,
+            "n_routed_experts": 128,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "torch_dtype": "bfloat16"
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::NemotronH,
+                model_type: "nemotron_h".to_string(),
+                effective_model_type: "nemotron_h".to_string(),
             })
         );
     }
