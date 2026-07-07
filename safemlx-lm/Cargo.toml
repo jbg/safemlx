@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-lm"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,16 +13,25 @@ readme = "README.md"
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
+no-default-features = true
+features = ["fancy-regex"]
+
+[features]
+default = ["onig", "esaxx_fast"]
+
+esaxx_fast = ["tokenizers/esaxx_fast", "safemlx-lm-utils/esaxx_fast"]
+fancy-regex = ["tokenizers/fancy-regex", "safemlx-lm-utils/fancy-regex"]
+onig = ["tokenizers/onig", "safemlx-lm-utils/onig"]
 
 [dependencies]
 # Local dependencies
 safemlx = { workspace = true, features = ["safetensors"] }
-safemlx-lm-utils.workspace = true
+safemlx-lm-utils = { workspace = true, default-features = false }
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
-tokenizers = { version = "0.22.0", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.22.0", default-features = false }
 clap = { version = "4", features = ["derive"] }
 idna_adapter = "1.2" 
 thiserror = "2"

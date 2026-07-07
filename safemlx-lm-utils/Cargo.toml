@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-lm-utils"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -11,10 +11,21 @@ rust-version.workspace = true
 description = "Utilities for MLX language model runtimes"
 readme = "README.md"
 
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["fancy-regex"]
+
+[features]
+default = ["onig", "esaxx_fast"]
+
+esaxx_fast = ["tokenizers/esaxx_fast"]
+fancy-regex = ["tokenizers/fancy-regex"]
+onig = ["tokenizers/onig"]
+
 [dependencies]
 minijinja = { version = "2", features = ["loader"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.22", default-features = false }
