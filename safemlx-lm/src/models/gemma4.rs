@@ -10,6 +10,7 @@ use std::{
 use safemlx::{
     builder::Builder,
     error::Exception,
+    fast::{MetalKernel, MetalKernelConfig},
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
@@ -92,6 +93,7 @@ enum PerfComponent {
 
 thread_local! {
     static PERF_STATS: RefCell<Option<PerfStats>> = const { RefCell::new(None) };
+    static GELU_MUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
 /// Enables or disables per-thread Gemma 4 profiling.
@@ -134,6 +136,55 @@ fn profile_arrays(component: PerfComponent, arrays: &[&Array]) -> Result<(), Exc
 
 fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exception> {
     profile_arrays(component, &[array])
+}
+
+fn gelu_mul_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "gemma4_gelu_mul",
+        ["fused"],
+        ["out"],
+        concat!(
+            "uint elem = thread_position_in_grid.x;",
+            "uint col = elem % HIDDEN_DIM;",
+            "uint row = elem / HIDDEN_DIM;",
+            "uint base = row * HIDDEN_DIM * 2;",
+            "float gate = float(fused[base + col]);",
+            "float up = float(fused[base + HIDDEN_DIM + col]);",
+            "float x3 = gate * gate * gate;",
+            "float inner = 0.7978845608028654f * (gate + 0.044715f * x3);",
+            "float gelu = 0.5f * gate * (1.0f + metal::tanh(inner));",
+            "out[elem] = T(gelu * up);"
+        ),
+        "",
+        true,
+        false,
+    )
+}
+
+fn gelu_mul_fused(fused: &Array, hidden_dim: i32, stream: &Stream) -> Result<Array, Exception> {
+    let mut output_shape = fused.shape().to_vec();
+    let Some(last) = output_shape.last_mut() else {
+        return Err(Exception::custom(
+            "fused Gemma 4 MLP output has no dimensions",
+        ));
+    };
+    *last = hidden_dim;
+
+    GELU_MUL_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(gelu_mul_kernel()?);
+        }
+        let config = MetalKernelConfig::new()
+            .with_template_arg_dtype("T", fused.dtype())
+            .with_template_arg_int("HIDDEN_DIM", hidden_dim)
+            .with_grid([output_shape.iter().product(), 1, 1])
+            .with_thread_group([256, 1, 1])
+            .with_output_arg(output_shape, fused.dtype());
+        cell.borrow()
+            .as_ref()
+            .expect("Gemma 4 GELU/mul kernel initialized")
+            .apply_one_device([fused], &config, stream)
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -755,7 +806,7 @@ impl Mlp {
         &mut self,
         input: &Array,
         stream: &Stream,
-    ) -> Result<Option<(Array, Array)>, Exception> {
+    ) -> Result<Option<Array>, Exception> {
         let Some(fused) = self.ensure_fused_gate_up(stream)? else {
             return Ok(None);
         };
@@ -769,9 +820,7 @@ impl Mlp {
             fused.bits,
             stream,
         )?;
-        let gate = output.try_index_device((.., .., ..self.hidden_dim), stream)?;
-        let up = output.try_index_device((.., .., self.hidden_dim..), stream)?;
-        Ok(Some((gate, up)))
+        Ok(Some(gelu_mul_fused(&output, self.hidden_dim, stream)?))
     }
 }
 
@@ -780,14 +829,14 @@ impl Module<&Array> for Mlp {
     type Error = Exception;
 
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
-        let (gate, up) = match self.fused_gate_up_forward(input, stream)? {
-            Some((gate, up)) => (gate, up),
-            None => (
-                self.gate_proj.forward(input, stream)?,
-                self.up_proj.forward(input, stream)?,
-            ),
+        let down_proj_input = match self.fused_gate_up_forward(input, stream)? {
+            Some(down_proj_input) => down_proj_input,
+            None => {
+                let gate = self.gate_proj.forward(input, stream)?;
+                let up = self.up_proj.forward(input, stream)?;
+                nn::gelu_approximate(gate, stream)?.multiply(up, stream)?
+            }
         };
-        let down_proj_input = nn::gelu_approximate(gate, stream)?.multiply(up, stream)?;
         self.down_proj.forward(&down_proj_input, stream)
     }
 
