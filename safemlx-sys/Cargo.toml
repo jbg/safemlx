@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-sys"
-version = "0.1.1"
+version = "0.1.2"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,11 +20,12 @@ targets = ["aarch64-apple-darwin"]
 default = ["accelerate", "metal"]
 
 accelerate = []
+generate-bindings = ["dep:bindgen"]
 metal = []
 
 [dependencies]
 
 [build-dependencies]
-bindgen.workspace = true
+bindgen = { workspace = true, optional = true }
 cmake.workspace = true
 cc.workspace = true
