@@ -64,7 +64,7 @@ pub enum ModelKind {
 impl ModelKind {
     fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
-            "gemma4" | "gemma4_text" => Ok(Self::Gemma4),
+            "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
@@ -547,7 +547,10 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
 }
 
 fn effective_model_type(metadata: &ModelMetadata) -> String {
-    if matches!(metadata.model_type.as_str(), "gemma4" | "qwen3_5_moe") {
+    if matches!(
+        metadata.model_type.as_str(),
+        "gemma4" | "gemma4_unified" | "qwen3_5_moe"
+    ) {
         metadata
             .text_config
             .as_ref()
@@ -573,11 +576,13 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
     }
 
     let metadata = read_model_metadata(model_dir)?;
-    if metadata.model_type == "gemma4"
-        || metadata
-            .text_config
-            .as_ref()
-            .is_some_and(|text_config| text_config.model_type == "gemma4_text")
+    if matches!(metadata.model_type.as_str(), "gemma4" | "gemma4_unified")
+        || metadata.text_config.as_ref().is_some_and(|text_config| {
+            matches!(
+                text_config.model_type.as_str(),
+                "gemma4_text" | "gemma4_unified_text"
+            )
+        })
     {
         return Ok(Some(GEMMA4_TEXT_TEMPLATE.to_string()));
     }
@@ -725,6 +730,61 @@ mod tests {
             "model_type": "gemma4",
             "text_config": {
                 "model_type": "gemma4_text",
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 32,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 128,
+                "head_dim": 4,
+                "enable_moe_block": true
+            }
+        }));
+
+        assert!(!support.is_supported());
+        assert_eq!(
+            support.unsupported_reason(),
+            Some("unsupported model architecture: Gemma 4 MoE models are not supported yet")
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_gemma4_unified_text() {
+        let support = check_model_config(&json!({
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 32,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 128,
+                "head_dim": 4,
+                "enable_moe_block": false
+            }
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Gemma4,
+                model_type: "gemma4_unified".to_string(),
+                effective_model_type: "gemma4_unified_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_gemma4_unified_moe_unsupported() {
+        let support = check_model_config(&json!({
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "model_type": "gemma4_unified_text",
                 "hidden_size": 8,
                 "num_hidden_layers": 1,
                 "intermediate_size": 16,

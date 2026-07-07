@@ -258,7 +258,7 @@ pub struct Attention {
     pub k_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
-    pub v_proj: MaybeQuantized<nn::Linear>,
+    pub v_proj: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
     #[param]
     pub o_proj: MaybeQuantized<nn::Linear>,
@@ -312,19 +312,18 @@ impl Attention {
             args.quantization_bits,
             stream,
         )?;
-        let v_proj_output_dims = if attention_k_eq_v {
-            dim
+        let v_proj = if attention_k_eq_v {
+            None
         } else {
-            n_kv_heads * head_dim
+            Some(maybe_quantized_linear(
+                args.quantized,
+                dim,
+                n_kv_heads * head_dim,
+                args.quantization_group_size,
+                args.quantization_bits,
+                stream,
+            )?)
         };
-        let v_proj = maybe_quantized_linear(
-            args.quantized,
-            dim,
-            v_proj_output_dims,
-            args.quantization_group_size,
-            args.quantization_bits,
-            stream,
-        )?;
         let o_proj = maybe_quantized_linear(
             args.quantized,
             n_heads * head_dim,
@@ -428,7 +427,10 @@ where
             let values = if self.attention_k_eq_v {
                 keys.clone()
             } else {
-                self.v_proj.forward(x, stream)?
+                self.v_proj
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("missing Gemma 4 value projection"))?
+                    .forward(x, stream)?
             };
             let mut keys = self.k_norm.forward(
                 &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
@@ -478,7 +480,9 @@ where
     fn training_mode(&mut self, mode: bool) {
         self.q_proj.training_mode(mode);
         self.k_proj.training_mode(mode);
-        self.v_proj.training_mode(mode);
+        if let Some(v_proj) = &mut self.v_proj {
+            v_proj.training_mode(mode);
+        }
         self.o_proj.training_mode(mode);
         self.q_norm.training_mode(mode);
         self.k_norm.training_mode(mode);
@@ -1300,6 +1304,12 @@ pub fn load_gemma4_model(
         .allow_unused_prefix("embed_vision.")
         .allow_unused_prefix("multi_modal_projector.")
         .allow_unused_prefix("vision_tower.")
+        .allow_unused_prefix("model.audio_tower.")
+        .allow_unused_prefix("model.embed_audio.")
+        .allow_unused_prefix("model.embed_vision.")
+        .allow_unused_prefix("model.multi_modal_projector.")
+        .allow_unused_prefix("model.vision_embedder.")
+        .allow_unused_prefix("model.vision_tower.")
         .allow_missing_suffix(".bias");
     let mut report = StrictLoadReport::default();
     if weights_index.exists() {
@@ -1437,3 +1447,85 @@ where
 }
 
 pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;
+
+#[cfg(test)]
+mod tests {
+    use safemlx::{module::ModuleParameters, Device, DeviceType, Stream};
+
+    use super::{Attention, LayerType, ModelArgs};
+
+    fn test_stream() -> Stream {
+        Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
+    }
+
+    fn model_args(attention_k_eq_v: bool) -> ModelArgs {
+        ModelArgs {
+            model_type: "gemma4_unified_text".to_string(),
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            intermediate_size: 16,
+            num_attention_heads: 2,
+            rms_norm_eps: 0.00001,
+            vocab_size: 32,
+            num_key_value_heads: 1,
+            num_global_key_value_heads: None,
+            max_position_embeddings: 128,
+            rope_theta: 10_000.0,
+            head_dim: 4,
+            global_head_dim: None,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            attention_k_eq_v,
+            quantized: false,
+            quantization_group_size: 64,
+            quantization_bits: 4,
+            hidden_size_per_layer_input: 0,
+            vocab_size_per_layer_input: None,
+            num_kv_shared_layers: 0,
+            layer_types: vec![LayerType::FullAttention],
+            sliding_window: None,
+            final_logit_softcapping: None,
+            enable_moe_block: false,
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            rope_scaling: None,
+            rope_parameters: None,
+        }
+    }
+
+    fn parameter_keys(attention: &Attention) -> Vec<String> {
+        let mut keys = attention
+            .parameters()
+            .flatten()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn full_attention_with_key_equal_value_does_not_allocate_v_proj() {
+        let stream = test_stream();
+        let attention =
+            Attention::new(&model_args(true), LayerType::FullAttention, 0, &stream).unwrap();
+        let keys = parameter_keys(&attention);
+
+        assert!(keys.iter().any(|key| key.starts_with("q_proj.")));
+        assert!(keys.iter().any(|key| key.starts_with("k_proj.")));
+        assert!(!keys.iter().any(|key| key.starts_with("v_proj.")));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn attention_allocates_v_proj_when_key_equal_value_is_disabled() {
+        let stream = test_stream();
+        let attention =
+            Attention::new(&model_args(false), LayerType::FullAttention, 0, &stream).unwrap();
+        let keys = parameter_keys(&attention);
+
+        assert!(keys.iter().any(|key| key.starts_with("v_proj.")));
+    }
+}
