@@ -2249,6 +2249,7 @@ pub fn load_qwen3_5_moe_model(
                 &mut model,
                 model_dir.join(weight_file),
                 weights_stream,
+                stream,
                 &config,
                 &mut report,
                 uses_fp8,
@@ -2259,6 +2260,7 @@ pub fn load_qwen3_5_moe_model(
             &mut model,
             model_dir.join("model.safetensors"),
             weights_stream,
+            stream,
             &config,
             &mut report,
             uses_fp8,
@@ -2273,16 +2275,18 @@ fn load_qwen3_5_moe_safetensors_strict(
     model: &mut Model,
     path: impl AsRef<Path>,
     weights_stream: &Stream,
+    transform_stream: &Stream,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
     uses_fp8: bool,
 ) -> Result<(), Error> {
+    let path = path.as_ref();
     if !uses_fp8 {
         return load_safetensors_strict(model, path, weights_stream, config, report);
     }
 
     let loaded = Array::load_safetensors(path, weights_stream)?;
-    let loaded = transform_qwen3_5_moe_fp8_weights(loaded, &model.args, weights_stream)?;
+    let loaded = transform_qwen3_5_moe_fp8_weights(loaded, &model.args, transform_stream)?;
     load_arrays_strict(model, loaded, config, report)
 }
 
@@ -2387,7 +2391,6 @@ fn transform_qwen3_5_moe_fp8_weights(
             })?;
             let gate_up_proj = concatenate_axis(&[gate, up], 0, stream)?;
             let gate_up_proj_scale = concatenate_axis(&[gate_scale, up_scale], 0, stream)?;
-            eval([&gate_up_proj, &gate_up_proj_scale])?;
             gate_up.push(gate_up_proj);
             gate_up_scale.push(gate_up_proj_scale);
             down.push(down_proj);
