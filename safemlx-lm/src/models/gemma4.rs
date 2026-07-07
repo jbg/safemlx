@@ -11,7 +11,7 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
-    ops::{indexing::TryIndexOp, mean_axis, rsqrt, tanh},
+    ops::{indexing::TryIndexOp, mean_axis, quantized_matmul, rsqrt, tanh},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -756,7 +756,7 @@ impl Gemma4Embedding {
 
     /// Applies the embedding table as a tied language-model head.
     pub fn as_linear(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let weight = if self.quantized {
+        if self.quantized {
             let scales = self
                 .scales
                 .as_ref()
@@ -767,18 +767,18 @@ impl Gemma4Embedding {
                 .as_ref()
                 .as_ref()
                 .expect("quantized embedding biases");
-            safemlx::ops::dequantize(
+            return quantized_matmul(
+                x,
                 &self.weight,
                 scales,
-                biases,
+                Some(biases),
+                true,
                 self.group_size,
                 self.bits,
                 stream,
-            )?
-        } else {
-            self.weight.as_ref().clone()
-        };
-        safemlx::ops::matmul(x, weight.transpose(stream)?, stream)
+            );
+        }
+        safemlx::ops::matmul(x, self.weight.as_ref().transpose(stream)?, stream)
     }
 
     /// Sets training mode.
@@ -1299,6 +1299,44 @@ pub struct Model {
 }
 
 impl Model {
+    fn project_logits(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(hidden_states, stream)?,
+            None => self
+                .model
+                .language_model
+                .embed_tokens
+                .as_linear(hidden_states, stream)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
+                .multiply(Array::from_f32(softcap), stream)?;
+        }
+        Ok(logits)
+    }
+
+    fn forward_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        last_token_only: bool,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let hidden_states = self.model.language_model.forward(input, stream)?;
+        let hidden_states = if last_token_only {
+            hidden_states.try_index_device((.., -1, ..), stream)?
+        } else {
+            hidden_states
+        };
+        self.project_logits(&hidden_states, stream)
+    }
+
     /// Creates an unloaded Gemma 4 causal language model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
@@ -1336,20 +1374,7 @@ where
         input: ModelInput<'_, C>,
         stream: &Stream,
     ) -> Result<Self::Output, Self::Error> {
-        let out = self.model.language_model.forward(input, stream)?;
-        let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&out, stream)?,
-            None => self
-                .model
-                .language_model
-                .embed_tokens
-                .as_linear(&out, stream)?,
-        };
-        if let Some(softcap) = self.args.final_logit_softcapping {
-            logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
-                .multiply(Array::from_f32(softcap), stream)?;
-        }
-        Ok(logits)
+        self.forward_logits(input, false, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -1482,18 +1507,7 @@ impl Model {
             .model
             .language_model
             .forward_with_state(input, stream)?;
-        let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&text_output.hidden, stream)?,
-            None => self
-                .model
-                .language_model
-                .embed_tokens
-                .as_linear(&text_output.hidden, stream)?,
-        };
-        if let Some(softcap) = self.args.final_logit_softcapping {
-            logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
-                .multiply(Array::from_f32(softcap), stream)?;
-        }
+        let logits = self.project_logits(&text_output.hidden, stream)?;
         Ok(Gemma4StepOutput {
             logits,
             hidden: text_output.pre_norm_hidden,
@@ -1554,15 +1568,15 @@ where
             )?;
         }
         let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
-        let logits = self.forward(
+        self.forward_logits(
             ModelInput {
                 inputs: &last,
                 mask: None,
                 cache,
             },
+            true,
             stream,
-        )?;
-        logits.try_index_device((.., -1, ..), stream)
+        )
     }
 
     fn decode_logits(
@@ -1571,15 +1585,15 @@ where
         cache: &mut Vec<Option<C>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = self.forward(
+        self.forward_logits(
             ModelInput {
                 inputs: input_tokens,
                 mask: None,
                 cache,
             },
+            true,
             stream,
-        )?;
-        logits.try_index_device((.., -1, ..), stream)
+        )
     }
 }
 
