@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-sys"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,11 +14,7 @@ documentation = "https://github.com/jbg/safemlx"
 readme = "README.md"
 
 [package.metadata.docs.rs]
-targets = [
-  "aarch64-apple-darwin",
-  "aarch64-apple-ios",
-  "aarch64-apple-ios-sim",
-]
+targets = ["aarch64-apple-darwin"]
 
 [features]
 default = ["accelerate", "metal"]

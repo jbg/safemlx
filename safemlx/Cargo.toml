@@ -1,6 +1,6 @@
 [package]
 name = "safemlx"
-version.workspace = true
+version = "0.1.1"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,11 +13,7 @@ description = "Unofficial rust wrapper for Apple's mlx machine learning library.
 readme = "README.md"
 
 [package.metadata.docs.rs]
-targets = [
-  "aarch64-apple-darwin",
-  "aarch64-apple-ios",
-  "aarch64-apple-ios-sim",
-]
+targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 safemlx-sys = { workspace = true, default-features = false }

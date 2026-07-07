@@ -203,6 +203,10 @@ where
 /// Returns a function which computes the gradient of `f` with the default
 /// argument numbers `&[0]`.
 ///
+/// Only arrays passed as explicit arguments to the returned function can be
+/// selected by `argnums` and differentiated. Arrays captured by `f`'s closure
+/// are treated as constants.
+///
 /// See also [`grad_with_argnums`] for a version that allows specifying the
 /// argument numbers
 pub fn grad<'a, F, Args, Output, Err>(f: F) -> impl FnMut(Args) -> Result<Output> + 'a
@@ -213,6 +217,10 @@ where
 }
 
 /// Returns a function which computes the gradient of `f`.
+///
+/// Only arrays passed as explicit arguments to the returned function can be
+/// selected by `argnums` and differentiated. Arrays captured by `f`'s closure
+/// are treated as constants.
 ///
 /// See also [`grad`] for a version that uses the default argument numbers
 /// `&[0]`.

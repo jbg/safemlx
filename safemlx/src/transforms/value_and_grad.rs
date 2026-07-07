@@ -84,6 +84,10 @@ where
 /// Returns a function which computes the value and gradient of `f` with a
 /// default argument number `&[0]`.
 ///
+/// Only arrays passed as explicit arguments to the returned function can be
+/// selected by `argnums` and differentiated. Arrays captured by `f`'s closure
+/// are treated as constants.
+///
 /// See also [`value_and_grad_with_argnums`] for a version that allows
 /// specifying the argument numbers
 pub fn value_and_grad<'a, F, Err>(
@@ -96,6 +100,10 @@ where
 }
 
 /// Returns a function which computes the value and gradient of `f`.
+///
+/// Only arrays passed as explicit arguments to the returned function can be
+/// selected by `argnums` and differentiated. Arrays captured by `f`'s closure
+/// are treated as constants.
 ///
 /// See also [`value_and_grad`] for a version that uses the default argument
 /// numbers `&[0]`.

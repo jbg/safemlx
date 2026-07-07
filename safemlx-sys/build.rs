@@ -3,6 +3,10 @@ extern crate cmake;
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
+fn is_docs_rs() -> bool {
+    env::var_os("DOCS_RS").is_some()
+}
+
 /// Find the clang runtime library path dynamically using xcrun
 fn find_clang_rt_path() -> Option<String> {
     // Use xcrun to find the active toolchain path
@@ -107,7 +111,13 @@ fn build_and_link_mlx_c() {
 }
 
 fn main() {
-    build_and_link_mlx_c();
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+
+    if is_docs_rs() {
+        println!("cargo:warning=Skipping native MLX-C build on docs.rs");
+    } else {
+        build_and_link_mlx_c();
+    }
 
     // generate bindings
     let bindings = bindgen::Builder::default()
