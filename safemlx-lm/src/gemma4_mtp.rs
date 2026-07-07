@@ -36,6 +36,7 @@ impl MtpStats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4_mtp(
     target: &mut Gemma4Model,
     assistant: &mut Gemma4AssistantDraftModel,

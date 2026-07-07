@@ -281,7 +281,7 @@ mod tests {
 
         let (clipped_grads, _) = clip_grad_norm(&small_grads, max_norm, stream).unwrap();
         for (key, value) in small_grads.iter() {
-            assert!(crate::array::eval_equal_values(&*clipped_grads[key], value));
+            assert!(crate::array::eval_equal_values(&clipped_grads[key], value));
         }
 
         // Test with large gradients that require clipping
@@ -310,15 +310,10 @@ mod tests {
         let scale = max_norm / total_norm;
         let expected_grads: FlattenedModuleParam = large_grads
             .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    value.multiply(array!(scale), stream).unwrap().into(),
-                )
-            })
+            .map(|(key, value)| (key.clone(), value.multiply(array!(scale), stream).unwrap()))
             .collect();
         for (key, value) in expected_grads.iter() {
-            assert!(crate::array::eval_equal_values(&*clipped_grads[key], value));
+            assert!(crate::array::eval_equal_values(&clipped_grads[key], value));
         }
     }
 }

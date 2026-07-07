@@ -520,6 +520,7 @@ fn fp8_linear(
     out.reshape(&output_shape, stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fp8_linear_tiled(
     input: &Array,
     weight: &Array,
@@ -550,6 +551,7 @@ fn fp8_linear_tiled(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fp8_linear_scalar(
     input: &Array,
     weight: &Array,
@@ -665,6 +667,7 @@ fn grouped_fp8_linear(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grouped_fp8_linear_tiled(
     input: &Array,
     weight: &Array,
@@ -696,6 +699,7 @@ fn grouped_fp8_linear_tiled(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grouped_fp8_linear_scalar(
     input: &Array,
     weight: &Array,
@@ -833,10 +837,11 @@ impl Cache {
     fn offset(&self) -> i32 {
         self.layers
             .iter()
-            .find_map(|layer| match layer {
-                LayerCache::FullAttention(cache) => Some(cache.offset()),
-                LayerCache::LinearAttention(cache) => Some(cache.offset),
+            .map(|layer| match layer {
+                LayerCache::FullAttention(cache) => cache.offset(),
+                LayerCache::LinearAttention(cache) => cache.offset,
             })
+            .next()
             .unwrap_or(0)
     }
 
@@ -1456,7 +1461,7 @@ impl LinearAttention {
         Ok((state, concatenate_axis(&outs, 1, stream)?))
     }
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, clippy::too_many_arguments)]
     fn recurrent_delta_rule(
         &self,
         query: Array,

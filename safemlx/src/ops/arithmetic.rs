@@ -148,9 +148,9 @@ impl Array {
     /// # Params
     /// - nan: value to replace NaN with
     /// - posInf: value to replace positive inifinites with.  If not specified will use
-    ///     the largest finite value for the given dtype.
+    ///   the largest finite value for the given dtype.
     /// - negInf: value to replace negative inifinites with.  If not specified will use
-    ///     the negative of the largest finite value for the given dtype.
+    ///   the negative of the largest finite value for the given dtype.
     /// - stream: stream or device to evaluate on
     pub fn nan_to_num(
         &self,
@@ -3497,7 +3497,7 @@ mod tests {
         let b = random::normal::<f32>(&[8, 100, 100], None, None, &key, stream).unwrap();
         let key = random_state.next_key(stream).unwrap();
         let rhs = sort(
-            &random::randint::<_, i32>(0, 8, &[100], &key, stream).unwrap(),
+            random::randint::<_, i32>(0, 8, &[100], &key, stream).unwrap(),
             stream,
         )
         .unwrap();

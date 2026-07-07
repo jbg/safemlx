@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
@@ -136,7 +139,7 @@ fn default_e4b_snapshot() -> Option<PathBuf> {
         .find(|path| path.join("config.json").exists())
 }
 
-fn print_config_summary(model_dir: &PathBuf) -> anyhow::Result<()> {
+fn print_config_summary(model_dir: &Path) -> anyhow::Result<()> {
     let config_path = model_dir.join("config.json");
     let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
     let text = config.get("text_config").unwrap_or(&config);

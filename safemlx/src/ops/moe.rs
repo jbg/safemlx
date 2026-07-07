@@ -307,7 +307,7 @@ mod tests {
         .reshape(&[3, 2, 2], stream)
         .unwrap();
         let expected = sum_axis(
-            &current
+            current
                 .multiply(
                     route_weights.index_device((.., .., crate::ops::indexing::NewAxis), stream),
                     stream,

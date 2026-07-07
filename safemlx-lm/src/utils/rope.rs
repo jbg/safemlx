@@ -71,6 +71,7 @@ pub struct Llama3Rope {
 }
 
 impl Llama3Rope {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dims: i32,
         traditional: bool,

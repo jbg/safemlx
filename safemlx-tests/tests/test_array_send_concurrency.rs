@@ -278,7 +278,7 @@ fn shared_input_array_can_feed_concurrent_ops_on_distinct_streams() {
 fn shared_array_clone_drop_churn_is_stable_while_reading() {
     let stream = cpu_stream();
     let array = Array::from_slice(&vec![3.0f32; LEN], &[LEN as i32])
-        .multiply(&Array::from_f32(2.0), &stream)
+        .multiply(Array::from_f32(2.0), &stream)
         .unwrap();
     let array = Arc::new(array);
     let barrier = Arc::new(Barrier::new(THREADS));

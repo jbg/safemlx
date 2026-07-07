@@ -325,6 +325,7 @@ impl Gemma4AssistantDraftModel {
         Ok((last_hidden, logits))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draft_block(
         &mut self,
         target_model: &mut Model,

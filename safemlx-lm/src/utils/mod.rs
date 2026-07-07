@@ -72,7 +72,7 @@ fn index_out_of_bound_exception() -> Exception {
     Exception::custom("index out of bound")
 }
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 pub(crate) fn quantized_scaled_dot_product_attention(
     queries: Array,
     mut q_keys: QuantizedKeys,

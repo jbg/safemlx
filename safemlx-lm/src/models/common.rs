@@ -270,6 +270,7 @@ where
     Ok((queries, keys, values))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn finish_attention<C>(
     queries: Array,
     keys: Array,

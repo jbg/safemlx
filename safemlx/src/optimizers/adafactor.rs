@@ -320,18 +320,22 @@ fn get_mut_or_insert_with<'a, T, E>(
     Ok(map.get_mut(key).unwrap())
 }
 
-fn compute_lr(
+struct ComputeLrConfig<'a> {
     relative_step: bool,
     warmup_init: bool,
     lr: Option<f32>,
     scale_parameter: bool,
-    eps: &(Array, Array),
+    eps: &'a (Array, Array),
+}
+
+fn compute_lr(
+    config: ComputeLrConfig<'_>,
     step: &Array,
     parameter_rms: &Array,
     stream: &Stream,
 ) -> crate::error::Result<Array> {
-    let relative_step_size = if relative_step {
-        let min_step = if warmup_init {
+    let relative_step_size = if config.relative_step {
+        let min_step = if config.warmup_init {
             array!(1e-6).multiply(step, stream)?
         } else {
             array!(1e-2)
@@ -342,12 +346,14 @@ fn compute_lr(
             stream,
         )?
     } else {
-        array!(lr.expect("The learning rate should be set if the relative step is not enabled"))
+        array!(config
+            .lr
+            .expect("The learning rate should be set if the relative step is not enabled"))
     };
 
     let mut parameter_scale = array!(1.0);
-    if scale_parameter {
-        parameter_scale = maximum(&eps.1, parameter_rms, stream)?;
+    if config.scale_parameter {
+        parameter_scale = maximum(&config.eps.1, parameter_rms, stream)?;
     }
 
     parameter_scale.multiply(relative_step_size, stream)
@@ -384,11 +390,13 @@ impl Optimizer for Adafactor {
 
         let parameter_rms = rms(parameter, stream)?;
         let lr = compute_lr(
-            self.relative_step,
-            self.warmup_init,
-            self.lr,
-            self.scale_parameter,
-            &self.eps,
+            ComputeLrConfig {
+                relative_step: self.relative_step,
+                warmup_init: self.warmup_init,
+                lr: self.lr,
+                scale_parameter: self.scale_parameter,
+                eps: &self.eps,
+            },
             step,
             &parameter_rms,
             stream,

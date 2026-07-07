@@ -150,15 +150,15 @@ mod tests {
 
         assert_eq!(flattened.len(), 3);
         assert!(crate::array::eval_equal_values(
-            &flattened["first"],
+            flattened["first"],
             &first_entry_content
         ));
         assert!(crate::array::eval_equal_values(
-            &flattened["second.a"],
+            flattened["second.a"],
             &second_entry_content_a
         ));
         assert!(crate::array::eval_equal_values(
-            &flattened["second.b"],
+            flattened["second.b"],
             &second_entry_content_b
         ));
     }
@@ -190,15 +190,15 @@ mod tests {
 
         assert_eq!(flattened.len(), 3);
         assert!(crate::array::eval_equal_values(
-            &flattened["first"],
+            flattened["first"],
             &array!([1, 2, 3])
         ));
         assert!(crate::array::eval_equal_values(
-            &flattened["second.a"],
+            flattened["second.a"],
             &array!([4, 5, 6])
         ));
         assert!(crate::array::eval_equal_values(
-            &flattened["second.b"],
+            flattened["second.b"],
             &array!([7, 8, 9])
         ));
     }

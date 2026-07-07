@@ -26,13 +26,13 @@ fn test_compile_module() {
     let stream = test_stream();
     let loss_stream = stream;
     let loss = move |model: &mut LinearFunctionModel, x: &Array| -> Array {
-        let y = model.forward(x, &loss_stream).unwrap();
-        y.square(&loss_stream)
+        let y = model.forward(x, loss_stream).unwrap();
+        y.square(loss_stream)
             .unwrap()
-            .sum(None, &loss_stream)
+            .sum(None, loss_stream)
             .unwrap()
     };
-    let mut model = LinearFunctionModel::new(None, &stream).unwrap();
+    let mut model = LinearFunctionModel::new(None, stream).unwrap();
 
     let x = ones::<f32>(&[10, 1], stream).unwrap();
     let x = vec![x];
@@ -59,13 +59,13 @@ fn compile_module_and_optimizer<O: Optimizer>(optimizer: O) -> (Array, Array) {
     let stream = test_stream();
     let loss_stream = stream;
     let loss = move |model: &mut LinearFunctionModel, x: &Array| -> Array {
-        let y = model.forward(x, &loss_stream).unwrap();
-        y.square(&loss_stream)
+        let y = model.forward(x, loss_stream).unwrap();
+        y.square(loss_stream)
             .unwrap()
-            .sum(None, &loss_stream)
+            .sum(None, loss_stream)
             .unwrap()
     };
-    let model = LinearFunctionModel::new(None, &stream).unwrap();
+    let model = LinearFunctionModel::new(None, stream).unwrap();
 
     let x = ones::<f32>(&[10, 1], stream).unwrap();
 
@@ -73,7 +73,7 @@ fn compile_module_and_optimizer<O: Optimizer>(optimizer: O) -> (Array, Array) {
     let step = move |(model, optimizer): &mut (LinearFunctionModel, O), x: &Array| -> Array {
         let mut lg = nn::value_and_grad(loss);
         let (loss, grad) = lg(model, x).unwrap();
-        optimizer.update(model, grad, &step_stream).unwrap();
+        optimizer.update(model, grad, step_stream).unwrap();
         loss
     };
 
@@ -181,10 +181,10 @@ fn test_compile_module_with_error() {
     let stream = test_stream();
     let loss_stream = stream;
     let loss = move |model: &mut LinearFunctionModel, x: &Array| -> Result<Array, Exception> {
-        let y = model.forward(x, &loss_stream)?;
-        y.square(&loss_stream)?.sum(None, &loss_stream)
+        let y = model.forward(x, loss_stream)?;
+        y.square(loss_stream)?.sum(None, loss_stream)
     };
-    let mut model = LinearFunctionModel::new(&[10], &stream).unwrap();
+    let mut model = LinearFunctionModel::new(&[10], stream).unwrap();
 
     let step =
         move |model: &mut LinearFunctionModel, x: &[Array]| -> Result<Vec<Array>, Exception> {
@@ -228,10 +228,10 @@ fn test_compile_module_and_optimizer_with_error() {
     let stream = test_stream();
     let loss_stream = stream;
     let loss = move |model: &mut LinearFunctionModel, x: &Array| -> Result<Array, Exception> {
-        let y = model.forward(x, &loss_stream)?;
-        y.square(&loss_stream)?.sum(None, &loss_stream)
+        let y = model.forward(x, loss_stream)?;
+        y.square(loss_stream)?.sum(None, loss_stream)
     };
-    let model = LinearFunctionModel::new(&[10], &stream).unwrap();
+    let model = LinearFunctionModel::new(&[10], stream).unwrap();
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
     let optimizer = Sgd::new(0.0);
@@ -243,7 +243,7 @@ fn test_compile_module_and_optimizer_with_error() {
         let mut lg = nn::value_and_grad(loss);
         let x = &x[0];
         let (loss, grad) = lg(model, x)?;
-        optimizer.update(model, grad, &step_stream)?;
+        optimizer.update(model, grad, step_stream)?;
         Ok(vec![loss])
     };
 

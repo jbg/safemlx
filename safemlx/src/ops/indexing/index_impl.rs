@@ -1006,7 +1006,7 @@ fn get_item_nd(
             gather_indices,
             gather_first,
             last_array_or_index,
-            &stream,
+            stream,
         )?;
 
         src = Cow::Owned(gathered);

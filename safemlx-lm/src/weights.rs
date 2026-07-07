@@ -7,25 +7,13 @@ use safemlx::{module::ModuleParameters, Array, Stream};
 
 use crate::error::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StrictLoadConfig {
     allowed_unused_prefixes: Vec<String>,
     allowed_missing_suffixes: Vec<String>,
     allowed_missing_contains: Vec<String>,
     key_prefixes_to_strip: Vec<String>,
     key_prefix_rewrites: Vec<(String, String)>,
-}
-
-impl Default for StrictLoadConfig {
-    fn default() -> Self {
-        Self {
-            allowed_unused_prefixes: Vec::new(),
-            allowed_missing_suffixes: Vec::new(),
-            allowed_missing_contains: Vec::new(),
-            key_prefixes_to_strip: Vec::new(),
-            key_prefix_rewrites: Vec::new(),
-        }
-    }
 }
 
 impl StrictLoadConfig {
