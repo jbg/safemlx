@@ -1,8 +1,10 @@
 //! Gemma 4 text model implementation and loader.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::Path,
+    time::Instant,
 };
 
 use safemlx::{
@@ -11,8 +13,9 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
-    ops::{indexing::TryIndexOp, mean_axis, quantized_matmul, rsqrt, tanh},
+    ops::{concatenate_axis, indexing::TryIndexOp, mean_axis, quantized_matmul, rsqrt, tanh},
     quantization::MaybeQuantized,
+    transforms::eval,
     Array, Dtype, Stream,
 };
 use serde::{Deserialize, Deserializer};
@@ -31,6 +34,107 @@ use crate::{
     },
     weights::{load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
 };
+
+#[derive(Debug, Clone, Default)]
+/// Profiling counters accumulated by Gemma 4 when profiling is enabled.
+pub struct PerfStats {
+    /// Time spent evaluating token embeddings.
+    pub embed_s: f64,
+    /// Time spent evaluating per-layer input embeddings/projections.
+    pub per_layer_inputs_s: f64,
+    /// Time spent evaluating attention outputs.
+    pub attention_s: f64,
+    /// Time spent evaluating MLP outputs.
+    pub mlp_s: f64,
+    /// Time spent evaluating per-layer input residuals.
+    pub per_layer_residual_s: f64,
+    /// Time spent evaluating final normalization.
+    pub final_norm_s: f64,
+    /// Time spent projecting hidden states to logits.
+    pub lm_head_s: f64,
+}
+
+impl PerfStats {
+    /// Returns the sum of all profiled component durations.
+    pub fn component_total_s(&self) -> f64 {
+        self.embed_s
+            + self.per_layer_inputs_s
+            + self.attention_s
+            + self.mlp_s
+            + self.per_layer_residual_s
+            + self.final_norm_s
+            + self.lm_head_s
+    }
+
+    fn add(&mut self, component: PerfComponent, elapsed_s: f64) {
+        match component {
+            PerfComponent::Embed => self.embed_s += elapsed_s,
+            PerfComponent::PerLayerInputs => self.per_layer_inputs_s += elapsed_s,
+            PerfComponent::Attention => self.attention_s += elapsed_s,
+            PerfComponent::Mlp => self.mlp_s += elapsed_s,
+            PerfComponent::PerLayerResidual => self.per_layer_residual_s += elapsed_s,
+            PerfComponent::FinalNorm => self.final_norm_s += elapsed_s,
+            PerfComponent::LmHead => self.lm_head_s += elapsed_s,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PerfComponent {
+    Embed,
+    PerLayerInputs,
+    Attention,
+    Mlp,
+    PerLayerResidual,
+    FinalNorm,
+    LmHead,
+}
+
+thread_local! {
+    static PERF_STATS: RefCell<Option<PerfStats>> = const { RefCell::new(None) };
+}
+
+/// Enables or disables per-thread Gemma 4 profiling.
+pub fn set_perf_profiling(enabled: bool) {
+    PERF_STATS.with(|stats| {
+        *stats.borrow_mut() = enabled.then(PerfStats::default);
+    });
+}
+
+/// Resets per-thread Gemma 4 profiling counters.
+pub fn reset_perf_stats() {
+    PERF_STATS.with(|stats| {
+        if let Some(stats) = stats.borrow_mut().as_mut() {
+            *stats = PerfStats::default();
+        }
+    });
+}
+
+/// Returns the current per-thread profiling counters, if profiling is enabled.
+pub fn perf_stats() -> Option<PerfStats> {
+    PERF_STATS.with(|stats| stats.borrow().clone())
+}
+
+fn profile_arrays(component: PerfComponent, arrays: &[&Array]) -> Result<(), Exception> {
+    let enabled = PERF_STATS.with(|stats| stats.borrow().is_some());
+    if !enabled {
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    eval(arrays.iter().copied())?;
+    let elapsed_s = start.elapsed().as_secs_f64();
+    PERF_STATS.with(|stats| {
+        if let Some(stats) = stats.borrow_mut().as_mut() {
+            stats.add(component, elapsed_s);
+        }
+    });
+    Ok(())
+}
+
+fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exception> {
+    profile_arrays(component, &[array])
+}
 
 #[derive(Debug, Clone, Deserialize)]
 /// Deserialized Gemma 4 text configuration used by this loader.
@@ -558,6 +662,8 @@ where
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Gemma 4 feed-forward layer.
 pub struct Mlp {
+    /// Dense intermediate size.
+    pub hidden_dim: i32,
     #[quantizable]
     #[param]
     /// Gate projection.
@@ -570,6 +676,23 @@ pub struct Mlp {
     #[param]
     /// Up projection.
     pub up_proj: MaybeQuantized<nn::Linear>,
+    /// Lazily fused quantized gate/up projection.
+    pub fused_gate_up: Option<FusedQuantizedGateUp>,
+}
+
+#[derive(Debug, Clone)]
+/// Packed gate/up projection used by quantized Gemma 4 MLPs.
+pub struct FusedQuantizedGateUp {
+    /// Concatenated packed gate/up weights.
+    pub weight: Array,
+    /// Concatenated quantization scales.
+    pub scales: Array,
+    /// Concatenated quantization biases.
+    pub biases: Array,
+    /// Quantization group size.
+    pub group_size: i32,
+    /// Quantization bit width.
+    pub bits: i32,
 }
 
 impl Mlp {
@@ -583,6 +706,7 @@ impl Mlp {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
+            hidden_dim,
             gate_proj: maybe_quantized_linear(
                 quantized, dim, hidden_dim, group_size, bits, stream,
             )?,
@@ -590,7 +714,64 @@ impl Mlp {
                 quantized, hidden_dim, dim, group_size, bits, stream,
             )?,
             up_proj: maybe_quantized_linear(quantized, dim, hidden_dim, group_size, bits, stream)?,
+            fused_gate_up: None,
         })
+    }
+
+    fn ensure_fused_gate_up(
+        &mut self,
+        stream: &Stream,
+    ) -> Result<Option<&FusedQuantizedGateUp>, Exception> {
+        if self.fused_gate_up.is_none() {
+            let (MaybeQuantized::Quantized(gate), MaybeQuantized::Quantized(up)) =
+                (&self.gate_proj, &self.up_proj)
+            else {
+                return Ok(None);
+            };
+            if gate.group_size != up.group_size
+                || gate.bits != up.bits
+                || gate.inner.bias.as_ref().is_some()
+                || up.inner.bias.as_ref().is_some()
+            {
+                return Ok(None);
+            }
+
+            self.fused_gate_up = Some(FusedQuantizedGateUp {
+                weight: concatenate_axis(
+                    &[gate.inner.weight.as_ref(), up.inner.weight.as_ref()],
+                    0,
+                    stream,
+                )?,
+                scales: concatenate_axis(&[gate.scales.as_ref(), up.scales.as_ref()], 0, stream)?,
+                biases: concatenate_axis(&[gate.biases.as_ref(), up.biases.as_ref()], 0, stream)?,
+                group_size: gate.group_size,
+                bits: gate.bits,
+            });
+        }
+        Ok(self.fused_gate_up.as_ref())
+    }
+
+    fn fused_gate_up_forward(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+    ) -> Result<Option<(Array, Array)>, Exception> {
+        let Some(fused) = self.ensure_fused_gate_up(stream)? else {
+            return Ok(None);
+        };
+        let output = quantized_matmul(
+            input,
+            &fused.weight,
+            &fused.scales,
+            Some(&fused.biases),
+            true,
+            fused.group_size,
+            fused.bits,
+            stream,
+        )?;
+        let gate = output.try_index_device((.., .., ..self.hidden_dim), stream)?;
+        let up = output.try_index_device((.., .., self.hidden_dim..), stream)?;
+        Ok(Some((gate, up)))
     }
 }
 
@@ -599,12 +780,21 @@ impl Module<&Array> for Mlp {
     type Error = Exception;
 
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
-        let down_proj_input = nn::gelu_approximate(self.gate_proj.forward(input, stream)?, stream)?
-            .multiply(self.up_proj.forward(input, stream)?, stream)?;
+        let (gate, up) = match self.fused_gate_up_forward(input, stream)? {
+            Some((gate, up)) => (gate, up),
+            None => (
+                self.gate_proj.forward(input, stream)?,
+                self.up_proj.forward(input, stream)?,
+            ),
+        };
+        let down_proj_input = nn::gelu_approximate(gate, stream)?.multiply(up, stream)?;
         self.down_proj.forward(&down_proj_input, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
+        if mode {
+            self.fused_gate_up = None;
+        }
         self.gate_proj.training_mode(mode);
         self.down_proj.training_mode(mode);
         self.up_proj.training_mode(mode);
@@ -967,10 +1157,12 @@ where
             disable_generated_mask,
         };
         let r = self.self_attn.forward(self_attn_input, stream)?;
+        profile_array(PerfComponent::Attention, &r)?;
         let r = self.post_attention_layernorm.forward(&r, stream)?;
         let h = x.add(r, stream)?;
         let pre_ff = self.pre_feedforward_layernorm.forward(&h, stream)?;
         let r = self.mlp.forward(&pre_ff, stream)?;
+        profile_array(PerfComponent::Mlp, &r)?;
         let r = self.post_feedforward_layernorm.forward(&r, stream)?;
         let mut h = h.add(r, stream)?;
         if let (Some(per_layer_input), Some(gate), Some(projection), Some(norm)) = (
@@ -984,6 +1176,7 @@ where
                 .multiply(per_layer_input, stream)?;
             let r = projection.forward(&r, stream)?;
             let r = norm.forward(&r, stream)?;
+            profile_array(PerfComponent::PerLayerResidual, &r)?;
             h = residual.add(r, stream)?;
         }
         self.apply_layer_scalar(h, stream)
@@ -1192,7 +1385,11 @@ impl Gemma4TextModel {
             .embed_tokens
             .forward(inputs, stream)?
             .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?;
+        profile_array(PerfComponent::Embed, &h)?;
         let per_layer_inputs = self.per_layer_inputs(inputs, &h, stream)?;
+        if let Some(per_layer_inputs) = &per_layer_inputs {
+            profile_array(PerfComponent::PerLayerInputs, per_layer_inputs)?;
+        }
         let position_offset = cache
             .iter()
             .flatten()
@@ -1233,6 +1430,7 @@ impl Gemma4TextModel {
         }
         let pre_norm_hidden = h.clone();
         let hidden = self.norm.forward(&h, stream)?;
+        profile_array(PerfComponent::FinalNorm, &hidden)?;
         Ok(Gemma4TextOutput {
             hidden,
             pre_norm_hidden,
@@ -1316,6 +1514,7 @@ impl Model {
             logits = tanh(&(logits.divide(Array::from_f32(softcap), stream)?), stream)?
                 .multiply(Array::from_f32(softcap), stream)?;
         }
+        profile_array(PerfComponent::LmHead, &logits)?;
         Ok(logits)
     }
 
