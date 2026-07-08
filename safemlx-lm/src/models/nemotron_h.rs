@@ -1630,7 +1630,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Nemotron-H token generation iterator.
-pub type Generate<'a> = common::Generate<'a, Model, Cache>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
 
 /// Loads `tokenizer.json` from a Nemotron-H model directory.
 pub fn load_nemotron_h_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {

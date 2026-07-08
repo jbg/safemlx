@@ -247,36 +247,58 @@ impl Model {
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Generate<'a> {
+        self.generate_with_sampler(cache, temp, prompt_tokens, prng_key, stream, DefaultSampler)
+    }
+
+    /// Creates a token iterator using a caller-provided sampler.
+    ///
+    /// Qwen3.5 MoE uses a heterogeneous cache and must be driven with
+    /// [`Model::generate_with_cache_sampler`] instead.
+    pub fn generate_with_sampler<'a, S>(
+        &'a mut self,
+        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
+        stream: &'a Stream,
+        sampler: S,
+    ) -> Generate<'a, S>
+    where
+        S: Sampler,
+    {
         match self {
-            Self::Gemma4(model) => Generate::Gemma4(gemma4::Generate::new(
+            Self::Gemma4(model) => Generate::Gemma4(gemma4::Generate::with_sampler(
                 model,
                 cache,
                 temp,
                 prompt_tokens,
                 prng_key,
                 stream,
+                sampler,
             )),
-            Self::Llama(model) => Generate::Llama(llama::Generate::new(
+            Self::Llama(model) => Generate::Llama(llama::Generate::with_sampler(
                 model,
                 cache,
                 temp,
                 prompt_tokens,
                 prng_key,
                 stream,
+                sampler,
             )),
-            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::new(
+            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::with_sampler(
                 model,
                 cache,
                 temp,
                 prompt_tokens,
                 prng_key,
                 stream,
+                sampler,
             )),
             Self::Qwen35Moe(_) => {
-                panic!("qwen3_5_moe requires ModelCache; use generate_with_cache")
+                panic!("qwen3_5_moe requires ModelCache; use generate_with_cache_sampler")
             }
             Self::NemotronH(_) => {
-                panic!("nemotron_h requires ModelCache; use generate_with_cache")
+                panic!("nemotron_h requires ModelCache; use generate_with_cache_sampler")
             }
         }
     }
@@ -299,38 +321,107 @@ impl Model {
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> ModelGenerate<'a> {
+        self.generate_with_cache_sampler(
+            cache,
+            temp,
+            prompt_tokens,
+            prng_key,
+            stream,
+            DefaultSampler,
+        )
+    }
+
+    /// Creates a token iterator using a cache returned by [`Model::new_cache`] and a caller-provided sampler.
+    pub fn generate_with_cache_sampler<'a, S>(
+        &'a mut self,
+        cache: &'a mut ModelCache,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
+        stream: &'a Stream,
+        sampler: S,
+    ) -> ModelGenerate<'a, S>
+    where
+        S: Sampler,
+    {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => ModelGenerate::Gemma4(
-                gemma4::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
-            ),
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
-                llama::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
-            ),
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
-                qwen3::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
-            ),
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => ModelGenerate::NemotronH(
-                nemotron_h::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
-            ),
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => ModelGenerate::Qwen35Moe(
-                qwen3_5_moe::Generate::new(model, cache, temp, prompt_tokens, prng_key, stream),
-            ),
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Gemma4(gemma4::Generate::with_sampler(
+                    model,
+                    cache,
+                    temp,
+                    prompt_tokens,
+                    prng_key,
+                    stream,
+                    sampler,
+                ))
+            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Llama(llama::Generate::with_sampler(
+                    model,
+                    cache,
+                    temp,
+                    prompt_tokens,
+                    prng_key,
+                    stream,
+                    sampler,
+                ))
+            }
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::Qwen3(qwen3::Generate::with_sampler(
+                    model,
+                    cache,
+                    temp,
+                    prompt_tokens,
+                    prng_key,
+                    stream,
+                    sampler,
+                ))
+            }
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+                ModelGenerate::NemotronH(nemotron_h::Generate::with_sampler(
+                    model,
+                    cache,
+                    temp,
+                    prompt_tokens,
+                    prng_key,
+                    stream,
+                    sampler,
+                ))
+            }
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                ModelGenerate::Qwen35Moe(qwen3_5_moe::Generate::with_sampler(
+                    model,
+                    cache,
+                    temp,
+                    prompt_tokens,
+                    prng_key,
+                    stream,
+                    sampler,
+                ))
+            }
             _ => panic!("model cache type does not match model kind"),
         }
     }
 }
 
 /// Token iterator for models backed by a vector of concatenating KV caches.
-pub enum Generate<'a> {
+pub enum Generate<'a, S = DefaultSampler>
+where
+    S: Sampler,
+{
     /// Gemma 4 generation iterator.
-    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
+    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama generation iterator.
-    Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Qwen3 generation iterator.
-    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
 }
 
-impl Iterator for Generate<'_> {
+impl<S> Iterator for Generate<'_, S>
+where
+    S: Sampler,
+{
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -343,6 +434,7 @@ impl Iterator for Generate<'_> {
 }
 
 /// Cache value matching a [`Model`] variant.
+#[derive(Clone)]
 pub enum ModelCache {
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
@@ -353,20 +445,26 @@ pub enum ModelCache {
 }
 
 /// Token iterator for any supported model variant.
-pub enum ModelGenerate<'a> {
+pub enum ModelGenerate<'a, S = DefaultSampler>
+where
+    S: Sampler,
+{
     /// Gemma 4 generation iterator.
-    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache>),
+    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama generation iterator.
-    Llama(llama::Generate<'a, ConcatKeyValueCache>),
+    Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Qwen3 generation iterator.
-    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache>),
+    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
     /// Nemotron-H generation iterator.
-    NemotronH(nemotron_h::Generate<'a>),
+    NemotronH(nemotron_h::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
-    Qwen35Moe(qwen3_5_moe::Generate<'a>),
+    Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
 }
 
-impl Iterator for ModelGenerate<'_> {
+impl<S> Iterator for ModelGenerate<'_, S>
+where
+    S: Sampler,
+{
     type Item = Result<Array, Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -569,6 +667,23 @@ impl LoadedModel {
             .generate(cache, temp, prompt_tokens, prng_key, stream)
     }
 
+    /// Creates a token iterator using a caller-provided sampler.
+    pub fn generate_with_sampler<'a, S>(
+        &'a mut self,
+        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
+        stream: &'a Stream,
+        sampler: S,
+    ) -> Generate<'a, S>
+    where
+        S: Sampler,
+    {
+        self.model
+            .generate_with_sampler(cache, temp, prompt_tokens, prng_key, stream, sampler)
+    }
+
     /// Creates an empty cache value appropriate for the loaded model.
     pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
@@ -585,6 +700,29 @@ impl LoadedModel {
     ) -> ModelGenerate<'a> {
         self.model
             .generate_with_cache(cache, temp, prompt_tokens, prng_key, stream)
+    }
+
+    /// Creates a token iterator using a cache returned by [`LoadedModel::new_cache`] and a caller-provided sampler.
+    pub fn generate_with_cache_sampler<'a, S>(
+        &'a mut self,
+        cache: &'a mut ModelCache,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
+        stream: &'a Stream,
+        sampler: S,
+    ) -> ModelGenerate<'a, S>
+    where
+        S: Sampler,
+    {
+        self.model.generate_with_cache_sampler(
+            cache,
+            temp,
+            prompt_tokens,
+            prng_key,
+            stream,
+            sampler,
+        )
     }
 
     /// Returns a mutable reference to the underlying architecture-specific model.

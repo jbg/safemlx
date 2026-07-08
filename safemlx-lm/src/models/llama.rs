@@ -609,7 +609,8 @@ where
 }
 
 /// Llama token generation iterator.
-pub type Generate<'a, C> = common::Generate<'a, Model, Vec<Option<C>>>;
+pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
+    common::Generate<'a, Model, Vec<Option<C>>, S>;
 
 #[cfg(test)]
 mod tests {

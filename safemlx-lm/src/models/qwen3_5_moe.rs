@@ -2833,7 +2833,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3.5 MoE token generation iterator.
-pub type Generate<'a> = common::Generate<'a, Model, Cache>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
 mod tests {

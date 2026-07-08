@@ -48,3 +48,248 @@ impl Sampler for DefaultSampler {
         }
     }
 }
+
+/// Configurable sampler for text generation.
+///
+/// The sampler mirrors the common llama.cpp sampling chain used by Goose:
+/// repetition/frequency/presence penalties, then top-k, top-p, min-p,
+/// temperature, and finally greedy or categorical token selection.
+#[derive(Debug, Clone)]
+pub struct GenerationSampler {
+    /// Keep only the `top_k` highest-logit tokens when positive.
+    pub top_k: i32,
+    /// Keep the smallest prefix of tokens whose probability mass reaches `top_p`.
+    pub top_p: f32,
+    /// Keep tokens whose probability is at least `min_p * max_probability`.
+    pub min_p: f32,
+    /// Repetition penalty applied to recently generated tokens. `1.0` disables it.
+    pub repeat_penalty: f32,
+    /// Number of generated tokens considered by repetition penalties. Negative means all.
+    pub repeat_last_n: i32,
+    /// Frequency penalty subtracted once per generated occurrence.
+    pub frequency_penalty: f32,
+    /// Presence penalty subtracted once for any generated occurrence.
+    pub presence_penalty: f32,
+    generated_tokens: Vec<u32>,
+}
+
+impl Default for GenerationSampler {
+    fn default() -> Self {
+        Self {
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.05,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            generated_tokens: Vec::new(),
+        }
+    }
+}
+
+impl GenerationSampler {
+    /// Creates a sampler with default generation settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets top-k filtering.
+    pub fn top_k(mut self, top_k: i32) -> Self {
+        self.top_k = top_k;
+        self
+    }
+
+    /// Sets top-p filtering.
+    pub fn top_p(mut self, top_p: f32) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    /// Sets min-p filtering.
+    pub fn min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
+        self
+    }
+
+    /// Sets repetition, frequency, and presence penalties.
+    pub fn penalties(
+        mut self,
+        repeat_penalty: f32,
+        repeat_last_n: i32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) -> Self {
+        self.repeat_penalty = repeat_penalty;
+        self.repeat_last_n = repeat_last_n;
+        self.frequency_penalty = frequency_penalty;
+        self.presence_penalty = presence_penalty;
+        self
+    }
+
+    /// Returns generated token ids already accepted by this sampler.
+    pub fn generated_tokens(&self) -> &[u32] {
+        &self.generated_tokens
+    }
+
+    fn apply_penalties(&self, logits: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if self.generated_tokens.is_empty()
+            || (self.repeat_penalty == 1.0
+                && self.frequency_penalty == 0.0
+                && self.presence_penalty == 0.0)
+        {
+            return Ok(logits.clone());
+        }
+
+        let vocab_size = logits.dim(-1) as usize;
+        if vocab_size == 0 {
+            return Ok(logits.clone());
+        }
+        let row_count = logits.size() / vocab_size;
+        let mut repeat_mask = vec![false; logits.size()];
+        let mut penalties = vec![0.0f32; logits.size()];
+
+        let start = if self.repeat_last_n < 0 {
+            0
+        } else {
+            self.generated_tokens
+                .len()
+                .saturating_sub(self.repeat_last_n as usize)
+        };
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        for &token_id in &self.generated_tokens[start..] {
+            *counts.entry(token_id).or_default() += 1;
+        }
+
+        for (token_id, count) in counts {
+            let token_index = token_id as usize;
+            if token_index >= vocab_size {
+                continue;
+            }
+            for row in 0..row_count {
+                let index = row * vocab_size + token_index;
+                repeat_mask[index] = true;
+                penalties[index] = self.frequency_penalty * count as f32 + self.presence_penalty;
+            }
+        }
+
+        let mut adjusted = logits.clone();
+        if self.repeat_penalty != 1.0 {
+            let mask = Array::from_slice(&repeat_mask, logits.shape());
+            let positive = adjusted.divide(array!(self.repeat_penalty), stream)?;
+            let negative = adjusted.multiply(array!(self.repeat_penalty), stream)?;
+            let penalized = safemlx::ops::r#where(
+                adjusted.gt(Array::from_f32(0.0), stream)?,
+                positive,
+                negative,
+                stream,
+            )?;
+            adjusted = safemlx::ops::r#where(mask, penalized, adjusted, stream)?;
+        }
+
+        if self.frequency_penalty != 0.0 || self.presence_penalty != 0.0 {
+            adjusted = adjusted.subtract(Array::from_slice(&penalties, logits.shape()), stream)?;
+        }
+
+        Ok(adjusted)
+    }
+
+    fn apply_top_k(&self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
+        let vocab_size = logits.dim(-1);
+        if self.top_k <= 0 || self.top_k >= vocab_size {
+            return Ok(logits);
+        }
+
+        let top_values = safemlx::ops::indexing::topk_axis(&logits, self.top_k, -1, stream)?;
+        let threshold = top_values.min_axis(-1, true, stream)?;
+        mask_logits(logits.lt(threshold, stream)?, logits, stream)
+    }
+
+    fn apply_min_p(&self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
+        if self.min_p <= 0.0 {
+            return Ok(logits);
+        }
+
+        let probabilities = safemlx::ops::softmax_axis(&logits, -1, true, stream)?;
+        let max_probability = probabilities.max_axis(-1, true, stream)?;
+        let threshold = max_probability.multiply(Array::from_f32(self.min_p), stream)?;
+        mask_logits(probabilities.lt(threshold, stream)?, logits, stream)
+    }
+
+    fn sample_filtered(
+        &mut self,
+        logits: &Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let token = match temp {
+            0.0 => argmax_axis!(logits, -1, stream = stream)?,
+            _ => {
+                let prng_state = prng_state.ok_or_else(|| {
+                    Exception::custom("random operations require an explicit PRNG key")
+                })?;
+                let key = prng_state.next_key(stream)?;
+                let logits = logits.multiply(array!(1.0 / temp), stream)?;
+                random::categorical(&logits, None, None, &key, stream)?
+            }
+        };
+        self.generated_tokens
+            .push(token.clone().item::<u32>(stream));
+        Ok(token)
+    }
+
+    fn sample_top_p(
+        &mut self,
+        logits: Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if self.top_p >= 1.0 {
+            let logits = self.apply_min_p(logits, stream)?;
+            return self.sample_filtered(&logits, temp, prng_state, stream);
+        }
+
+        let descending_indices = safemlx::ops::argsort_axis(logits.negative(stream)?, -1, stream)?;
+        let sorted_logits =
+            safemlx::ops::indexing::take_along_axis(&logits, &descending_indices, -1, stream)?;
+        let probabilities = safemlx::ops::softmax_axis(&sorted_logits, -1, true, stream)?;
+        let cumulative_probabilities = probabilities.cumsum(-1, None, None, stream)?;
+        let cumulative_before_token = cumulative_probabilities.subtract(probabilities, stream)?;
+        let mask = cumulative_before_token.gt(Array::from_f32(self.top_p.max(0.0)), stream)?;
+        let sorted_logits = mask_logits(mask, sorted_logits, stream)?;
+        let sorted_logits = self.apply_min_p(sorted_logits, stream)?;
+        let sorted_token = self.sample_filtered(&sorted_logits, temp, prng_state, stream)?;
+        let token = safemlx::ops::indexing::take_along_axis(
+            descending_indices,
+            &sorted_token.expand_dims_axes(&[-1], stream)?,
+            -1,
+            stream,
+        )?
+        .squeeze_axes(&[-1], stream)?;
+        if let Some(last) = self.generated_tokens.last_mut() {
+            *last = token.clone().item::<u32>(stream);
+        }
+        Ok(token)
+    }
+}
+
+impl Sampler for GenerationSampler {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let logits = self.apply_penalties(logits, stream)?;
+        let logits = self.apply_top_k(logits, stream)?;
+        self.sample_top_p(logits, temp, prng_state, stream)
+    }
+}
+
+fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
+    let min_value = Array::from_f32(logits.dtype().finfo_min()? as f32);
+    safemlx::ops::r#where(mask, min_value, logits, stream)
+}

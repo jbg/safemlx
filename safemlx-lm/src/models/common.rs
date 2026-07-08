@@ -22,6 +22,7 @@ use safemlx::{
 
 use crate::{
     cache::KeyValueCache,
+    sampler::{DefaultSampler, Sampler},
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
 
@@ -647,24 +648,26 @@ pub enum GenerateState<'a> {
 }
 
 /// Generic token iterator for a causal LM.
-pub struct Generate<'a, M, C>
+pub struct Generate<'a, M, C, S = DefaultSampler>
 where
     M: CausalLm<C>,
+    S: Sampler,
 {
     model: &'a mut M,
     cache: &'a mut C,
     temp: f32,
     prng_state: Option<RandomState>,
+    sampler: S,
     stream: &'a Stream,
     state: GenerateState<'a>,
     _cache: PhantomData<C>,
 }
 
-impl<'a, M, C> Generate<'a, M, C>
+impl<'a, M, C> Generate<'a, M, C, DefaultSampler>
 where
     M: CausalLm<C>,
 {
-    /// Creates a generation iterator over token-id arrays.
+    /// Creates a generation iterator over token-id arrays using the default sampler.
     pub fn new(
         model: &'a mut M,
         cache: &'a mut C,
@@ -673,11 +676,39 @@ where
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Self {
+        Self::with_sampler(
+            model,
+            cache,
+            temp,
+            prompt_tokens,
+            prng_key,
+            stream,
+            DefaultSampler,
+        )
+    }
+}
+
+impl<'a, M, C, S> Generate<'a, M, C, S>
+where
+    M: CausalLm<C>,
+    S: Sampler,
+{
+    /// Creates a generation iterator over token-id arrays using a caller-provided sampler.
+    pub fn with_sampler(
+        model: &'a mut M,
+        cache: &'a mut C,
+        temp: f32,
+        prompt_tokens: &'a Array,
+        prng_key: Option<Array>,
+        stream: &'a Stream,
+        sampler: S,
+    ) -> Self {
         Self {
             model,
             cache,
             temp,
             prng_state: prng_key.map(RandomState::from_key),
+            sampler,
             stream,
             state: GenerateState::Prefill { prompt_tokens },
             _cache: PhantomData,
@@ -685,9 +716,10 @@ where
     }
 }
 
-impl<M, C> Iterator for Generate<'_, M, C>
+impl<M, C, S> Iterator for Generate<'_, M, C, S>
 where
     M: CausalLm<C>,
+    S: Sampler,
 {
     type Item = Result<Array, Exception>;
 
@@ -708,7 +740,12 @@ where
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp, self.prng_state.as_mut(), self.stream) {
+                let y = match self.sampler.sample(
+                    &logits,
+                    self.temp,
+                    self.prng_state.as_mut(),
+                    self.stream,
+                ) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };
@@ -724,7 +761,12 @@ where
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
                 };
-                let y = match sample(&logits, self.temp, self.prng_state.as_mut(), self.stream) {
+                let y = match self.sampler.sample(
+                    &logits,
+                    self.temp,
+                    self.prng_state.as_mut(),
+                    self.stream,
+                ) {
                     Ok(y) => y,
                     Err(err) => return Some(Err(err)),
                 };
