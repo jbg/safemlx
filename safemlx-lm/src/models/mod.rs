@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::models::common::CausalLm;
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
 /// Shared building blocks used by multiple decoder-only model families.
@@ -309,6 +310,64 @@ impl Model {
             Self::Gemma4(_) | Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
             Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
+        }
+    }
+
+    /// Computes logits for an initial prompt using a cache returned by [`Model::new_cache`].
+    pub fn prefill_logits_with_cache(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+                model.prefill_logits(prompt_tokens, cache, stream)
+            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                model.prefill_logits(prompt_tokens, cache, stream)
+            }
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+                model.prefill_logits(prompt_tokens, cache, stream)
+            }
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                model.prefill_logits(prompt_tokens, cache, stream)
+            }
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                model.prefill_logits(prompt_tokens, cache, stream)
+            }
+            _ => Err(Exception::custom(
+                "model cache type does not match model kind",
+            )),
+        }
+    }
+
+    /// Computes logits for decode tokens using a cache returned by [`Model::new_cache`].
+    pub fn decode_logits_with_cache(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+                model.decode_logits(input_tokens, cache, stream)
+            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                model.decode_logits(input_tokens, cache, stream)
+            }
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+                model.decode_logits(input_tokens, cache, stream)
+            }
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                model.decode_logits(input_tokens, cache, stream)
+            }
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                model.decode_logits(input_tokens, cache, stream)
+            }
+            _ => Err(Exception::custom(
+                "model cache type does not match model kind",
+            )),
         }
     }
 
@@ -687,6 +746,28 @@ impl LoadedModel {
     /// Creates an empty cache value appropriate for the loaded model.
     pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
+    }
+
+    /// Computes logits for an initial prompt using a cache returned by [`LoadedModel::new_cache`].
+    pub fn prefill_logits_with_cache(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.model
+            .prefill_logits_with_cache(prompt_tokens, cache, stream)
+    }
+
+    /// Computes logits for decode tokens using a cache returned by [`LoadedModel::new_cache`].
+    pub fn decode_logits_with_cache(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.model
+            .decode_logits_with_cache(input_tokens, cache, stream)
     }
 
     /// Creates a token iterator using a cache returned by [`LoadedModel::new_cache`].
