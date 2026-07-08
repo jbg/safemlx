@@ -66,14 +66,14 @@
 // """
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::read_to_string,
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
 };
 
-use minijinja::{context, Environment, Template, Value as JinjaValue};
+use minijinja::{Environment, Template};
 use serde::Serialize;
 use tokenizers::Encoding;
 
@@ -150,6 +150,7 @@ impl Tokenizer {
         tools: Option<&'a [serde_json::Value]>,
         model_id: &'a str,
         add_generation_prompt: bool,
+        template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Vec<String>, Error>
     where
         I: IntoIterator<Item = Vec<serde_json::Value>>,
@@ -161,6 +162,7 @@ impl Tokenizer {
             tools,
             model_id,
             add_generation_prompt,
+            template_kwargs,
         )
     }
 }
@@ -263,6 +265,7 @@ where
     pub chat_template_id: Option<&'a str>,
     pub add_generation_prompt: Option<bool>,
     pub continue_final_message: Option<bool>,
+    pub template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
@@ -282,6 +285,56 @@ pub fn load_model_chat_template_from_file(
     let content = read_to_string(file)?;
     load_model_chat_template_from_str(&content)
 }
+
+/// Returns undeclared top-level variables referenced by a chat template.
+///
+/// This is static template analysis: it identifies variables that might be
+/// looked up at render time, but it does not infer value types or defaults.
+pub fn chat_template_variables(
+    model_template: &str,
+    model_id: &str,
+) -> Result<BTreeSet<String>, Error> {
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_template_owned(model_id.to_owned(), model_template.to_owned())?;
+    let template = env.get_template(model_id)?;
+    Ok(template.undeclared_variables(false).into_iter().collect())
+}
+
+/// Returns likely user-provided kwargs referenced by a chat template.
+///
+/// The result excludes the standard chat-template variables provided by this
+/// crate and MiniJinja's registered globals. It remains best-effort because
+/// Jinja templates do not carry a formal kwarg schema.
+pub fn chat_template_kwargs(
+    model_template: &str,
+    model_id: &str,
+) -> Result<BTreeSet<String>, Error> {
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_template_owned(model_id.to_owned(), model_template.to_owned())?;
+    let template = env.get_template(model_id)?;
+    let globals = env
+        .globals()
+        .map(|(name, _)| name.to_string())
+        .collect::<BTreeSet<_>>();
+
+    Ok(template
+        .undeclared_variables(false)
+        .into_iter()
+        .filter(|name| !STANDARD_CHAT_TEMPLATE_VARIABLES.contains(&name.as_str()))
+        .filter(|name| !globals.contains(name))
+        .collect())
+}
+
+const STANDARD_CHAT_TEMPLATE_VARIABLES: &[&str] = &[
+    "messages",
+    "tools",
+    "documents",
+    "add_generation_prompt",
+    "raise_exception",
+    "strftime_now",
+];
 
 // chat_template = self.get_chat_template(chat_template, tools)
 
@@ -460,6 +513,7 @@ pub fn apply_chat_template_json<'a, I>(
     tools: Option<&'a [serde_json::Value]>,
     model_id: &'a str,
     add_generation_prompt: bool,
+    template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
 where
     I: IntoIterator<Item = Vec<serde_json::Value>>,
@@ -482,6 +536,7 @@ where
             chat_template_id: None,
             add_generation_prompt: Some(add_generation_prompt),
             continue_final_message: None,
+            template_kwargs,
         },
     )
 }
@@ -504,6 +559,7 @@ where
         chat_template_id,
         add_generation_prompt,
         continue_final_message,
+        template_kwargs,
     } = args;
 
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
@@ -530,6 +586,7 @@ where
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
+        template_kwargs,
     )
 }
 
@@ -541,6 +598,7 @@ fn render_jinja_tempalte<'a, R, T>(
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
+    template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
@@ -564,21 +622,28 @@ where
                         if serde_json::to_value(&chat[0].role).ok()
                             == Some(serde_json::Value::Null) =>
                     {
-                        Some(JinjaValue::from_serialize(messages))
+                        Some(serde_json::Value::Array(messages))
                     }
                     _ => None,
                 })
         } else {
             None
         }
-        .unwrap_or_else(|| JinjaValue::from_serialize(&chat));
+        .unwrap_or_else(|| serde_json::to_value(&chat).unwrap_or(serde_json::Value::Null));
 
-        let mut rendered_chat = template.render(context! {
-            messages => messages,
-            tools => tools,
-            documents => documents,
-            add_generation_prompt => add_generation_prompt,
-        })?;
+        let mut context = serde_json::Map::new();
+        context.insert("messages".to_string(), messages);
+        context.insert("tools".to_string(), serde_json::to_value(tools)?);
+        context.insert("documents".to_string(), serde_json::to_value(documents)?);
+        context.insert(
+            "add_generation_prompt".to_string(),
+            serde_json::Value::Bool(add_generation_prompt),
+        );
+        if let Some(template_kwargs) = template_kwargs {
+            context.extend(template_kwargs.clone());
+        }
+
+        let mut rendered_chat = template.render(context)?;
         rendered_chat = rendered_chat.trim_start_matches('\n').to_string();
 
         if continue_final_message {
@@ -667,6 +732,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let mut env = Environment::new();
@@ -674,6 +740,63 @@ mod tests {
 
         let rendered_chat = apply_chat_template(&mut env, model_chat_template, args).unwrap();
         println!("{:?}", rendered_chat);
+    }
+
+    #[test]
+    fn test_apply_chat_template_with_template_kwargs() {
+        let model_template =
+            "{% if enable_thinking %}think{% else %}no-think{% endif %}".to_string();
+        let model_id = "test-model".to_string();
+        let conversations = vec![Conversation {
+            role: Role::User,
+            content: "hello",
+        }];
+        let mut template_kwargs = serde_json::Map::new();
+        template_kwargs.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let args = ApplyChatTemplateArgs {
+            conversations: [conversations.into()],
+            tools: None,
+            documents: None,
+            model_id: &model_id,
+            chat_template_id: None,
+            add_generation_prompt: None,
+            continue_final_message: None,
+            template_kwargs: Some(&template_kwargs),
+        };
+
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
+        let rendered_chat = apply_chat_template(&mut env, model_template, args).unwrap();
+        assert_eq!(rendered_chat, vec!["no-think"]);
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_filters_standard_variables_and_globals() {
+        let model_template = concat!(
+            "{% set ns = namespace(found=false) %}",
+            "{% for message in messages %}{{ message.role }}{% endfor %}",
+            "{% if tools %}{{ tools|length }}{% endif %}",
+            "{% if documents %}{{ documents|length }}{% endif %}",
+            "{% if add_generation_prompt and enable_thinking is defined %}{{ tone }}{% endif %}",
+        );
+
+        let kwargs = super::chat_template_kwargs(model_template, "test-model").unwrap();
+        assert_eq!(
+            kwargs.into_iter().collect::<Vec<_>>(),
+            vec!["enable_thinking", "tone"]
+        );
+    }
+
+    #[test]
+    fn test_qwen_fixture_reports_enable_thinking_kwarg() {
+        let file = fixtures_dir().join("tokenizer_config.json");
+        let chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
+        let kwargs = super::chat_template_kwargs(&chat_template, "qwen-fixture").unwrap();
+        assert!(kwargs.contains("enable_thinking"), "{kwargs:?}");
     }
 
     #[test]
@@ -704,6 +827,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let rendered_chat = tokenizer
@@ -739,6 +863,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let encodings = tokenizer

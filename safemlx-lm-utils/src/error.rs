@@ -14,4 +14,7 @@ pub enum Error {
 
     #[error(transparent)]
     Encode(#[from] tokenizers::tokenizer::Error),
+
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
 }

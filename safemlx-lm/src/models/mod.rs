@@ -13,13 +13,16 @@ use safemlx::{
     Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
-    load_model_chat_template_from_file, ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
+    chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
+    ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
+use crate::sampler::{DefaultSampler, Sampler};
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
 /// Shared building blocks used by multiple decoder-only model families.
@@ -233,6 +236,59 @@ impl Model {
             Self::NemotronH(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
             Self::Qwen35Moe(model) => model.model_type(),
+        }
+    }
+
+    /// Runs a detailed instrumented forward pass for supported model families.
+    ///
+    /// Llama and Qwen3 currently report detailed layer activations. Other
+    /// families return an error until their family-specific inspection paths
+    /// are wired.
+    pub fn forward_with_observer(
+        &mut self,
+        input_tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut ModelCache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
+                llama::ModelInput {
+                    inputs: input_tokens,
+                    mask,
+                    cache,
+                },
+                stream,
+                observer,
+            ),
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
+                qwen3::ModelInput {
+                    inputs: input_tokens,
+                    mask,
+                    cache,
+                },
+                stream,
+                observer,
+            ),
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => model.forward_with_observer(
+                qwen3_5_moe::ModelInput {
+                    inputs: input_tokens,
+                    mask,
+                    cache: Some(cache),
+                },
+                stream,
+                observer,
+            ),
+            (Self::Gemma4(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for gemma4 yet",
+            )),
+            (Self::NemotronH(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for nemotron_h yet",
+            )),
+            _ => Err(Exception::custom(
+                "model cache type does not match model kind",
+            )),
         }
     }
 
@@ -620,6 +676,20 @@ impl LoadedModel {
         self.chat_template.is_some()
     }
 
+    /// Returns likely user-provided kwargs referenced by the loaded chat template.
+    ///
+    /// This is static template analysis and does not infer value types or
+    /// defaults. Standard chat-template variables supplied by this crate are
+    /// excluded.
+    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, Error> {
+        let Some(template) = &self.chat_template else {
+            return Ok(Vec::new());
+        };
+        Ok(inspect_chat_template_kwargs(template, &self.model_id)?
+            .into_iter()
+            .collect())
+    }
+
     /// Applies the loaded chat template to structured conversations.
     ///
     /// Returns `Ok(None)` when no chat template is available.
@@ -628,6 +698,24 @@ impl LoadedModel {
         conversations: I,
         tools: Option<&'a [serde_json::Value]>,
         add_generation_prompt: bool,
+    ) -> Result<Option<String>, Error>
+    where
+        I: IntoIterator<Item = Chat<'a, R, T>>,
+        R: Serialize + 'a,
+        T: Serialize + 'a,
+    {
+        self.apply_chat_template_with_kwargs(conversations, tools, add_generation_prompt, None)
+    }
+
+    /// Applies the loaded chat template to structured conversations with extra template variables.
+    ///
+    /// Returns `Ok(None)` when no chat template is available.
+    pub fn apply_chat_template_with_kwargs<'a, I, R, T>(
+        &'a mut self,
+        conversations: I,
+        tools: Option<&'a [serde_json::Value]>,
+        add_generation_prompt: bool,
+        template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Option<String>, Error>
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
@@ -648,6 +736,7 @@ impl LoadedModel {
                 chat_template_id: None,
                 add_generation_prompt: Some(add_generation_prompt),
                 continue_final_message: None,
+                template_kwargs,
             },
         )?;
         Ok(rendered.into_iter().next())
@@ -662,6 +751,19 @@ impl LoadedModel {
         tools: Option<&[serde_json::Value]>,
         add_generation_prompt: bool,
     ) -> Result<Option<String>, Error> {
+        self.apply_chat_template_json_with_kwargs(conversations, tools, add_generation_prompt, None)
+    }
+
+    /// Applies the loaded chat template to JSON-valued conversations with extra template variables.
+    ///
+    /// Returns `Ok(None)` when no chat template is available.
+    pub fn apply_chat_template_json_with_kwargs(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Option<String>, Error> {
         let Some(template) = self.chat_template.clone() else {
             return Ok(None);
         };
@@ -672,6 +774,7 @@ impl LoadedModel {
             tools,
             &self.model_id,
             add_generation_prompt,
+            template_kwargs,
         )?;
         Ok(rendered.into_iter().next())
     }
@@ -862,6 +965,20 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     }
 }
 
+/// Returns likely user-provided kwargs referenced by a model directory's chat template.
+///
+/// This reads tokenizer/chat-template metadata only and does not load model weights.
+pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, Error> {
+    let model_dir = model_dir.as_ref();
+    let Some(template) = load_chat_template(model_dir)? else {
+        return Ok(Vec::new());
+    };
+    let model_id = model_dir.display().to_string();
+    Ok(inspect_chat_template_kwargs(&template, &model_id)?
+        .into_iter()
+        .collect())
+}
+
 fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
@@ -926,8 +1043,9 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 mod tests {
     use super::{
         check_model_config, check_model_config_json, check_model_dir, load_chat_template,
-        load_tokenizer,
+        load_tokenizer, LoadedModel,
     };
+    use crate::inspection::ActivationRecorder;
     use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
     use serde_json::json;
     use std::{
@@ -939,6 +1057,50 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
 
     static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
+    fn observer_forward_reports_attention_and_residual_hooks() {
+        let model_dir = std::env::var("SAFEMLX_INSPECTION_MODEL_DIR")
+            .expect("set SAFEMLX_INSPECTION_MODEL_DIR to a local model directory");
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights_ctx =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = LoadedModel::load(model_dir, ctx.stream(), weights_ctx.stream()).unwrap();
+        let input = model.encode_to_array("hello", true, ctx.stream()).unwrap();
+        let mut cache = model.new_cache();
+        let mut recorder = ActivationRecorder::new();
+
+        model
+            .model_mut()
+            .forward_with_observer(&input, None, &mut cache, ctx.stream(), &mut recorder)
+            .unwrap();
+
+        let names = recorder
+            .activations()
+            .iter()
+            .map(|activation| activation.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name.ends_with(".attention_probs")),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with(".residual_delta_attention")),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with(".residual_delta_mlp"))
+                || names
+                    .iter()
+                    .any(|name| name.ends_with(".residual_delta_moe")),
+            "{names:?}"
+        );
+    }
 
     fn temp_model_dir(config: &str) -> std::path::PathBuf {
         let id = SystemTime::now()
@@ -1012,6 +1174,7 @@ mod tests {
                 None,
                 "nemotron_h",
                 true,
+                None,
             )
             .unwrap()
             .remove(0);

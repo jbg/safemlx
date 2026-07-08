@@ -26,7 +26,11 @@ pub use super::common::sample;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    models::common::{self, project_logits_dense, silu, CausalLm, TopKRouterScoreFunction},
+    inspection::ActivationObserver,
+    models::common::{
+        self, attention_probabilities, project_logits_dense, silu, CausalLm,
+        TopKRouterScoreFunction,
+    },
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -1206,6 +1210,87 @@ impl Module<FullAttentionInput<'_>> for FullAttention {
     }
 }
 
+impl FullAttention {
+    /// Forward pass that reports full-attention activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: FullAttentionInput<'_>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let FullAttentionInput { x, mask, mut cache } = input;
+        let shape = x.shape();
+        let b = shape[0];
+        let l = shape[1];
+        let q_proj = self
+            .q_proj
+            .forward(x, stream)?
+            .reshape(&[b, l, self.n_heads, 2 * self.head_dim], stream)?;
+        observer.observe(&format!("{prefix}.q_proj"), &q_proj)?;
+        let query = q_proj.try_index_device((.., .., .., ..self.head_dim), stream)?;
+        let gate = q_proj
+            .try_index_device((.., .., .., self.head_dim..), stream)?
+            .reshape(&[b, l, self.n_heads * self.head_dim], stream)?;
+        observer.observe(&format!("{prefix}.gate"), &gate)?;
+        let mut query = self
+            .q_norm
+            .forward(&query, stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        observer.observe(&format!("{prefix}.q_norm"), &query)?;
+        let mut key = self
+            .k_norm
+            .forward(
+                &self
+                    .k_proj
+                    .forward(x, stream)?
+                    .reshape(&[b, l, self.n_kv_heads, self.head_dim], stream)?,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        observer.observe(&format!("{prefix}.k_norm"), &key)?;
+        let mut value = self
+            .v_proj
+            .forward(x, stream)?
+            .reshape(&[b, l, self.n_kv_heads, self.head_dim], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        observer.observe(&format!("{prefix}.values"), &value)?;
+
+        if let Some(cache) = cache.as_mut() {
+            let offset = cache.offset();
+            query = self.rope.forward(
+                nn::RopeInputBuilder::new(&query).offset(offset).build()?,
+                stream,
+            )?;
+            key = self.rope.forward(
+                nn::RopeInputBuilder::new(&key).offset(offset).build()?,
+                stream,
+            )?;
+            (key, value) = cache.update_and_fetch(key, value, stream)?;
+        } else {
+            query = self.rope.forward(nn::RopeInput::new(&query), stream)?;
+            key = self.rope.forward(nn::RopeInput::new(&key), stream)?;
+        }
+        observer.observe(&format!("{prefix}.queries_rope"), &query)?;
+        observer.observe(&format!("{prefix}.keys_rope"), &key)?;
+        observer.observe(&format!("{prefix}.values_cache"), &value)?;
+        let attention_probs = attention_probabilities(&query, &key, self.scale, mask, stream)?;
+        observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
+
+        let out = crate::utils::scaled_dot_product_attention(
+            query, key, value, cache, self.scale, mask, stream,
+        )?
+        .transpose_axes(&[0, 2, 1, 3], stream)?
+        .reshape(&[b, l, -1], stream)?;
+        observer.observe(&format!("{prefix}.attention"), &out)?;
+        let gated = out.multiply(sigmoid(gate, stream)?, stream)?;
+        observer.observe(&format!("{prefix}.attention_gated"), &gated)?;
+        let output = self.o_proj.forward(&gated, stream)?;
+        observer.observe(&format!("{prefix}.o_proj"), &output)?;
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 /// Depthwise one-dimensional convolution parameters.
 pub struct DepthwiseConv1d {
@@ -1715,6 +1800,99 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
     }
 }
 
+impl LinearAttention {
+    /// Forward pass that reports recurrent linear-attention internals.
+    #[allow(non_snake_case)]
+    pub fn forward_with_observer(
+        &mut self,
+        input: LinearAttentionInput<'_>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let LinearAttentionInput { x, mut cache } = input;
+        let shape = x.shape();
+        let B = shape[0];
+        let L = shape[1];
+        let mixed_qkv = self.in_proj_qkv.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.in_proj_qkv"), &mixed_qkv)?;
+        let z = self
+            .in_proj_z
+            .forward(x, stream)?
+            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        observer.observe(&format!("{prefix}.z_proj"), &z)?;
+        let b = self.in_proj_b.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.beta_proj"), &b)?;
+        let a = self.in_proj_a.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.a_proj"), &a)?;
+        let mixed_qkv = self.depthwise_causal_conv(&mixed_qkv, cache.as_deref_mut(), stream)?;
+        observer.observe(&format!("{prefix}.causal_conv"), &mixed_qkv)?;
+
+        let query = mixed_qkv
+            .try_index_device((.., .., ..self.key_dim), stream)?
+            .reshape(&[B, L, self.num_k_heads, self.head_k_dim], stream)?;
+        observer.observe(&format!("{prefix}.query_raw"), &query)?;
+        let key = mixed_qkv
+            .try_index_device((.., .., self.key_dim..2 * self.key_dim), stream)?
+            .reshape(&[B, L, self.num_k_heads, self.head_k_dim], stream)?;
+        observer.observe(&format!("{prefix}.key_raw"), &key)?;
+        let mut value = mixed_qkv
+            .try_index_device((.., .., 2 * self.key_dim..), stream)?
+            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        observer.observe(&format!("{prefix}.value"), &value)?;
+        let mut query = Self::l2norm(query, stream)?;
+        observer.observe(&format!("{prefix}.query_l2norm"), &query)?;
+        let mut key = Self::l2norm(key, stream)?;
+        observer.observe(&format!("{prefix}.key_l2norm"), &key)?;
+        let beta = sigmoid(b, stream)?;
+        observer.observe(&format!("{prefix}.beta"), &beta)?;
+        let dt_bias = self.dt_bias.reshape(&[1, 1, self.num_v_heads], stream)?;
+        let g = nn::softplus(a.add(dt_bias, stream)?, stream)?.multiply(
+            exp(self.A_log.as_ref(), stream)?.multiply(Array::from_f32(-1.0), stream)?,
+            stream,
+        )?;
+        observer.observe(&format!("{prefix}.decay"), &g)?;
+
+        let repeats = self.num_v_heads / self.num_k_heads;
+        if repeats > 1 {
+            let expanded_query = query.try_index_device((.., .., .., NewAxis, ..), stream)?;
+            query = broadcast_to(
+                &expanded_query,
+                &[B, L, self.num_k_heads, repeats, self.head_k_dim],
+                stream,
+            )?
+            .reshape(&[B, L, self.num_v_heads, self.head_k_dim], stream)?;
+            observer.observe(&format!("{prefix}.query_repeated"), &query)?;
+            let expanded_key = key.try_index_device((.., .., .., NewAxis, ..), stream)?;
+            key = broadcast_to(
+                &expanded_key,
+                &[B, L, self.num_k_heads, repeats, self.head_k_dim],
+                stream,
+            )?
+            .reshape(&[B, L, self.num_v_heads, self.head_k_dim], stream)?;
+            observer.observe(&format!("{prefix}.key_repeated"), &key)?;
+        }
+
+        value = value.as_dtype(x.dtype(), stream)?;
+        let core = self.recurrent_delta_rule(query, key, value, g, beta, cache, stream)?;
+        observer.observe(&format!("{prefix}.recurrent_core"), &core)?;
+        let z_shape = z.shape().to_vec();
+        let core = core.reshape(&[-1, self.head_v_dim], stream)?;
+        observer.observe(&format!("{prefix}.recurrent_core_flat"), &core)?;
+        let z = z.reshape(&[-1, self.head_v_dim], stream)?;
+        observer.observe(&format!("{prefix}.z_flat"), &z)?;
+        let normalized = self.norm.forward(&core, &z, stream)?;
+        observer.observe(&format!("{prefix}.gated_norm"), &normalized)?;
+        let out = normalized
+            .reshape(&z_shape, stream)?
+            .reshape(&[B, L, self.value_dim], stream)?;
+        observer.observe(&format!("{prefix}.pre_out_proj"), &out)?;
+        let output = self.out_proj.forward(&out, stream)?;
+        observer.observe(&format!("{prefix}.out_proj"), &output)?;
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 /// Dense SwiGLU MLP used by the shared expert.
 pub struct Mlp {
@@ -1921,6 +2099,123 @@ impl Experts {
         concatenate_axis(&outputs, 0, stream)
     }
 
+    /// Evaluates routed experts while reporting per-route expert internals.
+    pub fn forward_chunked_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.shape()[0];
+        if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
+            return self.forward_with_observer(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                stream,
+                prefix,
+                observer,
+            );
+        }
+
+        let mut outputs = Vec::with_capacity(
+            ((num_tokens + ROUTED_EXPERT_CHUNK_TOKENS - 1) / ROUTED_EXPERT_CHUNK_TOKENS)
+                .try_into()
+                .expect("number of MoE chunks must fit in usize"),
+        );
+        let mut start = 0;
+        let mut chunk = 0;
+        while start < num_tokens {
+            let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
+            let hidden_chunk = hidden_states.try_index_device((start..end, ..), stream)?;
+            observer.observe(&format!("{prefix}.chunks.{chunk}.input"), &hidden_chunk)?;
+            let expert_chunk = top_k_index.try_index_device((start..end, ..), stream)?;
+            let weight_chunk = top_k_weights.try_index_device((start..end, ..), stream)?;
+            outputs.push(self.forward_expert_major_chunk_with_observer(
+                &hidden_chunk,
+                &expert_chunk,
+                &weight_chunk,
+                stream,
+                &format!("{prefix}.chunks.{chunk}"),
+                observer,
+            )?);
+            start = end;
+            chunk += 1;
+        }
+        let output = concatenate_axis(&outputs, 0, stream)?;
+        observer.observe(&format!("{prefix}.chunked_output"), &output)?;
+        Ok(output)
+    }
+
+    /// Evaluates routed experts for flattened token hidden states with observer hooks.
+    pub fn forward_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        observer.observe(&format!("{prefix}.input"), hidden_states)?;
+        observer.observe(&format!("{prefix}.top_k_experts"), top_k_index)?;
+        observer.observe(&format!("{prefix}.top_k_weights"), top_k_weights)?;
+        if self.use_fp8 {
+            return self.forward_expert_major_chunk_with_observer(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                stream,
+                prefix,
+                observer,
+            );
+        }
+
+        let num_tokens = hidden_states.shape()[0];
+        let top_k = top_k_index.shape()[1];
+        let selected_gate_up = self
+            .gate_up_proj
+            .as_ref()
+            .take_axis(top_k_index, 0, stream)?;
+        observer.observe(
+            &format!("{prefix}.selected_gate_up_weight"),
+            &selected_gate_up,
+        )?;
+        let hidden = hidden_states.try_index_device((.., NewAxis, NewAxis, ..), stream)?;
+        let gate_up = matmul(&hidden, selected_gate_up.swap_axes(-1, -2, stream)?, stream)?
+            .reshape(&[num_tokens, top_k, 2 * self.intermediate_dim], stream)?;
+        observer.observe(&format!("{prefix}.gate_up_proj"), &gate_up)?;
+        let gate = gate_up.try_index_device((.., .., ..self.intermediate_dim), stream)?;
+        observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
+        let up = gate_up.try_index_device((.., .., self.intermediate_dim..), stream)?;
+        observer.observe(&format!("{prefix}.up_proj"), &up)?;
+        let gate_activation = silu(gate, stream)?;
+        observer.observe(&format!("{prefix}.gate_activation"), &gate_activation)?;
+        let current = gate_activation.multiply(up, stream)?;
+        observer.observe(&format!("{prefix}.down_proj_input"), &current)?;
+
+        let selected_down = self.down_proj.as_ref().take_axis(top_k_index, 0, stream)?;
+        observer.observe(&format!("{prefix}.selected_down_weight"), &selected_down)?;
+        let route_output = matmul(
+            current.try_index_device((.., .., NewAxis, ..), stream)?,
+            selected_down.swap_axes(-1, -2, stream)?,
+            stream,
+        )?
+        .reshape(&[num_tokens, top_k, self.hidden_dim], stream)?;
+        observer.observe(&format!("{prefix}.route_output"), &route_output)?;
+        let weighted = route_output.multiply(
+            top_k_weights.try_index_device((.., .., NewAxis), stream)?,
+            stream,
+        )?;
+        observer.observe(&format!("{prefix}.weighted_route_output"), &weighted)?;
+        let output = sum_axis(&weighted, -2, false, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        Ok(output)
+    }
+
     fn forward_expert_major_chunk(
         &mut self,
         hidden_states: &Array,
@@ -1972,6 +2267,85 @@ impl Experts {
             )?
         };
         common::weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    fn forward_expert_major_chunk_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.shape()[0];
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        observer.observe(&format!("{prefix}.route_indices"), &plan.route_indices)?;
+        observer.observe(&format!("{prefix}.token_indices"), &plan.token_indices)?;
+        observer.observe(&format!("{prefix}.slot_indices"), &plan.slot_indices)?;
+        observer.observe(
+            &format!("{prefix}.sorted_group_ids"),
+            &plan.sorted_group_ids,
+        )?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        observer.observe(&format!("{prefix}.expert_major_input"), &hidden)?;
+        let gate_up = if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
+            grouped_fp8_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                scale,
+                &plan.sorted_group_ids,
+                stream,
+            )?
+        } else {
+            let gate_up_weights = self.gate_up_proj.as_ref().swap_axes(-1, -2, stream)?;
+            grouped_matmul(
+                &hidden,
+                &gate_up_weights,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        observer.observe(&format!("{prefix}.expert_major_gate_up_proj"), &gate_up)?;
+        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        observer.observe(&format!("{prefix}.expert_major_gate_proj"), &gate)?;
+        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        observer.observe(&format!("{prefix}.expert_major_up_proj"), &up)?;
+        let gate_activation = silu(gate, stream)?;
+        observer.observe(
+            &format!("{prefix}.expert_major_gate_activation"),
+            &gate_activation,
+        )?;
+        let current = gate_activation.multiply(up, stream)?;
+        observer.observe(&format!("{prefix}.expert_major_down_proj_input"), &current)?;
+
+        let route_output = if let Some(scale) = self.down_proj_scale_inv.as_ref() {
+            grouped_fp8_linear(
+                &current,
+                self.down_proj.as_ref(),
+                scale,
+                &plan.sorted_group_ids,
+                stream,
+            )?
+        } else {
+            let down_weights = self.down_proj.as_ref().swap_axes(-1, -2, stream)?;
+            grouped_matmul(
+                &current,
+                &down_weights,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        observer.observe(
+            &format!("{prefix}.expert_major_route_output"),
+            &route_output,
+        )?;
+        let output =
+            common::weighted_route_sum(route_output, top_k_weights, &plan, num_tokens, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        Ok(output)
     }
 
     /// Sets training mode.
@@ -2027,6 +2401,57 @@ impl SparseMoeBlock {
             )?,
             shared_expert_gate: QwenLinear::new(args.hidden_size, 1, false, false, stream)?,
         })
+    }
+
+    /// Forward pass that reports router and expert activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let b = shape[0];
+        let l = shape[1];
+        let h = shape[2];
+        let flat = hidden_states.reshape(&[-1, h], stream)?;
+        observer.observe(&format!("{prefix}.input_flat"), &flat)?;
+
+        let shared_gate = sigmoid(self.shared_expert_gate.forward(&flat, stream)?, stream)?;
+        observer.observe(&format!("{prefix}.shared_expert_gate"), &shared_gate)?;
+        let shared = self
+            .shared_expert
+            .forward(&flat, stream)?
+            .multiply(shared_gate, stream)?;
+        observer.observe(&format!("{prefix}.shared_expert_output"), &shared)?;
+        profile_array(PerfComponent::MoeShared, &shared)?;
+
+        let (selected_experts, routing_weights) =
+            self.gate
+                .forward_with_observer(&flat, stream, &format!("{prefix}.gate"), observer)?;
+        profile_arrays(
+            PerfComponent::MoeRouter,
+            &[&selected_experts, &routing_weights],
+        )?;
+
+        let routed = self.experts.forward_chunked_with_observer(
+            &flat,
+            &selected_experts,
+            &routing_weights,
+            stream,
+            &format!("{prefix}.experts"),
+            observer,
+        )?;
+        observer.observe(&format!("{prefix}.routed_expert_output"), &routed)?;
+        profile_array(PerfComponent::MoeRouted, &routed)?;
+
+        let combined = routed.add(shared, stream)?;
+        observer.observe(&format!("{prefix}.combined_flat"), &combined)?;
+        let output = combined.reshape(&[b, l, h], stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        profile_array(PerfComponent::MoeCombine, &output)?;
+        Ok(output)
     }
 }
 
@@ -2209,6 +2634,103 @@ impl Module<BlockInput<'_>> for TransformerBlock {
     }
 }
 
+impl TransformerBlock {
+    /// Forward pass that reports Qwen3.5 MoE block activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: BlockInput<'_>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let BlockInput { x, mask, cache } = input;
+        observer.observe(&format!("{prefix}.input"), x)?;
+        observer.observe(&format!("{prefix}.residual_before_attention"), x)?;
+        let residual = x;
+        let h = self.input_layernorm.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.input_layernorm"), &h)?;
+        let h = match (self.layer_type, cache) {
+            (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_with_observer(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    &format!("{prefix}.self_attn"),
+                    observer,
+                )?,
+            (LayerType::FullAttention, _) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_with_observer(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                    &format!("{prefix}.self_attn"),
+                    observer,
+                )?,
+            (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_with_observer(
+                    LinearAttentionInput {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    &format!("{prefix}.linear_attn"),
+                    observer,
+                )?,
+            (LayerType::LinearAttention, _) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_with_observer(
+                    LinearAttentionInput { x: &h, cache: None },
+                    stream,
+                    &format!("{prefix}.linear_attn"),
+                    observer,
+                )?,
+        };
+        observer.observe(&format!("{prefix}.attention_output"), &h)?;
+        observer.observe(&format!("{prefix}.residual_delta_attention"), &h)?;
+        match self.layer_type {
+            LayerType::FullAttention => profile_array(PerfComponent::FullAttention, &h)?,
+            LayerType::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
+        }
+        let h = residual.add(h, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
+        observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
+
+        observer.observe(&format!("{prefix}.residual_before_moe"), &h)?;
+        let residual = h.clone();
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
+        let h = self.mlp.forward_with_observer(
+            &post_normed,
+            stream,
+            &format!("{prefix}.moe"),
+            observer,
+        )?;
+        observer.observe(&format!("{prefix}.moe_output"), &h)?;
+        observer.observe(&format!("{prefix}.residual_delta_moe"), &h)?;
+        let output = residual.add(h, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        observer.observe(&format!("{prefix}.residual_after_moe"), &output)?;
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 /// Qwen3.5 MoE text transformer body without the language-model head.
 pub struct Qwen35MoeTextModel {
@@ -2242,6 +2764,80 @@ impl Qwen35MoeTextModel {
             layers,
             norm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
         })
+    }
+
+    /// Forward pass that reports activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: ModelInput<'_>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let ModelInput {
+            inputs,
+            mask,
+            mut cache,
+        } = input;
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
+        observer.observe("model.embed_tokens", &h)?;
+        profile_array(PerfComponent::Embed, &h)?;
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => {
+                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
+                if h.shape()[1] > 1 {
+                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
+                        Some(AttentionMask::Array(a)) => Some(a),
+                        Some(AttentionMask::Causal) => {
+                            return Err(Exception::custom("Only `Array` mask is supported"));
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(mask) = mask.as_ref() {
+            observer.observe("model.attention_mask", mask)?;
+        }
+
+        if let Some(cache) = cache.as_mut() {
+            for (i, (layer, layer_cache)) in self
+                .layers
+                .iter_mut()
+                .zip(cache.layers.iter_mut())
+                .enumerate()
+            {
+                h = layer.forward_with_observer(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: Some(layer_cache),
+                    },
+                    stream,
+                    &format!("model.layers.{i}"),
+                    observer,
+                )?;
+            }
+        } else {
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                h = layer.forward_with_observer(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: None,
+                    },
+                    stream,
+                    &format!("model.layers.{i}"),
+                    observer,
+                )?;
+            }
+        }
+        let h = self.norm.forward(&h, stream)?;
+        observer.observe("model.norm", &h)?;
+        profile_array(PerfComponent::FinalNorm, &h)?;
+        Ok(h)
     }
 }
 
@@ -2458,6 +3054,21 @@ impl Model {
             hidden_states
         };
         self.project_logits(&hidden_states, stream)
+    }
+
+    /// Forward pass that reports activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: ModelInput<'_>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        self.reject_multimodal_tokens(input.inputs, stream)?;
+        let hidden_states = self.model.forward_with_observer(input, stream, observer)?;
+        observer.observe("model.output", &hidden_states)?;
+        let logits = self.project_logits(&hidden_states, stream)?;
+        observer.observe("lm_head.logits", &logits)?;
+        Ok(logits)
     }
 }
 
@@ -2845,6 +3456,7 @@ mod tests {
     };
     use crate::{
         error::Error,
+        inspection::ActivationRecorder,
         weights::{load_safetensors_strict, StrictLoadReport},
     };
     use safemlx::{
@@ -3099,6 +3711,44 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
+    fn linear_attention_observer_reports_internal_hooks() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let mut attn = LinearAttention::new(&args, stream).unwrap();
+        let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
+        let mut recorder = ActivationRecorder::new();
+
+        let out = attn
+            .forward_with_observer(
+                LinearAttentionInput { x: &x, cache: None },
+                stream,
+                "model.layers.0.linear_attn",
+                &mut recorder,
+            )
+            .unwrap();
+
+        assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
+        let names = recorder
+            .activations()
+            .iter()
+            .map(|activation| activation.name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "model.layers.0.linear_attn.in_proj_qkv",
+            "model.layers.0.linear_attn.causal_conv",
+            "model.layers.0.linear_attn.query_l2norm",
+            "model.layers.0.linear_attn.recurrent_core",
+            "model.layers.0.linear_attn.gated_norm",
+            "model.layers.0.linear_attn.out_proj",
+        ] {
+            assert!(names.contains(&expected), "{names:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
     fn sparse_moe_forward_shape_smoke() {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -3123,6 +3773,56 @@ mod tests {
             .unwrap();
         let out = moe.forward(&x, stream).unwrap();
         assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn sparse_moe_observer_reports_routed_expert_internals() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let mut moe = SparseMoeBlock::new(&args, stream).unwrap();
+        let gate_values = (0..args.num_experts)
+            .flat_map(|expert| {
+                (0..args.hidden_size).map(move |hidden| ((expert + 1) * (hidden + 1)) as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        moe.gate.weight = Param::new(
+            Array::from(gate_values.as_slice())
+                .reshape(&[args.num_experts, args.hidden_size], stream)
+                .unwrap(),
+        );
+        let input_values = (0..(2 * args.hidden_size))
+            .map(|index| index as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let x = Array::from(input_values.as_slice())
+            .reshape(&[1, 2, args.hidden_size], stream)
+            .unwrap();
+        let mut recorder = ActivationRecorder::new();
+
+        let out = moe
+            .forward_with_observer(&x, stream, "model.layers.0.moe", &mut recorder)
+            .unwrap();
+
+        assert_eq!(out.shape(), &[1, 2, args.hidden_size]);
+        let names = recorder
+            .activations()
+            .iter()
+            .map(|activation| activation.name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "model.layers.0.moe.gate.router_logits",
+            "model.layers.0.moe.gate.top_k_experts",
+            "model.layers.0.moe.experts.gate_proj",
+            "model.layers.0.moe.experts.up_proj",
+            "model.layers.0.moe.experts.down_proj_input",
+            "model.layers.0.moe.experts.route_output",
+            "model.layers.0.moe.experts.weighted_route_output",
+            "model.layers.0.moe.combined_flat",
+        ] {
+            assert!(names.contains(&expected), "{names:?}");
+        }
     }
 
     #[test]

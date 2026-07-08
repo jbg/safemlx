@@ -23,8 +23,9 @@ pub use super::common::sample;
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    inspection::ActivationObserver,
     models::common::{
-        self, apply_rope_and_update_cache, batch_seq, finish_attention,
+        self, apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
         project_logits_maybe_quantized, reshape_attention_projection, AttentionInput, CausalLm,
         SwiGluMlp,
     },
@@ -171,6 +172,53 @@ impl Attention {
             rope,
         })
     }
+
+    /// Forward pass that reports attention activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, mut cache } = input;
+
+        let (batch, seq_len) = batch_seq(x);
+
+        let queries = self.q_proj.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.q_proj"), &queries)?;
+        let keys = self.k_proj.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.k_proj"), &keys)?;
+        let values = self.v_proj.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.v_proj"), &values)?;
+
+        let queries = reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?;
+        observer.observe(&format!("{prefix}.queries"), &queries)?;
+        let keys = reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?;
+        observer.observe(&format!("{prefix}.keys"), &keys)?;
+        let values = reshape_attention_projection(values, batch, seq_len, self.n_kv_heads, stream)?;
+        observer.observe(&format!("{prefix}.values"), &values)?;
+
+        let (queries, keys, values) =
+            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
+        observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
+        observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
+        observer.observe(&format!("{prefix}.values_cache"), &values)?;
+        let attention_probs = attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
+        observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
+
+        let output = finish_attention(
+            queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+        )?;
+        observer.observe(&format!("{prefix}.attention"), &output)?;
+
+        let output = self.o_proj.forward(&output, stream)?;
+        observer.observe(&format!("{prefix}.o_proj"), &output)?;
+        Ok(output)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for Attention
@@ -272,6 +320,58 @@ impl TransformerBlock {
             post_attention_layernorm,
         })
     }
+
+    /// Forward pass that reports block activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, cache } = input;
+
+        observer.observe(&format!("{prefix}.input"), x)?;
+        observer.observe(&format!("{prefix}.residual_before_attention"), x)?;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.input_layernorm"), &normed)?;
+
+        let self_attn_input = AttentionInput {
+            x: &normed,
+            mask,
+            cache,
+        };
+        let r = self.self_attn.forward_with_observer(
+            self_attn_input,
+            stream,
+            &format!("{prefix}.self_attn"),
+            observer,
+        )?;
+        observer.observe(&format!("{prefix}.self_attn_output"), &r)?;
+        observer.observe(&format!("{prefix}.residual_delta_attention"), &r)?;
+        let h = x.add(r, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
+        observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
+
+        observer.observe(&format!("{prefix}.residual_before_mlp"), &h)?;
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
+        let r = self.mlp.forward_with_observer(
+            &post_normed,
+            stream,
+            &format!("{prefix}.mlp"),
+            observer,
+        )?;
+        observer.observe(&format!("{prefix}.mlp_output"), &r)?;
+        observer.observe(&format!("{prefix}.residual_delta_mlp"), &r)?;
+        let output = h.add(r, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        observer.observe(&format!("{prefix}.residual_after_mlp"), &output)?;
+        Ok(output)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for TransformerBlock
@@ -357,6 +457,66 @@ impl LlamaModel {
             layers,
             norm,
         })
+    }
+
+    /// Forward pass that reports transformer-body activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let ModelInput {
+            inputs,
+            mask,
+            cache,
+        } = input;
+
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
+        observer.observe("model.embed_tokens", &h)?;
+
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => {
+                if h.shape()[1] > 1 {
+                    let m = nn::MultiHeadAttention::create_additive_causal_mask::<f32>(
+                        h.shape()[1],
+                        stream,
+                    )?;
+                    Some(m.as_dtype(h.dtype(), stream)?)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(mask) = mask.as_ref() {
+            observer.observe("model.attention_mask", mask)?;
+        }
+
+        if cache.is_empty() {
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
+        }
+
+        for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+            let layer_input = AttentionInput {
+                x: &h,
+                mask: mask.as_ref(),
+                cache: c.as_mut(),
+            };
+            h = layer.forward_with_observer(
+                layer_input,
+                stream,
+                &format!("model.layers.{i}"),
+                observer,
+            )?;
+        }
+
+        let output = self.norm.forward(&h, stream)?;
+        observer.observe("model.norm", &output)?;
+        Ok(output)
     }
 }
 
@@ -472,6 +632,28 @@ impl Model {
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    /// Forward pass that reports activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward_with_observer(input, stream, observer)?;
+        observer.observe("model.output", &out)?;
+        let logits = project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &out,
+            stream,
+        )?;
+        observer.observe("lm_head.logits", &logits)?;
+        Ok(logits)
     }
 }
 

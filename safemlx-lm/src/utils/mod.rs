@@ -127,7 +127,8 @@ pub(crate) fn quantized_scaled_dot_product_attention(
 
         if mask.dtype() == Dtype::Bool {
             let finfo_min = scores.dtype().finfo_min()?;
-            scores = safemlx::ops::r#where(mask, scores, Array::from_f64(finfo_min), stream)?;
+            scores =
+                safemlx::ops::r#where(mask, scores, Array::from_f32(finfo_min as f32), stream)?;
         } else {
             scores = scores.add(mask, stream)?;
         }

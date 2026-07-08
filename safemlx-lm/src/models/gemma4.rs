@@ -534,8 +534,8 @@ pub struct Attention {
     pub q_proj: MaybeQuantized<nn::Linear>,
     #[quantizable]
     #[param]
-    /// Key projection.
-    pub k_proj: MaybeQuantized<nn::Linear>,
+    /// Optional key projection. Shared-KV layers reuse keys from earlier layers.
+    pub k_proj: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
     #[param]
     /// Optional value projection.
@@ -548,8 +548,8 @@ pub struct Attention {
     /// Query normalization.
     pub q_norm: nn::RmsNorm,
     #[param]
-    /// Key normalization.
-    pub k_norm: nn::RmsNorm,
+    /// Optional key normalization. Shared-KV layers reuse normalized keys from earlier layers.
+    pub k_norm: Option<nn::RmsNorm>,
     #[param]
     /// Rotary position embedding module.
     pub rope: RopeVariant,
@@ -590,15 +590,19 @@ impl Attention {
             args.quantization_bits,
             stream,
         )?;
-        let k_proj = maybe_quantized_linear(
-            args.quantized,
-            dim,
-            n_kv_heads * head_dim,
-            args.quantization_group_size,
-            args.quantization_bits,
-            stream,
-        )?;
-        let v_proj = if attention_k_eq_v {
+        let k_proj = if is_kv_shared_layer {
+            None
+        } else {
+            Some(maybe_quantized_linear(
+                args.quantized,
+                dim,
+                n_kv_heads * head_dim,
+                args.quantization_group_size,
+                args.quantization_bits,
+                stream,
+            )?)
+        };
+        let v_proj = if is_kv_shared_layer || attention_k_eq_v {
             None
         } else {
             Some(maybe_quantized_linear(
@@ -620,7 +624,16 @@ impl Attention {
         )?;
 
         let q_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
-        let k_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let k_norm = if is_kv_shared_layer {
+            None
+        } else {
+            Some(nn::RmsNorm::unloaded(
+                head_dim,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?)
+        };
 
         let rope_dims = partial_rotary_dims(head_dim, &args.rope_scaling);
         let rope = initialize_rope(
@@ -724,7 +737,11 @@ where
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared Gemma 4 KV states"))?
         } else {
-            let keys = self.k_proj.forward(x, stream)?;
+            let keys = self
+                .k_proj
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma 4 key projection"))?
+                .forward(x, stream)?;
             let values = if self.attention_k_eq_v {
                 keys.clone()
             } else {
@@ -733,10 +750,14 @@ where
                     .ok_or_else(|| Exception::custom("missing Gemma 4 value projection"))?
                     .forward(x, stream)?
             };
-            let mut keys = self.k_norm.forward(
-                &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
-                stream,
-            )?;
+            let mut keys = self
+                .k_norm
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma 4 key normalization"))?
+                .forward(
+                    &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
+                    stream,
+                )?;
             let mut values = rms_norm_without_scale(
                 &values.reshape(&[B, L, self.n_kv_heads, -1], stream)?,
                 1e-6,
@@ -803,13 +824,17 @@ where
 
     fn training_mode(&mut self, mode: bool) {
         self.q_proj.training_mode(mode);
-        self.k_proj.training_mode(mode);
+        if let Some(k_proj) = &mut self.k_proj {
+            k_proj.training_mode(mode);
+        }
         if let Some(v_proj) = &mut self.v_proj {
             v_proj.training_mode(mode);
         }
         self.o_proj.training_mode(mode);
         self.q_norm.training_mode(mode);
-        self.k_norm.training_mode(mode);
+        if let Some(k_norm) = &mut self.k_norm {
+            k_norm.training_mode(mode);
+        }
         <RopeVariant as Module<nn::RopeInput>>::training_mode(&mut self.rope, mode);
     }
 }
@@ -1414,13 +1439,14 @@ impl Gemma4TextModel {
             None
         };
         let per_layer_model_projection = if args.hidden_size_per_layer_input > 0 {
-            Some(MaybeQuantized::Original(nn::Linear::unloaded(
+            Some(maybe_quantized_linear(
+                args.quantized,
                 args.hidden_size,
                 args.num_hidden_layers * args.hidden_size_per_layer_input,
-                false,
-                Dtype::Float32,
+                args.quantization_group_size,
+                args.quantization_bits,
                 stream,
-            )?))
+            )?)
         } else {
             None
         };

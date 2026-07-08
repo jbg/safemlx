@@ -10,7 +10,7 @@ use safemlx::{
     module::{Module, Param},
     nn,
     ops::{
-        argpartition_axis, gather_grouped_rows, gather_route_values, grouped_matmul,
+        argpartition_axis, broadcast_to, gather_grouped_rows, gather_route_values, grouped_matmul,
         indexing::{take_along_axis, topk_axis, NewAxis, TryIndexOp},
         matmul, maximum, r#where, segment_sum_by_index, sigmoid, softmax_axis, sum_axis,
         topk_route_plan, GroupedRoutePlan,
@@ -22,6 +22,7 @@ use safemlx::{
 
 use crate::{
     cache::KeyValueCache,
+    inspection::ActivationObserver,
     sampler::{DefaultSampler, Sampler},
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
@@ -99,6 +100,31 @@ impl SwiGluMlp {
                 stream,
             )?),
         })
+    }
+
+    /// Forward pass that reports intermediate activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let gate = self.gate_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
+
+        let up = self.up_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.up_proj"), &up)?;
+
+        let activated_gate = silu(gate, stream)?;
+        observer.observe(&format!("{prefix}.gate_activation"), &activated_gate)?;
+
+        let down_proj_input = activated_gate.multiply(up, stream)?;
+        observer.observe(&format!("{prefix}.down_proj_input"), &down_proj_input)?;
+
+        let output = self.down_proj.forward(&down_proj_input, stream)?;
+        observer.observe(&format!("{prefix}.down_proj"), &output)?;
+        Ok(output)
     }
 }
 
@@ -295,6 +321,56 @@ impl TopKRouter {
         if self.routed_scaling_factor != 1.0 {
             top_k_weights =
                 top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+        }
+        Ok((top_k_index, top_k_weights))
+    }
+
+    /// Returns selected expert ids and weights while reporting router internals.
+    pub fn forward_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<(Array, Array), Exception> {
+        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
+        observer.observe(&format!("{prefix}.router_logits"), &logits)?;
+        let scores = match self.score_function {
+            TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
+            TopKRouterScoreFunction::Sigmoid => sigmoid(logits, stream)?,
+        };
+        observer.observe(&format!("{prefix}.router_scores"), &scores)?;
+
+        let mut scores_for_choice = scores.clone();
+        if let Some(bias) = self.e_score_correction_bias.as_ref() {
+            scores_for_choice = scores_for_choice.add(bias, stream)?;
+            observer.observe(
+                &format!("{prefix}.router_scores_for_choice"),
+                &scores_for_choice,
+            )?;
+        }
+
+        let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
+        observer.observe(&format!("{prefix}.top_k_experts"), &top_k_index)?;
+        let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        observer.observe(&format!("{prefix}.top_k_scores"), &top_k_weights)?;
+        if self.norm_topk_prob {
+            let mut denominator = sum_axis(&top_k_weights, -1, true, stream)?;
+            if self.normalization_epsilon != 0.0 {
+                denominator =
+                    denominator.add(Array::from_f32(self.normalization_epsilon), stream)?;
+            }
+            top_k_weights = top_k_weights.divide(denominator, stream)?;
+            observer.observe(
+                &format!("{prefix}.top_k_weights_normalized"),
+                &top_k_weights,
+            )?;
+        }
+        if self.routed_scaling_factor != 1.0 {
+            top_k_weights =
+                top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+            observer.observe(&format!("{prefix}.top_k_weights_scaled"), &top_k_weights)?;
         }
         Ok((top_k_index, top_k_weights))
     }
@@ -527,6 +603,53 @@ pub fn reshape_attention_projection(
     projection
         .reshape(&[batch, seq_len, heads, -1], stream)?
         .transpose_axes(&[0, 2, 1, 3], stream)
+}
+
+/// Computes explicit attention probabilities for inspection views.
+pub fn attention_probabilities(
+    queries: &Array,
+    keys: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let queries_shape = queries.shape();
+    let keys_shape = keys.shape();
+    let batch = queries_shape[0];
+    let query_heads = queries_shape[1];
+    let key_heads = keys_shape[1];
+    let key_len = keys_shape[2];
+    let head_dim = keys_shape[3];
+    let keys = if query_heads == key_heads {
+        keys.clone()
+    } else if query_heads % key_heads == 0 {
+        let repeats = query_heads / key_heads;
+        broadcast_to(
+            &keys.reshape(&[batch, key_heads, 1, key_len, head_dim], stream)?,
+            &[batch, key_heads, repeats, key_len, head_dim],
+            stream,
+        )?
+        .reshape(&[batch, query_heads, key_len, head_dim], stream)?
+    } else {
+        return Err(Exception::custom(
+            "query attention heads are not divisible by key/value heads",
+        ));
+    };
+
+    let mut scores = matmul(
+        &queries.multiply(Array::from_f32(scale), stream)?,
+        &keys.swap_axes(-1, -2, stream)?,
+        stream,
+    )?;
+    if let Some(mask) = mask {
+        if mask.dtype() == Dtype::Bool {
+            let finfo_min = scores.dtype().finfo_min()?;
+            scores = r#where(mask, scores, Array::from_f32(finfo_min as f32), stream)?;
+        } else {
+            scores = scores.add(mask, stream)?;
+        }
+    }
+    softmax_axis(&scores, -1, true, stream)
 }
 
 /// Applies RoPE to queries and keys, then updates a cache when provided.
@@ -779,8 +902,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::sample;
-    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+    use super::{attention_probabilities, sample};
+    use safemlx::{Array, Device, DeviceType, Dtype, ExecutionContext};
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
@@ -793,5 +916,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("random operations require an explicit PRNG key"));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn bool_attention_mask_keeps_attention_probabilities_float32() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let queries = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]);
+        let keys = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]);
+        let mask = Array::from_slice(&[false, true, false, false], &[1, 1, 2, 2]);
+
+        let probs = attention_probabilities(&queries, &keys, 1.0, Some(&mask), stream).unwrap();
+
+        assert_eq!(probs.dtype(), Dtype::Float32);
     }
 }
