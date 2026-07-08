@@ -94,6 +94,16 @@ impl GenerationSampler {
         Self::default()
     }
 
+    /// Creates a sampler with an initial accepted-token history.
+    ///
+    /// The history is used by repetition, frequency, and presence penalties.
+    /// This is useful when resuming generation or when tokens were accepted by
+    /// a caller outside of [`Sampler::sample`].
+    pub fn with_generated_tokens(mut self, token_ids: impl IntoIterator<Item = u32>) -> Self {
+        self.generated_tokens = token_ids.into_iter().collect();
+        self
+    }
+
     /// Sets top-k filtering.
     pub fn top_k(mut self, top_k: i32) -> Self {
         self.top_k = top_k;
@@ -130,6 +140,25 @@ impl GenerationSampler {
     /// Returns generated token ids already accepted by this sampler.
     pub fn generated_tokens(&self) -> &[u32] {
         &self.generated_tokens
+    }
+
+    /// Replaces the accepted-token history used by repetition penalties.
+    pub fn set_generated_tokens(&mut self, token_ids: impl IntoIterator<Item = u32>) {
+        self.generated_tokens = token_ids.into_iter().collect();
+    }
+
+    /// Records a token accepted by the caller.
+    ///
+    /// [`Sampler::sample`] records sampled tokens automatically. Call this only
+    /// for tokens chosen outside the sampler, for example a constrained token
+    /// or an externally selected branch token.
+    pub fn accept_token(&mut self, token_id: u32) {
+        self.generated_tokens.push(token_id);
+    }
+
+    /// Clears accepted-token history.
+    pub fn clear_generated_tokens(&mut self) {
+        self.generated_tokens.clear();
     }
 
     fn apply_penalties(&self, logits: &Array, stream: &Stream) -> Result<Array, Exception> {
@@ -292,4 +321,24 @@ impl Sampler for GenerationSampler {
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
     let min_value = Array::from_f32(logits.dtype().finfo_min()? as f32);
     safemlx::ops::r#where(mask, min_value, logits, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerationSampler;
+
+    #[test]
+    fn generation_sampler_accepts_external_token_history() {
+        let mut sampler = GenerationSampler::new().with_generated_tokens([1, 2]);
+        assert_eq!(sampler.generated_tokens(), &[1, 2]);
+
+        sampler.accept_token(3);
+        assert_eq!(sampler.generated_tokens(), &[1, 2, 3]);
+
+        sampler.set_generated_tokens([5, 8]);
+        assert_eq!(sampler.generated_tokens(), &[5, 8]);
+
+        sampler.clear_generated_tokens();
+        assert!(sampler.generated_tokens().is_empty());
+    }
 }
