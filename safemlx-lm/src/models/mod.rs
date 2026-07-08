@@ -241,9 +241,9 @@ impl Model {
 
     /// Runs a detailed instrumented forward pass for supported model families.
     ///
-    /// Llama and Qwen3 currently report detailed layer activations. Other
-    /// families return an error until their family-specific inspection paths
-    /// are wired.
+    /// Llama, Qwen3, Qwen3.5 MoE, and Gemma4 currently report detailed layer
+    /// activations. Other families return an error until their family-specific
+    /// inspection paths are wired.
     pub fn forward_with_observer(
         &mut self,
         input_tokens: &Array,
@@ -280,9 +280,15 @@ impl Model {
                 stream,
                 observer,
             ),
-            (Self::Gemma4(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for gemma4 yet",
-            )),
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
+                gemma4::ModelInput {
+                    inputs: input_tokens,
+                    mask,
+                    cache,
+                },
+                stream,
+                observer,
+            ),
             (Self::NemotronH(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
             )),

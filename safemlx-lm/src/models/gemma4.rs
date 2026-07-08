@@ -28,7 +28,11 @@ pub use super::common::sample;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    models::common::{self, batch_seq, finish_attention, reshape_attention_projection, CausalLm},
+    inspection::ActivationObserver,
+    models::common::{
+        self, attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
+        CausalLm,
+    },
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -839,6 +843,160 @@ where
     }
 }
 
+impl Attention {
+    /// Forward pass that reports attention activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput {
+            x,
+            mask,
+            mut cache,
+            position_offset,
+            mut shared_kv,
+            generated_sliding_window,
+            ..
+        } = input;
+
+        let (batch, seq_len) = batch_seq(x);
+
+        let queries = self.q_proj.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.q_proj"), &queries)?;
+        let mut queries = self.q_norm.forward(
+            &reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?,
+            stream,
+        )?;
+        observer.observe(&format!("{prefix}.q_norm"), &queries)?;
+        queries = self.rope.forward(
+            nn::RopeInputBuilder::new(&queries)
+                .offset(position_offset)
+                .build()?,
+            stream,
+        )?;
+        observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
+
+        let (keys, values) = if self.is_kv_shared_layer {
+            let (keys, values) = shared_kv
+                .as_ref()
+                .and_then(|shared_kv| shared_kv.get(&self.layer_type))
+                .cloned()
+                .ok_or_else(|| Exception::custom("missing shared Gemma 4 KV states"))?;
+            observer.observe(&format!("{prefix}.keys_shared"), &keys)?;
+            observer.observe(&format!("{prefix}.values_shared"), &values)?;
+            (keys, values)
+        } else {
+            let keys = self
+                .k_proj
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma 4 key projection"))?
+                .forward(x, stream)?;
+            observer.observe(&format!("{prefix}.k_proj"), &keys)?;
+            let values = if self.attention_k_eq_v {
+                keys.clone()
+            } else {
+                let values = self
+                    .v_proj
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("missing Gemma 4 value projection"))?
+                    .forward(x, stream)?;
+                observer.observe(&format!("{prefix}.v_proj"), &values)?;
+                values
+            };
+            let mut keys = self
+                .k_norm
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma 4 key normalization"))?
+                .forward(
+                    &reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?,
+                    stream,
+                )?;
+            observer.observe(&format!("{prefix}.k_norm"), &keys)?;
+            let mut values = rms_norm_without_scale(
+                &values.reshape(&[batch, seq_len, self.n_kv_heads, -1], stream)?,
+                1e-6,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+            observer.observe(&format!("{prefix}.values"), &values)?;
+            keys = self.rope.forward(
+                nn::RopeInputBuilder::new(&keys)
+                    .offset(position_offset)
+                    .build()?,
+                stream,
+            )?;
+            observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
+            if let Some(cache) = cache.as_mut() {
+                (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+            }
+            observer.observe(&format!("{prefix}.keys_cache"), &keys)?;
+            observer.observe(&format!("{prefix}.values_cache"), &values)?;
+            if self.store_full_length_kv {
+                if let Some(shared_kv) = shared_kv.as_mut() {
+                    shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
+                    observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
+                    observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
+                }
+            }
+            (keys, values)
+        };
+
+        let attention_probs = attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
+        observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
+
+        let attention_cache = if self.is_kv_shared_layer || shared_kv.is_some() {
+            None
+        } else {
+            cache
+        };
+        let output = if attention_cache.is_none()
+            && mask.is_some()
+            && seq_len > 1
+            && self.layer_type == LayerType::SlidingAttention
+            && generated_sliding_window.is_some()
+            && keys.shape()[2] == position_offset + seq_len
+            && (position_offset + seq_len
+                <= generated_sliding_window.expect("checked generated sliding window") + 1
+                || seq_len >= 1024)
+        {
+            sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                generated_sliding_window.expect("checked generated sliding window"),
+                position_offset,
+                batch,
+                seq_len,
+                stream,
+            )?
+        } else {
+            finish_attention(
+                queries,
+                keys,
+                values,
+                attention_cache,
+                self.scale,
+                mask,
+                batch,
+                seq_len,
+                stream,
+            )?
+        };
+        observer.observe(&format!("{prefix}.attention"), &output)?;
+
+        let output = self.o_proj.forward(&output, stream)?;
+        observer.observe(&format!("{prefix}.o_proj"), &output)?;
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Gemma 4 feed-forward layer.
 pub struct Mlp {
@@ -976,6 +1134,33 @@ impl Module<&Array> for Mlp {
         self.gate_proj.training_mode(mode);
         self.down_proj.training_mode(mode);
         self.up_proj.training_mode(mode);
+    }
+}
+
+impl Mlp {
+    /// Forward pass that reports MLP activations to an observer.
+    pub fn forward_with_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let gate = self.gate_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
+
+        let up = self.up_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.up_proj"), &up)?;
+
+        let activated_gate = nn::gelu_approximate(gate, stream)?;
+        observer.observe(&format!("{prefix}.gate_activation"), &activated_gate)?;
+
+        let down_proj_input = activated_gate.multiply(up, stream)?;
+        observer.observe(&format!("{prefix}.down_proj_input"), &down_proj_input)?;
+
+        let output = self.down_proj.forward(&down_proj_input, stream)?;
+        observer.observe(&format!("{prefix}.down_proj"), &output)?;
+        Ok(output)
     }
 }
 
@@ -1284,6 +1469,122 @@ impl TransformerBlock {
     fn apply_layer_scalar(&self, x: Array, stream: &Stream) -> Result<Array, Exception> {
         x.multiply(&*self.layer_scalar, stream)
     }
+
+    /// Forward pass that reports block activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput {
+            x,
+            mask,
+            cache,
+            position_offset,
+            per_layer_input,
+            shared_kv,
+            disable_generated_mask,
+            generated_sliding_window: _,
+        } = input;
+        let generated_mask = if disable_generated_mask {
+            None
+        } else if self.layer_type == LayerType::SlidingAttention {
+            if x.shape()[1] > 1 || self.sliding_window.is_some() {
+                Some(create_causal_mask(
+                    x.shape()[1],
+                    Some(position_offset),
+                    self.sliding_window,
+                    None,
+                    stream,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let generated_sliding_window = generated_mask.as_ref().and(self.sliding_window);
+        if let Some(mask) = generated_mask.as_ref().or(mask) {
+            observer.observe(&format!("{prefix}.attention_mask"), mask)?;
+        }
+
+        observer.observe(&format!("{prefix}.input"), x)?;
+        observer.observe(&format!("{prefix}.residual_before_attention"), x)?;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        observer.observe(&format!("{prefix}.input_layernorm"), &normed)?;
+
+        let self_attn_input = AttentionInput {
+            x: &normed,
+            mask: generated_mask.as_ref().or(mask),
+            cache,
+            position_offset,
+            per_layer_input: None,
+            shared_kv,
+            disable_generated_mask,
+            generated_sliding_window,
+        };
+        let r = self.self_attn.forward_with_observer(
+            self_attn_input,
+            stream,
+            &format!("{prefix}.self_attn"),
+            observer,
+        )?;
+        profile_array(PerfComponent::Attention, &r)?;
+        observer.observe(&format!("{prefix}.self_attn_output"), &r)?;
+        let r = self.post_attention_layernorm.forward(&r, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_layernorm"), &r)?;
+        observer.observe(&format!("{prefix}.residual_delta_attention"), &r)?;
+        let h = x.add(r, stream)?;
+        observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
+        observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
+
+        observer.observe(&format!("{prefix}.residual_before_mlp"), &h)?;
+        let pre_ff = self.pre_feedforward_layernorm.forward(&h, stream)?;
+        observer.observe(&format!("{prefix}.pre_feedforward_layernorm"), &pre_ff)?;
+        let r =
+            self.mlp
+                .forward_with_observer(&pre_ff, stream, &format!("{prefix}.mlp"), observer)?;
+        profile_array(PerfComponent::Mlp, &r)?;
+        observer.observe(&format!("{prefix}.mlp_output"), &r)?;
+        let r = self.post_feedforward_layernorm.forward(&r, stream)?;
+        observer.observe(&format!("{prefix}.post_feedforward_layernorm"), &r)?;
+        observer.observe(&format!("{prefix}.residual_delta_mlp"), &r)?;
+        let mut h = h.add(r, stream)?;
+        observer.observe(&format!("{prefix}.post_mlp_residual"), &h)?;
+        observer.observe(&format!("{prefix}.residual_after_mlp"), &h)?;
+
+        if let (Some(per_layer_input), Some(gate), Some(projection), Some(norm)) = (
+            per_layer_input,
+            self.per_layer_input_gate.as_mut(),
+            self.per_layer_projection.as_mut(),
+            self.post_per_layer_input_norm.as_mut(),
+        ) {
+            observer.observe(&format!("{prefix}.per_layer_input"), per_layer_input)?;
+            let residual = h.clone();
+            let gate_projection = gate.forward(&h, stream)?;
+            observer.observe(&format!("{prefix}.per_layer_input_gate"), &gate_projection)?;
+            let r =
+                nn::gelu_approximate(gate_projection, stream)?.multiply(per_layer_input, stream)?;
+            observer.observe(&format!("{prefix}.per_layer_projection_input"), &r)?;
+            let r = projection.forward(&r, stream)?;
+            observer.observe(&format!("{prefix}.per_layer_projection"), &r)?;
+            let r = norm.forward(&r, stream)?;
+            observer.observe(&format!("{prefix}.post_per_layer_input_norm"), &r)?;
+            profile_array(PerfComponent::PerLayerResidual, &r)?;
+            observer.observe(&format!("{prefix}.residual_delta_per_layer_input"), &r)?;
+            h = residual.add(r, stream)?;
+            observer.observe(&format!("{prefix}.residual_after_per_layer_input"), &h)?;
+        }
+
+        let output = self.apply_layer_scalar(h, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        Ok(output)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for TransformerBlock
@@ -1536,6 +1837,61 @@ impl Gemma4TextModel {
                 .multiply(Array::from_f32(2.0_f32.powf(-0.5)), stream)?,
         ))
     }
+
+    fn per_layer_inputs_with_observer(
+        &mut self,
+        input_ids: &Array,
+        inputs_embeds: &Array,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Option<Array>, Exception> {
+        let Some(embed_tokens_per_layer) = self.embed_tokens_per_layer.as_mut() else {
+            return Ok(None);
+        };
+        let Some(per_layer_model_projection) = self.per_layer_model_projection.as_mut() else {
+            return Ok(None);
+        };
+        let Some(per_layer_projection_norm) = self.per_layer_projection_norm.as_mut() else {
+            return Ok(None);
+        };
+        let ple_dim = self.hidden_size_per_layer_input;
+        let token_identity = embed_tokens_per_layer
+            .forward(input_ids, stream)?
+            .multiply(Array::from_f32((ple_dim as f32).sqrt()), stream)?
+            .reshape(
+                &[
+                    input_ids.shape()[0],
+                    input_ids.shape()[1],
+                    self.num_hidden_layers,
+                    ple_dim,
+                ],
+                stream,
+            )?;
+        observer.observe("model.per_layer_token_identity", &token_identity)?;
+        let projected = per_layer_model_projection
+            .forward(inputs_embeds, stream)?
+            .multiply(
+                Array::from_f32((self.hidden_size as f32).sqrt().recip()),
+                stream,
+            )?
+            .reshape(
+                &[
+                    inputs_embeds.shape()[0],
+                    inputs_embeds.shape()[1],
+                    self.num_hidden_layers,
+                    ple_dim,
+                ],
+                stream,
+            )?;
+        observer.observe("model.per_layer_model_projection", &projected)?;
+        let projected = per_layer_projection_norm.forward(&projected, stream)?;
+        observer.observe("model.per_layer_projection_norm", &projected)?;
+        let output = projected
+            .add(token_identity, stream)?
+            .multiply(Array::from_f32(2.0_f32.powf(-0.5)), stream)?;
+        observer.observe("model.per_layer_inputs", &output)?;
+        Ok(Some(output))
+    }
 }
 
 /// Input for a Gemma 4 text forward pass.
@@ -1619,6 +1975,86 @@ impl Gemma4TextModel {
             pre_norm_hidden,
             shared_kv_states: shared_kv,
         })
+    }
+
+    /// Forward pass that reports transformer-body activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let ModelInput {
+            inputs,
+            mask,
+            cache,
+        } = input;
+        let mut h = self
+            .embed_tokens
+            .forward(inputs, stream)?
+            .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?;
+        profile_array(PerfComponent::Embed, &h)?;
+        observer.observe("model.embed_tokens", &h)?;
+
+        let per_layer_inputs = self.per_layer_inputs_with_observer(inputs, &h, stream, observer)?;
+        if let Some(per_layer_inputs) = &per_layer_inputs {
+            profile_array(PerfComponent::PerLayerInputs, per_layer_inputs)?;
+        }
+        let position_offset = cache
+            .iter()
+            .flatten()
+            .map(KeyValueCache::offset)
+            .max()
+            .unwrap_or(0);
+        let mut shared_kv = HashMap::new();
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None if h.shape()[1] > 1 => Some(create_causal_mask(
+                h.shape()[1],
+                Some(position_offset),
+                None,
+                None,
+                stream,
+            )?),
+            None => None,
+        };
+        if let Some(mask) = mask.as_ref() {
+            observer.observe("model.attention_mask", mask)?;
+        }
+
+        if cache.is_empty() {
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
+        }
+        for (index, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+            let layer_ple = per_layer_inputs
+                .as_ref()
+                .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
+                .transpose()?;
+            let layer_input = AttentionInput {
+                x: &h,
+                mask: mask.as_ref(),
+                cache: c.as_mut(),
+                position_offset,
+                per_layer_input: layer_ple.as_ref(),
+                shared_kv: Some(&mut shared_kv),
+                disable_generated_mask: false,
+                generated_sliding_window: None,
+            };
+            h = layer.forward_with_observer(
+                layer_input,
+                stream,
+                &format!("model.layers.{index}"),
+                observer,
+            )?;
+        }
+        observer.observe("model.pre_norm_hidden", &h)?;
+        let output = self.norm.forward(&h, stream)?;
+        profile_array(PerfComponent::FinalNorm, &output)?;
+        observer.observe("model.norm", &output)?;
+        Ok(output)
     }
 }
 
@@ -1741,6 +2177,26 @@ impl Model {
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    /// Forward pass that reports activations to an observer.
+    pub fn forward_with_observer<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self
+            .model
+            .language_model
+            .forward_with_observer(input, stream, observer)?;
+        observer.observe("model.output", &out)?;
+        let logits = self.project_logits(&out, stream)?;
+        observer.observe("lm_head.logits", &logits)?;
+        Ok(logits)
     }
 }
 
