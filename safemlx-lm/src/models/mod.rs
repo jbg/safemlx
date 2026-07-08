@@ -298,6 +298,96 @@ impl Model {
         }
     }
 
+    /// Computes initial prompt logits while reporting detailed activations.
+    ///
+    /// This mirrors each model family's prefill semantics and returns logits for
+    /// the final prompt token with shape `[batch, vocab]`. Gemma4 uses a split
+    /// prefill internally, so callers that want faithful instrumented generation
+    /// should use this instead of calling [`Model::forward_with_observer`]
+    /// directly on the whole prompt.
+    pub fn prefill_logits_with_observer(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+                let prompt_len = prompt_tokens.shape()[1];
+                if prompt_len <= 0 {
+                    return Err(Exception::custom("prompt must contain at least one token"));
+                }
+                if prompt_len > 1 {
+                    let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
+                    model.forward_with_observer(
+                        gemma4::ModelInput {
+                            inputs: &prefix,
+                            mask: None,
+                            cache,
+                        },
+                        stream,
+                        observer,
+                    )?;
+                }
+                let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
+                let logits = model.forward_with_observer(
+                    gemma4::ModelInput {
+                        inputs: &last,
+                        mask: None,
+                        cache,
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                let logits = model.forward_with_observer(
+                    llama::ModelInput {
+                        inputs: prompt_tokens,
+                        mask: None,
+                        cache,
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                let logits = model.forward_with_observer(
+                    qwen3::ModelInput {
+                        inputs: prompt_tokens,
+                        mask: None,
+                        cache,
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
+            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                let logits = model.forward_with_observer(
+                    qwen3_5_moe::ModelInput {
+                        inputs: prompt_tokens,
+                        mask: None,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    observer,
+                )?;
+                let logits = final_token_logits(&logits, stream)?;
+                model.adjust_prefill_logits(logits, cache, stream)
+            }
+            (Self::NemotronH(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for nemotron_h yet",
+            )),
+            _ => Err(Exception::custom(
+                "model cache type does not match model kind",
+            )),
+        }
+    }
+
     /// Creates a token iterator for models that use a plain key/value cache.
     ///
     /// Qwen3.5 MoE uses a heterogeneous cache and must be driven with
@@ -868,6 +958,21 @@ impl LoadedModel {
             .prefill_logits_with_cache(prompt_tokens, cache, stream)
     }
 
+    /// Computes initial prompt logits while reporting detailed activations.
+    ///
+    /// The returned logits have shape `[batch, vocab]` and match
+    /// [`LoadedModel::prefill_logits_with_cache`] for the same model/cache.
+    pub fn prefill_logits_with_observer(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        self.model
+            .prefill_logits_with_observer(prompt_tokens, cache, stream, observer)
+    }
+
     /// Computes logits for decode tokens using a cache returned by [`LoadedModel::new_cache`].
     pub fn decode_logits_with_cache(
         &mut self,
@@ -918,6 +1023,17 @@ impl LoadedModel {
     /// Returns a mutable reference to the underlying architecture-specific model.
     pub fn model_mut(&mut self) -> &mut Model {
         &mut self.model
+    }
+}
+
+fn final_token_logits(logits: &Array, stream: &Stream) -> Result<Array, Exception> {
+    match logits.ndim() {
+        2 => Ok(logits.clone()),
+        3 => logits.try_index_device((.., -1, ..), stream),
+        ndim => Err(Exception::custom(format!(
+            "expected 2D or 3D logits, got {ndim}D with shape {:?}",
+            logits.shape()
+        ))),
     }
 }
 

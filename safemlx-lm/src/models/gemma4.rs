@@ -2441,9 +2441,11 @@ pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use safemlx::{module::ModuleParameters, Device, DeviceType, Stream};
 
-    use super::{Attention, LayerType, ModelArgs};
+    use super::{partial_rotary_dims, Attention, FloatOrString, LayerType, ModelArgs};
 
     fn test_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -2494,6 +2496,27 @@ mod tests {
             .collect::<Vec<_>>();
         keys.sort();
         keys
+    }
+
+    #[test]
+    fn proportional_rope_keeps_full_head_dimensions() {
+        let scaling = Some(HashMap::from([
+            (
+                "rope_type".to_string(),
+                FloatOrString::String("proportional".to_string()),
+            ),
+            (
+                "partial_rotary_factor".to_string(),
+                FloatOrString::Float(0.25),
+            ),
+        ]));
+
+        assert_eq!(partial_rotary_dims(512, &scaling), 512);
+    }
+
+    #[test]
+    fn rotary_dims_default_to_full_head() {
+        assert_eq!(partial_rotary_dims(256, &None), 256);
     }
 
     #[test]

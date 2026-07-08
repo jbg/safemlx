@@ -8,7 +8,7 @@ use safemlx::{
     error::Exception,
     module::Module,
     nn,
-    ops::{arange, concatenate_axis, which, zeros},
+    ops::{arange, which},
     Array, Stream,
 };
 use serde::Deserialize;
@@ -188,20 +188,35 @@ where
 
 /// Proportional RoPE used by Gemma 4 full-attention layers.
 ///
-/// Unlike partial RoPE, proportional RoPE keeps `dimensions == head_dim` and fills
-/// non-rotary dimensions with zero frequencies. Passing zero frequencies to MLX's
-/// RoPE implementation leaves those dimensions unchanged while preserving the
-/// full head shape expected by Gemma 4.
+/// Proportional RoPE computes frequencies over the configured rotary
+/// sub-dimension, then passes only that sub-dimension to MLX RoPE. MLX leaves
+/// the remaining head dimensions unchanged.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct ProportionalRope {
-    /// Head dimension passed to MLX RoPE.
+    /// Rotary dimension passed to MLX RoPE.
     pub dimensions: i32,
     /// Whether to use traditional pair ordering.
     pub traditional: bool,
     /// Runtime scale factor passed to MLX RoPE.
     pub scale: f32,
-    /// Frequency vector with non-rotary dimensions represented by zeros.
+    /// Frequency vector for the rotary sub-dimension.
     pub freqs: Array,
+}
+
+fn proportional_rotary_dims(dims: i32, proportion: f32) -> (i32, i32) {
+    let half_dims = dims / 2;
+    let rotary_dims = ((proportion * dims as f32).round() as i32).clamp(2, dims);
+    let rope_angles = (rotary_dims / 2).clamp(1, half_dims);
+    (rope_angles * 2, rope_angles)
+}
+
+fn proportional_frequency_values(dims: i32, base: f32, factor: f32, proportion: f32) -> Vec<f32> {
+    let (rotary_dims, rope_angles) = proportional_rotary_dims(dims, proportion);
+    let mut freqs = Vec::with_capacity(rope_angles as usize);
+    for index in 0..rope_angles {
+        freqs.push(base.powf(2.0 * index as f32 / rotary_dims as f32) / factor);
+    }
+    freqs
 }
 
 impl ProportionalRope {
@@ -212,31 +227,13 @@ impl ProportionalRope {
         base: f32,
         factor: f32,
         proportion: f32,
-        stream: &Stream,
+        _stream: &Stream,
     ) -> Result<Self, Exception> {
-        let half_dims = dims / 2;
-        let rope_angles = ((proportion * dims as f32) / 2.0).floor() as i32;
-        let rotated_freqs = if rope_angles > 0 {
-            let indices = arange::<_, f32>(None, rope_angles, None, stream)?;
-            let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32), stream)?;
-            Array::from_f32(base)
-                .power(&exponents, stream)?
-                .divide(Array::from_f32(factor), stream)?
-        } else {
-            zeros::<f32>(&[0], stream)?
-        };
-        let nope_angles = half_dims - rope_angles;
-        let freqs = if nope_angles > 0 {
-            concatenate_axis(
-                &[rotated_freqs, zeros::<f32>(&[nope_angles], stream)?],
-                0,
-                stream,
-            )?
-        } else {
-            rotated_freqs
-        };
+        let (rotary_dims, rope_angles) = proportional_rotary_dims(dims, proportion);
+        let freqs = proportional_frequency_values(dims, base, factor, proportion);
+        let freqs = Array::from_slice(&freqs, &[rope_angles]);
         Ok(Self {
-            dimensions: dims,
+            dimensions: rotary_dims,
             traditional,
             scale: 1.0,
             freqs,
@@ -467,4 +464,22 @@ pub fn initialize_rope(
     Err(Exception::custom(format!(
         "Unsupported RoPE type {rope_type:?}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{proportional_frequency_values, proportional_rotary_dims};
+
+    #[test]
+    fn proportional_rope_uses_partial_dimension_for_frequency_ladder() {
+        let (rotary_dims, rope_angles) = proportional_rotary_dims(512, 0.25);
+        let freqs = proportional_frequency_values(512, 1_000_000.0, 1.0, 0.25);
+
+        assert_eq!(rotary_dims, 128);
+        assert_eq!(rope_angles, 64);
+        assert_eq!(freqs.len(), 64);
+        assert_eq!(freqs[0], 1.0);
+        assert!((freqs[1] - 1_000_000.0_f32.powf(2.0 / 128.0)).abs() < 0.0001);
+        assert!(freqs[63] > 0.0);
+    }
 }
