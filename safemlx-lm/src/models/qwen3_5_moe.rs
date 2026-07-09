@@ -26,7 +26,7 @@ pub use super::common::sample;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    inspection::ActivationObserver,
+    inspection::{ActivationObserver, MoeRoutingObservation},
     models::common::{
         self, attention_probabilities, project_logits_dense, silu, CausalLm,
         TopKRouterScoreFunction,
@@ -2427,9 +2427,12 @@ impl SparseMoeBlock {
         observer.observe(&format!("{prefix}.shared_expert_output"), &shared)?;
         profile_array(PerfComponent::MoeShared, &shared)?;
 
-        let (selected_experts, routing_weights) =
+        let routing =
             self.gate
                 .forward_with_observer(&flat, stream, &format!("{prefix}.gate"), observer)?;
+        let selected_experts = routing.indices;
+        let selected_scores = routing.scores;
+        let routing_weights = routing.weights;
         profile_arrays(
             PerfComponent::MoeRouter,
             &[&selected_experts, &routing_weights],
@@ -2446,8 +2449,18 @@ impl SparseMoeBlock {
         observer.observe(&format!("{prefix}.routed_expert_output"), &routed)?;
         profile_array(PerfComponent::MoeRouted, &routed)?;
 
-        let combined = routed.add(shared, stream)?;
+        let combined = routed.add(&shared, stream)?;
         observer.observe(&format!("{prefix}.combined_flat"), &combined)?;
+        observer.observe_moe_routing(MoeRoutingObservation {
+            prefix,
+            selected_experts: &selected_experts,
+            selected_scores: &selected_scores,
+            routing_weights: &routing_weights,
+            routed_output: &routed,
+            shared_output: Some(&shared),
+            combined_output: Some(&combined),
+            num_experts: self.gate.num_experts,
+        })?;
         let output = combined.reshape(&[b, l, h], stream)?;
         observer.observe(&format!("{prefix}.output"), &output)?;
         profile_array(PerfComponent::MoeCombine, &output)?;

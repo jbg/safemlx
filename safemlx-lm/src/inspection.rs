@@ -2,6 +2,30 @@
 
 use safemlx::{error::Exception, Array};
 
+/// Normalized routing data emitted by MoE implementations during observed passes.
+///
+/// The arrays are intentionally limited to routing decisions and compact
+/// contribution tensors so observers can build per-token summaries without
+/// depending on model-family-specific activation names.
+pub struct MoeRoutingObservation<'a> {
+    /// Stable path-like name of the MoE block.
+    pub prefix: &'a str,
+    /// Selected expert ids with shape `[tokens, top_k]`.
+    pub selected_experts: &'a Array,
+    /// Router probabilities or scores for the selected experts.
+    pub selected_scores: &'a Array,
+    /// Final route weights applied to selected expert outputs.
+    pub routing_weights: &'a Array,
+    /// Summed routed expert contribution with shape `[tokens, hidden]`.
+    pub routed_output: &'a Array,
+    /// Shared expert contribution with shape `[tokens, hidden]`, when present.
+    pub shared_output: Option<&'a Array>,
+    /// Combined MoE output with shape `[tokens, hidden]`, when present.
+    pub combined_output: Option<&'a Array>,
+    /// Total number of routed experts.
+    pub num_experts: i32,
+}
+
 /// Receives named tensors from instrumented model forward passes.
 ///
 /// Implementations should be selective about evaluating tensors: activations
@@ -9,6 +33,14 @@ use safemlx::{error::Exception, Array};
 pub trait ActivationObserver {
     /// Observe a named tensor.
     fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception>;
+
+    /// Observe compact, model-normalized MoE routing metadata.
+    fn observe_moe_routing(
+        &mut self,
+        _routing: MoeRoutingObservation<'_>,
+    ) -> Result<(), Exception> {
+        Ok(())
+    }
 }
 
 impl<F> ActivationObserver for F

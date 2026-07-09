@@ -262,6 +262,16 @@ pub struct TopKRouter {
     pub e_score_correction_bias: Param<Option<Array>>,
 }
 
+/// Selected expert ids plus the score and weight arrays produced by a top-k router.
+pub struct TopKRouterOutput {
+    /// Selected expert ids with shape `[tokens, top_k]`.
+    pub indices: Array,
+    /// Router probabilities or scores gathered at the selected ids.
+    pub scores: Array,
+    /// Final routing weights after optional normalization/scaling.
+    pub weights: Array,
+}
+
 impl TopKRouter {
     /// Creates an unloaded router.
     pub fn new(config: TopKRouterConfig, stream: &Stream) -> Result<Self, Exception> {
@@ -332,7 +342,7 @@ impl TopKRouter {
         stream: &Stream,
         prefix: &str,
         observer: &mut impl ActivationObserver,
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
         observer.observe(&format!("{prefix}.router_logits"), &logits)?;
@@ -354,6 +364,7 @@ impl TopKRouter {
         let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
         observer.observe(&format!("{prefix}.top_k_experts"), &top_k_index)?;
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        let top_k_scores = top_k_weights.clone();
         observer.observe(&format!("{prefix}.top_k_scores"), &top_k_weights)?;
         if self.norm_topk_prob {
             let mut denominator = sum_axis(&top_k_weights, -1, true, stream)?;
@@ -372,7 +383,11 @@ impl TopKRouter {
                 top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
             observer.observe(&format!("{prefix}.top_k_weights_scaled"), &top_k_weights)?;
         }
-        Ok((top_k_index, top_k_weights))
+        Ok(TopKRouterOutput {
+            indices: top_k_index,
+            scores: top_k_scores,
+            weights: top_k_weights,
+        })
     }
 
     fn topk_indices(&self, scores_for_choice: &Array, stream: &Stream) -> Result<Array, Exception> {
