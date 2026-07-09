@@ -24,10 +24,13 @@ use crate::{
     cache::KeyValueCache,
     error::Error,
     inspection::ActivationObserver,
-    models::common::{
-        self, apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
-        project_logits_maybe_quantized, reshape_attention_projection, AttentionInput, CausalLm,
-        SwiGluMlp,
+    models::{
+        common::{
+            self, apply_rope_and_update_cache, attention_probabilities, batch_seq,
+            finish_attention, project_logits_maybe_quantized, reshape_attention_projection,
+            AttentionInput, CausalLm, SwiGluMlp,
+        },
+        input,
     },
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
 };
@@ -755,15 +758,16 @@ impl<C> CausalLm<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
 {
-    fn prefill_logits(
+    fn prefill_input_logits(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut Vec<Option<C>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        let prompt_tokens = input::text_token_ids(input, stream)?;
         let logits = self.forward(
             ModelInput {
-                inputs: prompt_tokens,
+                inputs: &prompt_tokens,
                 mask: None,
                 cache,
             },
@@ -936,13 +940,12 @@ mod tests {
         let eot_token_id = 128009u32;
 
         let mut token_ids = Vec::new();
-        let generate = super::Generate::<ConcatKeyValueCache>::new(
-            &mut model,
-            &mut cache,
-            0.0,
+        let input_parts = [crate::models::input::InputPart::text_token_ids(
             &prompt_tokens,
-            None,
-            stream,
+        )];
+        let input = crate::models::input::ModelInput::new(&input_parts);
+        let generate = super::Generate::<ConcatKeyValueCache>::new(
+            &mut model, &mut cache, 0.0, input, None, stream,
         );
         for (token, _ntoks) in generate.zip(0..50) {
             let token = token.unwrap();

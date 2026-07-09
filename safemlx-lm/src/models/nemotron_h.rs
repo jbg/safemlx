@@ -21,9 +21,13 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    models::common::{
-        self, apply_rope_and_update_cache, batch_seq, finish_attention, project_logits_dense,
-        relu2, reshape_attention_projection, CausalLm, PackedRelu2Experts, TopKRouterScoreFunction,
+    models::{
+        common::{
+            self, apply_rope_and_update_cache, batch_seq, finish_attention, project_logits_dense,
+            relu2, reshape_attention_projection, CausalLm, PackedRelu2Experts,
+            TopKRouterScoreFunction,
+        },
+        input,
     },
     utils::{create_attention_mask, rope::initialize_rope, AttentionMask},
     weights::{
@@ -1594,15 +1598,16 @@ impl Module<ModelInput<'_>> for Model {
 }
 
 impl CausalLm<Cache> for Model {
-    fn prefill_logits(
+    fn prefill_input_logits(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        let prompt_tokens = input::text_token_ids(input, stream)?;
         self.forward_logits(
             ModelInput {
-                inputs: prompt_tokens,
+                inputs: &prompt_tokens,
                 mask: None,
                 cache: Some(cache),
             },
@@ -2087,7 +2092,9 @@ mod tests {
         let mut model = Model::new(tiny_full_args(), stream).unwrap();
         let mut cache = model.new_cache();
         let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let logits = CausalLm::prefill_logits(&mut model, &prompt, &mut cache, stream).unwrap();
+        let input_parts = [crate::models::input::InputPart::text_token_ids(&prompt)];
+        let input = crate::models::input::ModelInput::new(&input_parts);
+        let logits = CausalLm::prefill_input_logits(&mut model, input, &mut cache, stream).unwrap();
         assert_eq!(logits.shape(), &[1, 16]);
         assert!(cache.offset() >= 3);
 

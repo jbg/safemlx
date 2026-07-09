@@ -31,6 +31,8 @@ pub mod common;
 pub mod gemma4;
 /// Gemma 4 assistant draft-model support.
 pub mod gemma4_assistant;
+/// Typed runtime input support.
+pub mod input;
 /// Llama decoder-only model support.
 pub mod llama;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
@@ -274,6 +276,7 @@ impl Model {
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => model.forward_with_observer(
                 qwen3_5_moe::ModelInput {
                     inputs: input_tokens,
+                    inputs_embeds: None,
                     mask,
                     cache: Some(cache),
                 },
@@ -305,24 +308,25 @@ impl Model {
     /// prefill internally, so callers that want faithful instrumented generation
     /// should use this instead of calling [`Model::forward_with_observer`]
     /// directly on the whole prompt.
-    pub fn prefill_logits_with_observer(
+    pub fn prefill_input_with_observer(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
+        let prompt_tokens = input::text_token_ids(input, stream)?;
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 let prompt_len = prompt_tokens.shape()[1];
                 if prompt_len <= 0 {
                     return Err(Exception::custom("prompt must contain at least one token"));
                 }
-                cache.token_ids = gemma4::token_ids_from_array(prompt_tokens, stream)?;
+                cache.token_ids = gemma4::token_ids_from_array(&prompt_tokens, stream)?;
                 cache.kv.clear();
                 let logits = model.forward_with_observer(
                     gemma4::ModelInput {
-                        inputs: prompt_tokens,
+                        inputs: &prompt_tokens,
                         mask: None,
                         cache: &mut cache.kv,
                     },
@@ -334,7 +338,7 @@ impl Model {
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
                 let logits = model.forward_with_observer(
                     llama::ModelInput {
-                        inputs: prompt_tokens,
+                        inputs: &prompt_tokens,
                         mask: None,
                         cache,
                     },
@@ -346,7 +350,7 @@ impl Model {
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
                 let logits = model.forward_with_observer(
                     qwen3::ModelInput {
-                        inputs: prompt_tokens,
+                        inputs: &prompt_tokens,
                         mask: None,
                         cache,
                     },
@@ -358,7 +362,8 @@ impl Model {
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 let logits = model.forward_with_observer(
                     qwen3_5_moe::ModelInput {
-                        inputs: prompt_tokens,
+                        inputs: &prompt_tokens,
+                        inputs_embeds: None,
                         mask: None,
                         cache: Some(cache),
                     },
@@ -377,74 +382,6 @@ impl Model {
         }
     }
 
-    /// Creates a token iterator for models that use a plain key/value cache.
-    ///
-    /// Qwen3.5 MoE uses a heterogeneous cache and must be driven with
-    /// [`Model::generate_with_cache`] instead.
-    pub fn generate<'a>(
-        &'a mut self,
-        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
-        temp: f32,
-        prompt_tokens: &'a Array,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-    ) -> Generate<'a> {
-        self.generate_with_sampler(cache, temp, prompt_tokens, prng_key, stream, DefaultSampler)
-    }
-
-    /// Creates a token iterator using a caller-provided sampler.
-    ///
-    /// Qwen3.5 MoE uses a heterogeneous cache and must be driven with
-    /// [`Model::generate_with_cache_sampler`] instead.
-    pub fn generate_with_sampler<'a, S>(
-        &'a mut self,
-        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
-        temp: f32,
-        prompt_tokens: &'a Array,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-        sampler: S,
-    ) -> Generate<'a, S>
-    where
-        S: Sampler,
-    {
-        match self {
-            Self::Gemma4(model) => Generate::Gemma4(common::Generate::with_sampler(
-                model,
-                cache,
-                temp,
-                prompt_tokens,
-                prng_key,
-                stream,
-                sampler,
-            )),
-            Self::Llama(model) => Generate::Llama(llama::Generate::with_sampler(
-                model,
-                cache,
-                temp,
-                prompt_tokens,
-                prng_key,
-                stream,
-                sampler,
-            )),
-            Self::Qwen3(model) => Generate::Qwen3(qwen3::Generate::with_sampler(
-                model,
-                cache,
-                temp,
-                prompt_tokens,
-                prng_key,
-                stream,
-                sampler,
-            )),
-            Self::Qwen35Moe(_) => {
-                panic!("qwen3_5_moe requires ModelCache; use generate_with_cache_sampler")
-            }
-            Self::NemotronH(_) => {
-                panic!("nemotron_h requires ModelCache; use generate_with_cache_sampler")
-            }
-        }
-    }
-
     /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
@@ -455,28 +392,28 @@ impl Model {
         }
     }
 
-    /// Computes logits for an initial prompt using a cache returned by [`Model::new_cache`].
-    pub fn prefill_logits_with_cache(
+    /// Computes logits for an initial typed input using a cache returned by [`Model::new_cache`].
+    pub fn prefill_input_with_cache(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                model.prefill_logits(prompt_tokens, cache, stream)
+                model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_logits(prompt_tokens, cache, stream)
+                model.prefill_input_logits(input, cache, stream)
             }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                model.prefill_logits(prompt_tokens, cache, stream)
+                model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_logits(prompt_tokens, cache, stream)
+                model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                model.prefill_logits(prompt_tokens, cache, stream)
+                model.prefill_input_logits(input, cache, stream)
             }
             _ => Err(Exception::custom(
                 "model cache type does not match model kind",
@@ -484,60 +421,24 @@ impl Model {
         }
     }
 
-    /// Computes logits for decode tokens using a cache returned by [`Model::new_cache`].
-    pub fn decode_logits_with_cache(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut ModelCache,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                model.decode_logits(input_tokens, cache, stream)
-            }
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                model.decode_logits(input_tokens, cache, stream)
-            }
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                model.decode_logits(input_tokens, cache, stream)
-            }
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
-                model.decode_logits(input_tokens, cache, stream)
-            }
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                model.decode_logits(input_tokens, cache, stream)
-            }
-            _ => Err(Exception::custom(
-                "model cache type does not match model kind",
-            )),
-        }
-    }
-
-    /// Creates a token iterator using a cache returned by [`Model::new_cache`].
-    pub fn generate_with_cache<'a>(
+    /// Creates a token iterator from typed input using a cache returned by [`Model::new_cache`].
+    pub fn generate_input_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> ModelGenerate<'a> {
-        self.generate_with_cache_sampler(
-            cache,
-            temp,
-            prompt_tokens,
-            prng_key,
-            stream,
-            DefaultSampler,
-        )
+        self.generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, DefaultSampler)
     }
 
-    /// Creates a token iterator using a cache returned by [`Model::new_cache`] and a caller-provided sampler.
-    pub fn generate_with_cache_sampler<'a, S>(
+    /// Creates a token iterator from typed input with a caller-provided sampler.
+    pub fn generate_input_with_cache_sampler<'a, S>(
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
         sampler: S,
@@ -548,88 +449,26 @@ impl Model {
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 ModelGenerate::Gemma4(gemma4::Generate::with_sampler(
-                    model,
-                    cache,
-                    temp,
-                    prompt_tokens,
-                    prng_key,
-                    stream,
-                    sampler,
+                    model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Llama(llama::Generate::with_sampler(
-                    model,
-                    cache,
-                    temp,
-                    prompt_tokens,
-                    prng_key,
-                    stream,
-                    sampler,
-                ))
-            }
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Qwen3(qwen3::Generate::with_sampler(
-                    model,
-                    cache,
-                    temp,
-                    prompt_tokens,
-                    prng_key,
-                    stream,
-                    sampler,
-                ))
-            }
+            (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
+                llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+            ),
+            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
+                qwen3::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+            ),
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
                 ModelGenerate::NemotronH(nemotron_h::Generate::with_sampler(
-                    model,
-                    cache,
-                    temp,
-                    prompt_tokens,
-                    prng_key,
-                    stream,
-                    sampler,
+                    model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 ModelGenerate::Qwen35Moe(qwen3_5_moe::Generate::with_sampler(
-                    model,
-                    cache,
-                    temp,
-                    prompt_tokens,
-                    prng_key,
-                    stream,
-                    sampler,
+                    model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
             _ => panic!("model cache type does not match model kind"),
-        }
-    }
-}
-
-/// Token iterator for models backed by a vector of concatenating KV caches.
-pub enum Generate<'a, S = DefaultSampler>
-where
-    S: Sampler,
-{
-    /// Gemma 4 generation iterator.
-    Gemma4(common::Generate<'a, gemma4::Model, Vec<Option<ConcatKeyValueCache>>, S>),
-    /// Llama generation iterator.
-    Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
-    /// Qwen3 generation iterator.
-    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
-}
-
-impl<S> Iterator for Generate<'_, S>
-where
-    S: Sampler,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Gemma4(generate) => generate.next(),
-            Self::Llama(generate) => generate.next(),
-            Self::Qwen3(generate) => generate.next(),
         }
     }
 }
@@ -906,97 +745,55 @@ impl LoadedModel {
         self.eos_token_ids.contains(&id)
     }
 
-    /// Creates a token iterator for models that use a plain key/value cache.
-    pub fn generate<'a>(
-        &'a mut self,
-        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
-        temp: f32,
-        prompt_tokens: &'a Array,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-    ) -> Generate<'a> {
-        self.model
-            .generate(cache, temp, prompt_tokens, prng_key, stream)
-    }
-
-    /// Creates a token iterator using a caller-provided sampler.
-    pub fn generate_with_sampler<'a, S>(
-        &'a mut self,
-        cache: &'a mut Vec<Option<ConcatKeyValueCache>>,
-        temp: f32,
-        prompt_tokens: &'a Array,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-        sampler: S,
-    ) -> Generate<'a, S>
-    where
-        S: Sampler,
-    {
-        self.model
-            .generate_with_sampler(cache, temp, prompt_tokens, prng_key, stream, sampler)
-    }
-
     /// Creates an empty cache value appropriate for the loaded model.
     pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
     }
 
-    /// Computes logits for an initial prompt using a cache returned by [`LoadedModel::new_cache`].
-    pub fn prefill_logits_with_cache(
+    /// Computes logits for an initial typed input using a cache returned by [`LoadedModel::new_cache`].
+    pub fn prefill_input_with_cache(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.model
-            .prefill_logits_with_cache(prompt_tokens, cache, stream)
+        self.model.prefill_input_with_cache(input, cache, stream)
     }
 
     /// Computes initial prompt logits while reporting detailed activations.
     ///
     /// The returned logits have shape `[batch, vocab]` and match
-    /// [`LoadedModel::prefill_logits_with_cache`] for the same model/cache.
-    pub fn prefill_logits_with_observer(
+    /// [`LoadedModel::prefill_input_with_cache`] for the same model/cache.
+    pub fn prefill_input_with_observer(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
         self.model
-            .prefill_logits_with_observer(prompt_tokens, cache, stream, observer)
+            .prefill_input_with_observer(input, cache, stream, observer)
     }
 
-    /// Computes logits for decode tokens using a cache returned by [`LoadedModel::new_cache`].
-    pub fn decode_logits_with_cache(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut ModelCache,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.model
-            .decode_logits_with_cache(input_tokens, cache, stream)
-    }
-
-    /// Creates a token iterator using a cache returned by [`LoadedModel::new_cache`].
-    pub fn generate_with_cache<'a>(
+    /// Creates a token iterator from typed input using a cache returned by [`LoadedModel::new_cache`].
+    pub fn generate_input_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> ModelGenerate<'a> {
         self.model
-            .generate_with_cache(cache, temp, prompt_tokens, prng_key, stream)
+            .generate_input_with_cache(cache, temp, input, prng_key, stream)
     }
 
-    /// Creates a token iterator using a cache returned by [`LoadedModel::new_cache`] and a caller-provided sampler.
-    pub fn generate_with_cache_sampler<'a, S>(
+    /// Creates a token iterator from typed input with a caller-provided sampler.
+    pub fn generate_input_with_cache_sampler<'a, S>(
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
         sampler: S,
@@ -1004,14 +801,8 @@ impl LoadedModel {
     where
         S: Sampler,
     {
-        self.model.generate_with_cache_sampler(
-            cache,
-            temp,
-            prompt_tokens,
-            prng_key,
-            stream,
-            sampler,
-        )
+        self.model
+            .generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, sampler)
     }
 
     /// Returns a mutable reference to the underlying architecture-specific model.

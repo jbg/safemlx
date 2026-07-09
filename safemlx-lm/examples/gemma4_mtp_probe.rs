@@ -8,7 +8,10 @@ use safemlx::{
 use safemlx_lm::{
     gemma4_mtp::generate_gemma4_mtp,
     models::{
-        gemma4::load_gemma4_model, gemma4_assistant::load_gemma4_assistant_model, LoadedModel,
+        gemma4::load_gemma4_model,
+        gemma4_assistant::load_gemma4_assistant_model,
+        input::{InputPart, ModelInput},
+        LoadedModel,
     },
 };
 
@@ -113,8 +116,10 @@ fn run_greedy(
     let mut ids = Vec::new();
     let start = Instant::now();
     {
+        let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
+        let input = ModelInput::new(&input_parts);
         let generator = loaded
-            .generate_with_cache(&mut cache, 0.0, &prompt_tokens, None, stream)
+            .generate_input_with_cache(&mut cache, 0.0, input, None, stream)
             .take(max_tokens);
         for token in generator {
             let token = token?;

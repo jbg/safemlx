@@ -33,9 +33,12 @@ use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     inspection::ActivationObserver,
-    models::common::{
-        self, attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
-        CausalLm,
+    models::{
+        common::{
+            self, attention_probabilities, batch_seq, finish_attention,
+            reshape_attention_projection, CausalLm,
+        },
+        input,
     },
     utils::{
         create_causal_mask,
@@ -2393,15 +2396,16 @@ impl<C> CausalLm<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
 {
-    fn prefill_logits(
+    fn prefill_input_logits(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut Vec<Option<C>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        let prompt_tokens = input::text_token_ids(input, stream)?;
         self.forward_logits(
             ModelInput {
-                inputs: prompt_tokens,
+                inputs: &prompt_tokens,
                 mask: None,
                 cache,
             },
@@ -2460,17 +2464,18 @@ fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exc
 }
 
 impl CausalLm<Cache> for Model {
-    fn prefill_logits(
+    fn prefill_input_logits(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        cache.token_ids = token_ids_from_array(prompt_tokens, stream)?;
+        let prompt_tokens = input::text_token_ids(input, stream)?;
+        cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
         cache.kv.clear();
         self.forward_logits(
             ModelInput {
-                inputs: prompt_tokens,
+                inputs: &prompt_tokens,
                 mask: None,
                 cache: &mut cache.kv,
             },

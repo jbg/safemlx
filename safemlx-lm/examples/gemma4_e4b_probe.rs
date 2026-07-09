@@ -9,7 +9,10 @@ use safemlx::{
 };
 use safemlx_lm::{
     error::Error,
-    models::{LoadedModel, ModelCache},
+    models::{
+        input::{InputPart, ModelInput},
+        LoadedModel, ModelCache,
+    },
 };
 use serde_json::Value;
 
@@ -76,7 +79,10 @@ fn main() -> anyhow::Result<()> {
     };
 
     {
-        let mut generator = model.generate_with_cache(&mut cache, temp, &tokens, prng_key, stream);
+        let input_parts = [InputPart::text_token_ids(&tokens)];
+        let input = ModelInput::new(&input_parts);
+        let mut generator =
+            model.generate_input_with_cache(&mut cache, temp, input, prng_key, stream);
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
@@ -112,7 +118,9 @@ fn print_first_token_distribution(
     tokens: &safemlx::Array,
     stream: &Stream,
 ) -> anyhow::Result<()> {
-    let mut generator = model.generate_with_cache(cache, 0.0, tokens, None, stream);
+    let input_parts = [InputPart::text_token_ids(tokens)];
+    let input = ModelInput::new(&input_parts);
+    let mut generator = model.generate_input_with_cache(cache, 0.0, input, None, stream);
     let Some(first) = generator.next() else {
         return Ok(());
     };

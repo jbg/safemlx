@@ -5,7 +5,10 @@ use safemlx::{
     transforms::eval,
     Array, ExecutionContext, Stream,
 };
-use safemlx_lm::models::{qwen3_5_moe, LoadedModel};
+use safemlx_lm::models::{
+    input::{InputPart, ModelInput},
+    qwen3_5_moe, LoadedModel,
+};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[
@@ -115,8 +118,10 @@ fn run_case(
 ) -> anyhow::Result<BenchResult> {
     let prompt_ids = model.encode(prompt, false)?;
     let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
+    let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
+    let input = ModelInput::new(&input_parts);
     let mut cache = model.new_cache();
-    let mut generator = model.generate_with_cache(&mut cache, 0.0, &prompt_tokens, None, stream);
+    let mut generator = model.generate_input_with_cache(&mut cache, 0.0, input, None, stream);
     let mut ids = Vec::with_capacity(decode_tokens);
 
     qwen3_5_moe::set_perf_profiling(profile_components);

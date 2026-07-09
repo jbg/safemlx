@@ -23,6 +23,7 @@ use safemlx::{
 use crate::{
     cache::KeyValueCache,
     inspection::ActivationObserver,
+    models::input,
     sampler::{DefaultSampler, Sampler},
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
@@ -744,10 +745,10 @@ pub fn sample(
 
 /// Minimal interface required by the generic token generator.
 pub trait CausalLm<C> {
-    /// Computes logits for an initial prompt and fills `cache`.
-    fn prefill_logits(
+    /// Computes logits for an initial typed input and fills `cache`.
+    fn prefill_input_logits(
         &mut self,
-        prompt_tokens: &Array,
+        input: input::ModelInput<'_>,
         cache: &mut C,
         stream: &Stream,
     ) -> Result<Array, Exception>;
@@ -775,8 +776,8 @@ pub trait CausalLm<C> {
 pub enum GenerateState<'a> {
     /// The iterator has not consumed the prompt yet.
     Prefill {
-        /// Prompt token ids used for the initial prefill pass.
-        prompt_tokens: &'a Array,
+        /// Typed input used for the initial prefill pass.
+        input: input::ModelInput<'a>,
     },
     /// The iterator is decoding from the previous sampled token.
     Decode {
@@ -810,19 +811,11 @@ where
         model: &'a mut M,
         cache: &'a mut C,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
     ) -> Self {
-        Self::with_sampler(
-            model,
-            cache,
-            temp,
-            prompt_tokens,
-            prng_key,
-            stream,
-            DefaultSampler,
-        )
+        Self::with_sampler(model, cache, temp, input, prng_key, stream, DefaultSampler)
     }
 }
 
@@ -836,7 +829,7 @@ where
         model: &'a mut M,
         cache: &'a mut C,
         temp: f32,
-        prompt_tokens: &'a Array,
+        input: input::ModelInput<'a>,
         prng_key: Option<Array>,
         stream: &'a Stream,
         sampler: S,
@@ -848,7 +841,7 @@ where
             prng_state: prng_key.map(RandomState::from_key),
             sampler,
             stream,
-            state: GenerateState::Prefill { prompt_tokens },
+            state: GenerateState::Prefill { input },
             _cache: PhantomData,
         }
     }
@@ -863,10 +856,10 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         match &self.state {
-            GenerateState::Prefill { prompt_tokens } => {
+            GenerateState::Prefill { input } => {
                 let logits = match self
                     .model
-                    .prefill_logits(prompt_tokens, self.cache, self.stream)
+                    .prefill_input_logits(*input, self.cache, self.stream)
                 {
                     Ok(logits) => logits,
                     Err(err) => return Some(Err(err)),
