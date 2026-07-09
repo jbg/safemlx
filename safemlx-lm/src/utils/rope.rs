@@ -8,7 +8,11 @@ use safemlx::{
     error::Exception,
     module::Module,
     nn,
-    ops::{arange, which},
+    ops::{
+        arange, concatenate_axis, cos,
+        indexing::{NewAxis, TryIndexOp},
+        sin, which,
+    },
     Array, Stream,
 };
 use serde::Deserialize;
@@ -170,6 +174,27 @@ where
         let nn::RopeInput { x, offset } = input.into();
         let shape = x.shape();
         let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
+        if !self.traditional {
+            let seq_len = x.dim(-2);
+            let half_dims = self.dimensions / 2;
+            let positions = Array::arange::<_, f32>(Some(offset), offset + seq_len, None, stream)?
+                .try_index_device((.., NewAxis), stream)?;
+            let freqs = self.freqs.try_index_device(NewAxis, stream)?;
+            let angles = positions
+                .divide(&freqs, stream)?
+                .multiply(Array::from_f32(self.scale), stream)?;
+            let cos = cos(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
+            let sin = sin(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
+            let x1 = x.try_index_device((.., .., ..half_dims), stream)?;
+            let x2 = x.try_index_device((.., .., half_dims..), stream)?;
+            let out1 = x1
+                .multiply(&cos, stream)?
+                .subtract(x2.multiply(&sin, stream)?, stream)?;
+            let out2 = x2
+                .multiply(cos, stream)?
+                .add(x1.multiply(sin, stream)?, stream)?;
+            return concatenate_axis(&[out1, out2], -1, stream)?.reshape(shape, stream);
+        }
         let x = safemlx::fast::rope(
             x,
             self.dimensions,
@@ -188,18 +213,20 @@ where
 
 /// Proportional RoPE used by Gemma 4 full-attention layers.
 ///
-/// Proportional RoPE computes frequencies over the configured rotary
-/// sub-dimension, then passes only that sub-dimension to MLX RoPE. MLX leaves
-/// the remaining head dimensions unchanged.
+/// Proportional RoPE keeps the full head dimension so non-traditional
+/// half-rotation pairs match Hugging Face's layout. Frequency slots outside the
+/// configured rotary proportion use the largest finite `f32` denominator, which
+/// MLX reciprocates to an effectively zero inverse frequency and therefore
+/// leaves unchanged for real context lengths.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct ProportionalRope {
-    /// Rotary dimension passed to MLX RoPE.
+    /// Head dimension passed to MLX RoPE.
     pub dimensions: i32,
     /// Whether to use traditional pair ordering.
     pub traditional: bool,
     /// Runtime scale factor passed to MLX RoPE.
     pub scale: f32,
-    /// Frequency vector for the rotary sub-dimension.
+    /// Frequency vector for the full half-head dimension.
     pub freqs: Array,
 }
 
@@ -211,10 +238,15 @@ fn proportional_rotary_dims(dims: i32, proportion: f32) -> (i32, i32) {
 }
 
 fn proportional_frequency_values(dims: i32, base: f32, factor: f32, proportion: f32) -> Vec<f32> {
-    let (rotary_dims, rope_angles) = proportional_rotary_dims(dims, proportion);
-    let mut freqs = Vec::with_capacity(rope_angles as usize);
-    for index in 0..rope_angles {
-        freqs.push(base.powf(2.0 * index as f32 / rotary_dims as f32) / factor);
+    let (_, rope_angles) = proportional_rotary_dims(dims, proportion);
+    let half_dims = dims / 2;
+    let mut freqs = Vec::with_capacity(half_dims as usize);
+    for index in 0..half_dims {
+        if index < rope_angles {
+            freqs.push(base.powf(2.0 * index as f32 / dims as f32) / factor);
+        } else {
+            freqs.push(f32::MAX);
+        }
     }
     freqs
 }
@@ -229,11 +261,10 @@ impl ProportionalRope {
         proportion: f32,
         _stream: &Stream,
     ) -> Result<Self, Exception> {
-        let (rotary_dims, rope_angles) = proportional_rotary_dims(dims, proportion);
         let freqs = proportional_frequency_values(dims, base, factor, proportion);
-        let freqs = Array::from_slice(&freqs, &[rope_angles]);
+        let freqs = Array::from_slice(&freqs, &[dims / 2]);
         Ok(Self {
-            dimensions: rotary_dims,
+            dimensions: dims,
             traditional,
             scale: 1.0,
             freqs,
@@ -471,15 +502,17 @@ mod tests {
     use super::{proportional_frequency_values, proportional_rotary_dims};
 
     #[test]
-    fn proportional_rope_uses_partial_dimension_for_frequency_ladder() {
+    fn proportional_rope_uses_full_half_head_frequency_layout() {
         let (rotary_dims, rope_angles) = proportional_rotary_dims(512, 0.25);
         let freqs = proportional_frequency_values(512, 1_000_000.0, 1.0, 0.25);
 
         assert_eq!(rotary_dims, 128);
         assert_eq!(rope_angles, 64);
-        assert_eq!(freqs.len(), 64);
+        assert_eq!(freqs.len(), 256);
         assert_eq!(freqs[0], 1.0);
-        assert!((freqs[1] - 1_000_000.0_f32.powf(2.0 / 128.0)).abs() < 0.0001);
+        assert!((freqs[1] - 1_000_000.0_f32.powf(2.0 / 512.0)).abs() < 0.0001);
         assert!(freqs[63] > 0.0);
+        assert_eq!(freqs[64], f32::MAX);
+        assert_eq!(freqs[255], f32::MAX);
     }
 }

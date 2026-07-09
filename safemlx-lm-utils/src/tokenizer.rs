@@ -84,6 +84,7 @@ use crate::error::Error;
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     env: Environment<'static>,
+    template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
 impl FromStr for Tokenizer {
@@ -101,7 +102,19 @@ impl Tokenizer {
         Self {
             inner: tokenizer,
             env,
+            template_kwargs: serde_json::Map::new(),
         }
+    }
+
+    pub fn set_template_kwargs(
+        &mut self,
+        template_kwargs: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.template_kwargs = template_kwargs;
+    }
+
+    pub fn template_kwargs(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.template_kwargs
     }
 
     pub fn from_file(file: impl AsRef<Path>) -> tokenizers::Result<Self> {
@@ -122,7 +135,12 @@ impl Tokenizer {
         R: Serialize + 'a,
         T: Serialize + 'a,
     {
-        apply_chat_template(&mut self.env, model_template, args)
+        apply_chat_template_with_default_kwargs(
+            &mut self.env,
+            model_template,
+            args,
+            Some(&self.template_kwargs),
+        )
     }
 
     pub fn apply_chat_template_and_encode<'a, I, R, T>(
@@ -135,9 +153,18 @@ impl Tokenizer {
         R: Serialize + 'a,
         T: Serialize + 'a,
     {
-        let Self { inner, env } = self;
+        let Self {
+            inner,
+            env,
+            template_kwargs,
+        } = self;
 
-        let rendered_chats = apply_chat_template(env, model_template, args)?;
+        let rendered_chats = apply_chat_template_with_default_kwargs(
+            env,
+            model_template,
+            args,
+            Some(template_kwargs),
+        )?;
         inner
             .encode_batch(rendered_chats, false)
             .map_err(Into::into)
@@ -155,13 +182,14 @@ impl Tokenizer {
     where
         I: IntoIterator<Item = Vec<serde_json::Value>>,
     {
-        apply_chat_template_json(
+        apply_chat_template_json_with_default_kwargs(
             &mut self.env,
             model_template,
             conversations,
             tools,
             model_id,
             add_generation_prompt,
+            Some(&self.template_kwargs),
             template_kwargs,
         )
     }
@@ -518,6 +546,31 @@ pub fn apply_chat_template_json<'a, I>(
 where
     I: IntoIterator<Item = Vec<serde_json::Value>>,
 {
+    apply_chat_template_json_with_default_kwargs(
+        env,
+        model_template,
+        conversations,
+        tools,
+        model_id,
+        add_generation_prompt,
+        None,
+        template_kwargs,
+    )
+}
+
+fn apply_chat_template_json_with_default_kwargs<'a, I>(
+    env: &mut Environment<'static>,
+    model_template: String,
+    conversations: I,
+    tools: Option<&'a [serde_json::Value]>,
+    model_id: &'a str,
+    add_generation_prompt: bool,
+    default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
+) -> Result<Vec<String>, Error>
+where
+    I: IntoIterator<Item = Vec<serde_json::Value>>,
+{
     let conversations = conversations.into_iter().map(|conversation| {
         Chat::Owned(vec![Conversation {
             role: serde_json::Value::Null,
@@ -525,7 +578,7 @@ where
         }])
     });
 
-    apply_chat_template(
+    apply_chat_template_with_default_kwargs(
         env,
         model_template,
         ApplyChatTemplateArgs {
@@ -538,6 +591,7 @@ where
             continue_final_message: None,
             template_kwargs,
         },
+        default_template_kwargs,
     )
 }
 
@@ -545,6 +599,20 @@ pub fn apply_chat_template<'a, I, R, T>(
     env: &mut Environment<'static>,
     model_template: String,
     args: ApplyChatTemplateArgs<'a, I, R, T>,
+) -> Result<Vec<String>, Error>
+where
+    I: IntoIterator<Item = Chat<'a, R, T>>,
+    R: Serialize + 'a,
+    T: Serialize + 'a,
+{
+    apply_chat_template_with_default_kwargs(env, model_template, args, None)
+}
+
+fn apply_chat_template_with_default_kwargs<'a, I, R, T>(
+    env: &mut Environment<'static>,
+    model_template: String,
+    args: ApplyChatTemplateArgs<'a, I, R, T>,
+    default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
 where
     I: IntoIterator<Item = Chat<'a, R, T>>,
@@ -586,6 +654,7 @@ where
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
+        default_template_kwargs,
         template_kwargs,
     )
 }
@@ -598,6 +667,7 @@ fn render_jinja_tempalte<'a, R, T>(
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
+    default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
 where
@@ -639,6 +709,9 @@ where
             "add_generation_prompt".to_string(),
             serde_json::Value::Bool(add_generation_prompt),
         );
+        if let Some(default_template_kwargs) = default_template_kwargs {
+            context.extend(default_template_kwargs.clone());
+        }
         if let Some(template_kwargs) = template_kwargs {
             context.extend(template_kwargs.clone());
         }
@@ -772,6 +845,53 @@ mod tests {
 
         let rendered_chat = apply_chat_template(&mut env, model_template, args).unwrap();
         assert_eq!(rendered_chat, vec!["no-think"]);
+    }
+
+    #[test]
+    fn test_tokenizer_template_kwargs_defaults_can_be_overridden() {
+        let raw = tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let mut tokenizer = super::Tokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+            (
+                "bos_token".to_string(),
+                serde_json::Value::String("<bos>".to_string()),
+            ),
+            (
+                "tone".to_string(),
+                serde_json::Value::String("default".to_string()),
+            ),
+        ]));
+        let model_template =
+            "{{ bos_token }}{{ messages[0].role }}: {{ messages[0].content }} {{ tone }}"
+                .to_string();
+        let model_id = "test-model".to_string();
+        let conversations = vec![Conversation {
+            role: Role::User,
+            content: "hello",
+        }];
+        let mut template_kwargs = serde_json::Map::new();
+        template_kwargs.insert(
+            "tone".to_string(),
+            serde_json::Value::String("override".to_string()),
+        );
+
+        let rendered_chat = tokenizer
+            .apply_chat_template(
+                model_template,
+                ApplyChatTemplateArgs {
+                    conversations: [conversations.into()],
+                    tools: None,
+                    documents: None,
+                    model_id: &model_id,
+                    chat_template_id: None,
+                    add_generation_prompt: None,
+                    continue_final_message: None,
+                    template_kwargs: Some(&template_kwargs),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(rendered_chat, vec!["<bos>user: hello override"]);
     }
 
     #[test]

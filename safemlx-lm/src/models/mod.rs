@@ -17,7 +17,7 @@ use safemlx_lm_utils::tokenizer::{
     ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
 use crate::inspection::ActivationObserver;
@@ -280,11 +280,11 @@ impl Model {
                 stream,
                 observer,
             ),
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => model.forward_with_observer(
                 gemma4::ModelInput {
                     inputs: input_tokens,
                     mask,
-                    cache,
+                    cache: &mut cache.kv,
                 },
                 stream,
                 observer,
@@ -313,29 +313,18 @@ impl Model {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 let prompt_len = prompt_tokens.shape()[1];
                 if prompt_len <= 0 {
                     return Err(Exception::custom("prompt must contain at least one token"));
                 }
-                if prompt_len > 1 {
-                    let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
-                    model.forward_with_observer(
-                        gemma4::ModelInput {
-                            inputs: &prefix,
-                            mask: None,
-                            cache,
-                        },
-                        stream,
-                        observer,
-                    )?;
-                }
-                let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
+                cache.token_ids = gemma4::token_ids_from_array(prompt_tokens, stream)?;
+                cache.kv.clear();
                 let logits = model.forward_with_observer(
                     gemma4::ModelInput {
-                        inputs: &last,
+                        inputs: prompt_tokens,
                         mask: None,
-                        cache,
+                        cache: &mut cache.kv,
                     },
                     stream,
                     observer,
@@ -420,7 +409,7 @@ impl Model {
         S: Sampler,
     {
         match self {
-            Self::Gemma4(model) => Generate::Gemma4(gemma4::Generate::with_sampler(
+            Self::Gemma4(model) => Generate::Gemma4(common::Generate::with_sampler(
                 model,
                 cache,
                 temp,
@@ -459,7 +448,8 @@ impl Model {
     /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
-            Self::Gemma4(_) | Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
+            Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
+            Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
             Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
         }
@@ -473,7 +463,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 model.prefill_logits(prompt_tokens, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
@@ -502,7 +492,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 model.decode_logits(input_tokens, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
@@ -556,7 +546,7 @@ impl Model {
         S: Sampler,
     {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::KeyValue(cache)) => {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 ModelGenerate::Gemma4(gemma4::Generate::with_sampler(
                     model,
                     cache,
@@ -622,7 +612,7 @@ where
     S: Sampler,
 {
     /// Gemma 4 generation iterator.
-    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache, S>),
+    Gemma4(common::Generate<'a, gemma4::Model, Vec<Option<ConcatKeyValueCache>>, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Qwen3 generation iterator.
@@ -647,6 +637,8 @@ where
 /// Cache value matching a [`Model`] variant.
 #[derive(Clone)]
 pub enum ModelCache {
+    /// Gemma 4 generation cache.
+    Gemma4(gemma4::Cache),
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
@@ -661,7 +653,7 @@ where
     S: Sampler,
 {
     /// Gemma 4 generation iterator.
-    Gemma4(gemma4::Generate<'a, ConcatKeyValueCache, S>),
+    Gemma4(gemma4::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Qwen3 generation iterator.
@@ -713,7 +705,8 @@ impl LoadedModel {
         let metadata = read_model_metadata(model_dir)?;
         let model_type = effective_model_type(&metadata);
         let kind = ModelKind::from_model_type(&model_type)?;
-        let tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
+        let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
+        tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
         let model = match kind {
             ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(
@@ -783,6 +776,7 @@ impl LoadedModel {
         };
         Ok(inspect_chat_template_kwargs(template, &self.model_id)?
             .into_iter()
+            .filter(|name| !self.tokenizer.template_kwargs().contains_key(name))
             .collect())
     }
 
@@ -1096,8 +1090,10 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
         return Ok(Vec::new());
     };
     let model_id = model_dir.display().to_string();
+    let tokenizer_template_kwargs = load_tokenizer_template_kwargs(model_dir)?;
     Ok(inspect_chat_template_kwargs(&template, &model_id)?
         .into_iter()
+        .filter(|name| !tokenizer_template_kwargs.contains_key(name))
         .collect())
 }
 
@@ -1156,6 +1152,24 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
     Ok(None)
 }
 
+fn load_tokenizer_template_kwargs(model_dir: &Path) -> Result<Map<String, Value>, Error> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    if !config_path.exists() {
+        return Ok(Map::new());
+    }
+
+    let value: Value = serde_json::from_reader(std::fs::File::open(config_path)?)?;
+    let Some(object) = value.as_object() else {
+        return Ok(Map::new());
+    };
+
+    Ok(object
+        .iter()
+        .filter(|(key, value)| key.ends_with("_token") && (value.is_string() || value.is_null()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
+}
+
 const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set role = 'model' if message['role'] == 'assistant' else message['role'] %}<|turn>{{ role }}
 {% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'text' %}{{ content['text'] }}{% elif content['type'] == 'image' %}<|image>{% elif content['type'] == 'audio' %}<|audio>{% endif %}{% endfor %}{% endif %}<turn|>
 {% endfor %}{% if add_generation_prompt %}<|turn>model
@@ -1164,8 +1178,8 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 #[cfg(test)]
 mod tests {
     use super::{
-        check_model_config, check_model_config_json, check_model_dir, load_chat_template,
-        load_tokenizer, LoadedModel,
+        chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
+        load_chat_template, load_tokenizer, load_tokenizer_template_kwargs, LoadedModel,
     };
     use crate::inspection::ActivationRecorder;
     use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
@@ -1269,6 +1283,28 @@ mod tests {
 
         let template = load_chat_template(&dir).unwrap().unwrap();
         assert_eq!(template, "hello {{ messages[0].role }}");
+    }
+
+    #[test]
+    fn load_tokenizer_template_kwargs_reads_special_tokens() {
+        let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{
+              "bos_token": "<bos>",
+              "eos_token": "<eos>",
+              "chat_template": "{{ bos_token }}{{ messages[0]['content'] }}{{ custom_flag }}",
+              "model_max_length": 128
+            }"#,
+        )
+        .unwrap();
+
+        let kwargs = load_tokenizer_template_kwargs(&dir).unwrap();
+        assert_eq!(kwargs.get("bos_token"), Some(&json!("<bos>")));
+        assert_eq!(kwargs.get("eos_token"), Some(&json!("<eos>")));
+        assert!(!kwargs.contains_key("chat_template"));
+        assert!(!kwargs.contains_key("model_max_length"));
+        assert_eq!(chat_template_kwargs(&dir).unwrap(), vec!["custom_flag"]);
     }
 
     #[test]

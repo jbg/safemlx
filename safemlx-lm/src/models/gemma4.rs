@@ -14,7 +14,11 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp, mean_axis, quantized_matmul, rsqrt, tanh},
+    ops::{
+        concatenate_axis,
+        indexing::{NewAxis, TryIndexOp},
+        mean_axis, quantized_matmul, rsqrt, tanh,
+    },
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -1494,9 +1498,10 @@ impl TransformerBlock {
         let generated_mask = if disable_generated_mask {
             None
         } else if self.layer_type == LayerType::SlidingAttention {
-            if x.shape()[1] > 1 || self.sliding_window.is_some() {
+            let seq_len = x.shape()[1];
+            if seq_len > 1 || self.sliding_window.is_some() {
                 Some(create_causal_mask(
-                    x.shape()[1],
+                    seq_len,
                     Some(position_offset),
                     self.sliding_window,
                     None,
@@ -1612,9 +1617,10 @@ where
         let generated_mask = if disable_generated_mask {
             None
         } else if self.layer_type == LayerType::SlidingAttention {
-            if x.shape()[1] > 1 || self.sliding_window.is_some() {
+            let seq_len = x.shape()[1];
+            if seq_len > 1 || self.sliding_window.is_some() {
                 Some(create_causal_mask(
-                    x.shape()[1],
+                    seq_len,
                     Some(position_offset),
                     self.sliding_window,
                     None,
@@ -2393,22 +2399,9 @@ where
         cache: &mut Vec<Option<C>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let prompt_len = prompt_tokens.shape()[1];
-        if prompt_len > 1 {
-            let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
-            self.forward(
-                ModelInput {
-                    inputs: &prefix,
-                    mask: None,
-                    cache,
-                },
-                stream,
-            )?;
-        }
-        let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
         self.forward_logits(
             ModelInput {
-                inputs: &last,
+                inputs: prompt_tokens,
                 mask: None,
                 cache,
             },
@@ -2435,9 +2428,82 @@ where
     }
 }
 
+/// Gemma 4 generation cache.
+#[derive(Clone, Default)]
+pub struct Cache {
+    pub(crate) kv: Vec<Option<ConcatKeyValueCache>>,
+    pub(crate) token_ids: Vec<u32>,
+}
+
+pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
+    let shape = tokens.shape();
+    if shape.len() != 2 || shape[0] != 1 {
+        return Err(Exception::custom(format!(
+            "Gemma 4 generation expects batch-1 token ids, got shape {shape:?}"
+        )));
+    }
+    let mut ids = Vec::with_capacity(shape[1] as usize);
+    for index in 0..shape[1] {
+        ids.push(
+            tokens
+                .try_index_device((0, index), stream)?
+                .item::<u32>(stream),
+        );
+    }
+    Ok(ids)
+}
+
+fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exception> {
+    Array::from(token_ids)
+        .try_index_device(NewAxis, stream)
+        .map_err(Into::into)
+}
+
+impl CausalLm<Cache> for Model {
+    fn prefill_logits(
+        &mut self,
+        prompt_tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        cache.token_ids = token_ids_from_array(prompt_tokens, stream)?;
+        cache.kv.clear();
+        self.forward_logits(
+            ModelInput {
+                inputs: prompt_tokens,
+                mask: None,
+                cache: &mut cache.kv,
+            },
+            true,
+            stream,
+        )
+    }
+
+    fn decode_logits(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        cache
+            .token_ids
+            .extend(token_ids_from_array(input_tokens, stream)?);
+        cache.kv.clear();
+        let tokens = array_from_token_ids(&cache.token_ids, stream)?;
+        self.forward_logits(
+            ModelInput {
+                inputs: &tokens,
+                mask: None,
+                cache: &mut cache.kv,
+            },
+            true,
+            stream,
+        )
+    }
+}
+
 /// Gemma 4 token generation iterator.
-pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
-    common::Generate<'a, Model, Vec<Option<C>>, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
 mod tests {
