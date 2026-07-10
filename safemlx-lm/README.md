@@ -17,7 +17,7 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 ```toml
 [dependencies]
-safemlx-lm = "0.1"
+safemlx-lm = "0.2"
 ```
 
 ## License
