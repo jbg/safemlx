@@ -49,6 +49,15 @@ impl<'a> InputPart<'a> {
             metadata,
         }
     }
+
+    /// Creates a video tensor part.
+    pub fn video_tensor(tensor: &'a Array, metadata: InputMetadata<'a>) -> Self {
+        Self {
+            modality: Modality::Video,
+            payload: InputPayload::Tensor(tensor),
+            metadata,
+        }
+    }
 }
 
 /// Runtime modality.

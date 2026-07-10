@@ -1,6 +1,6 @@
 [package]
 name = "safemlx-lm"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,7 +14,7 @@ readme = "README.md"
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
-features = ["fancy-regex"]
+features = ["fancy-regex", "image-processing"]
 
 [features]
 default = ["onig", "esaxx_fast"]
@@ -22,6 +22,7 @@ default = ["onig", "esaxx_fast"]
 esaxx_fast = ["tokenizers/esaxx_fast", "safemlx-lm-utils/esaxx_fast"]
 fancy-regex = ["tokenizers/fancy-regex", "safemlx-lm-utils/fancy-regex"]
 onig = ["tokenizers/onig", "safemlx-lm-utils/onig"]
+image-processing = ["dep:image"]
 
 [dependencies]
 # Local dependencies
@@ -37,6 +38,7 @@ idna_adapter = "1.2"
 thiserror = "2"
 serde_json = "1"
 minijinja = "2"
+image = { version = "=0.25.8", default-features = false, optional = true }
 
 [dev-dependencies]
 lazy_static = "1"

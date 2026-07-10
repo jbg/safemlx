@@ -22,6 +22,8 @@ use tokenizers::Tokenizer;
 
 use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
+#[cfg(feature = "image-processing")]
+use crate::processor::{load_processor, MediaInput, ModelProcessor, PreparedModelInput};
 use crate::sampler::{DefaultSampler, Sampler};
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
@@ -527,6 +529,8 @@ where
 /// used by the template renderer, and EOS token ids parsed from config.
 pub struct LoadedModel {
     model: Model,
+    #[cfg(feature = "image-processing")]
+    processor: Option<ModelProcessor>,
     tokenizer: ChatTokenizer,
     chat_template: Option<String>,
     model_id: String,
@@ -547,6 +551,8 @@ impl LoadedModel {
         let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
+        #[cfg(feature = "image-processing")]
+        let processor = load_processor(model_dir)?;
         let model = match kind {
             ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(
                 model_dir,
@@ -582,6 +588,8 @@ impl LoadedModel {
 
         Ok(Self {
             model,
+            #[cfg(feature = "image-processing")]
+            processor,
             tokenizer,
             chat_template,
             model_id: model_type,
@@ -602,6 +610,41 @@ impl LoadedModel {
     /// Returns whether a chat template is available for this model.
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
+    }
+
+    /// Returns whether this model directory includes a supported media processor.
+    #[cfg(feature = "image-processing")]
+    pub fn has_processor(&self) -> bool {
+        self.processor.is_some()
+    }
+
+    /// Returns the loaded architecture-dispatched media processor, if available.
+    #[cfg(feature = "image-processing")]
+    pub fn processor(&self) -> Option<&ModelProcessor> {
+        self.processor.as_ref()
+    }
+
+    /// Tokenizes rendered prompt text and preprocesses its ordered media items.
+    ///
+    /// The rendered text must contain one architecture-specific placeholder for
+    /// each media item, in the same order as `media`.
+    #[cfg(feature = "image-processing")]
+    pub fn prepare_input(
+        &self,
+        rendered_text: &str,
+        media: &[MediaInput<'_>],
+        add_special_tokens: bool,
+    ) -> Result<PreparedModelInput, Error> {
+        let processor = self.processor.clone().ok_or_else(|| {
+            Error::Processor(format!(
+                "model type '{}' does not have a loaded media processor",
+                self.model_type()
+            ))
+        })?;
+        let token_ids = self.encode(rendered_text, add_special_tokens)?;
+        processor.prepare_token_ids_with_text_encoder(&token_ids, media, &mut |text| {
+            self.encode(text, false)
+        })
     }
 
     /// Returns likely user-provided kwargs referenced by the loaded chat template.
@@ -760,6 +803,17 @@ impl LoadedModel {
         self.model.prefill_input_with_cache(input, cache, stream)
     }
 
+    /// Computes initial logits from an owned processor result.
+    #[cfg(feature = "image-processing")]
+    pub fn prefill_prepared_input_with_cache(
+        &mut self,
+        input: &PreparedModelInput,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        input.with_model_input(|input| self.prefill_input_with_cache(input, cache, stream))
+    }
+
     /// Computes initial prompt logits while reporting detailed activations.
     ///
     /// The returned logits have shape `[batch, vocab]` and match
@@ -773,6 +827,20 @@ impl LoadedModel {
     ) -> Result<Array, Exception> {
         self.model
             .prefill_input_with_observer(input, cache, stream, observer)
+    }
+
+    /// Computes initial logits from an owned processor result while observing activations.
+    #[cfg(feature = "image-processing")]
+    pub fn prefill_prepared_input_with_observer(
+        &mut self,
+        input: &PreparedModelInput,
+        cache: &mut ModelCache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        input.with_model_input(|input| {
+            self.prefill_input_with_observer(input, cache, stream, observer)
+        })
     }
 
     /// Creates a token iterator from typed input using a cache returned by [`LoadedModel::new_cache`].

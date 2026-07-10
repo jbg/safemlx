@@ -17,8 +17,49 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 ```toml
 [dependencies]
-safemlx-lm = "0.2"
+safemlx-lm = { version = "0.2", features = ["image-processing"] }
 ```
+
+For Qwen image prompts, render the chat template with one image placeholder per
+image, then prepare decoded RGB8 pixels before prefill:
+
+```rust,ignore
+use safemlx_lm::processor::{MediaInput, RgbImageView};
+
+let image = RgbImageView::packed(rgb_pixels, width, height)?;
+let prepared = model.prepare_input(
+    &rendered_prompt,
+    &[MediaInput::image_rgb8(image)],
+    false,
+)?;
+let logits = model.prefill_prepared_input_with_cache(
+    &prepared,
+    &mut cache,
+    stream,
+)?;
+```
+
+Decoded videos use the same processor with an ordered frame sequence and source
+frame rate. Container decoding remains with the caller:
+
+```rust,ignore
+let frames = decoded_rgb_frames
+    .iter()
+    .map(|frame| RgbImageView::packed(frame, width, height))
+    .collect::<Result<Vec<_>, _>>()?;
+let prepared = model.prepare_input(
+    &rendered_video_prompt,
+    &[MediaInput::video_rgb8(&frames, Some(source_fps))],
+    false,
+)?;
+```
+
+The optional `image-processing` feature enables the processor, which reads
+the image and video preprocessor configs and owns frame sampling, timestamps,
+resizing, normalization, model-native patch packing, grid metadata, and
+placeholder binding. Without the feature, callers can still supply model-native
+`Image/Tensor` and `Video/Tensor` inputs directly without depending on the
+`image` crate.
 
 ## License
 

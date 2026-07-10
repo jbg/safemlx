@@ -27,6 +27,10 @@ pub enum Error {
     #[error("unsupported model architecture: {0}")]
     UnsupportedArchitecture(String),
 
+    /// Media processor configuration or input error.
+    #[error("media processor error: {0}")]
+    Processor(String),
+
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]
     StrictLoadValidation {
