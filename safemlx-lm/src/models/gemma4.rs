@@ -28,7 +28,11 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 pub use super::common::sample;
-use super::gemma4_vision::{Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionTower};
+use super::{
+    gemma4_audio::{Gemma4AudioConfig, Gemma4AudioTower},
+    gemma4_multimodal::Gemma4ModalityEmbedder,
+    gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower},
+};
 
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
@@ -413,6 +417,10 @@ struct Gemma4Config {
     vision_config: Option<Gemma4VisionConfig>,
     #[serde(default)]
     image_token_id: Option<i32>,
+    #[serde(default)]
+    audio_config: Option<Gemma4AudioConfig>,
+    #[serde(default)]
+    audio_token_id: Option<i32>,
     #[serde(default = "default_true")]
     tie_word_embeddings: bool,
     #[serde(default)]
@@ -501,20 +509,40 @@ pub(super) fn maybe_quantized_linear(
     bits: i32,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    maybe_quantized_linear_with_bias(
+        quantized,
+        input_dims,
+        output_dims,
+        group_size,
+        bits,
+        false,
+        stream,
+    )
+}
+
+pub(super) fn maybe_quantized_linear_with_bias(
+    quantized: bool,
+    input_dims: i32,
+    output_dims: i32,
+    group_size: i32,
+    bits: i32,
+    bias: bool,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     if quantized {
         Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
             input_dims,
             output_dims,
             group_size,
             bits,
-            false,
+            bias,
             stream,
         )?))
     } else {
         Ok(MaybeQuantized::Original(nn::Linear::unloaded(
             input_dims,
             output_dims,
-            false,
+            bias,
             Dtype::Float32,
             stream,
         )?))
@@ -2150,7 +2178,14 @@ pub struct Gemma4ForConditionalGeneration {
     #[quantizable]
     #[param]
     /// Optional projection from vision features into text hidden space.
-    pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
+    pub(crate) embed_vision: Option<Gemma4ModalityEmbedder>,
+    #[param]
+    /// Optional audio encoder.
+    pub(crate) audio_tower: Option<Gemma4AudioTower>,
+    #[quantizable]
+    #[param]
+    /// Optional projection from audio features into text hidden space.
+    pub(crate) embed_audio: Option<Gemma4ModalityEmbedder>,
 }
 
 impl Gemma4ForConditionalGeneration {
@@ -2160,12 +2195,15 @@ impl Gemma4ForConditionalGeneration {
             language_model: Gemma4TextModel::new(args, stream)?,
             vision_tower: None,
             embed_vision: None,
+            audio_tower: None,
+            embed_audio: None,
         })
     }
 
-    fn new_with_vision(
+    fn new_with_modalities(
         args: &ModelArgs,
         vision_config: Option<Gemma4VisionConfig>,
+        audio_config: Option<Gemma4AudioConfig>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let vision_tower = vision_config
@@ -2175,12 +2213,37 @@ impl Gemma4ForConditionalGeneration {
         let embed_vision = vision_config
             .as_ref()
             .map(|config| {
-                Gemma4MultimodalEmbedder::new(
-                    config,
+                Gemma4ModalityEmbedder::new(
+                    config.hidden_size,
                     args.hidden_size,
-                    args.quantized,
-                    args.quantization_group_size,
-                    args.quantization_bits,
+                    config.rms_norm_eps,
+                    false,
+                    (
+                        args.quantized,
+                        args.quantization_group_size,
+                        args.quantization_bits,
+                    ),
+                    stream,
+                )
+            })
+            .transpose()?;
+        let audio_tower = audio_config
+            .as_ref()
+            .map(|config| Gemma4AudioTower::new(config, stream))
+            .transpose()?;
+        let embed_audio = audio_config
+            .as_ref()
+            .map(|config| {
+                Gemma4ModalityEmbedder::new(
+                    config.output_proj_dims,
+                    args.hidden_size,
+                    config.rms_norm_eps,
+                    true,
+                    (
+                        args.quantized,
+                        args.quantization_group_size,
+                        args.quantization_bits,
+                    ),
                     stream,
                 )
             })
@@ -2189,6 +2252,8 @@ impl Gemma4ForConditionalGeneration {
             language_model: Gemma4TextModel::new(args, stream)?,
             vision_tower,
             embed_vision,
+            audio_tower,
+            embed_audio,
         })
     }
 }
@@ -2200,6 +2265,8 @@ pub struct Model {
     pub args: ModelArgs,
     /// Image placeholder token ID for multimodal checkpoints.
     pub image_token_id: Option<i32>,
+    /// Audio placeholder token ID for multimodal checkpoints.
+    pub audio_token_id: Option<i32>,
     #[quantizable]
     #[param]
     /// Conditional-generation model body.
@@ -2266,7 +2333,7 @@ impl Model {
                 let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
-                    self.image_token_id.expect("image token was validated") as u32,
+                    self.image_token_id.map(|id| id as u32),
                     self.args.sliding_window,
                 );
                 self.forward_with_observer(
@@ -2319,18 +2386,26 @@ impl Model {
         Ok(Self {
             args,
             image_token_id: None,
+            audio_token_id: None,
             model,
             lm_head,
         })
     }
 
-    fn new_with_vision(
+    fn new_with_modalities(
         args: ModelArgs,
         image_token_id: Option<i32>,
         vision_config: Option<Gemma4VisionConfig>,
+        audio_token_id: Option<i32>,
+        audio_config: Option<Gemma4AudioConfig>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let model = Gemma4ForConditionalGeneration::new_with_vision(&args, vision_config, stream)?;
+        let model = Gemma4ForConditionalGeneration::new_with_modalities(
+            &args,
+            vision_config,
+            audio_config,
+            stream,
+        )?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::build_unloaded_maybe_quantized_lm_head(
                 args.hidden_size,
@@ -2343,6 +2418,7 @@ impl Model {
         Ok(Self {
             args,
             image_token_id,
+            audio_token_id,
             model,
             lm_head,
         })
@@ -2365,10 +2441,16 @@ impl Model {
                 token_id: token_id as u32,
             })
             .into_iter()
+            .chain(self.audio_token_id.map(|token_id| input::ModalityToken {
+                modality: input::Modality::Audio,
+                token_id: token_id as u32,
+            }))
             .collect::<Vec<_>>();
         let embed_tokens = &mut self.model.language_model.embed_tokens;
         let vision_tower = &mut self.model.vision_tower;
         let embed_vision = &mut self.model.embed_vision;
+        let audio_tower = &mut self.model.audio_tower;
+        let embed_audio = &mut self.model.embed_audio;
         let text_scale = (self.args.hidden_size as f32).sqrt();
         let prepared = input::prepare_decoder_prefill(
             input,
@@ -2381,9 +2463,9 @@ impl Model {
                     .forward(tokens, stream)?
                     .multiply(Array::from_f32(text_scale), stream)
             },
-            |part, stream| match part.payload {
-                input::InputPayload::Embeddings(embeddings) => Ok(vec![embeddings.clone()]),
-                input::InputPayload::Tensor(tensor) => {
+            |part, stream| match (part.modality, part.payload) {
+                (_, input::InputPayload::Embeddings(embeddings)) => Ok(vec![embeddings.clone()]),
+                (input::Modality::Image, input::InputPayload::Tensor(tensor)) => {
                     let position_ids = part.metadata.patch_position_ids.ok_or_else(|| {
                         Exception::custom(
                             "gemma4 image tensor input requires patch_position_ids metadata",
@@ -2404,34 +2486,66 @@ impl Model {
                         })?
                         .forward(&features, stream)?])
                 }
-                input::InputPayload::TokenIds(_) => Err(Exception::custom(
-                    "gemma4 image input does not accept token-id payloads",
-                )),
+                (input::Modality::Audio, input::InputPayload::Tensor(tensor)) => {
+                    let mask = part.metadata.audio_mask.ok_or_else(|| {
+                        Exception::custom("gemma4 audio tensor input requires audio_mask metadata")
+                    })?;
+                    let features = audio_tower
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Exception::custom(
+                                "gemma4 audio tensor input requires audio_config and audio weights",
+                            )
+                        })?
+                        .forward(tensor, mask, stream)?;
+                    Ok(vec![embed_audio
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Exception::custom("gemma4 audio input requires embed_audio weights")
+                        })?
+                        .forward(&features, stream)?])
+                }
+                (modality, input::InputPayload::Tensor(_)) => Err(Exception::custom(format!(
+                    "gemma4 does not support {} tensor inputs",
+                    modality.as_str()
+                ))),
+                (modality, input::InputPayload::TokenIds(_)) => Err(Exception::custom(format!(
+                    "gemma4 {} input does not accept token-id payloads",
+                    modality.as_str()
+                ))),
             },
         )?;
-        if let (input::PreparedPrefill::Text(tokens), Some(image_token_id)) =
-            (&prepared, self.image_token_id)
-        {
-            if input::token_ids_from_array(tokens, stream)?.contains(&(image_token_id as u32)) {
-                return Err(Exception::custom(
-                    "gemma4 prompt contains an image placeholder but no image input",
-                ));
+        if let input::PreparedPrefill::Text(tokens) = &prepared {
+            let token_ids = input::token_ids_from_array(tokens, stream)?;
+            for (modality, placeholder) in [
+                ("image", self.image_token_id),
+                ("audio", self.audio_token_id),
+            ] {
+                if placeholder.is_some_and(|id| token_ids.contains(&(id as u32))) {
+                    return Err(Exception::custom(format!(
+                        "gemma4 prompt contains an {modality} placeholder but no {modality} input"
+                    )));
+                }
             }
         }
         Ok(prepared)
     }
 
     fn per_layer_ids_for_media(&self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let Some(image_token_id) = self.image_token_id else {
-            return Ok(tokens.clone());
-        };
-        let image_mask = tokens.eq(Array::from_int(image_token_id), stream)?;
-        r#where(
-            &image_mask,
-            Array::from_int(self.args.pad_token_id),
-            tokens,
-            stream,
-        )
+        let mut output = tokens.clone();
+        for token_id in [self.image_token_id, self.audio_token_id]
+            .into_iter()
+            .flatten()
+        {
+            let mask = output.eq(Array::from_int(token_id), stream)?;
+            output = r#where(
+                &mask,
+                Array::from_int(self.args.pad_token_id),
+                &output,
+                stream,
+            )?;
+        }
+        Ok(output)
     }
 
     /// Forward pass that reports activations to an observer.
@@ -2501,9 +2615,15 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
     Ok(get_gemma4_model_config(model_dir.as_ref())?.0)
 }
 
-fn get_gemma4_model_config(
-    model_dir: &Path,
-) -> Result<(ModelArgs, Option<Gemma4VisionConfig>, Option<i32>), Error> {
+type Gemma4ModelConfigParts = (
+    ModelArgs,
+    Option<Gemma4VisionConfig>,
+    Option<i32>,
+    Option<Gemma4AudioConfig>,
+    Option<i32>,
+);
+
+fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
     if config.text_config.enable_moe_block {
@@ -2521,6 +2641,8 @@ fn get_gemma4_model_config(
         config.text_config,
         config.vision_config,
         config.image_token_id,
+        config.audio_config,
+        config.audio_token_id,
     ))
 }
 
@@ -2552,19 +2674,25 @@ pub fn load_gemma4_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let (model_args, vision_config, image_token_id) = get_gemma4_model_config(model_dir)?;
-    let mut model = Model::new_with_vision(model_args, image_token_id, vision_config, stream)?;
+    let (model_args, vision_config, image_token_id, audio_config, audio_token_id) =
+        get_gemma4_model_config(model_dir)?;
+    let mut model = Model::new_with_modalities(
+        model_args,
+        image_token_id,
+        vision_config,
+        audio_token_id,
+        audio_config,
+        stream,
+    )?;
     let weights_index = model_dir.join("model.safetensors.index.json");
     let config = StrictLoadConfig::default()
         .rewrite_prefix("language_model.model.", "model.language_model.")
         .rewrite_prefix("model.language_model.", "model.language_model.")
         .rewrite_prefix("vision_tower.", "model.vision_tower.")
         .rewrite_prefix("embed_vision.", "model.embed_vision.")
-        .allow_unused_prefix("audio_tower.")
-        .allow_unused_prefix("embed_audio.")
+        .rewrite_prefix("audio_tower.", "model.audio_tower.")
+        .rewrite_prefix("embed_audio.", "model.embed_audio.")
         .allow_unused_prefix("multi_modal_projector.")
-        .allow_unused_prefix("model.audio_tower.")
-        .allow_unused_prefix("model.embed_audio.")
         .allow_unused_prefix("model.multi_modal_projector.")
         .allow_unused_prefix("model.vision_embedder.")
         .allow_missing_suffix(".bias");
@@ -2732,7 +2860,7 @@ struct Gemma4AttentionMasks {
 
 fn multimodal_attention_masks(
     token_ids: &[u32],
-    image_token_id: u32,
+    image_token_id: Option<u32>,
     sliding_window: Option<i32>,
 ) -> Gemma4AttentionMasks {
     let sequence = token_ids.len();
@@ -2740,7 +2868,7 @@ fn multimodal_attention_masks(
     let mut group = -1i32;
     let mut previous_was_image = false;
     for (index, token_id) in token_ids.iter().enumerate() {
-        let is_image = *token_id == image_token_id;
+        let is_image = image_token_id == Some(*token_id);
         if is_image && !previous_was_image {
             group += 1;
         }
@@ -2806,7 +2934,7 @@ impl CausalLm<Cache> for Model {
                 let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
-                    self.image_token_id.expect("image token was validated") as u32,
+                    self.image_token_id.map(|id| id as u32),
                     self.args.sliding_window,
                 );
                 self.forward_logits(
@@ -2860,7 +2988,7 @@ impl CausalLm<Cache> for Model {
         let masks = generated_embeddings.as_ref().map(|_| {
             multimodal_attention_masks(
                 &cache.token_ids,
-                self.image_token_id.expect("image token was validated") as u32,
+                self.image_token_id.map(|id| id as u32),
                 self.args.sliding_window,
             )
         });
@@ -2962,6 +3090,40 @@ mod tests {
         let parts = [
             InputPart::text_token_ids(&tokens),
             InputPart::image_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
+        ];
+        let mut cache = Cache::default();
+        let logits = model
+            .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
+        let decode = Array::from_slice(&[8u32], &[1, 1]);
+        let logits = model
+            .decode_logits(&decode, &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
+    }
+
+    #[test]
+    #[ignore = "requires a local Gemma 4 E4B checkpoint and Metal"]
+    fn local_e4b_audio_prefill_and_decode() {
+        let home = std::env::var("HOME").unwrap();
+        let snapshots = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-4bit/snapshots");
+        let model_dir = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.join("model.safetensors").exists())
+            .unwrap();
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let tokens = Array::from_slice(&[2u32, 258881, 7], &[1, 3]);
+        let features = Array::from_slice(&vec![0.0f32; 16 * 128], &[1, 16, 128]);
+        let mask = Array::from_slice(&[true; 16], &[1, 16]);
+        let parts = [
+            InputPart::text_token_ids(&tokens),
+            InputPart::audio_tensor(&features, InputMetadata::audio_mask(&mask)),
         ];
         let mut cache = Cache::default();
         let logits = model

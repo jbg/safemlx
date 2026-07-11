@@ -20,7 +20,7 @@ pub mod inspection;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;
 /// Model-agnostic media processing and prepared-input helpers.
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "media-processing")]
 pub mod processor;
 /// Token sampling strategies.
 pub mod sampler;

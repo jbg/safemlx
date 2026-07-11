@@ -61,6 +61,29 @@ binding. Qwen also supports decoded video sampling and timestamps. Without the
 feature, callers can still supply Gemma 4 or Qwen `Image/Tensor` inputs, and
 Qwen `Video/Tensor` inputs, directly without depending on the `image` crate.
 
+Gemma 4 audio accepts model-native log-mel tensors through the typed input API
+without optional dependencies. Enable `audio-processing` to prepare mono `f32`
+PCM in the shared processor instead:
+
+```toml
+[dependencies]
+safemlx-lm = { version = "0.3", features = ["audio-processing"] }
+```
+
+```rust,ignore
+use safemlx_lm::processor::MediaInput;
+
+let audio = MediaInput::audio_f32(mono_pcm, sample_rate)?;
+let prepared = model.prepare_input(&rendered_prompt, &[audio], false)?;
+let logits = model.prefill_prepared_input_with_cache(&prepared, &mut cache, stream)?;
+```
+
+The common audio processor validates and resamples neither channels nor sample
+rate: Gemma 4 currently requires mono 16 kHz PCM. It computes the model's log-mel
+features and valid-frame mask. The optional FFT dependency is only enabled by
+`audio-processing`; callers that provide `Audio/Tensor` and `audio_mask` directly
+do not pay that dependency cost.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.

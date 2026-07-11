@@ -1,16 +1,15 @@
 use safemlx::{
     error::Exception,
     fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask},
-    macros::{ModuleParameters, Quantizable},
+    macros::ModuleParameters,
     module::{Module, Param},
     nn,
-    ops::{clip, concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, maximum, mean_axes},
-    quantization::MaybeQuantized,
+    ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, maximum, mean_axes},
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
 
-use super::gemma4::{maybe_quantized_linear, rms_norm_without_scale};
+use super::{gemma4::rms_norm_without_scale, gemma4_multimodal::Gemma4ClippedLinear};
 use crate::utils::rope::FloatOrString;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,50 +117,18 @@ impl VisionPatchEmbedder {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-pub(crate) struct VisionLinear {
-    #[param]
-    pub linear: nn::Linear,
-    #[param]
-    pub input_min: Param<Array>,
-    #[param]
-    pub input_max: Param<Array>,
-    #[param]
-    pub output_min: Param<Array>,
-    #[param]
-    pub output_max: Param<Array>,
-}
-
-impl VisionLinear {
-    fn new(input: i32, output: i32, stream: &Stream) -> Result<Self, Exception> {
-        Ok(Self {
-            linear: nn::Linear::unloaded(input, output, false, Dtype::Float32, stream)?,
-            input_min: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
-            input_max: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
-            output_min: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
-            output_max: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
-        })
-    }
-
-    fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let x = clip(x, (&*self.input_min, &*self.input_max), stream)?;
-        let output = self.linear.forward(&x, stream)?;
-        clip(output, (&*self.output_min, &*self.output_max), stream)
-    }
-}
-
-#[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct VisionAttention {
     pub num_heads: i32,
     pub num_kv_heads: i32,
     pub head_dim: i32,
     #[param]
-    pub q_proj: VisionLinear,
+    pub q_proj: Gemma4ClippedLinear,
     #[param]
-    pub k_proj: VisionLinear,
+    pub k_proj: Gemma4ClippedLinear,
     #[param]
-    pub v_proj: VisionLinear,
+    pub v_proj: Gemma4ClippedLinear,
     #[param]
-    pub o_proj: VisionLinear,
+    pub o_proj: Gemma4ClippedLinear,
     #[param]
     pub q_norm: nn::RmsNorm,
     #[param]
@@ -175,24 +142,28 @@ impl VisionAttention {
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
-            q_proj: VisionLinear::new(
+            q_proj: Gemma4ClippedLinear::new(
                 config.hidden_size,
                 config.num_attention_heads * config.head_dim,
+                false,
                 stream,
             )?,
-            k_proj: VisionLinear::new(
+            k_proj: Gemma4ClippedLinear::new(
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
+                false,
                 stream,
             )?,
-            v_proj: VisionLinear::new(
+            v_proj: Gemma4ClippedLinear::new(
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
+                false,
                 stream,
             )?,
-            o_proj: VisionLinear::new(
+            o_proj: Gemma4ClippedLinear::new(
                 config.num_attention_heads * config.head_dim,
                 config.hidden_size,
+                false,
                 stream,
             )?,
             q_norm: nn::RmsNorm::unloaded(
@@ -270,20 +241,35 @@ impl VisionAttention {
 pub(crate) struct VisionMlp {
     pub activation: String,
     #[param]
-    pub gate_proj: VisionLinear,
+    pub gate_proj: Gemma4ClippedLinear,
     #[param]
-    pub up_proj: VisionLinear,
+    pub up_proj: Gemma4ClippedLinear,
     #[param]
-    pub down_proj: VisionLinear,
+    pub down_proj: Gemma4ClippedLinear,
 }
 
 impl VisionMlp {
     fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             activation: config.hidden_activation.clone(),
-            gate_proj: VisionLinear::new(config.hidden_size, config.intermediate_size, stream)?,
-            up_proj: VisionLinear::new(config.hidden_size, config.intermediate_size, stream)?,
-            down_proj: VisionLinear::new(config.intermediate_size, config.hidden_size, stream)?,
+            gate_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+                stream,
+            )?,
+            up_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+                stream,
+            )?,
+            down_proj: Gemma4ClippedLinear::new(
+                config.intermediate_size,
+                config.hidden_size,
+                false,
+                stream,
+            )?,
         })
     }
 
@@ -451,42 +437,6 @@ impl Gemma4VisionTower {
             hidden = hidden.subtract(bias, stream)?.multiply(scale, stream)?;
         }
         hidden.as_dtype(working_dtype, stream)
-    }
-}
-
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
-pub(crate) struct Gemma4MultimodalEmbedder {
-    pub eps: f32,
-    #[quantizable]
-    #[param]
-    pub embedding_projection: MaybeQuantized<nn::Linear>,
-}
-
-impl Gemma4MultimodalEmbedder {
-    pub(super) fn new(
-        vision: &Gemma4VisionConfig,
-        text_hidden_size: i32,
-        quantized: bool,
-        group_size: i32,
-        bits: i32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Ok(Self {
-            eps: vision.rms_norm_eps,
-            embedding_projection: maybe_quantized_linear(
-                quantized,
-                vision.hidden_size,
-                text_hidden_size,
-                group_size,
-                bits,
-                stream,
-            )?,
-        })
-    }
-
-    pub(super) fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
-        self.embedding_projection
-            .forward(&rms_norm_without_scale(x, self.eps, stream)?, stream)
     }
 }
 

@@ -9,13 +9,22 @@ use crate::{
     models::input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
 };
 
+/// Shared PCM waveform validation and spectral operations.
+#[cfg(feature = "audio-processing")]
+pub mod audio;
 mod gemma4;
 /// Shared decoded-image operations.
+#[cfg(feature = "image-processing")]
 pub mod image;
+#[cfg(feature = "image-processing")]
 mod qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
+#[cfg(feature = "image-processing")]
 pub mod video;
 
+#[cfg(feature = "audio-processing")]
+pub use audio::AudioWaveform;
+#[cfg(feature = "image-processing")]
 pub use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
@@ -29,6 +38,7 @@ pub struct MediaInput<'a> {
 
 impl<'a> MediaInput<'a> {
     /// Creates an RGB8 image input.
+    #[cfg(feature = "image-processing")]
     pub fn image_rgb8(image: RgbImageView<'a>) -> Self {
         Self {
             modality: Modality::Image,
@@ -37,11 +47,13 @@ impl<'a> MediaInput<'a> {
     }
 
     /// Creates a decoded RGB8 video input using processor-default sampling.
+    #[cfg(feature = "image-processing")]
     pub fn video_rgb8(frames: &'a [RgbImageView<'a>], source_fps: Option<f64>) -> Self {
         Self::video_rgb8_with_sampling(frames, source_fps, VideoSampling::ProcessorDefault)
     }
 
     /// Creates a decoded RGB8 video input with an explicit sampling policy.
+    #[cfg(feature = "image-processing")]
     pub fn video_rgb8_with_sampling(
         frames: &'a [RgbImageView<'a>],
         source_fps: Option<f64>,
@@ -56,9 +68,19 @@ impl<'a> MediaInput<'a> {
             }),
         }
     }
+
+    /// Creates a mono floating-point PCM audio input.
+    #[cfg(feature = "audio-processing")]
+    pub fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
+        Ok(Self {
+            modality: Modality::Audio,
+            payload: MediaPayload::AudioF32(AudioWaveform::new(samples, sample_rate)?),
+        })
+    }
 }
 
 /// Frame-selection policy for decoded video input.
+#[cfg(feature = "image-processing")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum VideoSampling {
     /// Uses the model processor's default frame rate and limits.
@@ -73,6 +95,7 @@ pub enum VideoSampling {
 }
 
 /// Borrowed sequence of decoded RGB8 video frames.
+#[cfg(feature = "image-processing")]
 #[derive(Debug, Clone, Copy)]
 pub struct VideoFrames<'a> {
     /// Frames in source order.
@@ -87,14 +110,23 @@ pub struct VideoFrames<'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum MediaPayload<'a> {
     /// Decoded RGB8 image pixels.
+    #[cfg(feature = "image-processing")]
     Rgb8(RgbImageView<'a>),
     /// Decoded RGB8 video frames and timing metadata.
+    #[cfg(feature = "image-processing")]
     VideoFrames(VideoFrames<'a>),
+    /// Mono floating-point PCM samples and their sampling rate.
+    #[cfg(feature = "audio-processing")]
+    AudioF32(AudioWaveform<'a>),
+    #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+    #[doc(hidden)]
+    _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
 #[derive(Debug)]
 enum OwnedInputPayload {
     TokenIds(Array),
+    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
     Tensor(Array),
 }
 
@@ -102,8 +134,12 @@ enum OwnedInputPayload {
 enum OwnedInputMetadata {
     #[default]
     None,
+    #[cfg(feature = "image-processing")]
     GridThw(Array),
+    #[cfg(feature = "image-processing")]
     PatchPositionIds(Array),
+    #[cfg(feature = "audio-processing")]
+    AudioMask(Array),
 }
 
 /// One owned part of a prepared model input.
@@ -123,6 +159,7 @@ impl PreparedInputPart {
         }
     }
 
+    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
     fn media_tensor(modality: Modality, tensor: Array, metadata: OwnedInputMetadata) -> Self {
         Self {
             modality,
@@ -135,6 +172,7 @@ impl PreparedInputPart {
     pub fn as_input_part(&self) -> InputPart<'_> {
         let payload = match &self.payload {
             OwnedInputPayload::TokenIds(value) => InputPayload::TokenIds(value),
+            #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
             OwnedInputPayload::Tensor(value) => InputPayload::Tensor(value),
         };
         InputPart {
@@ -142,13 +180,19 @@ impl PreparedInputPart {
             payload,
             metadata: InputMetadata {
                 qwen_grid_thw: match &self.metadata {
-                    OwnedInputMetadata::None => None,
+                    #[cfg(feature = "image-processing")]
                     OwnedInputMetadata::GridThw(value) => Some(value),
-                    OwnedInputMetadata::PatchPositionIds(_) => None,
+                    _ => None,
                 },
                 patch_position_ids: match &self.metadata {
+                    #[cfg(feature = "image-processing")]
                     OwnedInputMetadata::PatchPositionIds(value) => Some(value),
-                    OwnedInputMetadata::None | OwnedInputMetadata::GridThw(_) => None,
+                    _ => None,
+                },
+                audio_mask: match &self.metadata {
+                    #[cfg(feature = "audio-processing")]
+                    OwnedInputMetadata::AudioMask(value) => Some(value),
+                    _ => None,
                 },
             },
         }
@@ -203,6 +247,7 @@ pub struct ModelProcessor {
 #[derive(Debug, Clone)]
 enum ProcessorKind {
     Gemma4(gemma4::Gemma4Processor),
+    #[cfg(feature = "image-processing")]
     Qwen(qwen::QwenProcessor),
 }
 
@@ -215,6 +260,7 @@ impl ModelProcessor {
         })
     }
 
+    #[cfg(feature = "image-processing")]
     pub(crate) fn load_qwen(model_dir: &Path) -> Result<Option<Self>, Error> {
         qwen::QwenProcessor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {
@@ -248,8 +294,11 @@ impl ModelProcessor {
         media: &[MediaInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
+        #[cfg(not(feature = "image-processing"))]
+        let _ = &encode_text;
         match &self.kind {
             ProcessorKind::Gemma4(processor) => processor.prepare_token_ids(token_ids, media),
+            #[cfg(feature = "image-processing")]
             ProcessorKind::Qwen(processor) => {
                 processor.prepare_token_ids(token_ids, media, encode_text)
             }
@@ -282,7 +331,16 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
             ModelProcessor::load_gemma4(model_dir)
         }
-        "qwen3_5_moe" | "qwen3_5_moe_text" => ModelProcessor::load_qwen(model_dir),
+        "qwen3_5_moe" | "qwen3_5_moe_text" => {
+            #[cfg(feature = "image-processing")]
+            {
+                ModelProcessor::load_qwen(model_dir)
+            }
+            #[cfg(not(feature = "image-processing"))]
+            {
+                Ok(None)
+            }
+        }
         _ => Ok(None),
     }
 }

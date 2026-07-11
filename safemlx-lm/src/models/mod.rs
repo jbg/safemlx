@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 
 use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, MediaInput, ModelProcessor, PreparedModelInput};
 use crate::sampler::{DefaultSampler, Sampler};
 use crate::{cache::ConcatKeyValueCache, error::Error};
@@ -33,6 +33,8 @@ pub mod common;
 pub mod gemma4;
 /// Gemma 4 assistant draft-model support.
 pub mod gemma4_assistant;
+mod gemma4_audio;
+mod gemma4_multimodal;
 mod gemma4_vision;
 /// Typed runtime input support.
 pub mod input;
@@ -520,7 +522,7 @@ where
 /// used by the template renderer, and EOS token ids parsed from config.
 pub struct LoadedModel {
     model: Model,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     processor: Option<ModelProcessor>,
     tokenizer: ChatTokenizer,
     chat_template: Option<String>,
@@ -542,7 +544,7 @@ impl LoadedModel {
         let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
         let chat_template = load_chat_template(model_dir)?;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "media-processing")]
         let processor = load_processor(model_dir)?;
         let model = match kind {
             ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(
@@ -579,7 +581,7 @@ impl LoadedModel {
 
         Ok(Self {
             model,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "media-processing")]
             processor,
             tokenizer,
             chat_template,
@@ -604,13 +606,13 @@ impl LoadedModel {
     }
 
     /// Returns whether this model directory includes a supported media processor.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     pub fn has_processor(&self) -> bool {
         self.processor.is_some()
     }
 
     /// Returns the loaded architecture-dispatched media processor, if available.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     pub fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }
@@ -619,7 +621,7 @@ impl LoadedModel {
     ///
     /// The rendered text must contain one architecture-specific placeholder for
     /// each media item, in the same order as `media`.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     pub fn prepare_input(
         &self,
         rendered_text: &str,
@@ -795,7 +797,7 @@ impl LoadedModel {
     }
 
     /// Computes initial logits from an owned processor result.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     pub fn prefill_prepared_input_with_cache(
         &mut self,
         input: &PreparedModelInput,
@@ -821,7 +823,7 @@ impl LoadedModel {
     }
 
     /// Computes initial logits from an owned processor result while observing activations.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "media-processing")]
     pub fn prefill_prepared_input_with_observer(
         &mut self,
         input: &PreparedModelInput,

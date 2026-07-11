@@ -58,6 +58,15 @@ impl<'a> InputPart<'a> {
             metadata,
         }
     }
+
+    /// Creates an audio feature tensor part.
+    pub fn audio_tensor(tensor: &'a Array, metadata: InputMetadata<'a>) -> Self {
+        Self {
+            modality: Modality::Audio,
+            payload: InputPayload::Tensor(tensor),
+            metadata,
+        }
+    }
 }
 
 /// Runtime modality.
@@ -103,6 +112,8 @@ pub struct InputMetadata<'a> {
     pub qwen_grid_thw: Option<&'a Array>,
     /// Patch positions shaped `[batch, patches, 2]`, with negative coordinates for padding.
     pub patch_position_ids: Option<&'a Array>,
+    /// Valid-frame mask for model-native audio features.
+    pub audio_mask: Option<&'a Array>,
 }
 
 impl<'a> InputMetadata<'a> {
@@ -116,6 +127,7 @@ impl<'a> InputMetadata<'a> {
         Self {
             qwen_grid_thw: Some(grid_thw),
             patch_position_ids: None,
+            audio_mask: None,
         }
     }
 
@@ -124,6 +136,16 @@ impl<'a> InputMetadata<'a> {
         Self {
             qwen_grid_thw: None,
             patch_position_ids: Some(position_ids),
+            audio_mask: None,
+        }
+    }
+
+    /// Creates metadata carrying a valid-frame mask for audio features.
+    pub fn audio_mask(mask: &'a Array) -> Self {
+        Self {
+            qwen_grid_thw: None,
+            patch_position_ids: None,
+            audio_mask: Some(mask),
         }
     }
 }
