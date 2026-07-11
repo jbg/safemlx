@@ -34,6 +34,14 @@ pub trait ActivationObserver {
     /// Observe a named tensor.
     fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception>;
 
+    /// Optionally replace a named activation before downstream computation uses it.
+    ///
+    /// Instrumented model paths call this at causal intervention points such as
+    /// transformer block outputs. Returning `None` preserves the original value.
+    fn intervene(&mut self, _name: &str, _value: &Array) -> Result<Option<Array>, Exception> {
+        Ok(None)
+    }
+
     /// Observe compact, model-normalized MoE routing metadata.
     fn observe_moe_routing(
         &mut self,

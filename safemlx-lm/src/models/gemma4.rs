@@ -1632,6 +1632,9 @@ impl TransformerBlock {
         }
 
         let output = self.apply_layer_scalar(h, stream)?;
+        let output = observer
+            .intervene(&format!("{prefix}.output"), &output)?
+            .unwrap_or(output);
         observer.observe(&format!("{prefix}.output"), &output)?;
         Ok(output)
     }

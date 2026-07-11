@@ -371,6 +371,9 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.mlp_output"), &r)?;
         observer.observe(&format!("{prefix}.residual_delta_mlp"), &r)?;
         let output = h.add(r, stream)?;
+        let output = observer
+            .intervene(&format!("{prefix}.output"), &output)?
+            .unwrap_or(output);
         observer.observe(&format!("{prefix}.output"), &output)?;
         observer.observe(&format!("{prefix}.residual_after_mlp"), &output)?;
         Ok(output)
