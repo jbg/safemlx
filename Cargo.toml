@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Jasper Hugo <jasper@jasperhugo.com>"]
 repository = "https://github.com/jbg/safemlx"
@@ -21,27 +21,27 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
 
 [workspace.dependencies]
-safemlx = { version = "0.1.2", path = "safemlx" }
-safemlx-sys = { version = "0.1.2", path = "safemlx-sys", default-features = false }
-safemlx-macros = { version = "0.1.0", path = "safemlx-macros" }
-safemlx-internal-macros = { version = "0.1.0", path = "safemlx-internal-macros" }
-safemlx-lm = { version = "0.3.1", path = "safemlx-lm" }
-safemlx-lm-utils = { version = "0.1.3", path = "safemlx-lm-utils", default-features = false }
+safemlx = { version = "0.1.3", path = "safemlx" }
+safemlx-sys = { version = "0.1.3", path = "safemlx-sys", default-features = false }
+safemlx-macros = { version = "0.1.1", path = "safemlx-macros" }
+safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" }
+safemlx-lm = { version = "0.3.2", path = "safemlx-lm" }
+safemlx-lm-utils = { version = "0.1.4", path = "safemlx-lm-utils", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizers = "0.22"
+tokenizers = "0.23"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 clap = { version = "4", features = ["derive"] }
-idna_adapter = "1.2"
+idna_adapter = "1"
 anyhow = "1"
 syn = { version = "2", features = ["full"] }
 quote = "1"
-darling = "0.21"
+darling = "0.23"
 proc-macro2 = "1"
-itertools = "0.14"
-bindgen = "0.72.1"
+itertools = "0.15"
+bindgen = "0.72"
 cmake = "0.1"
 cc = "1"
 tempfile = "3"
