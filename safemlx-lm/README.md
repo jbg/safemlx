@@ -55,11 +55,13 @@ let prepared = model.prepare_input(
 ```
 
 The optional `image-processing` feature enables architecture-dispatched Gemma 4
-and Qwen processors. Shared code owns decoded-image validation and resizing;
-each processor adds its model-native patch packing, metadata, and placeholder
-binding. Qwen also supports decoded video sampling and timestamps. Without the
-feature, callers can still supply Gemma 4 or Qwen `Image/Tensor` inputs, and
-Qwen `Video/Tensor` inputs, directly without depending on the `image` crate.
+and Qwen processors. Shared code owns decoded-image validation, frame sampling,
+and timestamp operations; each processor adds its model-native patch packing,
+prompt format, metadata, and placeholder binding. Gemma samples up to 32 frames
+by default and encodes each timestamped frame through its vision tower. Qwen
+uses its temporal patch packing and timestamp format. Without the feature,
+callers can still supply Gemma 4 or Qwen `Image/Tensor` and `Video/Tensor`
+inputs directly without depending on the `image` crate.
 
 Gemma 4 audio accepts model-native log-mel tensors through the typed input API
 without optional dependencies. Enable `audio-processing` to prepare mono `f32`

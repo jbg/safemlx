@@ -45,6 +45,61 @@ pub fn uniform_sample_indices(
         .collect())
 }
 
+/// Computes a uniformly sampled frame count from source and target rates.
+pub fn sampled_frame_count(
+    total_frames: usize,
+    source_fps: f64,
+    target_fps: f64,
+    min_frames: usize,
+    max_frames: usize,
+) -> Result<usize, Error> {
+    if !source_fps.is_finite() || source_fps <= 0.0 {
+        return Err(Error::Processor(format!(
+            "video source FPS must be finite and positive, got {source_fps}"
+        )));
+    }
+    if !target_fps.is_finite() || target_fps <= 0.0 {
+        return Err(Error::Processor(format!(
+            "video target FPS must be finite and positive, got {target_fps}"
+        )));
+    }
+    if min_frames == 0 || max_frames < min_frames {
+        return Err(Error::Processor(format!(
+            "video frame limits must be positive and ordered, got {min_frames}..{max_frames}"
+        )));
+    }
+    let requested = (total_frames as f64 / source_fps * target_fps) as usize;
+    Ok(requested
+        .max(min_frames)
+        .min(max_frames)
+        .min(total_frames)
+        .max(1))
+}
+
+/// Converts selected source-frame indices to timestamps in seconds.
+pub fn frame_timestamps(indices: &[usize], source_fps: f64) -> Result<Vec<f64>, Error> {
+    if !source_fps.is_finite() || source_fps <= 0.0 {
+        return Err(Error::Processor(format!(
+            "video source FPS must be finite and positive, got {source_fps}"
+        )));
+    }
+    Ok(indices
+        .iter()
+        .map(|index| *index as f64 / source_fps)
+        .collect())
+}
+
+/// Formats a timestamp using Gemma-style zero-padded `mm:ss` text.
+pub fn format_mm_ss(timestamp: f64) -> Result<String, Error> {
+    if !timestamp.is_finite() || timestamp < 0.0 {
+        return Err(Error::Processor(format!(
+            "video timestamp must be finite and non-negative, got {timestamp}"
+        )));
+    }
+    let seconds = timestamp.floor() as u64;
+    Ok(format!("{:02}:{:02}", seconds / 60, seconds % 60))
+}
+
 /// Pads frame indices by repeating the last frame to a temporal multiple.
 pub fn pad_frame_indices(indices: &mut Vec<usize>, temporal_factor: usize) -> Result<(), Error> {
     if indices.is_empty() || temporal_factor == 0 {
@@ -89,7 +144,10 @@ pub fn temporal_group_timestamps(
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_frame_indices, temporal_group_timestamps, uniform_sample_indices};
+    use super::{
+        format_mm_ss, frame_timestamps, pad_frame_indices, sampled_frame_count,
+        temporal_group_timestamps, uniform_sample_indices,
+    };
 
     #[test]
     fn uniform_sampling_includes_endpoints() {
@@ -105,5 +163,15 @@ mod tests {
             temporal_group_timestamps(&indices, 2.0, 2).unwrap(),
             vec![0.5, 2.0]
         );
+    }
+
+    #[test]
+    fn shared_sampling_and_timestamp_helpers_cover_architecture_formats() {
+        assert_eq!(sampled_frame_count(120, 24.0, 2.0, 1, 32).unwrap(), 10);
+        assert_eq!(
+            frame_timestamps(&[0, 24, 1_464], 24.0).unwrap(),
+            vec![0.0, 1.0, 61.0]
+        );
+        assert_eq!(format_mm_ss(61.9).unwrap(), "01:01");
     }
 }

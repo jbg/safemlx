@@ -110,7 +110,7 @@ pub enum InputPayload<'a> {
 pub struct InputMetadata<'a> {
     /// Qwen image/video grid metadata shaped as expected by the checkpoint.
     pub qwen_grid_thw: Option<&'a Array>,
-    /// Patch positions shaped `[batch, patches, 2]`, with negative coordinates for padding.
+    /// Image or video-frame patch positions shaped `[batch, patches, 2]`, with negative coordinates for padding.
     pub patch_position_ids: Option<&'a Array>,
     /// Valid-frame mask for model-native audio features.
     pub audio_mask: Option<&'a Array>,

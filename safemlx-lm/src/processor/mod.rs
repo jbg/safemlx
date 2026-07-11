@@ -297,7 +297,9 @@ impl ModelProcessor {
         #[cfg(not(feature = "image-processing"))]
         let _ = &encode_text;
         match &self.kind {
-            ProcessorKind::Gemma4(processor) => processor.prepare_token_ids(token_ids, media),
+            ProcessorKind::Gemma4(processor) => {
+                processor.prepare_token_ids(token_ids, media, encode_text)
+            }
             #[cfg(feature = "image-processing")]
             ProcessorKind::Qwen(processor) => {
                 processor.prepare_token_ids(token_ids, media, encode_text)
@@ -347,9 +349,30 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
 
 struct PreparedMediaBinding {
     placeholder_token_id: u32,
-    prefix_token_ids: Vec<u32>,
-    suffix_token_ids: Vec<u32>,
-    part: PreparedInputPart,
+    replacement: Vec<PreparedInputPart>,
+}
+
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+impl PreparedMediaBinding {
+    fn around_part(
+        placeholder_token_id: u32,
+        prefix_token_ids: Vec<u32>,
+        part: PreparedInputPart,
+        suffix_token_ids: Vec<u32>,
+    ) -> Self {
+        let mut replacement = Vec::with_capacity(3);
+        if !prefix_token_ids.is_empty() {
+            replacement.push(PreparedInputPart::text_token_ids(&prefix_token_ids));
+        }
+        replacement.push(part);
+        if !suffix_token_ids.is_empty() {
+            replacement.push(PreparedInputPart::text_token_ids(&suffix_token_ids));
+        }
+        Self {
+            placeholder_token_id,
+            replacement,
+        }
+    }
 }
 
 fn bind_media_parts(
@@ -385,13 +408,7 @@ fn bind_media_parts(
         if start < index {
             parts.push(PreparedInputPart::text_token_ids(&token_ids[start..index]));
         }
-        if !binding.prefix_token_ids.is_empty() {
-            parts.push(PreparedInputPart::text_token_ids(&binding.prefix_token_ids));
-        }
-        parts.push(binding.part);
-        if !binding.suffix_token_ids.is_empty() {
-            parts.push(PreparedInputPart::text_token_ids(&binding.suffix_token_ids));
-        }
+        parts.extend(binding.replacement);
         start = index + 1;
     }
     if start < token_ids.len() {
@@ -421,12 +438,12 @@ mod tests {
         let prepared = bind_media_parts(
             &[10, 42, 11],
             &[42],
-            vec![PreparedMediaBinding {
-                placeholder_token_id: 42,
-                prefix_token_ids: Vec::new(),
-                suffix_token_ids: Vec::new(),
-                part: image,
-            }],
+            vec![PreparedMediaBinding::around_part(
+                42,
+                Vec::new(),
+                image,
+                Vec::new(),
+            )],
         )
         .unwrap();
         let parts = prepared.input_parts();

@@ -8,9 +8,16 @@ use serde::Deserialize;
 use super::audio::{extract_log_mel, LogMelConfig};
 #[cfg(feature = "image-processing")]
 use super::image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage};
+#[cfg(feature = "image-processing")]
+use super::video::{
+    format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
+    validate_rgb_frames,
+};
 use super::{bind_media_parts, MediaInput, PreparedModelInput};
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
 use super::{MediaPayload, OwnedInputMetadata, PreparedInputPart, PreparedMediaBinding};
+#[cfg(feature = "image-processing")]
+use super::{VideoFrames, VideoSampling};
 use crate::error::Error;
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
 use crate::models::input::Modality;
@@ -23,6 +30,8 @@ struct Gemma4ModelConfig {
     boi_token_id: Option<u32>,
     #[cfg(feature = "image-processing")]
     eoi_token_id: Option<u32>,
+    #[cfg(feature = "image-processing")]
+    video_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
     audio_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
@@ -59,6 +68,31 @@ struct Gemma4PreprocessorConfig {
 }
 
 #[cfg(feature = "image-processing")]
+#[derive(Debug, Clone, Deserialize)]
+struct Gemma4VideoPreprocessorConfig {
+    #[serde(default = "default_patch_size")]
+    patch_size: usize,
+    #[serde(default = "default_pooling_kernel_size")]
+    pooling_kernel_size: usize,
+    #[serde(default = "default_video_soft_tokens")]
+    max_soft_tokens: usize,
+    #[serde(default = "default_video_frames")]
+    num_frames: usize,
+}
+
+#[cfg(feature = "image-processing")]
+impl Default for Gemma4VideoPreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            patch_size: default_patch_size(),
+            pooling_kernel_size: default_pooling_kernel_size(),
+            max_soft_tokens: default_video_soft_tokens(),
+            num_frames: default_video_frames(),
+        }
+    }
+}
+
+#[cfg(feature = "image-processing")]
 fn default_patch_size() -> usize {
     16
 }
@@ -71,6 +105,16 @@ fn default_pooling_kernel_size() -> usize {
 #[cfg(feature = "image-processing")]
 fn default_soft_tokens() -> usize {
     280
+}
+
+#[cfg(feature = "image-processing")]
+fn default_video_soft_tokens() -> usize {
+    70
+}
+
+#[cfg(feature = "image-processing")]
+fn default_video_frames() -> usize {
+    32
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +131,16 @@ pub(super) struct Gemma4Processor {
     boi_token_id: Option<u32>,
     #[cfg(feature = "image-processing")]
     eoi_token_id: Option<u32>,
+    #[cfg(feature = "image-processing")]
+    video_token_id: Option<u32>,
+    #[cfg(feature = "image-processing")]
+    video_patch_size: usize,
+    #[cfg(feature = "image-processing")]
+    video_pooling_kernel_size: usize,
+    #[cfg(feature = "image-processing")]
+    video_max_soft_tokens: usize,
+    #[cfg(feature = "image-processing")]
+    video_num_frames: usize,
     #[cfg(feature = "audio-processing")]
     audio_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
@@ -122,6 +176,14 @@ impl Gemma4Processor {
             Gemma4PreprocessorConfig::default()
         };
         #[cfg(feature = "image-processing")]
+        let video_processor_path = model_dir.join("video_preprocessor_config.json");
+        #[cfg(feature = "image-processing")]
+        let video_processor = if video_processor_path.exists() {
+            serde_json::from_slice(&fs::read(video_processor_path)?)?
+        } else {
+            Gemma4VideoPreprocessorConfig::default()
+        };
+        #[cfg(feature = "image-processing")]
         let max_soft_tokens = processor
             .max_soft_tokens
             .unwrap_or(config.vision_soft_tokens_per_image);
@@ -130,6 +192,15 @@ impl Gemma4Processor {
         {
             return Err(Error::Processor(format!(
                 "Gemma 4 max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
+            )));
+        }
+        #[cfg(feature = "image-processing")]
+        if !matches!(video_processor.max_soft_tokens, 70 | 140 | 280 | 560 | 1120)
+            || video_processor.num_frames == 0
+        {
+            return Err(Error::Processor(format!(
+                "Gemma 4 video processor requires a supported soft-token budget and positive frame count, got {} tokens and {} frames",
+                video_processor.max_soft_tokens, video_processor.num_frames
             )));
         }
         Ok(Some(Self {
@@ -157,6 +228,16 @@ impl Gemma4Processor {
             boi_token_id: config.boi_token_id,
             #[cfg(feature = "image-processing")]
             eoi_token_id: config.eoi_token_id,
+            #[cfg(feature = "image-processing")]
+            video_token_id: config.video_token_id,
+            #[cfg(feature = "image-processing")]
+            video_patch_size: video_processor.patch_size,
+            #[cfg(feature = "image-processing")]
+            video_pooling_kernel_size: video_processor.pooling_kernel_size,
+            #[cfg(feature = "image-processing")]
+            video_max_soft_tokens: video_processor.max_soft_tokens,
+            #[cfg(feature = "image-processing")]
+            video_num_frames: video_processor.num_frames,
             #[cfg(feature = "audio-processing")]
             audio_token_id: config.audio_token_id,
             #[cfg(feature = "audio-processing")]
@@ -170,44 +251,51 @@ impl Gemma4Processor {
         &self,
         token_ids: &[u32],
         media: &[MediaInput<'_>],
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
+        #[cfg(not(feature = "image-processing"))]
+        let _ = &encode_text;
         #[allow(unused_mut)]
         let mut bindings = Vec::with_capacity(media.len());
         for item in media {
             match (item.modality, item.payload) {
                 #[cfg(feature = "image-processing")]
                 (Modality::Image, MediaPayload::Rgb8(image)) => {
-                    bindings.push(PreparedMediaBinding {
-                        placeholder_token_id: self.image_token_id.ok_or_else(|| {
+                    bindings.push(PreparedMediaBinding::around_part(
+                        self.image_token_id.ok_or_else(|| {
                             Error::Processor(
                                 "Gemma 4 image processor requires image_token_id".into(),
                             )
                         })?,
-                        prefix_token_ids: vec![self.boi_token_id.ok_or_else(|| {
+                        vec![self.boi_token_id.ok_or_else(|| {
                             Error::Processor("Gemma 4 image processor requires boi_token_id".into())
                         })?],
-                        suffix_token_ids: vec![self.eoi_token_id.ok_or_else(|| {
+                        self.process_image(image)?,
+                        vec![self.eoi_token_id.ok_or_else(|| {
                             Error::Processor("Gemma 4 image processor requires eoi_token_id".into())
                         })?],
-                        part: self.process_image(image)?,
-                    })
+                    ))
+                }
+                #[cfg(feature = "image-processing")]
+                (Modality::Video, MediaPayload::VideoFrames(video)) => {
+                    bindings.push(self.process_video(video, encode_text)?)
                 }
                 #[cfg(feature = "audio-processing")]
                 (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
-                    bindings.push(PreparedMediaBinding {
-                        placeholder_token_id: self.audio_token_id.ok_or_else(|| {
+                    bindings.push(PreparedMediaBinding::around_part(
+                        self.audio_token_id.ok_or_else(|| {
                             Error::Processor(
                                 "Gemma 4 audio processor requires audio_token_id".into(),
                             )
                         })?,
-                        prefix_token_ids: vec![self.boa_token_id.ok_or_else(|| {
+                        vec![self.boa_token_id.ok_or_else(|| {
                             Error::Processor("Gemma 4 audio processor requires boa_token_id".into())
                         })?],
-                        suffix_token_ids: vec![self.eoa_token_id.ok_or_else(|| {
+                        self.process_audio(waveform)?,
+                        vec![self.eoa_token_id.ok_or_else(|| {
                             Error::Processor("Gemma 4 audio processor requires eoa_token_id".into())
                         })?],
-                        part: self.process_audio(waveform)?,
-                    })
+                    ))
                 }
                 _ => {
                     return Err(Error::Processor(format!(
@@ -221,6 +309,10 @@ impl Gemma4Processor {
         let mut placeholder_ids = Vec::new();
         #[cfg(feature = "image-processing")]
         if let Some(token) = self.image_token_id {
+            placeholder_ids.push(token);
+        }
+        #[cfg(feature = "image-processing")]
+        if let Some(token) = self.video_token_id {
             placeholder_ids.push(token);
         }
         #[cfg(feature = "audio-processing")]
@@ -255,6 +347,85 @@ impl Gemma4Processor {
             patches,
             OwnedInputMetadata::PatchPositionIds(positions),
         ))
+    }
+
+    #[cfg(feature = "image-processing")]
+    fn process_video(
+        &self,
+        video: VideoFrames<'_>,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
+    ) -> Result<PreparedMediaBinding, Error> {
+        let video_token_id = self.video_token_id.ok_or_else(|| {
+            Error::Processor("Gemma 4 video processor requires video_token_id".into())
+        })?;
+        let boi_token_id = self.boi_token_id.ok_or_else(|| {
+            Error::Processor("Gemma 4 video processor requires boi_token_id".into())
+        })?;
+        let eoi_token_id = self.eoi_token_id.ok_or_else(|| {
+            Error::Processor("Gemma 4 video processor requires eoi_token_id".into())
+        })?;
+        let (width, height) = validate_rgb_frames(video.frames)?;
+        let source_fps = video.source_fps.unwrap_or(24.0);
+        let total_frames = video.frames.len();
+        let sample_count = match video.sampling {
+            VideoSampling::ProcessorDefault => self.video_num_frames.min(total_frames),
+            VideoSampling::All => total_frames,
+            VideoSampling::FrameCount(count) => count.clamp(1, total_frames),
+            VideoSampling::Fps(target_fps) => sampled_frame_count(
+                total_frames,
+                source_fps,
+                target_fps,
+                1,
+                self.video_num_frames,
+            )?,
+        };
+        let indices = uniform_sample_indices(total_frames, sample_count)?;
+        let timestamps = frame_timestamps(&indices, source_fps)?;
+        let max_patches = self
+            .video_max_soft_tokens
+            .checked_mul(self.video_pooling_kernel_size * self.video_pooling_kernel_size)
+            .ok_or_else(|| Error::Processor("Gemma 4 video patch budget overflow".into()))?;
+        let (resized_height, resized_width) = aspect_ratio_preserving_size(
+            height as usize,
+            width as usize,
+            self.video_patch_size,
+            max_patches,
+            self.video_pooling_kernel_size,
+        )?;
+        let mut replacement = Vec::with_capacity(indices.len() * 3);
+        for (frame_index, (source_index, timestamp)) in
+            indices.into_iter().zip(timestamps).enumerate()
+        {
+            let timestamp = format_mm_ss(timestamp)?;
+            let timestamp_text = if frame_index == 0 {
+                format!("{timestamp} ")
+            } else {
+                format!(" {timestamp} ")
+            };
+            let mut prefix = encode_text(&timestamp_text)?;
+            prefix.push(boi_token_id);
+            replacement.push(PreparedInputPart::text_token_ids(&prefix));
+
+            let resized = resize_rgb8_bicubic(
+                video.frames[source_index],
+                resized_width as u32,
+                resized_height as u32,
+            )?;
+            let normalized =
+                rescale_and_normalize_rgb8(resized.as_view(), 1.0 / 255.0, [0.0; 3], [1.0; 3])?;
+            let (patches, positions) =
+                pack_patches(&normalized, self.video_patch_size, max_patches)?;
+            replacement.push(PreparedInputPart::media_tensor(
+                Modality::Video,
+                patches,
+                OwnedInputMetadata::PatchPositionIds(positions),
+            ));
+            replacement.push(PreparedInputPart::text_token_ids(&[eoi_token_id]));
+        }
+        Ok(PreparedMediaBinding {
+            placeholder_token_id: video_token_id,
+            replacement,
+        })
     }
 
     #[cfg(feature = "audio-processing")]
@@ -407,6 +578,11 @@ mod tests {
             image_token_id: Some(42),
             boi_token_id: Some(43),
             eoi_token_id: Some(44),
+            video_token_id: Some(45),
+            video_patch_size: 2,
+            video_pooling_kernel_size: 1,
+            video_max_soft_tokens: 70,
+            video_num_frames: 32,
             #[cfg(feature = "audio-processing")]
             audio_token_id: None,
             #[cfg(feature = "audio-processing")]
@@ -417,13 +593,64 @@ mod tests {
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
-            .prepare_token_ids(&[7, 42, 8], &[MediaInput::image_rgb8(image)])
+            .prepare_token_ids(&[7, 42, 8], &[MediaInput::image_rgb8(image)], &mut |_| {
+                Ok(Vec::new())
+            })
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
         assert_eq!(parts[2].modality, Modality::Image);
         assert!(matches!(parts[2].payload, InputPayload::Tensor(_)));
         assert!(parts[2].metadata.patch_position_ids.is_some());
+    }
+
+    #[test]
+    fn processor_interleaves_timestamped_video_frames() {
+        let processor = Gemma4Processor {
+            patch_size: 2,
+            pooling_kernel_size: 1,
+            max_soft_tokens: 70,
+            image_token_id: Some(42),
+            boi_token_id: Some(43),
+            eoi_token_id: Some(44),
+            video_token_id: Some(45),
+            video_patch_size: 2,
+            video_pooling_kernel_size: 1,
+            video_max_soft_tokens: 70,
+            video_num_frames: 32,
+            #[cfg(feature = "audio-processing")]
+            audio_token_id: None,
+            #[cfg(feature = "audio-processing")]
+            boa_token_id: None,
+            #[cfg(feature = "audio-processing")]
+            eoa_token_id: None,
+        };
+        let pixels = vec![128u8; 4 * 4 * 3];
+        let frames = [
+            RgbImageView::packed(&pixels, 4, 4).unwrap(),
+            RgbImageView::packed(&pixels, 4, 4).unwrap(),
+        ];
+        let mut encoded = Vec::new();
+        let prepared = processor
+            .prepare_token_ids(
+                &[7, 45, 8],
+                &[MediaInput::video_rgb8(&frames, Some(1.0))],
+                &mut |text| {
+                    encoded.push(text.to_string());
+                    Ok(vec![90])
+                },
+            )
+            .unwrap();
+        let parts = prepared.input_parts();
+        let video_parts = parts
+            .iter()
+            .filter(|part| part.modality == Modality::Video)
+            .collect::<Vec<_>>();
+        assert_eq!(video_parts.len(), 2);
+        assert!(video_parts
+            .iter()
+            .all(|part| part.metadata.patch_position_ids.is_some()));
+        assert_eq!(encoded, vec!["00:00 ", " 00:01 "]);
     }
 }
 
@@ -450,13 +677,25 @@ mod audio_tests {
             boi_token_id: None,
             #[cfg(feature = "image-processing")]
             eoi_token_id: None,
+            #[cfg(feature = "image-processing")]
+            video_token_id: None,
+            #[cfg(feature = "image-processing")]
+            video_patch_size: 16,
+            #[cfg(feature = "image-processing")]
+            video_pooling_kernel_size: 3,
+            #[cfg(feature = "image-processing")]
+            video_max_soft_tokens: 70,
+            #[cfg(feature = "image-processing")]
+            video_num_frames: 32,
             audio_token_id: Some(42),
             boa_token_id: Some(43),
             eoa_token_id: Some(44),
         };
         let samples = vec![0.0f32; 16_000];
         let audio = MediaInput::audio_f32(&samples, 16_000).unwrap();
-        let prepared = processor.prepare_token_ids(&[7, 42, 8], &[audio]).unwrap();
+        let prepared = processor
+            .prepare_token_ids(&[7, 42, 8], &[audio], &mut |_| Ok(Vec::new()))
+            .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
         assert_eq!(parts[2].modality, Modality::Audio);

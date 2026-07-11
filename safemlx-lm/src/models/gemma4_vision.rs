@@ -515,8 +515,8 @@ fn pool_hidden(
 ) -> Result<Array, Exception> {
     let x_positions = position_ids.try_index_device((.., .., 0), stream)?;
     let y_positions = position_ids.try_index_device((.., .., 1), stream)?;
-    let width = x_positions.max_axis(1, false, stream)?.item::<i32>(stream) + 1;
-    let height = y_positions.max_axis(1, false, stream)?.item::<i32>(stream) + 1;
+    let width = x_positions.max(false, stream)?.item::<i32>(stream) + 1;
+    let height = y_positions.max(false, stream)?.item::<i32>(stream) + 1;
     if width % kernel != 0 || height % kernel != 0 {
         return Err(Exception::custom(format!(
             "Gemma 4 patch grid {height}x{width} is not divisible by pooling kernel {kernel}"

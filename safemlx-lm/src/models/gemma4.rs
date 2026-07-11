@@ -418,6 +418,8 @@ struct Gemma4Config {
     #[serde(default)]
     image_token_id: Option<i32>,
     #[serde(default)]
+    video_token_id: Option<i32>,
+    #[serde(default)]
     audio_config: Option<Gemma4AudioConfig>,
     #[serde(default)]
     audio_token_id: Option<i32>,
@@ -2265,6 +2267,8 @@ pub struct Model {
     pub args: ModelArgs,
     /// Image placeholder token ID for multimodal checkpoints.
     pub image_token_id: Option<i32>,
+    /// Video placeholder token ID for multimodal checkpoints.
+    pub video_token_id: Option<i32>,
     /// Audio placeholder token ID for multimodal checkpoints.
     pub audio_token_id: Option<i32>,
     #[quantizable]
@@ -2334,6 +2338,7 @@ impl Model {
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
+                    self.video_token_id.map(|id| id as u32),
                     self.args.sliding_window,
                 );
                 self.forward_with_observer(
@@ -2386,6 +2391,7 @@ impl Model {
         Ok(Self {
             args,
             image_token_id: None,
+            video_token_id: None,
             audio_token_id: None,
             model,
             lm_head,
@@ -2396,6 +2402,7 @@ impl Model {
         args: ModelArgs,
         image_token_id: Option<i32>,
         vision_config: Option<Gemma4VisionConfig>,
+        video_token_id: Option<i32>,
         audio_token_id: Option<i32>,
         audio_config: Option<Gemma4AudioConfig>,
         stream: &Stream,
@@ -2418,6 +2425,7 @@ impl Model {
         Ok(Self {
             args,
             image_token_id,
+            video_token_id,
             audio_token_id,
             model,
             lm_head,
@@ -2441,6 +2449,10 @@ impl Model {
                 token_id: token_id as u32,
             })
             .into_iter()
+            .chain(self.video_token_id.map(|token_id| input::ModalityToken {
+                modality: input::Modality::Video,
+                token_id: token_id as u32,
+            }))
             .chain(self.audio_token_id.map(|token_id| input::ModalityToken {
                 modality: input::Modality::Audio,
                 token_id: token_id as u32,
@@ -2465,26 +2477,45 @@ impl Model {
             },
             |part, stream| match (part.modality, part.payload) {
                 (_, input::InputPayload::Embeddings(embeddings)) => Ok(vec![embeddings.clone()]),
-                (input::Modality::Image, input::InputPayload::Tensor(tensor)) => {
+                (
+                    modality @ (input::Modality::Image | input::Modality::Video),
+                    input::InputPayload::Tensor(tensor),
+                ) => {
                     let position_ids = part.metadata.patch_position_ids.ok_or_else(|| {
-                        Exception::custom(
-                            "gemma4 image tensor input requires patch_position_ids metadata",
-                        )
+                        Exception::custom(format!(
+                            "gemma4 {} tensor input requires patch_position_ids metadata",
+                            modality.as_str()
+                        ))
                     })?;
                     let features = vision_tower
                         .as_mut()
                         .ok_or_else(|| {
-                            Exception::custom(
-                                "gemma4 image tensor input requires vision_config and vision weights",
-                            )
+                            Exception::custom(format!(
+                                "gemma4 {} tensor input requires vision_config and vision weights",
+                                modality.as_str()
+                            ))
                         })?
                         .forward(tensor, position_ids, stream)?;
-                    Ok(vec![embed_vision
+                    let embeddings = embed_vision
                         .as_mut()
                         .ok_or_else(|| {
-                            Exception::custom("gemma4 image input requires embed_vision weights")
+                            Exception::custom(format!(
+                                "gemma4 {} input requires embed_vision weights",
+                                modality.as_str()
+                            ))
                         })?
-                        .forward(&features, stream)?])
+                        .forward(&features, stream)?;
+                    if modality == input::Modality::Video {
+                        let mut frames = Vec::with_capacity(embeddings.dim(0) as usize);
+                        for frame in 0..embeddings.dim(0) {
+                            frames.push(
+                                embeddings.try_index_device((frame..frame + 1, .., ..), stream)?,
+                            );
+                        }
+                        Ok(frames)
+                    } else {
+                        Ok(vec![embeddings])
+                    }
                 }
                 (input::Modality::Audio, input::InputPayload::Tensor(tensor)) => {
                     let mask = part.metadata.audio_mask.ok_or_else(|| {
@@ -2519,6 +2550,7 @@ impl Model {
             let token_ids = input::token_ids_from_array(tokens, stream)?;
             for (modality, placeholder) in [
                 ("image", self.image_token_id),
+                ("video", self.video_token_id),
                 ("audio", self.audio_token_id),
             ] {
                 if placeholder.is_some_and(|id| token_ids.contains(&(id as u32))) {
@@ -2533,9 +2565,13 @@ impl Model {
 
     fn per_layer_ids_for_media(&self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
         let mut output = tokens.clone();
-        for token_id in [self.image_token_id, self.audio_token_id]
-            .into_iter()
-            .flatten()
+        for token_id in [
+            self.image_token_id,
+            self.video_token_id,
+            self.audio_token_id,
+        ]
+        .into_iter()
+        .flatten()
         {
             let mask = output.eq(Array::from_int(token_id), stream)?;
             output = r#where(
@@ -2619,6 +2655,7 @@ type Gemma4ModelConfigParts = (
     ModelArgs,
     Option<Gemma4VisionConfig>,
     Option<i32>,
+    Option<i32>,
     Option<Gemma4AudioConfig>,
     Option<i32>,
 );
@@ -2641,6 +2678,7 @@ fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, E
         config.text_config,
         config.vision_config,
         config.image_token_id,
+        config.video_token_id,
         config.audio_config,
         config.audio_token_id,
     ))
@@ -2674,12 +2712,13 @@ pub fn load_gemma4_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let (model_args, vision_config, image_token_id, audio_config, audio_token_id) =
+    let (model_args, vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
         get_gemma4_model_config(model_dir)?;
     let mut model = Model::new_with_modalities(
         model_args,
         image_token_id,
         vision_config,
+        video_token_id,
         audio_token_id,
         audio_config,
         stream,
@@ -2861,21 +2900,22 @@ struct Gemma4AttentionMasks {
 fn multimodal_attention_masks(
     token_ids: &[u32],
     image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
     sliding_window: Option<i32>,
 ) -> Gemma4AttentionMasks {
     let sequence = token_ids.len();
     let mut groups = vec![-1i32; sequence];
     let mut group = -1i32;
-    let mut previous_was_image = false;
+    let mut previous_visual_token = None;
     for (index, token_id) in token_ids.iter().enumerate() {
-        let is_image = image_token_id == Some(*token_id);
-        if is_image && !previous_was_image {
+        let is_visual = image_token_id == Some(*token_id) || video_token_id == Some(*token_id);
+        if is_visual && previous_visual_token != Some(*token_id) {
             group += 1;
         }
-        if is_image {
+        if is_visual {
             groups[index] = group;
         }
-        previous_was_image = is_image;
+        previous_visual_token = is_visual.then_some(*token_id);
     }
     let window = sliding_window.unwrap_or(sequence as i32);
     let mut full = Vec::with_capacity(sequence * sequence);
@@ -2935,6 +2975,7 @@ impl CausalLm<Cache> for Model {
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
+                    self.video_token_id.map(|id| id as u32),
                     self.args.sliding_window,
                 );
                 self.forward_logits(
@@ -2989,6 +3030,7 @@ impl CausalLm<Cache> for Model {
             multimodal_attention_masks(
                 &cache.token_ids,
                 self.image_token_id.map(|id| id as u32),
+                self.video_token_id.map(|id| id as u32),
                 self.args.sliding_window,
             )
         });
@@ -3090,6 +3132,41 @@ mod tests {
         let parts = [
             InputPart::text_token_ids(&tokens),
             InputPart::image_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
+        ];
+        let mut cache = Cache::default();
+        let logits = model
+            .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
+        let decode = Array::from_slice(&[8u32], &[1, 1]);
+        let logits = model
+            .decode_logits(&decode, &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
+    }
+
+    #[test]
+    #[ignore = "requires a local Gemma 4 E4B checkpoint and Metal"]
+    fn local_e4b_video_prefill_and_decode() {
+        let home = std::env::var("HOME").unwrap();
+        let snapshots = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-4bit/snapshots");
+        let model_dir = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.join("model.safetensors").exists())
+            .unwrap();
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let tokens = Array::from_slice(&[2u32, 258884, 7, 258884, 8], &[1, 5]);
+        let patches = Array::from_slice(&vec![0.5f32; 2 * 9 * 16 * 16 * 3], &[2, 9, 768]);
+        let frame_positions = [0i32, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
+        let positions = Array::from_slice(&[frame_positions, frame_positions].concat(), &[2, 9, 2]);
+        let parts = [
+            InputPart::text_token_ids(&tokens),
+            InputPart::video_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
         ];
         let mut cache = Cache::default();
         let logits = model

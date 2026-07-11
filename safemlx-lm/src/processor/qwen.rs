@@ -4,7 +4,8 @@ use safemlx::Array;
 use serde::Deserialize;
 
 use super::video::{
-    pad_frame_indices, temporal_group_timestamps, uniform_sample_indices, validate_rgb_frames,
+    pad_frame_indices, sampled_frame_count, temporal_group_timestamps, uniform_sample_indices,
+    validate_rgb_frames,
 };
 use super::{
     bind_media_parts,
@@ -144,26 +145,26 @@ impl QwenProcessor {
         for item in media {
             match (item.modality, item.payload) {
                 (Modality::Image, MediaPayload::Rgb8(image)) => {
-                    bindings.push(PreparedMediaBinding {
-                        placeholder_token_id: self.image_token_id,
-                        prefix_token_ids: Vec::new(),
-                        suffix_token_ids: Vec::new(),
-                        part: self.process_image(image)?,
-                    });
+                    bindings.push(PreparedMediaBinding::around_part(
+                        self.image_token_id,
+                        Vec::new(),
+                        self.process_image(image)?,
+                        Vec::new(),
+                    ));
                 }
                 (Modality::Video, MediaPayload::VideoFrames(video)) => {
                     let (part, timestamps) = self.process_video(video)?;
-                    bindings.push(PreparedMediaBinding {
-                        placeholder_token_id: self.video_token_id.ok_or_else(|| {
+                    bindings.push(PreparedMediaBinding::around_part(
+                        self.video_token_id.ok_or_else(|| {
                             Error::Processor(
                                 "Qwen video processor requires video_token_id in config.json"
                                     .into(),
                             )
                         })?,
-                        prefix_token_ids: self.video_prompt_tokens(&timestamps, encode_text)?,
-                        suffix_token_ids: Vec::new(),
+                        self.video_prompt_tokens(&timestamps, encode_text)?,
                         part,
-                    });
+                        Vec::new(),
+                    ));
                 }
                 (modality, _) => {
                     return Err(Error::Processor(format!(
@@ -333,26 +334,6 @@ impl QwenProcessor {
         }
         Ok(tokens)
     }
-}
-
-fn sampled_frame_count(
-    total_frames: usize,
-    source_fps: f64,
-    target_fps: f64,
-    min_frames: usize,
-    max_frames: usize,
-) -> Result<usize, Error> {
-    if !target_fps.is_finite() || target_fps <= 0.0 {
-        return Err(Error::Processor(format!(
-            "video target FPS must be finite and positive, got {target_fps}"
-        )));
-    }
-    let requested = (total_frames as f64 / source_fps * target_fps) as usize;
-    Ok(requested
-        .max(min_frames)
-        .min(max_frames)
-        .min(total_frames)
-        .max(1))
 }
 
 fn load_visual_config(path: &Path) -> Result<Option<QwenVisualProcessorConfig>, Error> {
