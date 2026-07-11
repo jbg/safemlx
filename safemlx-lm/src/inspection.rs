@@ -119,8 +119,23 @@ impl ActivationObserver for ActivationRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationObserver, ActivationRecorder};
-    use safemlx::Array;
+    use super::{ActivationObserver, ActivationRecorder, NoopObserver};
+    use safemlx::{error::Exception, Array};
+
+    struct ReplacingObserver {
+        intervention_name: Option<String>,
+    }
+
+    impl ActivationObserver for ReplacingObserver {
+        fn observe(&mut self, _name: &str, _value: &Array) -> Result<(), Exception> {
+            Ok(())
+        }
+
+        fn intervene(&mut self, name: &str, _value: &Array) -> Result<Option<Array>, Exception> {
+            self.intervention_name = Some(name.to_string());
+            Ok(Some(Array::from_slice(&[9.0f32, 8.0], &[2])))
+        }
+    }
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
@@ -134,5 +149,28 @@ mod tests {
         assert_eq!(activations.len(), 1);
         assert_eq!(activations[0].name, "layer.output");
         assert_eq!(activations[0].value.shape(), &[2]);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn intervention_defaults_to_passthrough_and_can_replace_an_activation() {
+        let array = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        assert!(NoopObserver
+            .intervene("model.layers.0.output", &array)
+            .unwrap()
+            .is_none());
+
+        let mut observer = ReplacingObserver {
+            intervention_name: None,
+        };
+        let replacement = observer
+            .intervene("model.layers.0.output", &array)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.shape(), &[2]);
+        assert_eq!(
+            observer.intervention_name.as_deref(),
+            Some("model.layers.0.output")
+        );
     }
 }
