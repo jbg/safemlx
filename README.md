@@ -21,7 +21,7 @@ upstream `mlx-lm` packages:
 ```toml
 safemlx = "0.1"
 safemlx-sys = "0.1"
-safemlx-lm = "0.3"
+safemlx-lm = "0.4"
 safemlx-lm-utils = "0.1"
 ```
 

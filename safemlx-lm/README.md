@@ -17,20 +17,23 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 ```toml
 [dependencies]
-safemlx-lm = { version = "0.3", features = ["image-processing"] }
+safemlx-lm = { version = "0.4", features = ["image-processing"] }
 ```
 
-For Gemma 4 or Qwen image prompts, render the chat template with one image
-placeholder per image, then prepare decoded RGB8 pixels before prefill:
+For Gemma 4 or Qwen image prompts, pass text and media as ordered processor
+segments. Media is inserted where the segment appears; callers do not put
+image/video/audio media tokens in rendered prompt text:
 
 ```rust,ignore
-use safemlx_lm::processor::{MediaInput, RgbImageView};
+use safemlx_lm::processor::{MediaInput, ProcessorInput, RgbImageView};
 
 let image = RgbImageView::packed(rgb_pixels, width, height)?;
 let prepared = model.prepare_input(
-    &rendered_prompt,
-    &[MediaInput::image_rgb8(image)],
-    false,
+    &[
+        ProcessorInput::Text(prompt_before_image),
+        ProcessorInput::Media(MediaInput::image_rgb8(image)),
+        ProcessorInput::Text(prompt_after_image),
+    ],
 )?;
 let logits = model.prefill_prepared_input_with_cache(
     &prepared,
@@ -48,16 +51,18 @@ let frames = decoded_rgb_frames
     .map(|frame| RgbImageView::packed(frame, width, height))
     .collect::<Result<Vec<_>, _>>()?;
 let prepared = model.prepare_input(
-    &rendered_video_prompt,
-    &[MediaInput::video_rgb8(&frames, Some(source_fps))],
-    false,
+    &[
+        ProcessorInput::Text(prompt_before_video),
+        ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(source_fps))),
+        ProcessorInput::Text(prompt_after_video),
+    ],
 )?;
 ```
 
 The optional `image-processing` feature enables architecture-dispatched Gemma 4
 and Qwen processors. Shared code owns decoded-image validation, frame sampling,
 and timestamp operations; each processor adds its model-native patch packing,
-prompt format, metadata, and placeholder binding. Gemma samples up to 32 frames
+prompt format, metadata, and ordered media insertion. Gemma samples up to 32 frames
 by default and encodes each timestamped frame through its vision tower. Qwen
 uses its temporal patch packing and timestamp format. Without the feature,
 callers can still supply Gemma 4 or Qwen `Image/Tensor` and `Video/Tensor`
@@ -69,14 +74,18 @@ PCM in the shared processor instead:
 
 ```toml
 [dependencies]
-safemlx-lm = { version = "0.3", features = ["audio-processing"] }
+safemlx-lm = { version = "0.4", features = ["audio-processing"] }
 ```
 
 ```rust,ignore
-use safemlx_lm::processor::MediaInput;
+use safemlx_lm::processor::{MediaInput, ProcessorInput};
 
 let audio = MediaInput::audio_f32(mono_pcm, sample_rate)?;
-let prepared = model.prepare_input(&rendered_prompt, &[audio], false)?;
+let prepared = model.prepare_input(&[
+    ProcessorInput::Text(prompt_before_audio),
+    ProcessorInput::Media(audio),
+    ProcessorInput::Text(prompt_after_audio),
+])?;
 let logits = model.prefill_prepared_input_with_cache(&prepared, &mut cache, stream)?;
 ```
 

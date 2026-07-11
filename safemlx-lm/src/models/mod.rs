@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
 #[cfg(feature = "media-processing")]
-use crate::processor::{load_processor, MediaInput, ModelProcessor, PreparedModelInput};
+use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::sampler::{DefaultSampler, Sampler};
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
@@ -617,27 +617,16 @@ impl LoadedModel {
         self.processor.as_ref()
     }
 
-    /// Tokenizes rendered prompt text and preprocesses its ordered media items.
-    ///
-    /// The rendered text must contain one architecture-specific placeholder for
-    /// each media item, in the same order as `media`.
+    /// Tokenizes and preprocesses ordered text and media segments.
     #[cfg(feature = "media-processing")]
-    pub fn prepare_input(
-        &self,
-        rendered_text: &str,
-        media: &[MediaInput<'_>],
-        add_special_tokens: bool,
-    ) -> Result<PreparedModelInput, Error> {
-        let processor = self.processor.clone().ok_or_else(|| {
+    pub fn prepare_input(&self, input: &[ProcessorInput<'_>]) -> Result<PreparedModelInput, Error> {
+        let processor = self.processor.as_ref().ok_or_else(|| {
             Error::Processor(format!(
                 "model type '{}' does not have a loaded media processor",
                 self.model_type()
             ))
         })?;
-        let token_ids = self.encode(rendered_text, add_special_tokens)?;
-        processor.prepare_token_ids_with_text_encoder(&token_ids, media, &mut |text| {
-            self.encode(text, false)
-        })
+        processor.prepare_input(input, &mut |text| self.encode(text, false))
     }
 
     /// Returns likely user-provided kwargs referenced by the loaded chat template.

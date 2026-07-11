@@ -2268,11 +2268,11 @@ impl Gemma4ForConditionalGeneration {
 pub struct Model {
     /// Model configuration.
     pub args: ModelArgs,
-    /// Image placeholder token ID for multimodal checkpoints.
+    /// Image media token ID for multimodal checkpoints.
     pub image_token_id: Option<i32>,
-    /// Video placeholder token ID for multimodal checkpoints.
+    /// Video media token ID for multimodal checkpoints.
     pub video_token_id: Option<i32>,
-    /// Audio placeholder token ID for multimodal checkpoints.
+    /// Audio media token ID for multimodal checkpoints.
     pub audio_token_id: Option<i32>,
     #[quantizable]
     #[param]
@@ -2549,20 +2549,6 @@ impl Model {
                 ))),
             },
         )?;
-        if let input::PreparedPrefill::Text(tokens) = &prepared {
-            let token_ids = input::token_ids_from_array(tokens, stream)?;
-            for (modality, placeholder) in [
-                ("image", self.image_token_id),
-                ("video", self.video_token_id),
-                ("audio", self.audio_token_id),
-            ] {
-                if placeholder.is_some_and(|id| token_ids.contains(&(id as u32))) {
-                    return Err(Exception::custom(format!(
-                        "gemma4 prompt contains an {modality} placeholder but no {modality} input"
-                    )));
-                }
-            }
-        }
         Ok(prepared)
     }
 

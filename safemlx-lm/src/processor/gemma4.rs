@@ -13,9 +13,12 @@ use super::video::{
     format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
     validate_rgb_frames,
 };
-use super::{bind_media_parts, MediaInput, PreparedModelInput};
+use super::{
+    prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
+    ProcessorInput,
+};
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use super::{MediaPayload, OwnedInputMetadata, PreparedInputPart, PreparedMediaBinding};
+use super::{MediaPayload, OwnedInputMetadata};
 #[cfg(feature = "image-processing")]
 use super::{VideoFrames, VideoSampling};
 use crate::error::Error;
@@ -25,15 +28,9 @@ use crate::models::input::Modality;
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4ModelConfig {
     #[cfg(feature = "image-processing")]
-    image_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
     boi_token_id: Option<u32>,
     #[cfg(feature = "image-processing")]
     eoi_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
-    video_token_id: Option<u32>,
-    #[cfg(feature = "audio-processing")]
-    audio_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
     boa_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
@@ -126,13 +123,9 @@ pub(super) struct Gemma4Processor {
     #[cfg(feature = "image-processing")]
     max_soft_tokens: usize,
     #[cfg(feature = "image-processing")]
-    image_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
     boi_token_id: Option<u32>,
     #[cfg(feature = "image-processing")]
     eoi_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
-    video_token_id: Option<u32>,
     #[cfg(feature = "image-processing")]
     video_patch_size: usize,
     #[cfg(feature = "image-processing")]
@@ -141,8 +134,6 @@ pub(super) struct Gemma4Processor {
     video_max_soft_tokens: usize,
     #[cfg(feature = "image-processing")]
     video_num_frames: usize,
-    #[cfg(feature = "audio-processing")]
-    audio_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
     boa_token_id: Option<u32>,
     #[cfg(feature = "audio-processing")]
@@ -223,13 +214,9 @@ impl Gemma4Processor {
             #[cfg(feature = "image-processing")]
             max_soft_tokens,
             #[cfg(feature = "image-processing")]
-            image_token_id: config.image_token_id,
-            #[cfg(feature = "image-processing")]
             boi_token_id: config.boi_token_id,
             #[cfg(feature = "image-processing")]
             eoi_token_id: config.eoi_token_id,
-            #[cfg(feature = "image-processing")]
-            video_token_id: config.video_token_id,
             #[cfg(feature = "image-processing")]
             video_patch_size: video_processor.patch_size,
             #[cfg(feature = "image-processing")]
@@ -239,87 +226,89 @@ impl Gemma4Processor {
             #[cfg(feature = "image-processing")]
             video_num_frames: video_processor.num_frames,
             #[cfg(feature = "audio-processing")]
-            audio_token_id: config.audio_token_id,
-            #[cfg(feature = "audio-processing")]
             boa_token_id: config.boa_token_id,
             #[cfg(feature = "audio-processing")]
             eoa_token_id: config.eoa_token_id,
         }))
     }
 
-    pub(super) fn prepare_token_ids(
+    pub(super) fn prepare_input(
         &self,
-        token_ids: &[u32],
-        media: &[MediaInput<'_>],
+        input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
-        #[cfg(not(feature = "image-processing"))]
-        let _ = &encode_text;
-        #[allow(unused_mut)]
-        let mut bindings = Vec::with_capacity(media.len());
-        for item in media {
-            match (item.modality, item.payload) {
-                #[cfg(feature = "image-processing")]
-                (Modality::Image, MediaPayload::Rgb8(image)) => {
-                    bindings.push(PreparedMediaBinding::around_part(
-                        self.image_token_id.ok_or_else(|| {
-                            Error::Processor(
-                                "Gemma 4 image processor requires image_token_id".into(),
-                            )
-                        })?,
-                        vec![self.boi_token_id.ok_or_else(|| {
-                            Error::Processor("Gemma 4 image processor requires boi_token_id".into())
-                        })?],
-                        self.process_image(image)?,
-                        vec![self.eoi_token_id.ok_or_else(|| {
-                            Error::Processor("Gemma 4 image processor requires eoi_token_id".into())
-                        })?],
-                    ))
+        let mut parts = Vec::new();
+        for item in input {
+            match *item {
+                ProcessorInput::Text(text) => {
+                    push_text_token_ids(&mut parts, &encode_text(text)?);
                 }
-                #[cfg(feature = "image-processing")]
-                (Modality::Video, MediaPayload::VideoFrames(video)) => {
-                    bindings.push(self.process_video(video, encode_text)?)
+                ProcessorInput::TokenIds(token_ids) => {
+                    push_text_token_ids(&mut parts, token_ids);
                 }
-                #[cfg(feature = "audio-processing")]
-                (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
-                    bindings.push(PreparedMediaBinding::around_part(
-                        self.audio_token_id.ok_or_else(|| {
-                            Error::Processor(
-                                "Gemma 4 audio processor requires audio_token_id".into(),
-                            )
-                        })?,
-                        vec![self.boa_token_id.ok_or_else(|| {
-                            Error::Processor("Gemma 4 audio processor requires boa_token_id".into())
-                        })?],
-                        self.process_audio(waveform)?,
-                        vec![self.eoa_token_id.ok_or_else(|| {
-                            Error::Processor("Gemma 4 audio processor requires eoa_token_id".into())
-                        })?],
-                    ))
-                }
-                _ => {
-                    return Err(Error::Processor(format!(
-                        "Gemma 4 processor does not support {} media with the enabled features",
-                        item.modality.as_str()
-                    )))
+                ProcessorInput::Media(media) => {
+                    self.push_media_parts(&mut parts, media, encode_text)?;
                 }
             }
         }
-        #[allow(unused_mut)]
-        let mut placeholder_ids = Vec::new();
-        #[cfg(feature = "image-processing")]
-        if let Some(token) = self.image_token_id {
-            placeholder_ids.push(token);
+        prepared_model_input(parts)
+    }
+
+    fn push_media_parts(
+        &self,
+        parts: &mut Vec<PreparedInputPart>,
+        item: MediaInput<'_>,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
+    ) -> Result<(), Error> {
+        #[cfg(not(feature = "image-processing"))]
+        let _ = &encode_text;
+        #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+        let _ = &parts;
+        match (item.modality, item.payload) {
+            #[cfg(feature = "image-processing")]
+            (Modality::Image, MediaPayload::Rgb8(image)) => {
+                push_text_token_ids(
+                    parts,
+                    &[self.boi_token_id.ok_or_else(|| {
+                        Error::Processor("Gemma 4 image processor requires boi_token_id".into())
+                    })?],
+                );
+                parts.push(self.process_image(image)?);
+                push_text_token_ids(
+                    parts,
+                    &[self.eoi_token_id.ok_or_else(|| {
+                        Error::Processor("Gemma 4 image processor requires eoi_token_id".into())
+                    })?],
+                );
+                Ok(())
+            }
+            #[cfg(feature = "image-processing")]
+            (Modality::Video, MediaPayload::VideoFrames(video)) => {
+                parts.extend(self.process_video(video, encode_text)?);
+                Ok(())
+            }
+            #[cfg(feature = "audio-processing")]
+            (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
+                push_text_token_ids(
+                    parts,
+                    &[self.boa_token_id.ok_or_else(|| {
+                        Error::Processor("Gemma 4 audio processor requires boa_token_id".into())
+                    })?],
+                );
+                parts.push(self.process_audio(waveform)?);
+                push_text_token_ids(
+                    parts,
+                    &[self.eoa_token_id.ok_or_else(|| {
+                        Error::Processor("Gemma 4 audio processor requires eoa_token_id".into())
+                    })?],
+                );
+                Ok(())
+            }
+            _ => Err(Error::Processor(format!(
+                "Gemma 4 processor does not support {} media with the enabled features",
+                item.modality.as_str()
+            ))),
         }
-        #[cfg(feature = "image-processing")]
-        if let Some(token) = self.video_token_id {
-            placeholder_ids.push(token);
-        }
-        #[cfg(feature = "audio-processing")]
-        if let Some(token) = self.audio_token_id {
-            placeholder_ids.push(token);
-        }
-        bind_media_parts(token_ids, &placeholder_ids, bindings)
     }
 
     #[cfg(feature = "image-processing")]
@@ -354,10 +343,7 @@ impl Gemma4Processor {
         &self,
         video: VideoFrames<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedMediaBinding, Error> {
-        let video_token_id = self.video_token_id.ok_or_else(|| {
-            Error::Processor("Gemma 4 video processor requires video_token_id".into())
-        })?;
+    ) -> Result<Vec<PreparedInputPart>, Error> {
         let boi_token_id = self.boi_token_id.ok_or_else(|| {
             Error::Processor("Gemma 4 video processor requires boi_token_id".into())
         })?;
@@ -422,10 +408,7 @@ impl Gemma4Processor {
             ));
             replacement.push(PreparedInputPart::text_token_ids(&[eoi_token_id]));
         }
-        Ok(PreparedMediaBinding {
-            placeholder_token_id: video_token_id,
-            replacement,
-        })
+        Ok(replacement)
     }
 
     #[cfg(feature = "audio-processing")]
@@ -557,7 +540,7 @@ mod tests {
     use super::{aspect_ratio_preserving_size, Gemma4Processor};
     use crate::{
         models::input::{InputPayload, Modality},
-        processor::{MediaInput, RgbImageView},
+        processor::{MediaInput, ProcessorInput, RgbImageView},
     };
 
     #[test]
@@ -575,16 +558,12 @@ mod tests {
             patch_size: 2,
             pooling_kernel_size: 1,
             max_soft_tokens: 70,
-            image_token_id: Some(42),
             boi_token_id: Some(43),
             eoi_token_id: Some(44),
-            video_token_id: Some(45),
             video_patch_size: 2,
             video_pooling_kernel_size: 1,
             video_max_soft_tokens: 70,
             video_num_frames: 32,
-            #[cfg(feature = "audio-processing")]
-            audio_token_id: None,
             #[cfg(feature = "audio-processing")]
             boa_token_id: None,
             #[cfg(feature = "audio-processing")]
@@ -593,9 +572,14 @@ mod tests {
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
-            .prepare_token_ids(&[7, 42, 8], &[MediaInput::image_rgb8(image)], &mut |_| {
-                Ok(Vec::new())
-            })
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::image_rgb8(image)),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
+                &mut |_| Ok(Vec::new()),
+            )
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
@@ -610,16 +594,12 @@ mod tests {
             patch_size: 2,
             pooling_kernel_size: 1,
             max_soft_tokens: 70,
-            image_token_id: Some(42),
             boi_token_id: Some(43),
             eoi_token_id: Some(44),
-            video_token_id: Some(45),
             video_patch_size: 2,
             video_pooling_kernel_size: 1,
             video_max_soft_tokens: 70,
             video_num_frames: 32,
-            #[cfg(feature = "audio-processing")]
-            audio_token_id: None,
             #[cfg(feature = "audio-processing")]
             boa_token_id: None,
             #[cfg(feature = "audio-processing")]
@@ -632,9 +612,12 @@ mod tests {
         ];
         let mut encoded = Vec::new();
         let prepared = processor
-            .prepare_token_ids(
-                &[7, 45, 8],
-                &[MediaInput::video_rgb8(&frames, Some(1.0))],
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(1.0))),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
                 &mut |text| {
                     encoded.push(text.to_string());
                     Ok(vec![90])
@@ -659,7 +642,7 @@ mod audio_tests {
     use super::Gemma4Processor;
     use crate::{
         models::input::{InputPayload, Modality},
-        processor::MediaInput,
+        processor::{MediaInput, ProcessorInput},
     };
 
     #[test]
@@ -672,13 +655,9 @@ mod audio_tests {
             #[cfg(feature = "image-processing")]
             max_soft_tokens: 280,
             #[cfg(feature = "image-processing")]
-            image_token_id: None,
-            #[cfg(feature = "image-processing")]
             boi_token_id: None,
             #[cfg(feature = "image-processing")]
             eoi_token_id: None,
-            #[cfg(feature = "image-processing")]
-            video_token_id: None,
             #[cfg(feature = "image-processing")]
             video_patch_size: 16,
             #[cfg(feature = "image-processing")]
@@ -687,14 +666,20 @@ mod audio_tests {
             video_max_soft_tokens: 70,
             #[cfg(feature = "image-processing")]
             video_num_frames: 32,
-            audio_token_id: Some(42),
             boa_token_id: Some(43),
             eoa_token_id: Some(44),
         };
         let samples = vec![0.0f32; 16_000];
         let audio = MediaInput::audio_f32(&samples, 16_000).unwrap();
         let prepared = processor
-            .prepare_token_ids(&[7, 42, 8], &[audio], &mut |_| Ok(Vec::new()))
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(audio),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
+                &mut |_| Ok(Vec::new()),
+            )
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);

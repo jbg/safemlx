@@ -8,10 +8,9 @@ use super::video::{
     validate_rgb_frames,
 };
 use super::{
-    bind_media_parts,
     image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage, RgbImageView},
-    MediaInput, MediaPayload, OwnedInputMetadata, PreparedInputPart, PreparedMediaBinding,
-    PreparedModelInput, VideoFrames, VideoSampling,
+    prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
+    PreparedInputPart, PreparedModelInput, ProcessorInput, VideoFrames, VideoSampling,
 };
 use crate::{error::Error, models::input::Modality};
 
@@ -75,8 +74,6 @@ fn default_max_frames() -> usize {
 
 #[derive(Debug, Deserialize)]
 struct QwenModelConfig {
-    image_token_id: Option<u32>,
-    video_token_id: Option<u32>,
     vision_start_token_id: Option<u32>,
     vision_end_token_id: Option<u32>,
     #[serde(default)]
@@ -85,8 +82,6 @@ struct QwenModelConfig {
 
 #[derive(Debug, Deserialize)]
 struct QwenTextConfig {
-    image_token_id: Option<u32>,
-    video_token_id: Option<u32>,
     vision_start_token_id: Option<u32>,
     vision_end_token_id: Option<u32>,
 }
@@ -95,8 +90,6 @@ struct QwenTextConfig {
 pub(super) struct QwenProcessor {
     image_config: Option<QwenVisualProcessorConfig>,
     video_config: Option<QwenVisualProcessorConfig>,
-    image_token_id: u32,
-    video_token_id: Option<u32>,
     vision_start_token_id: Option<u32>,
     vision_end_token_id: Option<u32>,
 }
@@ -111,21 +104,9 @@ impl QwenProcessor {
         let model_config: QwenModelConfig =
             serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
         let text_config = model_config.text_config.as_ref();
-        let image_token_id = model_config
-            .image_token_id
-            .or_else(|| text_config.and_then(|text| text.image_token_id))
-            .ok_or_else(|| {
-                Error::Processor(
-                    "Qwen image processor requires image_token_id in config.json".into(),
-                )
-            })?;
         Ok(Some(Self {
             image_config,
             video_config,
-            image_token_id,
-            video_token_id: model_config
-                .video_token_id
-                .or_else(|| text_config.and_then(|text| text.video_token_id)),
             vision_start_token_id: model_config
                 .vision_start_token_id
                 .or_else(|| text_config.and_then(|text| text.vision_start_token_id)),
@@ -135,50 +116,63 @@ impl QwenProcessor {
         }))
     }
 
-    pub(super) fn prepare_token_ids(
+    pub(super) fn prepare_input(
         &self,
-        token_ids: &[u32],
-        media: &[MediaInput<'_>],
+        input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
-        let mut bindings = Vec::with_capacity(media.len());
-        for item in media {
-            match (item.modality, item.payload) {
-                (Modality::Image, MediaPayload::Rgb8(image)) => {
-                    bindings.push(PreparedMediaBinding::around_part(
-                        self.image_token_id,
-                        Vec::new(),
-                        self.process_image(image)?,
-                        Vec::new(),
-                    ));
+        let mut parts = Vec::new();
+        for item in input {
+            match *item {
+                ProcessorInput::Text(text) => {
+                    push_text_token_ids(&mut parts, &encode_text(text)?);
                 }
-                (Modality::Video, MediaPayload::VideoFrames(video)) => {
-                    let (part, timestamps) = self.process_video(video)?;
-                    bindings.push(PreparedMediaBinding::around_part(
-                        self.video_token_id.ok_or_else(|| {
-                            Error::Processor(
-                                "Qwen video processor requires video_token_id in config.json"
-                                    .into(),
-                            )
-                        })?,
-                        self.video_prompt_tokens(&timestamps, encode_text)?,
-                        part,
-                        Vec::new(),
-                    ));
+                ProcessorInput::TokenIds(token_ids) => {
+                    push_text_token_ids(&mut parts, token_ids);
                 }
-                (modality, _) => {
-                    return Err(Error::Processor(format!(
-                        "Qwen processor does not support {} media yet",
-                        modality.as_str()
-                    )));
+                ProcessorInput::Media(media) => {
+                    self.push_media_parts(&mut parts, media, encode_text)?;
                 }
             }
         }
-        let mut placeholder_ids = vec![self.image_token_id];
-        if let Some(video_token_id) = self.video_token_id {
-            placeholder_ids.push(video_token_id);
+        prepared_model_input(parts)
+    }
+
+    fn push_media_parts(
+        &self,
+        parts: &mut Vec<PreparedInputPart>,
+        item: MediaInput<'_>,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
+    ) -> Result<(), Error> {
+        match (item.modality, item.payload) {
+            (Modality::Image, MediaPayload::Rgb8(image)) => {
+                push_text_token_ids(parts, &[self.vision_start_token_id()?]);
+                parts.push(self.process_image(image)?);
+                push_text_token_ids(parts, &[self.vision_end_token_id()?]);
+            }
+            (Modality::Video, MediaPayload::VideoFrames(video)) => {
+                parts.extend(self.process_video(video, encode_text)?);
+            }
+            (modality, _) => {
+                return Err(Error::Processor(format!(
+                    "Qwen processor does not support {} media yet",
+                    modality.as_str()
+                )));
+            }
         }
-        bind_media_parts(token_ids, &placeholder_ids, bindings)
+        Ok(())
+    }
+
+    fn vision_start_token_id(&self) -> Result<u32, Error> {
+        self.vision_start_token_id.ok_or_else(|| {
+            Error::Processor("Qwen processor requires vision_start_token_id in config.json".into())
+        })
+    }
+
+    fn vision_end_token_id(&self) -> Result<u32, Error> {
+        self.vision_end_token_id.ok_or_else(|| {
+            Error::Processor("Qwen processor requires vision_end_token_id in config.json".into())
+        })
     }
 
     fn process_image(&self, image: RgbImageView<'_>) -> Result<PreparedInputPart, Error> {
@@ -223,7 +217,8 @@ impl QwenProcessor {
     fn process_video(
         &self,
         video: VideoFrames<'_>,
-    ) -> Result<(PreparedInputPart, Vec<f64>), Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
+    ) -> Result<Vec<PreparedInputPart>, Error> {
         let config = self.video_config.as_ref().ok_or_else(|| {
             Error::Processor("Qwen model directory has no video processor config".into())
         })?;
@@ -298,41 +293,23 @@ impl QwenProcessor {
                 std,
             )?);
         }
-        let (patches, grid_thw) = pack_video_patches(&frames, config)?;
-        Ok((
-            PreparedInputPart::media_tensor(
+        let mut parts = Vec::with_capacity(timestamps.len() * 3);
+        for (timestamp, chunk) in timestamps
+            .iter()
+            .zip(frames.chunks(config.temporal_patch_size))
+        {
+            let mut prefix = encode_text(&format!("<{timestamp:.1} seconds>"))?;
+            prefix.push(self.vision_start_token_id()?);
+            push_text_token_ids(&mut parts, &prefix);
+            let (patches, grid_thw) = pack_video_patches(chunk, config)?;
+            parts.push(PreparedInputPart::media_tensor(
                 Modality::Video,
                 patches,
                 OwnedInputMetadata::GridThw(grid_thw),
-            ),
-            timestamps,
-        ))
-    }
-
-    fn video_prompt_tokens(
-        &self,
-        timestamps: &[f64],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<Vec<u32>, Error> {
-        let video_token_id = self.video_token_id.ok_or_else(|| {
-            Error::Processor("Qwen video processor requires video_token_id in config.json".into())
-        })?;
-        let vision_start = self.vision_start_token_id.ok_or_else(|| {
-            Error::Processor(
-                "Qwen video processor requires vision_start_token_id in config.json".into(),
-            )
-        })?;
-        let vision_end = self.vision_end_token_id.ok_or_else(|| {
-            Error::Processor(
-                "Qwen video processor requires vision_end_token_id in config.json".into(),
-            )
-        })?;
-        let mut tokens = Vec::new();
-        for timestamp in timestamps {
-            tokens.extend(encode_text(&format!("<{timestamp:.1} seconds>"))?);
-            tokens.extend([vision_start, video_token_id, vision_end]);
+            ));
+            push_text_token_ids(&mut parts, &[self.vision_end_token_id()?]);
         }
-        Ok(tokens)
+        Ok(parts)
     }
 }
 
@@ -595,7 +572,7 @@ mod tests {
         models::input::{InputPayload, Modality},
         processor::{
             image::{rescale_and_normalize_rgb8, RgbImageView},
-            MediaInput, VideoSampling,
+            MediaInput, ProcessorInput, VideoSampling,
         },
     };
 
@@ -654,35 +631,44 @@ mod tests {
     }
 
     #[test]
-    fn processor_replaces_prompt_placeholder_with_owned_image_part() {
+    fn processor_wraps_ordered_image_with_vision_boundaries() {
         let processor = QwenProcessor {
             image_config: Some(tiny_config()),
             video_config: Some(tiny_config()),
-            image_token_id: 42,
-            video_token_id: Some(43),
             vision_start_token_id: Some(44),
             vision_end_token_id: Some(45),
         };
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
-            .prepare_token_ids(
-                &[10, 42, 11],
-                &[MediaInput::image_rgb8(image)],
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[10]),
+                    ProcessorInput::Media(MediaInput::image_rgb8(image)),
+                    ProcessorInput::TokenIds(&[11]),
+                ],
                 &mut |_text| Ok(Vec::new()),
             )
             .unwrap();
         let parts = prepared.input_parts();
-        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.len(), 5);
         assert_eq!(parts[0].modality, Modality::Text);
-        assert_eq!(parts[1].modality, Modality::Image);
-        assert_eq!(parts[2].modality, Modality::Text);
-        let InputPayload::Tensor(patches) = parts[1].payload else {
+        assert_eq!(parts[2].modality, Modality::Image);
+        assert_eq!(parts[4].modality, Modality::Text);
+        let InputPayload::TokenIds(start) = parts[1].payload else {
+            panic!("expected vision-start token");
+        };
+        assert_eq!(start.evaluated().unwrap().as_slice::<u32>(), &[44]);
+        let InputPayload::TokenIds(end) = parts[3].payload else {
+            panic!("expected vision-end token");
+        };
+        assert_eq!(end.evaluated().unwrap().as_slice::<u32>(), &[45]);
+        let InputPayload::Tensor(patches) = parts[2].payload else {
             panic!("expected processed image tensor");
         };
         assert_eq!(patches.shape(), &[4, 24]);
         assert_eq!(
-            parts[1]
+            parts[2]
                 .metadata
                 .qwen_grid_thw
                 .unwrap()
@@ -698,8 +684,6 @@ mod tests {
         let processor = QwenProcessor {
             image_config: Some(tiny_config()),
             video_config: Some(tiny_config()),
-            image_token_id: 42,
-            video_token_id: Some(43),
             vision_start_token_id: Some(44),
             vision_end_token_id: Some(45),
         };
@@ -712,13 +696,16 @@ mod tests {
             .collect::<Vec<_>>();
         let mut timestamp_text = Vec::new();
         let prepared = processor
-            .prepare_token_ids(
-                &[10, 43, 11],
-                &[MediaInput::video_rgb8_with_sampling(
-                    &frames,
-                    Some(2.0),
-                    VideoSampling::All,
-                )],
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[10]),
+                    ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
+                        &frames,
+                        Some(2.0),
+                        VideoSampling::All,
+                    )),
+                    ProcessorInput::TokenIds(&[11]),
+                ],
                 &mut |text| {
                     timestamp_text.push(text.to_string());
                     Ok(vec![90 + timestamp_text.len() as u32])
@@ -727,12 +714,20 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(timestamp_text, vec!["<0.2 seconds>", "<1.2 seconds>"]);
-        assert_eq!(parts.len(), 4);
+        assert_eq!(parts.len(), 8);
         assert_eq!(parts[2].modality, Modality::Video);
-        let InputPayload::Tensor(patches) = parts[2].payload else {
-            panic!("expected processed video tensor");
+        assert_eq!(parts[5].modality, Modality::Video);
+        let InputPayload::TokenIds(replacement) = parts[1].payload else {
+            panic!("expected timestamp replacement tokens");
         };
-        assert_eq!(patches.shape(), &[8, 24]);
+        assert_eq!(
+            replacement.evaluated().unwrap().as_slice::<u32>(),
+            &[91, 44]
+        );
+        let InputPayload::Tensor(first_patches) = parts[2].payload else {
+            panic!("expected first processed video tensor");
+        };
+        assert_eq!(first_patches.shape(), &[4, 24]);
         assert_eq!(
             parts[2]
                 .metadata
@@ -741,14 +736,22 @@ mod tests {
                 .evaluated()
                 .unwrap()
                 .as_slice::<i32>(),
-            &[2, 2, 2]
+            &[1, 2, 2]
         );
-        let InputPayload::TokenIds(replacement) = parts[1].payload else {
-            panic!("expected timestamp replacement tokens");
+        let InputPayload::TokenIds(first_end) = parts[3].payload else {
+            panic!("expected first vision-end token");
+        };
+        assert_eq!(first_end.evaluated().unwrap().as_slice::<u32>(), &[45]);
+        let InputPayload::TokenIds(second_prefix) = parts[4].payload else {
+            panic!("expected second timestamp prefix tokens");
         };
         assert_eq!(
-            replacement.evaluated().unwrap().as_slice::<u32>(),
-            &[91, 44, 43, 45, 92, 44, 43, 45]
+            second_prefix.evaluated().unwrap().as_slice::<u32>(),
+            &[92, 44]
         );
+        let InputPayload::Tensor(second_patches) = parts[5].payload else {
+            panic!("expected second processed video tensor");
+        };
+        assert_eq!(second_patches.shape(), &[4, 24]);
     }
 }

@@ -3878,7 +3878,7 @@ pub struct Model {
     pub vision_args: Option<VisionConfig>,
     /// Optional image token id rejected by text-only generation.
     pub image_token_id: Option<i32>,
-    /// Optional video placeholder token id.
+    /// Optional video media token id.
     pub video_token_id: Option<i32>,
     #[param]
     /// Optional Qwen vision encoder.
@@ -4401,9 +4401,6 @@ impl Model {
                 }
             },
         )?;
-        if let runtime_input::PreparedPrefill::Text(tokens) = &prepared {
-            self.reject_multimodal_tokens(tokens, false, stream)?;
-        }
         Ok(prepared)
     }
 }
@@ -4550,7 +4547,7 @@ mod tests {
         LinearAttentionInput, Model, ModelArgs, SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
-    use crate::processor::{load_processor, MediaInput, RgbImageView};
+    use crate::processor::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
         error::Error,
         inspection::ActivationRecorder,
@@ -5120,7 +5117,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 128]);
-        assert_eq!(cache.offset(), 4);
+        assert_eq!(cache.offset(), 6);
     }
 
     #[test]
@@ -5192,6 +5189,8 @@ mod tests {
             r#"{
               "model_type": "qwen3_5_moe",
               "image_token_id": 42,
+              "vision_start_token_id": 44,
+              "vision_end_token_id": 45,
               "text_config": { "model_type": "qwen3_5_moe_text" }
             }"#,
         );
@@ -5211,7 +5210,14 @@ mod tests {
         let pixels = vec![128u8; 8 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 8, 4).unwrap();
         let prepared = processor
-            .prepare_token_ids(&[7, 42, 8], &[MediaInput::image_rgb8(image)])
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::image_rgb8(image)),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
+                &mut |_text| Ok(Vec::new()),
+            )
             .unwrap();
         let mut cache = model.new_cache();
 
@@ -5277,9 +5283,12 @@ mod tests {
             .map(|pixels| RgbImageView::packed(pixels, 8, 4).unwrap())
             .collect::<Vec<_>>();
         let prepared = processor
-            .prepare_token_ids_with_text_encoder(
-                &[7, 43, 8],
-                &[MediaInput::video_rgb8(&frames, Some(2.0))],
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(2.0))),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
                 &mut |_timestamp| Ok(vec![50]),
             )
             .unwrap();
@@ -5307,7 +5316,14 @@ mod tests {
         let pixels = vec![128u8; 480 * 320 * 3];
         let image = RgbImageView::packed(&pixels, 480, 320).unwrap();
         let prepared = processor
-            .prepare_token_ids(&[7, 248056, 8], &[MediaInput::image_rgb8(image)])
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::image_rgb8(image)),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
+                &mut |_text| Ok(Vec::new()),
+            )
             .unwrap();
         let parts = prepared.input_parts();
         let image_part = parts
@@ -5334,9 +5350,12 @@ mod tests {
         let frame = RgbImageView::packed(&video_pixels, 480, 320).unwrap();
         let frames = [frame; 4];
         let prepared_video = processor
-            .prepare_token_ids_with_text_encoder(
-                &[7, 248057, 8],
-                &[MediaInput::video_rgb8(&frames, Some(2.0))],
+            .prepare_input(
+                &[
+                    ProcessorInput::TokenIds(&[7]),
+                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(2.0))),
+                    ProcessorInput::TokenIds(&[8]),
+                ],
                 &mut |_timestamp| Ok(vec![50]),
             )
             .unwrap();
@@ -5348,7 +5367,7 @@ mod tests {
         let runtime_input::InputPayload::Tensor(video_patches) = video_part.payload else {
             panic!("expected video tensor payload");
         };
-        assert_eq!(video_patches.shape(), &[1200, 1536]);
+        assert_eq!(video_patches.shape(), &[600, 1536]);
         assert_eq!(
             video_part
                 .metadata
@@ -5357,7 +5376,7 @@ mod tests {
                 .evaluated()
                 .unwrap()
                 .as_slice::<i32>(),
-            &[2, 20, 30]
+            &[1, 20, 30]
         );
     }
 

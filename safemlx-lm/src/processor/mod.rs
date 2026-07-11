@@ -79,6 +79,17 @@ impl<'a> MediaInput<'a> {
     }
 }
 
+/// One ordered input segment supplied to a model processor.
+#[derive(Debug, Clone, Copy)]
+pub enum ProcessorInput<'a> {
+    /// Text that should be tokenized by the caller-provided encoder.
+    Text(&'a str),
+    /// Already-tokenized text IDs.
+    TokenIds(&'a [u32]),
+    /// Decoded media to preprocess and insert at this exact position.
+    Media(MediaInput<'a>),
+}
+
 /// Frame-selection policy for decoded video input.
 #[cfg(feature = "image-processing")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -269,41 +280,18 @@ impl ModelProcessor {
         })
     }
 
-    /// Converts tokenized prompt text and decoded media into owned runtime input.
-    ///
-    /// Prompt placeholder tokens are replaced by ordered media parts. The model
-    /// runtime expands each media part to its encoded sequence length.
-    pub fn prepare_token_ids(
+    /// Converts ordered text and decoded media segments into owned runtime input.
+    pub fn prepare_input(
         &self,
-        token_ids: &[u32],
-        media: &[MediaInput<'_>],
-    ) -> Result<PreparedModelInput, Error> {
-        let mut no_text_encoder = |_text: &str| {
-            Err(Error::Processor(
-                "video preparation requires a text encoder for timestamps".to_string(),
-            ))
-        };
-        self.prepare_token_ids_with_text_encoder(token_ids, media, &mut no_text_encoder)
-    }
-
-    /// Converts tokenized prompt text and decoded media using an encoder for
-    /// processor-generated text such as video timestamps.
-    pub fn prepare_token_ids_with_text_encoder(
-        &self,
-        token_ids: &[u32],
-        media: &[MediaInput<'_>],
+        input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
         #[cfg(not(feature = "image-processing"))]
         let _ = &encode_text;
         match &self.kind {
-            ProcessorKind::Gemma4(processor) => {
-                processor.prepare_token_ids(token_ids, media, encode_text)
-            }
+            ProcessorKind::Gemma4(processor) => processor.prepare_input(input, encode_text),
             #[cfg(feature = "image-processing")]
-            ProcessorKind::Qwen(processor) => {
-                processor.prepare_token_ids(token_ids, media, encode_text)
-            }
+            ProcessorKind::Qwen(processor) => processor.prepare_input(input, encode_text),
         }
     }
 }
@@ -347,73 +335,7 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
     }
 }
 
-struct PreparedMediaBinding {
-    placeholder_token_id: u32,
-    replacement: Vec<PreparedInputPart>,
-}
-
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-impl PreparedMediaBinding {
-    fn around_part(
-        placeholder_token_id: u32,
-        prefix_token_ids: Vec<u32>,
-        part: PreparedInputPart,
-        suffix_token_ids: Vec<u32>,
-    ) -> Self {
-        let mut replacement = Vec::with_capacity(3);
-        if !prefix_token_ids.is_empty() {
-            replacement.push(PreparedInputPart::text_token_ids(&prefix_token_ids));
-        }
-        replacement.push(part);
-        if !suffix_token_ids.is_empty() {
-            replacement.push(PreparedInputPart::text_token_ids(&suffix_token_ids));
-        }
-        Self {
-            placeholder_token_id,
-            replacement,
-        }
-    }
-}
-
-fn bind_media_parts(
-    token_ids: &[u32],
-    placeholder_token_ids: &[u32],
-    bindings: Vec<PreparedMediaBinding>,
-) -> Result<PreparedModelInput, Error> {
-    let placeholder_count = token_ids
-        .iter()
-        .filter(|token| placeholder_token_ids.contains(token))
-        .count();
-    if placeholder_count != bindings.len() {
-        return Err(Error::Processor(format!(
-            "prompt contains {placeholder_count} media placeholders but {} media items were supplied",
-            bindings.len()
-        )));
-    }
-
-    let mut parts = Vec::with_capacity(bindings.len() * 3 + 1);
-    let mut media = bindings.into_iter();
-    let mut start = 0;
-    for (index, token) in token_ids.iter().enumerate() {
-        if !placeholder_token_ids.contains(token) {
-            continue;
-        }
-        let binding = media.next().expect("placeholder count was validated");
-        if *token != binding.placeholder_token_id {
-            return Err(Error::Processor(format!(
-                "prompt media placeholder {} does not match supplied {} media item",
-                token, binding.placeholder_token_id
-            )));
-        }
-        if start < index {
-            parts.push(PreparedInputPart::text_token_ids(&token_ids[start..index]));
-        }
-        parts.extend(binding.replacement);
-        start = index + 1;
-    }
-    if start < token_ids.len() {
-        parts.push(PreparedInputPart::text_token_ids(&token_ids[start..]));
-    }
+fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
             "prepared model input must not be empty".to_string(),
@@ -422,41 +344,8 @@ fn bind_media_parts(
     Ok(PreparedModelInput::new(parts))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{bind_media_parts, OwnedInputMetadata, PreparedInputPart, PreparedMediaBinding};
-    use crate::models::input::{InputPayload, Modality};
-    use safemlx::Array;
-
-    #[test]
-    fn placeholder_binding_preserves_part_order() {
-        let image = PreparedInputPart::media_tensor(
-            Modality::Image,
-            Array::from_slice(&[0.0f32], &[1, 1]),
-            OwnedInputMetadata::GridThw(Array::from_slice(&[1i32, 1, 1], &[1, 3])),
-        );
-        let prepared = bind_media_parts(
-            &[10, 42, 11],
-            &[42],
-            vec![PreparedMediaBinding::around_part(
-                42,
-                Vec::new(),
-                image,
-                Vec::new(),
-            )],
-        )
-        .unwrap();
-        let parts = prepared.input_parts();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0].modality, Modality::Text);
-        assert_eq!(parts[1].modality, Modality::Image);
-        assert_eq!(parts[2].modality, Modality::Text);
-        assert!(matches!(parts[1].payload, InputPayload::Tensor(_)));
-    }
-
-    #[test]
-    fn placeholder_binding_rejects_count_mismatch() {
-        let error = bind_media_parts(&[10, 42, 11], &[42], Vec::new()).unwrap_err();
-        assert!(error.to_string().contains("1 media placeholders"));
+fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
+    if !token_ids.is_empty() {
+        parts.push(PreparedInputPart::text_token_ids(token_ids));
     }
 }
