@@ -354,19 +354,7 @@ impl Model {
                 final_token_logits(&logits, stream)
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    qwen3_5_moe::ModelInput {
-                        inputs: &prompt_tokens,
-                        inputs_embeds: None,
-                        mask: None,
-                        cache: Some(cache),
-                    },
-                    stream,
-                    observer,
-                )?;
-                let logits = final_token_logits(&logits, stream)?;
-                model.adjust_prefill_logits(logits, cache, stream)
+                model.prefill_typed_with_observer(input, cache, stream, observer)
             }
             (Self::NemotronH(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",

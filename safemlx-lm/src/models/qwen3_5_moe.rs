@@ -4403,6 +4403,43 @@ impl Model {
         )?;
         Ok(prepared)
     }
+
+    fn forward_prepared_prefill(
+        &mut self,
+        prepared: runtime_input::PreparedPrefill,
+        cache: &mut Cache,
+        stream: &Stream,
+        forward: impl FnOnce(&mut Self, ModelInput<'_>, &Stream) -> Result<Array, Exception>,
+    ) -> Result<Array, Exception> {
+        let inputs = prepared.tokens();
+        let inputs_embeds = prepared.embeddings();
+        forward(
+            self,
+            ModelInput {
+                inputs,
+                inputs_embeds,
+                mask: None,
+                cache: Some(cache),
+            },
+            stream,
+        )
+    }
+
+    pub(crate) fn prefill_typed_with_observer(
+        &mut self,
+        input: runtime_input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let prepared = self.prepare_typed_prefill(input, stream)?;
+        let logits =
+            self.forward_prepared_prefill(prepared, cache, stream, |model, input, stream| {
+                model.forward_with_observer(input, stream, observer)
+            })?;
+        let logits = logits.try_index_device((.., -1, ..), stream)?;
+        self.adjust_prefill_logits(logits, cache, stream)
+    }
 }
 
 fn visual_embeddings_from_payload(
@@ -4475,29 +4512,10 @@ impl CausalLm<Cache> for Model {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        match self.prepare_typed_prefill(input, stream)? {
-            runtime_input::PreparedPrefill::Text(prompt_tokens) => self.forward_logits(
-                ModelInput {
-                    inputs: &prompt_tokens,
-                    inputs_embeds: None,
-                    mask: None,
-                    cache: Some(cache),
-                },
-                true,
-                stream,
-            ),
-            runtime_input::PreparedPrefill::Embeddings { tokens, embeddings } => self
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: Some(&embeddings),
-                        mask: None,
-                        cache: Some(cache),
-                    },
-                    true,
-                    stream,
-                ),
-        }
+        let prepared = self.prepare_typed_prefill(input, stream)?;
+        self.forward_prepared_prefill(prepared, cache, stream, |model, input, stream| {
+            model.forward_logits(input, true, stream)
+        })
     }
 
     fn decode_logits(
@@ -4551,7 +4569,7 @@ mod tests {
     use crate::{
         error::Error,
         inspection::ActivationRecorder,
-        models::{common::CausalLm, input as runtime_input},
+        models::{common::CausalLm, input as runtime_input, Model as AnyModel, ModelCache},
         weights::{load_safetensors_strict, StrictLoadReport},
     };
     use safemlx::{
@@ -4646,6 +4664,13 @@ mod tests {
             window_size: 8,
             out_hidden_size,
             fullatt_block_indexes: vec![0],
+        }
+    }
+
+    fn zero_model_parameters(model: &mut Model, stream: &safemlx::Stream) {
+        for (_, param) in model.parameters_mut().flatten() {
+            let shape = param.shape().to_vec();
+            *param = Array::zeros::<f32>(&shape, stream).unwrap();
         }
     }
 
@@ -5094,12 +5119,9 @@ mod tests {
             stream,
         )
         .unwrap();
-        for (_, param) in model.parameters_mut().flatten() {
-            let shape = param.shape().to_vec();
-            *param = Array::zeros::<f32>(&shape, stream).unwrap();
-        }
+        zero_model_parameters(&mut model, stream);
 
-        let text = runtime_input::token_ids_array(&[7, 42, 8], stream).unwrap();
+        let text = runtime_input::token_ids_array(&[7, 8], stream).unwrap();
         let grid_thw = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
         let pixel_values = Array::zeros::<f32>(&[8, 12], stream).unwrap();
         let parts = [
@@ -5117,7 +5139,191 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 128]);
-        assert_eq!(cache.offset(), 6);
+        assert_eq!(cache.offset(), 5);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn observer_image_tensor_prefill_uses_typed_preparation() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::FullAttention]);
+        let mut qwen = Model::new(
+            args,
+            Some(42),
+            Some(43),
+            Some(tiny_vision_config(16)),
+            stream,
+        )
+        .unwrap();
+        zero_model_parameters(&mut qwen, stream);
+        let mut model = AnyModel::Qwen35Moe(qwen);
+
+        let before = runtime_input::token_ids_array(&[7], stream).unwrap();
+        let after = runtime_input::token_ids_array(&[8], stream).unwrap();
+        let grid_thw = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+        let pixel_values = Array::zeros::<f32>(&[8, 12], stream).unwrap();
+        let parts = [
+            runtime_input::InputPart::text_token_ids(&before),
+            runtime_input::InputPart::image_tensor(
+                &pixel_values,
+                runtime_input::InputMetadata::qwen_grid_thw(&grid_thw),
+            ),
+            runtime_input::InputPart::text_token_ids(&after),
+        ];
+        let mut cache = model.new_cache();
+        let mut recorder = ActivationRecorder::new();
+
+        let logits = model
+            .prefill_input_with_observer(
+                runtime_input::ModelInput::new(&parts),
+                &mut cache,
+                stream,
+                &mut recorder,
+            )
+            .unwrap();
+
+        assert_eq!(logits.shape(), &[1, 128]);
+        let ModelCache::Qwen35Moe(cache) = cache else {
+            panic!("expected qwen cache");
+        };
+        assert_eq!(cache.offset(), 5);
+        assert!(recorder
+            .activations()
+            .iter()
+            .any(|activation| activation.name == "lm_head.logits"));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn normal_and_observer_multimodal_prefill_share_cache_semantics() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::FullAttention]);
+        let mut normal_qwen = Model::new(
+            args.clone(),
+            Some(42),
+            Some(43),
+            Some(tiny_vision_config(16)),
+            stream,
+        )
+        .unwrap();
+        let mut observed_qwen = Model::new(
+            args,
+            Some(42),
+            Some(43),
+            Some(tiny_vision_config(16)),
+            stream,
+        )
+        .unwrap();
+        zero_model_parameters(&mut normal_qwen, stream);
+        zero_model_parameters(&mut observed_qwen, stream);
+        let mut normal = AnyModel::Qwen35Moe(normal_qwen);
+        let mut observed = AnyModel::Qwen35Moe(observed_qwen);
+
+        let before = runtime_input::token_ids_array(&[7], stream).unwrap();
+        let after = runtime_input::token_ids_array(&[8], stream).unwrap();
+        let image_embeddings = Array::zeros::<f32>(&[1, 3, 16], stream).unwrap();
+        let grid_thw = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+        let parts = [
+            runtime_input::InputPart::text_token_ids(&before),
+            runtime_input::InputPart {
+                modality: runtime_input::Modality::Image,
+                payload: runtime_input::InputPayload::Embeddings(&image_embeddings),
+                metadata: runtime_input::InputMetadata::qwen_grid_thw(&grid_thw),
+            },
+            runtime_input::InputPart::text_token_ids(&after),
+        ];
+        let input = runtime_input::ModelInput::new(&parts);
+        let mut normal_cache = normal.new_cache();
+        let mut observed_cache = observed.new_cache();
+        let mut recorder = ActivationRecorder::new();
+
+        let normal_logits = normal
+            .prefill_input_with_cache(input, &mut normal_cache, stream)
+            .unwrap();
+        let observed_logits = observed
+            .prefill_input_with_observer(input, &mut observed_cache, stream, &mut recorder)
+            .unwrap();
+
+        assert_eq!(normal_logits.shape(), observed_logits.shape());
+        let ModelCache::Qwen35Moe(normal_cache) = normal_cache else {
+            panic!("expected qwen cache");
+        };
+        let ModelCache::Qwen35Moe(observed_cache) = observed_cache else {
+            panic!("expected qwen cache");
+        };
+        assert_eq!(normal_cache.offset(), observed_cache.offset());
+        assert_eq!(observed_cache.offset(), 5);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn text_only_observer_prefill_still_works() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::FullAttention]);
+        let mut qwen = Model::new(args, None, None, None, stream).unwrap();
+        zero_model_parameters(&mut qwen, stream);
+        let mut model = AnyModel::Qwen35Moe(qwen);
+
+        let text = runtime_input::token_ids_array(&[7, 8, 9], stream).unwrap();
+        let parts = [runtime_input::InputPart::text_token_ids(&text)];
+        let mut cache = model.new_cache();
+        let mut recorder = ActivationRecorder::new();
+
+        let logits = model
+            .prefill_input_with_observer(
+                runtime_input::ModelInput::new(&parts),
+                &mut cache,
+                stream,
+                &mut recorder,
+            )
+            .unwrap();
+
+        assert_eq!(logits.shape(), &[1, 128]);
+        let ModelCache::Qwen35Moe(cache) = cache else {
+            panic!("expected qwen cache");
+        };
+        assert_eq!(cache.offset(), 3);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn text_only_qwen_rejects_observer_image_input_clearly() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_args(vec![LayerType::FullAttention]);
+        let mut qwen = Model::new(args, None, None, None, stream).unwrap();
+        zero_model_parameters(&mut qwen, stream);
+        let mut model = AnyModel::Qwen35Moe(qwen);
+
+        let image_embeddings = Array::zeros::<f32>(&[1, 3, 16], stream).unwrap();
+        let grid_thw = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+        let parts = [runtime_input::InputPart {
+            modality: runtime_input::Modality::Image,
+            payload: runtime_input::InputPayload::Embeddings(&image_embeddings),
+            metadata: runtime_input::InputMetadata::qwen_grid_thw(&grid_thw),
+        }];
+        let mut cache = model.new_cache();
+        let mut recorder = ActivationRecorder::new();
+
+        let error = model
+            .prefill_input_with_observer(
+                runtime_input::ModelInput::new(&parts),
+                &mut cache,
+                stream,
+                &mut recorder,
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("qwen3_5_moe typed input does not support image input yet"));
     }
 
     #[test]
@@ -5135,12 +5341,9 @@ mod tests {
             stream,
         )
         .unwrap();
-        for (_, param) in model.parameters_mut().flatten() {
-            let shape = param.shape().to_vec();
-            *param = Array::zeros::<f32>(&shape, stream).unwrap();
-        }
+        zero_model_parameters(&mut model, stream);
 
-        let text = runtime_input::token_ids_array(&[7, 43, 8, 43, 9], stream).unwrap();
+        let text = runtime_input::token_ids_array(&[7, 8, 9], stream).unwrap();
         let grid_thw = Array::from_slice(&[2i32, 2, 4], &[1, 3]);
         let pixel_values = Array::zeros::<f32>(&[16, 12], stream).unwrap();
         let parts = [
@@ -5180,10 +5383,7 @@ mod tests {
             stream,
         )
         .unwrap();
-        for (_, param) in model.parameters_mut().flatten() {
-            let shape = param.shape().to_vec();
-            *param = Array::zeros::<f32>(&shape, stream).unwrap();
-        }
+        zero_model_parameters(&mut model, stream);
 
         let dir = temp_model_dir(
             r#"{
@@ -5246,10 +5446,7 @@ mod tests {
             stream,
         )
         .unwrap();
-        for (_, param) in model.parameters_mut().flatten() {
-            let shape = param.shape().to_vec();
-            *param = Array::zeros::<f32>(&shape, stream).unwrap();
-        }
+        zero_model_parameters(&mut model, stream);
 
         let dir = temp_model_dir(
             r#"{

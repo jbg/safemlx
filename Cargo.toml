@@ -25,7 +25,7 @@ safemlx = { version = "0.1.3", path = "safemlx" }
 safemlx-sys = { version = "0.1.3", path = "safemlx-sys", default-features = false }
 safemlx-macros = { version = "0.1.1", path = "safemlx-macros" }
 safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" }
-safemlx-lm = { version = "0.4.0", path = "safemlx-lm" }
+safemlx-lm = { version = "0.4.1", path = "safemlx-lm" }
 safemlx-lm-utils = { version = "0.1.4", path = "safemlx-lm-utils", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

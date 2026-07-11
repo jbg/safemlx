@@ -159,6 +159,24 @@ pub(crate) enum PreparedPrefill {
     Embeddings { tokens: Array, embeddings: Array },
 }
 
+impl PreparedPrefill {
+    /// Returns the decoder token IDs represented by this prepared input.
+    pub(crate) fn tokens(&self) -> &Array {
+        match self {
+            Self::Text(tokens) => tokens,
+            Self::Embeddings { tokens, .. } => tokens,
+        }
+    }
+
+    /// Returns prepared embeddings when the input included model-native media.
+    pub(crate) fn embeddings(&self) -> Option<&Array> {
+        match self {
+            Self::Text(_) => None,
+            Self::Embeddings { embeddings, .. } => Some(embeddings),
+        }
+    }
+}
+
 /// Placeholder token associated with one non-text modality.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModalityToken {
