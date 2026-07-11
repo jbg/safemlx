@@ -4358,316 +4358,114 @@ fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadConfig {
     }
 }
 
-enum QwenPrefill {
-    Text(Array),
-    Embeddings { tokens: Array, embeddings: Array },
-}
-
 impl Model {
     fn prepare_typed_prefill(
         &mut self,
         input: runtime_input::ModelInput<'_>,
         stream: &Stream,
-    ) -> Result<QwenPrefill, Exception> {
-        runtime_input::validate(input)?;
-        let has_non_text = input
-            .parts
-            .iter()
-            .any(|part| part.modality != runtime_input::Modality::Text);
-        if !has_non_text {
-            let tokens = runtime_input::text_token_ids(input, stream)?;
-            self.reject_multimodal_tokens(&tokens, false, stream)?;
-            return Ok(QwenPrefill::Text(tokens));
-        }
-
-        enum PreparedInputPart {
-            Text(Vec<u32>),
-            Media(Vec<usize>),
-        }
-        struct MediaEmbedding {
-            modality: runtime_input::Modality,
-            embeddings: Array,
-            consumed: bool,
-        }
-
-        let mut prepared_parts = Vec::new();
-        let mut media_embeddings = Vec::new();
-
-        for part in input.parts {
-            match (part.modality, part.payload) {
-                (runtime_input::Modality::Text, runtime_input::InputPayload::TokenIds(tokens)) => {
-                    ensure_batch_one(tokens, "qwen3_5_moe text tokens")?;
-                    let ids = token_ids_from_array(tokens, stream)?;
-                    prepared_parts.push(PreparedInputPart::Text(ids));
+    ) -> Result<runtime_input::PreparedPrefill, Exception> {
+        let modality_tokens = [
+            self.image_token_id
+                .map(|token_id| runtime_input::ModalityToken {
+                    modality: runtime_input::Modality::Image,
+                    token_id: token_id as u32,
+                }),
+            self.video_token_id
+                .map(|token_id| runtime_input::ModalityToken {
+                    modality: runtime_input::Modality::Video,
+                    token_id: token_id as u32,
+                }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let embed_tokens = &mut self.model.embed_tokens;
+        let visual = &mut self.visual;
+        let vision_args = self.vision_args.as_ref();
+        let prepared = runtime_input::prepare_decoder_prefill(
+            input,
+            &modality_tokens,
+            self.args.hidden_size,
+            "qwen3_5_moe",
+            stream,
+            |tokens, stream| embed_tokens.forward(tokens, stream),
+            |part, stream| {
+                let embeddings = visual_embeddings_from_payload(visual, part, stream)?;
+                if part.modality == runtime_input::Modality::Video {
+                    video_embedding_chunks(vision_args, part, &embeddings, stream)
+                } else {
+                    Ok(vec![embeddings])
                 }
-                (runtime_input::Modality::Image, payload) => {
-                    if self.image_token_id.is_none() {
-                        return Err(Exception::custom(
-                            "qwen3_5_moe image input requires image_token_id in config",
-                        ));
-                    }
-                    let embeddings = self.visual_embeddings_from_payload(part, payload, stream)?;
-                    ensure_batch_one(&embeddings, "qwen3_5_moe image embeddings")?;
-                    ensure_hidden_size(
-                        &embeddings,
-                        self.args.hidden_size,
-                        "qwen3_5_moe image embeddings",
-                    )?;
-                    let index = media_embeddings.len();
-                    media_embeddings.push(MediaEmbedding {
-                        modality: runtime_input::Modality::Image,
-                        embeddings,
-                        consumed: false,
-                    });
-                    prepared_parts.push(PreparedInputPart::Media(vec![index]));
-                }
-                (runtime_input::Modality::Audio, _) => {
-                    return Err(Exception::custom(
-                        "qwen3_5_moe typed input does not support audio input yet",
-                    ));
-                }
-                (runtime_input::Modality::Video, payload) => {
-                    if self.video_token_id.is_none() {
-                        return Err(Exception::custom(
-                            "qwen3_5_moe video input requires video_token_id in config",
-                        ));
-                    }
-                    let embeddings = self.visual_embeddings_from_payload(part, payload, stream)?;
-                    ensure_batch_one(&embeddings, "qwen3_5_moe video embeddings")?;
-                    ensure_hidden_size(
-                        &embeddings,
-                        self.args.hidden_size,
-                        "qwen3_5_moe video embeddings",
-                    )?;
-                    let chunks = self.video_embedding_chunks(part, &embeddings, stream)?;
-                    let mut indices = Vec::with_capacity(chunks.len());
-                    for embeddings in chunks {
-                        indices.push(media_embeddings.len());
-                        media_embeddings.push(MediaEmbedding {
-                            modality: runtime_input::Modality::Video,
-                            embeddings,
-                            consumed: false,
-                        });
-                    }
-                    prepared_parts.push(PreparedInputPart::Media(indices));
-                }
-                (runtime_input::Modality::Text, runtime_input::InputPayload::Embeddings(_)) => {
-                    return Err(Exception::custom(
-                        "qwen3_5_moe typed input does not support text embeddings yet",
-                    ));
-                }
-                (runtime_input::Modality::Text, runtime_input::InputPayload::Tensor(_)) => {
-                    return Err(Exception::custom(
-                        "qwen3_5_moe text input does not accept tensor payloads",
-                    ));
-                }
-            }
+            },
+        )?;
+        if let runtime_input::PreparedPrefill::Text(tokens) = &prepared {
+            self.reject_multimodal_tokens(tokens, false, stream)?;
         }
-
-        for (modality, token_id) in [
-            (runtime_input::Modality::Image, self.image_token_id),
-            (runtime_input::Modality::Video, self.video_token_id),
-        ] {
-            let Some(token_id) = token_id else {
-                continue;
-            };
-            let placeholders = prepared_parts
-                .iter()
-                .filter_map(|part| match part {
-                    PreparedInputPart::Text(ids) => Some(ids),
-                    PreparedInputPart::Media(_) => None,
-                })
-                .flatten()
-                .filter(|id| **id as i32 == token_id)
-                .count();
-            let chunks = media_embeddings
-                .iter()
-                .filter(|media| media.modality == modality)
-                .count();
-            if placeholders != 0 && placeholders != chunks {
-                return Err(Exception::custom(format!(
-                    "qwen3_5_moe {} input produced {chunks} embedding groups but prompt contains {placeholders} placeholders",
-                    modality.as_str()
-                )));
-            }
-        }
-
-        let mut token_parts = Vec::new();
-        let mut embedding_parts = Vec::new();
-        for part in prepared_parts {
-            match part {
-                PreparedInputPart::Text(ids) => {
-                    for id in ids {
-                        let modality = if Some(id as i32) == self.image_token_id {
-                            Some(runtime_input::Modality::Image)
-                        } else if Some(id as i32) == self.video_token_id {
-                            Some(runtime_input::Modality::Video)
-                        } else {
-                            None
-                        };
-                        if let Some(modality) = modality {
-                            let Some(media) = media_embeddings
-                                .iter_mut()
-                                .find(|media| media.modality == modality && !media.consumed)
-                            else {
-                                return Err(Exception::custom(format!(
-                                    "qwen3_5_moe {} placeholder has no matching input",
-                                    modality.as_str()
-                                )));
-                            };
-                            media.consumed = true;
-                            let embeddings = media.embeddings.clone();
-                            let media_len = embeddings.shape()[1];
-                            token_parts.push(placeholder_tokens(id, media_len as usize, stream)?);
-                            embedding_parts.push(embeddings);
-                        } else {
-                            let piece_tokens = runtime_input::token_ids_array(&[id], stream)?;
-                            embedding_parts
-                                .push(self.model.embed_tokens.forward(&piece_tokens, stream)?);
-                            token_parts.push(piece_tokens);
-                        }
-                    }
-                }
-                PreparedInputPart::Media(indices) => {
-                    for index in indices {
-                        let media = &mut media_embeddings[index];
-                        if media.consumed {
-                            continue;
-                        }
-                        media.consumed = true;
-                        let embeddings = media.embeddings.clone();
-                        let media_len = embeddings.shape()[1];
-                        let token_id = match media.modality {
-                            runtime_input::Modality::Image => self.image_token_id,
-                            runtime_input::Modality::Video => self.video_token_id,
-                            _ => None,
-                        }
-                        .expect("media token id was validated");
-                        token_parts.push(placeholder_tokens(
-                            token_id as u32,
-                            media_len as usize,
-                            stream,
-                        )?);
-                        embedding_parts.push(embeddings);
-                    }
-                }
-            }
-        }
-
-        let tokens = concatenate_axis(&token_parts, 1, stream)?;
-        let embeddings = concatenate_axis(&embedding_parts, 1, stream)?;
-        Ok(QwenPrefill::Embeddings { tokens, embeddings })
-    }
-
-    fn visual_embeddings_from_payload(
-        &mut self,
-        part: &runtime_input::InputPart<'_>,
-        payload: runtime_input::InputPayload<'_>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
-            Exception::custom(format!(
-                "qwen3_5_moe {} input requires qwen_grid_thw metadata",
-                part.modality.as_str()
-            ))
-        })?;
-        match payload {
-            runtime_input::InputPayload::Embeddings(embeddings) => Ok(embeddings.clone()),
-            runtime_input::InputPayload::Tensor(tensor) => {
-                let visual = self.visual.as_mut().ok_or_else(|| {
-                    Exception::custom(
-                        "qwen3_5_moe visual tensor input requires vision_config and visual weights",
-                    )
-                })?;
-                visual.forward(tensor, grid_thw, stream)
-            }
-            runtime_input::InputPayload::TokenIds(_) => Err(Exception::custom(
-                "qwen3_5_moe visual input does not accept token-id payloads",
-            )),
-        }
-    }
-
-    fn video_embedding_chunks(
-        &self,
-        part: &runtime_input::InputPart<'_>,
-        embeddings: &Array,
-        stream: &Stream,
-    ) -> Result<Vec<Array>, Exception> {
-        let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
-            Exception::custom("qwen3_5_moe video input requires qwen_grid_thw metadata")
-        })?;
-        let grid = grid_thw_from_array(grid_thw, stream)?;
-        if grid.len() != 1 {
-            return Err(Exception::custom(format!(
-                "qwen3_5_moe each video input part requires one grid entry, got {}",
-                grid.len()
-            )));
-        }
-        let (grid_t, grid_h, grid_w) = grid[0];
-        let merge = self
-            .vision_args
-            .as_ref()
-            .map(|config| config.spatial_merge_size)
-            .ok_or_else(|| Exception::custom("qwen3_5_moe video input requires vision_config"))?;
-        let chunk_len = grid_h * grid_w / (merge * merge);
-        let expected = grid_t * chunk_len;
-        if embeddings.dim(1) != expected {
-            return Err(Exception::custom(format!(
-                "qwen3_5_moe video grid expects {expected} merged embeddings, got {}",
-                embeddings.dim(1)
-            )));
-        }
-        let mut chunks = Vec::with_capacity(grid_t as usize);
-        for index in 0..grid_t {
-            let start = index * chunk_len;
-            let end = start + chunk_len;
-            chunks.push(embeddings.try_index_device((.., start..end, ..), stream)?);
-        }
-        Ok(chunks)
+        Ok(prepared)
     }
 }
 
-fn ensure_batch_one(array: &Array, name: &str) -> Result<(), Exception> {
-    let shape = array.shape();
-    if shape.first() != Some(&1) {
+fn visual_embeddings_from_payload(
+    visual: &mut Option<QwenVisionTransformer>,
+    part: &runtime_input::InputPart<'_>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
+        Exception::custom(format!(
+            "qwen3_5_moe {} input requires qwen_grid_thw metadata",
+            part.modality.as_str()
+        ))
+    })?;
+    match part.payload {
+        runtime_input::InputPayload::Embeddings(embeddings) => Ok(embeddings.clone()),
+        runtime_input::InputPayload::Tensor(tensor) => visual
+            .as_mut()
+            .ok_or_else(|| {
+                Exception::custom(
+                    "qwen3_5_moe visual tensor input requires vision_config and visual weights",
+                )
+            })?
+            .forward(tensor, grid_thw, stream),
+        runtime_input::InputPayload::TokenIds(_) => Err(Exception::custom(
+            "qwen3_5_moe visual input does not accept token-id payloads",
+        )),
+    }
+}
+
+fn video_embedding_chunks(
+    vision_args: Option<&VisionConfig>,
+    part: &runtime_input::InputPart<'_>,
+    embeddings: &Array,
+    stream: &Stream,
+) -> Result<Vec<Array>, Exception> {
+    let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
+        Exception::custom("qwen3_5_moe video input requires qwen_grid_thw metadata")
+    })?;
+    let grid = grid_thw_from_array(grid_thw, stream)?;
+    if grid.len() != 1 {
         return Err(Exception::custom(format!(
-            "{name} currently supports batch size 1, got shape {shape:?}"
+            "qwen3_5_moe each video input part requires one grid entry, got {}",
+            grid.len()
         )));
     }
-    Ok(())
-}
-
-fn ensure_hidden_size(array: &Array, hidden_size: i32, name: &str) -> Result<(), Exception> {
-    let shape = array.shape();
-    if shape.len() != 3 || shape[2] != hidden_size {
+    let (grid_t, grid_h, grid_w) = grid[0];
+    let merge = vision_args
+        .map(|config| config.spatial_merge_size)
+        .ok_or_else(|| Exception::custom("qwen3_5_moe video input requires vision_config"))?;
+    let chunk_len = grid_h * grid_w / (merge * merge);
+    let expected = grid_t * chunk_len;
+    if embeddings.dim(1) != expected {
         return Err(Exception::custom(format!(
-            "{name} must be shaped [batch, sequence, {hidden_size}], got {shape:?}"
+            "qwen3_5_moe video grid expects {expected} merged embeddings, got {}",
+            embeddings.dim(1)
         )));
     }
-    Ok(())
-}
-
-fn placeholder_tokens(token_id: u32, len: usize, stream: &Stream) -> Result<Array, Exception> {
-    let ids = vec![token_id; len];
-    runtime_input::token_ids_array(&ids, stream)
-}
-
-fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
-    let shape = tokens.shape();
-    if shape.len() != 2 || shape[0] != 1 {
-        return Err(Exception::custom(format!(
-            "qwen3_5_moe typed visual input expects batch-1 token ids, got shape {shape:?}"
-        )));
+    let mut chunks = Vec::with_capacity(grid_t as usize);
+    for index in 0..grid_t {
+        let start = index * chunk_len;
+        chunks.push(embeddings.try_index_device((.., start..start + chunk_len, ..), stream)?);
     }
-    let mut ids = Vec::with_capacity(shape[1] as usize);
-    for index in 0..shape[1] {
-        ids.push(
-            tokens
-                .try_index_device((0, index), stream)?
-                .item::<u32>(stream),
-        );
-    }
-    Ok(ids)
+    Ok(chunks)
 }
 
 impl CausalLm<Cache> for Model {
@@ -4678,7 +4476,7 @@ impl CausalLm<Cache> for Model {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match self.prepare_typed_prefill(input, stream)? {
-            QwenPrefill::Text(prompt_tokens) => self.forward_logits(
+            runtime_input::PreparedPrefill::Text(prompt_tokens) => self.forward_logits(
                 ModelInput {
                     inputs: &prompt_tokens,
                     inputs_embeds: None,
@@ -4688,16 +4486,17 @@ impl CausalLm<Cache> for Model {
                 true,
                 stream,
             ),
-            QwenPrefill::Embeddings { tokens, embeddings } => self.forward_logits(
-                ModelInput {
-                    inputs: &tokens,
-                    inputs_embeds: Some(&embeddings),
-                    mask: None,
-                    cache: Some(cache),
-                },
-                true,
-                stream,
-            ),
+            runtime_input::PreparedPrefill::Embeddings { tokens, embeddings } => self
+                .forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: Some(&embeddings),
+                        mask: None,
+                        cache: Some(cache),
+                    },
+                    true,
+                    stream,
+                ),
         }
     }
 

@@ -146,7 +146,8 @@ impl QwenProcessor {
                 (Modality::Image, MediaPayload::Rgb8(image)) => {
                     bindings.push(PreparedMediaBinding {
                         placeholder_token_id: self.image_token_id,
-                        replacement_token_ids: Vec::new(),
+                        prefix_token_ids: Vec::new(),
+                        suffix_token_ids: Vec::new(),
                         part: self.process_image(image)?,
                     });
                 }
@@ -159,8 +160,8 @@ impl QwenProcessor {
                                     .into(),
                             )
                         })?,
-                        replacement_token_ids: self
-                            .video_prompt_tokens(&timestamps, encode_text)?,
+                        prefix_token_ids: self.video_prompt_tokens(&timestamps, encode_text)?,
+                        suffix_token_ids: Vec::new(),
                         part,
                     });
                 }

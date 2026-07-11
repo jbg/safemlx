@@ -33,6 +33,7 @@ pub mod common;
 pub mod gemma4;
 /// Gemma 4 assistant draft-model support.
 pub mod gemma4_assistant;
+mod gemma4_vision;
 /// Typed runtime input support.
 pub mod input;
 /// Llama decoder-only model support.
@@ -288,7 +289,10 @@ impl Model {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => model.forward_with_observer(
                 gemma4::ModelInput {
                     inputs: input_tokens,
+                    inputs_embeds: None,
+                    per_layer_input_ids: None,
                     mask,
+                    sliding_mask: None,
                     cache: &mut cache.kv,
                 },
                 stream,
@@ -317,27 +321,12 @@ impl Model {
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
-        let prompt_tokens = input::text_token_ids(input, stream)?;
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                let prompt_len = prompt_tokens.shape()[1];
-                if prompt_len <= 0 {
-                    return Err(Exception::custom("prompt must contain at least one token"));
-                }
-                cache.token_ids = gemma4::token_ids_from_array(&prompt_tokens, stream)?;
-                cache.kv.clear();
-                let logits = model.forward_with_observer(
-                    gemma4::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache: &mut cache.kv,
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
+                model.prefill_typed_with_observer(input, cache, stream, observer)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
                 let logits = model.forward_with_observer(
                     llama::ModelInput {
                         inputs: &prompt_tokens,
@@ -350,6 +339,7 @@ impl Model {
                 final_token_logits(&logits, stream)
             }
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
                 let logits = model.forward_with_observer(
                     qwen3::ModelInput {
                         inputs: &prompt_tokens,
@@ -362,6 +352,7 @@ impl Model {
                 final_token_logits(&logits, stream)
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
                 let logits = model.forward_with_observer(
                     qwen3_5_moe::ModelInput {
                         inputs: &prompt_tokens,

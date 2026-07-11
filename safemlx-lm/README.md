@@ -17,11 +17,11 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 ```toml
 [dependencies]
-safemlx-lm = { version = "0.2", features = ["image-processing"] }
+safemlx-lm = { version = "0.3", features = ["image-processing"] }
 ```
 
-For Qwen image prompts, render the chat template with one image placeholder per
-image, then prepare decoded RGB8 pixels before prefill:
+For Gemma 4 or Qwen image prompts, render the chat template with one image
+placeholder per image, then prepare decoded RGB8 pixels before prefill:
 
 ```rust,ignore
 use safemlx_lm::processor::{MediaInput, RgbImageView};
@@ -54,12 +54,12 @@ let prepared = model.prepare_input(
 )?;
 ```
 
-The optional `image-processing` feature enables the processor, which reads
-the image and video preprocessor configs and owns frame sampling, timestamps,
-resizing, normalization, model-native patch packing, grid metadata, and
-placeholder binding. Without the feature, callers can still supply model-native
-`Image/Tensor` and `Video/Tensor` inputs directly without depending on the
-`image` crate.
+The optional `image-processing` feature enables architecture-dispatched Gemma 4
+and Qwen processors. Shared code owns decoded-image validation and resizing;
+each processor adds its model-native patch packing, metadata, and placeholder
+binding. Qwen also supports decoded video sampling and timestamps. Without the
+feature, callers can still supply Gemma 4 or Qwen `Image/Tensor` inputs, and
+Qwen `Video/Tensor` inputs, directly without depending on the `image` crate.
 
 ## License
 

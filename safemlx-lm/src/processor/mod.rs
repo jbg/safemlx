@@ -9,6 +9,7 @@ use crate::{
     models::input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
 };
 
+mod gemma4;
 /// Shared decoded-image operations.
 pub mod image;
 mod qwen;
@@ -102,6 +103,7 @@ enum OwnedInputMetadata {
     #[default]
     None,
     GridThw(Array),
+    PatchPositionIds(Array),
 }
 
 /// One owned part of a prepared model input.
@@ -142,6 +144,11 @@ impl PreparedInputPart {
                 qwen_grid_thw: match &self.metadata {
                     OwnedInputMetadata::None => None,
                     OwnedInputMetadata::GridThw(value) => Some(value),
+                    OwnedInputMetadata::PatchPositionIds(_) => None,
+                },
+                patch_position_ids: match &self.metadata {
+                    OwnedInputMetadata::PatchPositionIds(value) => Some(value),
+                    OwnedInputMetadata::None | OwnedInputMetadata::GridThw(_) => None,
                 },
             },
         }
@@ -195,10 +202,19 @@ pub struct ModelProcessor {
 
 #[derive(Debug, Clone)]
 enum ProcessorKind {
+    Gemma4(gemma4::Gemma4Processor),
     Qwen(qwen::QwenProcessor),
 }
 
 impl ModelProcessor {
+    pub(crate) fn load_gemma4(model_dir: &Path) -> Result<Option<Self>, Error> {
+        gemma4::Gemma4Processor::load(model_dir).map(|processor| {
+            processor.map(|processor| Self {
+                kind: ProcessorKind::Gemma4(processor),
+            })
+        })
+    }
+
     pub(crate) fn load_qwen(model_dir: &Path) -> Result<Option<Self>, Error> {
         qwen::QwenProcessor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {
@@ -233,6 +249,7 @@ impl ModelProcessor {
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
     ) -> Result<PreparedModelInput, Error> {
         match &self.kind {
+            ProcessorKind::Gemma4(processor) => processor.prepare_token_ids(token_ids, media),
             ProcessorKind::Qwen(processor) => {
                 processor.prepare_token_ids(token_ids, media, encode_text)
             }
@@ -262,6 +279,9 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
         .map(|text| text.model_type.as_str())
         .unwrap_or(&metadata.model_type);
     match effective_type {
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
+            ModelProcessor::load_gemma4(model_dir)
+        }
         "qwen3_5_moe" | "qwen3_5_moe_text" => ModelProcessor::load_qwen(model_dir),
         _ => Ok(None),
     }
@@ -269,7 +289,8 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
 
 struct PreparedMediaBinding {
     placeholder_token_id: u32,
-    replacement_token_ids: Vec<u32>,
+    prefix_token_ids: Vec<u32>,
+    suffix_token_ids: Vec<u32>,
     part: PreparedInputPart,
 }
 
@@ -306,12 +327,13 @@ fn bind_media_parts(
         if start < index {
             parts.push(PreparedInputPart::text_token_ids(&token_ids[start..index]));
         }
-        if !binding.replacement_token_ids.is_empty() {
-            parts.push(PreparedInputPart::text_token_ids(
-                &binding.replacement_token_ids,
-            ));
+        if !binding.prefix_token_ids.is_empty() {
+            parts.push(PreparedInputPart::text_token_ids(&binding.prefix_token_ids));
         }
         parts.push(binding.part);
+        if !binding.suffix_token_ids.is_empty() {
+            parts.push(PreparedInputPart::text_token_ids(&binding.suffix_token_ids));
+        }
         start = index + 1;
     }
     if start < token_ids.len() {
@@ -343,7 +365,8 @@ mod tests {
             &[42],
             vec![PreparedMediaBinding {
                 placeholder_token_id: 42,
-                replacement_token_ids: Vec::new(),
+                prefix_token_ids: Vec::new(),
+                suffix_token_ids: Vec::new(),
                 part: image,
             }],
         )

@@ -68,7 +68,10 @@ pub fn generate_gemma4_mtp(
         target.forward_with_state(
             ModelInput {
                 inputs: &prefix,
+                inputs_embeds: None,
+                per_layer_input_ids: None,
                 mask: None,
+                sliding_mask: None,
                 cache: &mut cache,
             },
             stream,
@@ -79,7 +82,10 @@ pub fn generate_gemma4_mtp(
     let first_out = target.forward_with_state(
         ModelInput {
             inputs: &last,
+            inputs_embeds: None,
+            per_layer_input_ids: None,
             mask: None,
+            sliding_mask: None,
             cache: &mut cache,
         },
         stream,
@@ -132,7 +138,10 @@ pub fn generate_gemma4_mtp(
         let verify_out = target.forward_with_state(
             ModelInput {
                 inputs: &verify_input,
+                inputs_embeds: None,
+                per_layer_input_ids: None,
                 mask: None,
+                sliding_mask: None,
                 cache: &mut cache,
             },
             stream,

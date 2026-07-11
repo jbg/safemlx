@@ -17,7 +17,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        mean_axis, quantized_matmul, rsqrt, tanh,
+        mean_axis, quantized_matmul, r#where, rsqrt, tanh,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 pub use super::common::sample;
+use super::gemma4_vision::{Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionTower};
 
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
@@ -294,6 +295,9 @@ pub struct ModelArgs {
     pub rms_norm_eps: f32,
     /// Token vocabulary size.
     pub vocab_size: i32,
+    #[serde(default)]
+    /// Padding token used for media positions in per-layer token embeddings.
+    pub pad_token_id: i32,
     /// Number of key/value attention heads.
     pub num_key_value_heads: i32,
     #[serde(default)]
@@ -405,6 +409,10 @@ impl<'de> Deserialize<'de> for LayerType {
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4Config {
     text_config: ModelArgs,
+    #[serde(default)]
+    vision_config: Option<Gemma4VisionConfig>,
+    #[serde(default)]
+    image_token_id: Option<i32>,
     #[serde(default = "default_true")]
     tie_word_embeddings: bool,
     #[serde(default)]
@@ -485,7 +493,7 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)
 }
 
-fn maybe_quantized_linear(
+pub(super) fn maybe_quantized_linear(
     quantized: bool,
     input_dims: i32,
     output_dims: i32,
@@ -513,7 +521,11 @@ fn maybe_quantized_linear(
     }
 }
 
-fn rms_norm_without_scale(x: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
+pub(super) fn rms_norm_without_scale(
+    x: &Array,
+    eps: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     let variance = mean_axis(&x.square(stream)?, -1, true, stream)?;
     x.multiply(
         rsqrt(variance.add(Array::from_f32(eps), stream)?, stream)?,
@@ -1907,8 +1919,14 @@ impl Gemma4TextModel {
 pub struct ModelInput<'a, C> {
     /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
+    /// Optional prepared embeddings replacing the token embedding lookup.
+    pub inputs_embeds: Option<&'a Array>,
+    /// Optional IDs used only for per-layer token-identity embeddings.
+    pub per_layer_input_ids: Option<&'a Array>,
     /// Optional attention mask.
     pub mask: Option<&'a Array>,
+    /// Optional sliding-layer mask when it differs from the full-attention mask.
+    pub sliding_mask: Option<&'a Array>,
     /// Mutable per-layer key/value cache.
     pub cache: &'a mut Vec<Option<C>>,
 }
@@ -1925,15 +1943,22 @@ impl Gemma4TextModel {
     {
         let ModelInput {
             inputs,
+            inputs_embeds,
+            per_layer_input_ids,
             mask,
+            sliding_mask,
             cache,
         } = input;
-        let mut h = self
-            .embed_tokens
-            .forward(inputs, stream)?
-            .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?;
+        let mut h = match inputs_embeds {
+            Some(embeddings) => embeddings.clone(),
+            None => self
+                .embed_tokens
+                .forward(inputs, stream)?
+                .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?,
+        };
         profile_array(PerfComponent::Embed, &h)?;
-        let per_layer_inputs = self.per_layer_inputs(inputs, &h, stream)?;
+        let per_layer_inputs =
+            self.per_layer_inputs(per_layer_input_ids.unwrap_or(inputs), &h, stream)?;
         if let Some(per_layer_inputs) = &per_layer_inputs {
             profile_array(PerfComponent::PerLayerInputs, per_layer_inputs)?;
         }
@@ -1964,14 +1989,19 @@ impl Gemma4TextModel {
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
+            let layer_mask = if layer.layer_type == LayerType::SlidingAttention {
+                sliding_mask.or(mask.as_ref())
+            } else {
+                mask.as_ref()
+            };
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
                 position_offset,
                 per_layer_input: layer_ple.as_ref(),
                 shared_kv: Some(&mut shared_kv),
-                disable_generated_mask: false,
+                disable_generated_mask: sliding_mask.is_some(),
                 generated_sliding_window: None,
             };
             h = layer.forward(layer_input, stream)?;
@@ -1998,17 +2028,28 @@ impl Gemma4TextModel {
     {
         let ModelInput {
             inputs,
+            inputs_embeds,
+            per_layer_input_ids,
             mask,
+            sliding_mask,
             cache,
         } = input;
-        let mut h = self
-            .embed_tokens
-            .forward(inputs, stream)?
-            .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?;
+        let mut h = match inputs_embeds {
+            Some(embeddings) => embeddings.clone(),
+            None => self
+                .embed_tokens
+                .forward(inputs, stream)?
+                .multiply(Array::from_f32((self.hidden_size as f32).sqrt()), stream)?,
+        };
         profile_array(PerfComponent::Embed, &h)?;
         observer.observe("model.embed_tokens", &h)?;
 
-        let per_layer_inputs = self.per_layer_inputs_with_observer(inputs, &h, stream, observer)?;
+        let per_layer_inputs = self.per_layer_inputs_with_observer(
+            per_layer_input_ids.unwrap_or(inputs),
+            &h,
+            stream,
+            observer,
+        )?;
         if let Some(per_layer_inputs) = &per_layer_inputs {
             profile_array(PerfComponent::PerLayerInputs, per_layer_inputs)?;
         }
@@ -2042,14 +2083,19 @@ impl Gemma4TextModel {
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
+            let layer_mask = if layer.layer_type == LayerType::SlidingAttention {
+                sliding_mask.or(mask.as_ref())
+            } else {
+                mask.as_ref()
+            };
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
                 position_offset,
                 per_layer_input: layer_ple.as_ref(),
                 shared_kv: Some(&mut shared_kv),
-                disable_generated_mask: false,
+                disable_generated_mask: sliding_mask.is_some(),
                 generated_sliding_window: None,
             };
             h = layer.forward_with_observer(
@@ -2098,6 +2144,13 @@ pub struct Gemma4ForConditionalGeneration {
     #[param]
     /// Text transformer body.
     pub language_model: Gemma4TextModel,
+    #[param]
+    /// Optional image encoder.
+    pub(crate) vision_tower: Option<Gemma4VisionTower>,
+    #[quantizable]
+    #[param]
+    /// Optional projection from vision features into text hidden space.
+    pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
 }
 
 impl Gemma4ForConditionalGeneration {
@@ -2105,6 +2158,37 @@ impl Gemma4ForConditionalGeneration {
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             language_model: Gemma4TextModel::new(args, stream)?,
+            vision_tower: None,
+            embed_vision: None,
+        })
+    }
+
+    fn new_with_vision(
+        args: &ModelArgs,
+        vision_config: Option<Gemma4VisionConfig>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let vision_tower = vision_config
+            .clone()
+            .map(|config| Gemma4VisionTower::new(config, stream))
+            .transpose()?;
+        let embed_vision = vision_config
+            .as_ref()
+            .map(|config| {
+                Gemma4MultimodalEmbedder::new(
+                    config,
+                    args.hidden_size,
+                    args.quantized,
+                    args.quantization_group_size,
+                    args.quantization_bits,
+                    stream,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            language_model: Gemma4TextModel::new(args, stream)?,
+            vision_tower,
+            embed_vision,
         })
     }
 }
@@ -2114,6 +2198,8 @@ impl Gemma4ForConditionalGeneration {
 pub struct Model {
     /// Model configuration.
     pub args: ModelArgs,
+    /// Image placeholder token ID for multimodal checkpoints.
+    pub image_token_id: Option<i32>,
     #[quantizable]
     #[param]
     /// Conditional-generation model body.
@@ -2144,6 +2230,60 @@ impl Model {
         }
         profile_array(PerfComponent::LmHead, &logits)?;
         Ok(logits)
+    }
+
+    pub(crate) fn prefill_typed_with_observer(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let logits = match self.prepare_typed_prefill(input, stream)? {
+            input::PreparedPrefill::Text(tokens) => {
+                cache.token_ids = token_ids_from_array(&tokens, stream)?;
+                cache.prefix_embeddings = None;
+                cache.prefix_len = 0;
+                cache.kv.clear();
+                self.forward_with_observer(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: None,
+                        per_layer_input_ids: None,
+                        mask: None,
+                        sliding_mask: None,
+                        cache: &mut cache.kv,
+                    },
+                    stream,
+                    observer,
+                )?
+            }
+            input::PreparedPrefill::Embeddings { tokens, embeddings } => {
+                cache.token_ids = token_ids_from_array(&tokens, stream)?;
+                cache.prefix_len = cache.token_ids.len();
+                cache.prefix_embeddings = Some(embeddings.clone());
+                cache.kv.clear();
+                let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
+                let masks = multimodal_attention_masks(
+                    &cache.token_ids,
+                    self.image_token_id.expect("image token was validated") as u32,
+                    self.args.sliding_window,
+                );
+                self.forward_with_observer(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: Some(&embeddings),
+                        per_layer_input_ids: Some(&per_layer_ids),
+                        mask: Some(&masks.full),
+                        sliding_mask: Some(&masks.sliding),
+                        cache: &mut cache.kv,
+                    },
+                    stream,
+                    observer,
+                )?
+            }
+        };
+        logits.try_index_device((.., -1, ..), stream)
     }
 
     fn forward_logits<C>(
@@ -2178,6 +2318,31 @@ impl Model {
         };
         Ok(Self {
             args,
+            image_token_id: None,
+            model,
+            lm_head,
+        })
+    }
+
+    fn new_with_vision(
+        args: ModelArgs,
+        image_token_id: Option<i32>,
+        vision_config: Option<Gemma4VisionConfig>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let model = Gemma4ForConditionalGeneration::new_with_vision(&args, vision_config, stream)?;
+        let lm_head = if !args.tie_word_embeddings {
+            Some(common::build_unloaded_maybe_quantized_lm_head(
+                args.hidden_size,
+                args.vocab_size,
+                stream,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            args,
+            image_token_id,
             model,
             lm_head,
         })
@@ -2186,6 +2351,87 @@ impl Model {
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn prepare_typed_prefill(
+        &mut self,
+        input: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<input::PreparedPrefill, Exception> {
+        let modality_tokens = self
+            .image_token_id
+            .map(|token_id| input::ModalityToken {
+                modality: input::Modality::Image,
+                token_id: token_id as u32,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let embed_tokens = &mut self.model.language_model.embed_tokens;
+        let vision_tower = &mut self.model.vision_tower;
+        let embed_vision = &mut self.model.embed_vision;
+        let text_scale = (self.args.hidden_size as f32).sqrt();
+        let prepared = input::prepare_decoder_prefill(
+            input,
+            &modality_tokens,
+            self.args.hidden_size,
+            "gemma4",
+            stream,
+            |tokens, stream| {
+                embed_tokens
+                    .forward(tokens, stream)?
+                    .multiply(Array::from_f32(text_scale), stream)
+            },
+            |part, stream| match part.payload {
+                input::InputPayload::Embeddings(embeddings) => Ok(vec![embeddings.clone()]),
+                input::InputPayload::Tensor(tensor) => {
+                    let position_ids = part.metadata.patch_position_ids.ok_or_else(|| {
+                        Exception::custom(
+                            "gemma4 image tensor input requires patch_position_ids metadata",
+                        )
+                    })?;
+                    let features = vision_tower
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Exception::custom(
+                                "gemma4 image tensor input requires vision_config and vision weights",
+                            )
+                        })?
+                        .forward(tensor, position_ids, stream)?;
+                    Ok(vec![embed_vision
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Exception::custom("gemma4 image input requires embed_vision weights")
+                        })?
+                        .forward(&features, stream)?])
+                }
+                input::InputPayload::TokenIds(_) => Err(Exception::custom(
+                    "gemma4 image input does not accept token-id payloads",
+                )),
+            },
+        )?;
+        if let (input::PreparedPrefill::Text(tokens), Some(image_token_id)) =
+            (&prepared, self.image_token_id)
+        {
+            if input::token_ids_from_array(tokens, stream)?.contains(&(image_token_id as u32)) {
+                return Err(Exception::custom(
+                    "gemma4 prompt contains an image placeholder but no image input",
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn per_layer_ids_for_media(&self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let Some(image_token_id) = self.image_token_id else {
+            return Ok(tokens.clone());
+        };
+        let image_mask = tokens.eq(Array::from_int(image_token_id), stream)?;
+        r#where(
+            &image_mask,
+            Array::from_int(self.args.pad_token_id),
+            tokens,
+            stream,
+        )
     }
 
     /// Forward pass that reports activations to an observer.
@@ -2252,7 +2498,13 @@ fn quantization_i32(config: &Option<Value>, key: &str, default: i32) -> i32 {
 
 /// Reads and normalizes Gemma 4 text model arguments from `config.json`.
 pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
+    Ok(get_gemma4_model_config(model_dir.as_ref())?.0)
+}
+
+fn get_gemma4_model_config(
+    model_dir: &Path,
+) -> Result<(ModelArgs, Option<Gemma4VisionConfig>, Option<i32>), Error> {
+    let file = std::fs::File::open(model_dir.join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
     if config.text_config.enable_moe_block {
         return Err(Error::UnsupportedArchitecture(
@@ -2265,7 +2517,11 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
         quantization_i32(&config.quantization, "group_size", 64);
     config.text_config.quantization_bits = quantization_i32(&config.quantization, "bits", 4);
     config.text_config.tie_word_embeddings = config.tie_word_embeddings;
-    Ok(config.text_config)
+    Ok((
+        config.text_config,
+        config.vision_config,
+        config.image_token_id,
+    ))
 }
 
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
@@ -2296,23 +2552,21 @@ pub fn load_gemma4_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    let model_args = get_gemma4_model_args(model_dir)?;
-    let mut model = Model::new(model_args, stream)?;
+    let (model_args, vision_config, image_token_id) = get_gemma4_model_config(model_dir)?;
+    let mut model = Model::new_with_vision(model_args, image_token_id, vision_config, stream)?;
     let weights_index = model_dir.join("model.safetensors.index.json");
     let config = StrictLoadConfig::default()
         .rewrite_prefix("language_model.model.", "model.language_model.")
         .rewrite_prefix("model.language_model.", "model.language_model.")
+        .rewrite_prefix("vision_tower.", "model.vision_tower.")
+        .rewrite_prefix("embed_vision.", "model.embed_vision.")
         .allow_unused_prefix("audio_tower.")
         .allow_unused_prefix("embed_audio.")
-        .allow_unused_prefix("embed_vision.")
         .allow_unused_prefix("multi_modal_projector.")
-        .allow_unused_prefix("vision_tower.")
         .allow_unused_prefix("model.audio_tower.")
         .allow_unused_prefix("model.embed_audio.")
-        .allow_unused_prefix("model.embed_vision.")
         .allow_unused_prefix("model.multi_modal_projector.")
         .allow_unused_prefix("model.vision_embedder.")
-        .allow_unused_prefix("model.vision_tower.")
         .allow_missing_suffix(".bias");
     let mut report = StrictLoadReport::default();
     if weights_index.exists() {
@@ -2406,7 +2660,10 @@ where
         self.forward_logits(
             ModelInput {
                 inputs: &prompt_tokens,
+                inputs_embeds: None,
+                per_layer_input_ids: None,
                 mask: None,
+                sliding_mask: None,
                 cache,
             },
             true,
@@ -2423,7 +2680,10 @@ where
         self.forward_logits(
             ModelInput {
                 inputs: input_tokens,
+                inputs_embeds: None,
+                per_layer_input_ids: None,
                 mask: None,
+                sliding_mask: None,
                 cache,
             },
             true,
@@ -2437,6 +2697,8 @@ where
 pub struct Cache {
     pub(crate) kv: Vec<Option<ConcatKeyValueCache>>,
     pub(crate) token_ids: Vec<u32>,
+    prefix_embeddings: Option<Array>,
+    prefix_len: usize,
 }
 
 pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
@@ -2463,6 +2725,53 @@ fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exc
         .map_err(Into::into)
 }
 
+struct Gemma4AttentionMasks {
+    full: Array,
+    sliding: Array,
+}
+
+fn multimodal_attention_masks(
+    token_ids: &[u32],
+    image_token_id: u32,
+    sliding_window: Option<i32>,
+) -> Gemma4AttentionMasks {
+    let sequence = token_ids.len();
+    let mut groups = vec![-1i32; sequence];
+    let mut group = -1i32;
+    let mut previous_was_image = false;
+    for (index, token_id) in token_ids.iter().enumerate() {
+        let is_image = *token_id == image_token_id;
+        if is_image && !previous_was_image {
+            group += 1;
+        }
+        if is_image {
+            groups[index] = group;
+        }
+        previous_was_image = is_image;
+    }
+    let window = sliding_window.unwrap_or(sequence as i32);
+    let mut full = Vec::with_capacity(sequence * sequence);
+    let mut sliding = Vec::with_capacity(sequence * sequence);
+    for query in 0..sequence {
+        for key in 0..sequence {
+            let causal = key <= query;
+            full.push(if causal { 0.0 } else { -1.0e9 });
+            let same_image_group = groups[query] >= 0 && groups[query] == groups[key];
+            let in_window = key as i32 > query as i32 - window;
+            sliding.push(if in_window && (causal || same_image_group) {
+                0.0
+            } else {
+                -1.0e9
+            });
+        }
+    }
+    let shape = [1, 1, sequence as i32, sequence as i32];
+    Gemma4AttentionMasks {
+        full: Array::from_slice(&full, &shape),
+        sliding: Array::from_slice(&sliding, &shape),
+    }
+}
+
 impl CausalLm<Cache> for Model {
     fn prefill_input_logits(
         &mut self,
@@ -2470,18 +2779,50 @@ impl CausalLm<Cache> for Model {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let prompt_tokens = input::text_token_ids(input, stream)?;
-        cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
-        cache.kv.clear();
-        self.forward_logits(
-            ModelInput {
-                inputs: &prompt_tokens,
-                mask: None,
-                cache: &mut cache.kv,
-            },
-            true,
-            stream,
-        )
+        match self.prepare_typed_prefill(input, stream)? {
+            input::PreparedPrefill::Text(prompt_tokens) => {
+                cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
+                cache.prefix_embeddings = None;
+                cache.prefix_len = 0;
+                cache.kv.clear();
+                self.forward_logits(
+                    ModelInput {
+                        inputs: &prompt_tokens,
+                        inputs_embeds: None,
+                        per_layer_input_ids: None,
+                        mask: None,
+                        sliding_mask: None,
+                        cache: &mut cache.kv,
+                    },
+                    true,
+                    stream,
+                )
+            }
+            input::PreparedPrefill::Embeddings { tokens, embeddings } => {
+                cache.token_ids = token_ids_from_array(&tokens, stream)?;
+                cache.prefix_len = cache.token_ids.len();
+                cache.prefix_embeddings = Some(embeddings.clone());
+                cache.kv.clear();
+                let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
+                let masks = multimodal_attention_masks(
+                    &cache.token_ids,
+                    self.image_token_id.expect("image token was validated") as u32,
+                    self.args.sliding_window,
+                );
+                self.forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: Some(&embeddings),
+                        per_layer_input_ids: Some(&per_layer_ids),
+                        mask: Some(&masks.full),
+                        sliding_mask: Some(&masks.sliding),
+                        cache: &mut cache.kv,
+                    },
+                    true,
+                    stream,
+                )
+            }
+        }
     }
 
     fn decode_logits(
@@ -2495,10 +2836,41 @@ impl CausalLm<Cache> for Model {
             .extend(token_ids_from_array(input_tokens, stream)?);
         cache.kv.clear();
         let tokens = array_from_token_ids(&cache.token_ids, stream)?;
+        let generated_embeddings = cache
+            .prefix_embeddings
+            .as_ref()
+            .map(|prefix| {
+                let generated = array_from_token_ids(&cache.token_ids[cache.prefix_len..], stream)?;
+                let generated = self
+                    .model
+                    .language_model
+                    .embed_tokens
+                    .forward(&generated, stream)?
+                    .multiply(
+                        Array::from_f32((self.args.hidden_size as f32).sqrt()),
+                        stream,
+                    )?;
+                concatenate_axis(&[prefix.clone(), generated], 1, stream)
+            })
+            .transpose()?;
+        let per_layer_ids = generated_embeddings
+            .as_ref()
+            .map(|_| self.per_layer_ids_for_media(&tokens, stream))
+            .transpose()?;
+        let masks = generated_embeddings.as_ref().map(|_| {
+            multimodal_attention_masks(
+                &cache.token_ids,
+                self.image_token_id.expect("image token was validated") as u32,
+                self.args.sliding_window,
+            )
+        });
         self.forward_logits(
             ModelInput {
                 inputs: &tokens,
-                mask: None,
+                inputs_embeds: generated_embeddings.as_ref(),
+                per_layer_input_ids: per_layer_ids.as_ref(),
+                mask: masks.as_ref().map(|masks| &masks.full),
+                sliding_mask: masks.as_ref().map(|masks| &masks.sliding),
                 cache: &mut cache.kv,
             },
             true,
@@ -2514,9 +2886,16 @@ pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a,
 mod tests {
     use std::collections::HashMap;
 
-    use safemlx::{module::ModuleParameters, Device, DeviceType, Stream};
+    use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext, Stream};
 
-    use super::{partial_rotary_dims, Attention, FloatOrString, LayerType, ModelArgs};
+    use super::{
+        load_gemma4_model, partial_rotary_dims, Attention, Cache, FloatOrString, LayerType,
+        ModelArgs,
+    };
+    use crate::models::{
+        common::CausalLm,
+        input::{InputMetadata, InputPart, ModelInput},
+    };
 
     fn test_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -2531,6 +2910,7 @@ mod tests {
             num_attention_heads: 2,
             rms_norm_eps: 0.00001,
             vocab_size: 32,
+            pad_token_id: 0,
             num_key_value_heads: 1,
             num_global_key_value_heads: None,
             max_position_embeddings: 128,
@@ -2556,6 +2936,43 @@ mod tests {
             rope_scaling: None,
             rope_parameters: None,
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local Gemma 4 E4B checkpoint and Metal"]
+    fn local_e4b_image_prefill_and_decode() {
+        let home = std::env::var("HOME").unwrap();
+        let snapshots = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-4bit/snapshots");
+        let model_dir = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.join("model.safetensors").exists())
+            .unwrap();
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let tokens = Array::from_slice(&[2u32, 258880, 7], &[1, 3]);
+        let patches = Array::from_slice(&vec![0.5f32; 9 * 16 * 16 * 3], &[1, 9, 768]);
+        let positions = Array::from_slice(
+            &[0i32, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2],
+            &[1, 9, 2],
+        );
+        let parts = [
+            InputPart::text_token_ids(&tokens),
+            InputPart::image_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
+        ];
+        let mut cache = Cache::default();
+        let logits = model
+            .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
+        let decode = Array::from_slice(&[8u32], &[1, 1]);
+        let logits = model
+            .decode_logits(&decode, &mut cache, gpu.stream())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 262144]);
     }
 
     fn parameter_keys(attention: &Attention) -> Vec<String> {
