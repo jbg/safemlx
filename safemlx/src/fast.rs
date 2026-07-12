@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::error::{Exception, Result};
+use crate::ops::{concatenate_axis, indexing::TryIndexOp};
 use crate::utils::guard::Guarded;
 use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
@@ -687,27 +688,44 @@ pub fn rope<'a>(
     #[optional] freqs: impl Into<Option<&'a Array>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    let stream = stream.as_ref();
+    let array = array.as_ref();
     let base = base.into();
     let base = safemlx_sys::mlx_optional_float {
         value: base.unwrap_or(0.0),
         has_value: base.is_some(),
     };
     let freqs = freqs.into();
-    Array::try_from_op(|res| unsafe {
-        safemlx_sys::mlx_fast_rope(
-            res,
-            array.as_ref().as_ptr(),
-            dimensions,
-            traditional,
-            base,
-            scale,
-            offset,
-            freqs
-                .map(|a| a.as_ptr())
-                .unwrap_or(safemlx_sys::mlx_array_new()),
-            stream.as_ref().as_ptr(),
-        )
-    })
+    let batches = if array.ndim() > 2 { array.dim(0) } else { 1 };
+    let mut outputs = Vec::with_capacity(batches as usize);
+    for index in 0..batches {
+        let input = if batches == 1 {
+            array.clone()
+        } else {
+            array.try_index_device(index..index + 1, stream)?
+        };
+        outputs.push(Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_fast_rope(
+                res,
+                input.as_ptr(),
+                dimensions,
+                traditional,
+                base,
+                scale,
+                offset,
+                freqs
+                    .map(|a| a.as_ptr())
+                    .unwrap_or(safemlx_sys::mlx_array_new()),
+                stream.as_ptr(),
+            )
+        })?);
+    }
+    let output = if outputs.len() == 1 {
+        outputs.pop().expect("RoPE always produces one output")
+    } else {
+        concatenate_axis(&outputs, 0, stream)?
+    };
+    Ok(output)
 }
 
 /// Optimized implementation of `NN.RoPE` with dynamic (array) offset.

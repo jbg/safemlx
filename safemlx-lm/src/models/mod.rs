@@ -40,6 +40,11 @@ mod gemma4_vision;
 pub mod input;
 /// Llama decoder-only model support.
 pub mod llama;
+/// Moshi token language-model support.
+///
+/// This module operates on pre-tokenized Mimi streams. It intentionally does
+/// not implement audio encoding, decoding, or realtime device I/O.
+pub mod moshi;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
 pub mod nemotron_h;
 /// Qwen3 decoder-only model support.

@@ -120,9 +120,7 @@ where
         stream: &crate::Stream,
     ) -> Result<Self::Output, Self::Error> {
         let RopeInput { x, offset } = input.into();
-        let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
-        let x = crate::fast::rope(
+        crate::fast::rope(
             x,
             self.dimensions,
             self.traditional,
@@ -131,8 +129,7 @@ where
             offset,
             None,
             stream,
-        )?;
-        x.reshape(shape, stream)
+        )
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -420,7 +417,13 @@ where
 #[allow(clippy::excessive_precision)]
 #[cfg(test)]
 mod tests {
-    use crate::{module::Module, nn::AlibiInput, random::uniform, Dtype};
+    use crate::{
+        module::Module,
+        nn::AlibiInput,
+        ops::{concatenate_axis, indexing::TryIndexOp},
+        random::uniform,
+        Dtype,
+    };
     use float_eq::assert_float_eq;
 
     use crate::nn::Rope;
@@ -459,6 +462,49 @@ mod tests {
             116.80096435546875,
             abs <= 2.3360192871093752
         );
+    }
+
+    #[test]
+    fn test_rope_preserves_batch_and_head_dimensions() {
+        let stream = crate::test_stream();
+        let input = crate::Array::from_slice(
+            &(0..64)
+                .map(|index| (index as f32 - 31.0) / 17.0)
+                .collect::<Vec<_>>(),
+            &[2, 4, 1, 8],
+        )
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+        let mut rope = Rope::new(8);
+
+        let actual = rope.forward((&input, 1), stream).unwrap();
+        let flat = input.reshape(&[8, 1, 8], stream).unwrap();
+        let expected_rows = (0..8)
+            .map(|index| {
+                crate::fast::rope(
+                    flat.try_index_device((index..index + 1, .., ..), stream)
+                        .unwrap(),
+                    8,
+                    false,
+                    10_000.0,
+                    1.0,
+                    1,
+                    None,
+                    stream,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected = concatenate_axis(&expected_rows, 0, stream)
+            .unwrap()
+            .reshape(&[2, 4, 1, 8], stream)
+            .unwrap();
+
+        assert_eq!(actual.shape(), &[2, 4, 1, 8]);
+        assert!(actual
+            .all_close(&expected, 0.0, 0.0, false, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     // The unit test below is adapted from the swift binding at:

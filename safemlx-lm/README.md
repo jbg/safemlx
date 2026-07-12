@@ -95,6 +95,51 @@ features and valid-frame mask. The optional FFT dependency is only enabled by
 `audio-processing`; callers that provide `Audio/Tensor` and `audio_mask` directly
 do not pay that dependency cost.
 
+## Moshi token parity
+
+The `models::moshi` module implements Moshi's temporal and depth language
+models over pre-tokenized Mimi streams. This first milestone does not include
+Mimi audio encoding/decoding or realtime audio I/O, and currently loads
+unquantized MLX checkpoints (`model.safetensors`). For the original released
+Moshika/Moshiko repositories, the loader uses Moshi's built-in v0.1 config when
+the model directory has no `config.json`.
+
+Generate a deterministic fixture with the upstream `moshi_mlx` package, then
+replay it through Rust:
+
+```sh
+python safemlx-lm/scripts/moshi_mlx_token_fixture.py \
+  /path/to/moshika-mlx-bf16 /tmp/moshi-token-parity.safetensors \
+  --require-mlx-version 0.32.0
+
+cargo run -p safemlx-lm --release --example moshi_token_parity -- \
+  /path/to/moshika-mlx-bf16 /tmp/moshi-token-parity.safetensors
+```
+
+Use the MLX version pinned by `safemlx-sys/src/mlx-c/CMakeLists.txt` when
+generating a reference fixture. The version guard prevents comparisons across
+different MLX kernel implementations.
+
+The comparator uses standard relative and absolute closeness checks and
+defaults to `rtol=0.02` and `atol=0.02`, suitable for BF16 cached inference.
+It reports the largest absolute difference observed. Pass explicit tolerances
+as the third and fourth arguments.
+
+The fixture contains delayed temporal inputs, teacher-forced depth inputs, the
+normalized temporal states, text logits, and logits from every depth slice. By
+default the exporter creates deterministic synthetic tokens; pass `--inputs`
+with a safetensors file containing `input.text`, `input.audio`, and `input.depth`
+to replay a prerecorded Mimi-token sequence.
+
+For a lightweight end-to-end check without downloading released weights, add
+`--create-tiny --steps 6`. This creates a deterministic miniature BF16
+checkpoint in the supplied model directory before exporting its reference
+fixture.
+
+Moshi projections preserve their checkpoint dtype. MLX 0.32.0 fixes the
+locally built NAX metallib behavior that previously required FP32 promotion
+with MLX 0.31.2.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.
