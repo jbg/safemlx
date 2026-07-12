@@ -16,6 +16,7 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{indexing::TryIndexOp, maximum, r#where, zeros_like},
+    random::RandomState,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -24,6 +25,7 @@ use serde_json::Value;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
+    sampler::{DefaultSampler, Sampler},
     weights::{load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
 };
 
@@ -187,6 +189,11 @@ impl ModelArgs {
                 self.n_q + 1,
                 self.delays.len()
             )));
+        }
+        if self.delays.iter().any(|delay| *delay < 0) {
+            return Err(Error::UnsupportedArchitecture(
+                "Moshi delays must be non-negative".into(),
+            ));
         }
         if !self.causal {
             return Err(Error::UnsupportedArchitecture(
@@ -591,14 +598,69 @@ pub struct TokenStepOutput {
     pub temporal_output: Array,
 }
 
-/// Greedy text and generated-audio tokens for one frame.
-pub struct GreedyStepOutput {
-    /// Predicted text token, shaped `[batch, 1]`.
+/// Sampled text and generated-audio tokens for one model step.
+pub struct SampleStepOutput {
+    /// Sampled text token, shaped `[batch, 1]`.
     pub text_token: Array,
-    /// Predicted generated codebook tokens, shaped `[batch, dep_q]`.
+    /// Sampled generated-codebook tokens, shaped `[batch, dep_q]`.
     pub audio_tokens: Array,
     /// Raw logits retained for parity inspection.
     pub logits: TokenStepOutput,
+}
+
+/// Greedy specialization of [`SampleStepOutput`].
+pub type GreedyStepOutput = SampleStepOutput;
+
+/// Output from one encoded-audio generation step.
+pub struct GenerationStepOutput {
+    /// Text token sampled at this model step, shaped `[batch, 1]`.
+    pub text_token: Array,
+    /// Newly sampled generated-codebook tokens before delay alignment.
+    pub sampled_audio_tokens: Array,
+    /// Coherent Mimi frame ready for decoding, shaped `[batch, dep_q]`.
+    ///
+    /// This is `None` while the delayed generated streams are warming up.
+    pub output_audio_tokens: Option<Array>,
+}
+
+/// Delayed-stream state for an encoded-audio Moshi inference session.
+///
+/// Input frames contain only the caller/user side of the Mimi stream. The
+/// generated side, temporal/depth caches, text feedback, and per-codebook
+/// delays remain internal to this state.
+pub struct GenerationState {
+    cache: MoshiCache,
+    frames: Vec<Vec<Option<Array>>>,
+    previous_text: Option<Array>,
+    step: usize,
+}
+
+impl GenerationState {
+    /// Creates an empty encoded-audio generation session.
+    pub fn new(model: &Model) -> Self {
+        Self {
+            cache: model.new_cache(),
+            frames: Vec::new(),
+            previous_text: None,
+            step: 0,
+        }
+    }
+
+    /// Number of encoded input frames consumed by this session.
+    pub fn step(&self) -> usize {
+        self.step
+    }
+}
+
+/// Text tokens and delay-aligned Mimi tokens from offline generation.
+pub struct EncodedAudioOutput {
+    /// Sampled text tokens, shaped `[batch, input_frames]`.
+    pub text_tokens: Array,
+    /// Generated Mimi tokens, shaped `[batch, dep_q, output_frames]`.
+    ///
+    /// The output may have fewer frames than the input because delayed streams
+    /// need future encoded input frames before a coherent output frame exists.
+    pub audio_tokens: Array,
 }
 
 /// Intermediate states retained for temporal-layer parity diagnostics.
@@ -713,13 +775,12 @@ impl Model {
         }
     }
 
-    fn temporal_step(
+    fn temporal_input(
         &mut self,
         text_token: &Array,
         audio_tokens: &Array,
-        cache: &mut MoshiCache,
         stream: &Stream,
-    ) -> Result<TemporalStepOutput, Exception> {
+    ) -> Result<Array, Exception> {
         if text_token.shape().len() != 2 || text_token.dim(1) != 1 {
             return Err(Exception::custom(
                 "Moshi text input must have shape [batch, 1]",
@@ -741,6 +802,17 @@ impl Model {
                 .expand_dims(1, stream)?;
             x = x.add(emb.forward(&token, stream)?, stream)?;
         }
+        Ok(x)
+    }
+
+    fn temporal_step(
+        &mut self,
+        text_token: &Array,
+        audio_tokens: &Array,
+        cache: &mut MoshiCache,
+        stream: &Stream,
+    ) -> Result<TemporalStepOutput, Exception> {
+        let x = self.temporal_input(text_token, audio_tokens, stream)?;
         let temporal_input = x.clone();
         let (hidden, layer_traces) =
             self.transformer
@@ -753,6 +825,20 @@ impl Model {
             output: hidden,
             logits,
         })
+    }
+
+    fn temporal_step_untraced(
+        &mut self,
+        text_token: &Array,
+        audio_tokens: &Array,
+        cache: &mut MoshiCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let x = self.temporal_input(text_token, audio_tokens, stream)?;
+        let hidden = self.transformer.forward(x, &mut cache.temporal, stream)?;
+        let hidden = self.out_norm.forward(&hidden, stream)?;
+        let logits = self.text_linear.forward(&hidden, stream)?;
+        Ok((hidden, logits))
     }
 
     fn depth_teacher_forced(
@@ -813,33 +899,33 @@ impl Model {
         })
     }
 
-    /// Runs one frame with greedy text and audio-codebook sampling.
-    pub fn greedy_step(
+    /// Runs one frame with caller-provided text and audio samplers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_step<TS: Sampler, AS: Sampler>(
         &mut self,
         text_token: &Array,
         audio_tokens: &Array,
         cache: &mut MoshiCache,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<GreedyStepOutput, Exception> {
+    ) -> Result<SampleStepOutput, Exception> {
         let temporal = self.temporal_step(text_token, audio_tokens, cache, stream)?;
-        let text = safemlx::argmax_axis!(&temporal.logits, -1, stream = stream)?;
-        cache.reset_depth();
-        let mut previous = text.clone();
-        let mut predicted = Vec::with_capacity(self.args.dep_q as usize);
-        let mut audio_logits = Vec::with_capacity(self.args.dep_q as usize);
-        for slice in &mut self.depformer.slices {
-            let x = slice
-                .linear_in
-                .forward(&temporal.output, stream)?
-                .add(slice.emb.forward(&previous, stream)?, stream)?;
-            let x = slice.transformer.forward(x, &mut cache.depth, stream)?;
-            let logits = slice.linear_out.forward(&x, stream)?;
-            previous = safemlx::argmax_axis!(&logits, -1, stream = stream)?;
-            predicted.push(previous.squeeze_axes(&[-1], stream)?);
-            audio_logits.push(logits);
-        }
-        let audio_tokens = safemlx::ops::stack_axis(&predicted, 1, stream)?;
-        Ok(GreedyStepOutput {
+        let (text, audio_tokens, audio_logits) = self.sample_temporal_output(
+            &temporal.output,
+            &temporal.logits,
+            cache,
+            text_sampler,
+            audio_samplers,
+            text_temperature,
+            audio_temperature,
+            prng_state,
+            stream,
+        )?;
+        Ok(SampleStepOutput {
             text_token: text,
             audio_tokens,
             logits: TokenStepOutput {
@@ -849,6 +935,270 @@ impl Model {
                 audio_logits,
                 temporal_output: temporal.output,
             },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_temporal_output<TS: Sampler, AS: Sampler>(
+        &mut self,
+        temporal_output: &Array,
+        text_logits: &Array,
+        cache: &mut MoshiCache,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        mut prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<(Array, Array, Vec<Array>), Exception> {
+        if audio_samplers.len() != self.args.dep_q as usize {
+            return Err(Exception::custom(format!(
+                "Moshi requires one audio sampler per generated codebook (expected {}, got {})",
+                self.args.dep_q,
+                audio_samplers.len()
+            )));
+        }
+        let text = text_sampler.sample(
+            text_logits,
+            text_temperature,
+            prng_state.as_deref_mut(),
+            stream,
+        )?;
+        cache.reset_depth();
+        let mut previous = text.clone();
+        let mut predicted = Vec::with_capacity(self.args.dep_q as usize);
+        let mut audio_logits = Vec::with_capacity(self.args.dep_q as usize);
+        for (slice, sampler) in self
+            .depformer
+            .slices
+            .iter_mut()
+            .zip(audio_samplers.iter_mut())
+        {
+            let x = slice
+                .linear_in
+                .forward(temporal_output, stream)?
+                .add(slice.emb.forward(&previous, stream)?, stream)?;
+            let x = slice.transformer.forward(x, &mut cache.depth, stream)?;
+            let logits = slice.linear_out.forward(&x, stream)?;
+            previous = sampler.sample(
+                &logits,
+                audio_temperature,
+                prng_state.as_deref_mut(),
+                stream,
+            )?;
+            predicted.push(previous.squeeze_axes(&[-1], stream)?);
+            audio_logits.push(logits);
+        }
+        let audio_tokens = safemlx::ops::stack_axis(&predicted, 1, stream)?;
+        Ok((text, audio_tokens, audio_logits))
+    }
+
+    /// Runs one frame with greedy text and audio-codebook sampling.
+    pub fn greedy_step(
+        &mut self,
+        text_token: &Array,
+        audio_tokens: &Array,
+        cache: &mut MoshiCache,
+        stream: &Stream,
+    ) -> Result<GreedyStepOutput, Exception> {
+        let mut text_sampler = DefaultSampler;
+        let mut audio_samplers = (0..self.args.dep_q)
+            .map(|_| DefaultSampler)
+            .collect::<Vec<_>>();
+        self.sample_step(
+            text_token,
+            audio_tokens,
+            cache,
+            &mut text_sampler,
+            &mut audio_samplers,
+            0.0,
+            0.0,
+            None,
+            stream,
+        )
+    }
+
+    /// Consumes one Mimi input-side frame and advances delayed-stream generation.
+    ///
+    /// `input_audio_tokens` must be `[batch, n_q - dep_q]`. Supply one sampler
+    /// per generated codebook. [`GenerationStepOutput::output_audio_tokens`]
+    /// contains a delay-aligned `[batch, dep_q]` frame once one is available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_step<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepOutput, Exception> {
+        let input_codebooks = self.args.n_q - self.args.dep_q;
+        if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
+            return Err(Exception::custom(format!(
+                "Moshi encoded input must have shape [batch, {input_codebooks}], got {:?}",
+                input_audio_tokens.shape()
+            )));
+        }
+
+        let batch = input_audio_tokens.dim(0);
+        let mut frame = vec![None; self.args.n_q as usize];
+        for codebook in 0..input_codebooks {
+            frame[(self.args.dep_q + codebook) as usize] = Some(
+                input_audio_tokens
+                    .try_index_device((.., codebook), stream)?
+                    .expand_dims(1, stream)?,
+            );
+        }
+        state.frames.push(frame);
+
+        let padding = Array::full::<i32>(
+            &[batch, 1],
+            Array::from_int(self.args.audio_padding_token()),
+            stream,
+        )?;
+        let mut delayed = Vec::with_capacity(self.args.n_q as usize);
+        for (codebook, &delay) in self.args.audio_delays().iter().enumerate() {
+            let source = state.step as isize - 1 - delay as isize;
+            if source < 0 {
+                delayed.push(padding.clone());
+                continue;
+            }
+            let token = state.frames[source as usize][codebook]
+                .as_ref()
+                .ok_or_else(|| {
+                    Exception::custom(format!(
+                        "Moshi delayed stream is missing codebook {codebook} at frame {source}"
+                    ))
+                })?
+                .clone();
+            delayed.push(token);
+        }
+        let delayed = safemlx::ops::concatenate_axis(&delayed, 1, stream)?;
+        let text_input = match &state.previous_text {
+            Some(token) => token.clone(),
+            None => Array::full::<i32>(
+                &[batch, 1],
+                Array::from_int(self.args.text_padding_token()),
+                stream,
+            )?,
+        };
+        let (temporal_output, text_logits) =
+            self.temporal_step_untraced(&text_input, &delayed, &mut state.cache, stream)?;
+        let (text_token, sampled_audio_tokens, _) = self.sample_temporal_output(
+            &temporal_output,
+            &text_logits,
+            &mut state.cache,
+            text_sampler,
+            audio_samplers,
+            text_temperature,
+            audio_temperature,
+            prng_state,
+            stream,
+        )?;
+
+        for (codebook, &delay) in self
+            .args
+            .audio_delays()
+            .iter()
+            .take(self.args.dep_q as usize)
+            .enumerate()
+        {
+            let target = state.step as isize - delay as isize;
+            if target >= 0 {
+                state.frames[target as usize][codebook] = Some(
+                    sampled_audio_tokens
+                        .try_index_device((.., codebook as i32), stream)?
+                        .expand_dims(1, stream)?,
+                );
+            }
+        }
+
+        let max_delay = self.args.audio_delays().iter().copied().max().unwrap_or(0) as usize;
+        let output_index = state.step.checked_sub(max_delay);
+        let output_audio_tokens = output_index
+            .map(|index| {
+                let tokens = state.frames[index]
+                    .iter()
+                    .take(self.args.dep_q as usize)
+                    .map(|token| {
+                        token.clone().ok_or_else(|| {
+                            Exception::custom(format!(
+                                "Moshi generated stream is incomplete at frame {index}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                safemlx::ops::concatenate_axis(&tokens, 1, stream)
+            })
+            .transpose()?;
+
+        state.previous_text = Some(text_token.clone());
+        state.step += 1;
+        Ok(GenerationStepOutput {
+            text_token,
+            sampled_audio_tokens,
+            output_audio_tokens,
+        })
+    }
+
+    /// Greedily generates delay-aligned Mimi tokens from an encoded input sequence.
+    ///
+    /// Input and output use Mimi's `[batch, codebooks, frames]` layout. This
+    /// method does not append encoded silence, so delayed tail frames are not
+    /// flushed after the supplied input ends.
+    pub fn generate_encoded_greedy(
+        &mut self,
+        input_audio_tokens: &Array,
+        stream: &Stream,
+    ) -> Result<EncodedAudioOutput, Exception> {
+        let input_codebooks = self.args.n_q - self.args.dep_q;
+        if input_audio_tokens.shape().len() != 3 || input_audio_tokens.dim(1) != input_codebooks {
+            return Err(Exception::custom(format!(
+                "Moshi encoded input sequence must have shape [batch, {input_codebooks}, frames], got {:?}",
+                input_audio_tokens.shape()
+            )));
+        }
+        let batch = input_audio_tokens.dim(0);
+        let mut state = GenerationState::new(self);
+        let mut text_sampler = DefaultSampler;
+        let mut audio_samplers = (0..self.args.dep_q)
+            .map(|_| DefaultSampler)
+            .collect::<Vec<_>>();
+        let mut text = Vec::with_capacity(input_audio_tokens.dim(2) as usize);
+        let mut audio = Vec::new();
+        for frame in 0..input_audio_tokens.dim(2) {
+            let input = input_audio_tokens.try_index_device((.., .., frame), stream)?;
+            let output = self.generate_step(
+                &mut state,
+                &input,
+                &mut text_sampler,
+                &mut audio_samplers,
+                0.0,
+                0.0,
+                None,
+                stream,
+            )?;
+            text.push(output.text_token.squeeze_axes(&[-1], stream)?);
+            if let Some(tokens) = output.output_audio_tokens {
+                audio.push(tokens);
+            }
+        }
+        let text_tokens = if text.is_empty() {
+            Array::zeros::<i32>(&[batch, 0], stream)?
+        } else {
+            safemlx::ops::stack_axis(&text, 1, stream)?
+        };
+        let audio_tokens = if audio.is_empty() {
+            Array::zeros::<i32>(&[batch, self.args.dep_q, 0], stream)?
+        } else {
+            safemlx::ops::stack_axis(&audio, 2, stream)?
+        };
+        Ok(EncodedAudioOutput {
+            text_tokens,
+            audio_tokens,
         })
     }
 }
@@ -943,6 +1293,18 @@ mod tests {
         value["delays"] = serde_json::json!([0, 1]);
         let args: ModelArgs = serde_json::from_value(value).unwrap();
         assert!(args.validate().unwrap_err().to_string().contains("delays"));
+    }
+
+    #[test]
+    fn rejects_negative_delays() {
+        let mut value: serde_json::Value = serde_json::from_str(minimal_config()).unwrap();
+        value["delays"] = serde_json::json!([0, 0, -1, 0, 1]);
+        let args: ModelArgs = serde_json::from_value(value).unwrap();
+        assert!(args
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-negative"));
     }
 
     #[test]

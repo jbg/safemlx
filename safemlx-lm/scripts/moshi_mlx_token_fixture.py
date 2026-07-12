@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from moshi_mlx import models
+from moshi_mlx import models, utils
 
 
 def main() -> None:
@@ -194,6 +194,47 @@ def main() -> None:
             tensors[f"expected.{step}.audio_logits.{slice_index}"] = (
                 dep_slice.linear_out(dep_x)
             )
+
+    input_codebooks = config.audio_codebooks - config.generated_codebooks
+    rng = np.random.default_rng(args.seed + 1)
+    generation_input = rng.integers(
+        0,
+        config.audio_vocab_size - 1,
+        size=(args.batch_size, input_codebooks, args.steps),
+        dtype=np.int32,
+    )
+    tensors["generation.input_audio"] = mx.array(generation_input)
+
+    generation_model = models.Lm(config)
+    generation_model.set_dtype(mx.bfloat16)
+    if ".q4." in weights_name or ".q8." in weights_name:
+        bits = 4 if ".q4." in weights_name else 8
+        group_size = 32 if bits == 4 else 64
+        nn.quantize(generation_model, bits=bits, group_size=group_size)
+    generation_model.load_weights(str(args.model_dir / weights_name), strict=True)
+    generator = models.LmGen(
+        model=generation_model,
+        max_steps=args.steps,
+        text_sampler=utils.Sampler(temp=0),
+        audio_sampler=utils.Sampler(temp=0),
+        check=False,
+    )
+    generated_text = []
+    generated_audio = []
+    for step in range(args.steps):
+        step_result = generator.step(tensors["generation.input_audio"][:, :, step])
+        text_token = step_result[0] if isinstance(step_result, tuple) else step_result
+        generated_text.append(text_token.squeeze(-1))
+        audio_tokens = generator.last_audio_tokens()
+        if audio_tokens is not None:
+            generated_audio.append(audio_tokens)
+    tensors["generation.expected_text"] = mx.stack(generated_text, axis=1)
+    if generated_audio:
+        tensors["generation.expected_audio"] = mx.stack(generated_audio, axis=2)
+    else:
+        tensors["generation.expected_audio"] = mx.zeros(
+            (args.batch_size, config.generated_codebooks, 0), dtype=mx.int32
+        )
 
     mx.eval(*tensors.values())
     args.output.parent.mkdir(parents=True, exist_ok=True)

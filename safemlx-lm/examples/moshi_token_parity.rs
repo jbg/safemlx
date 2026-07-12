@@ -130,15 +130,49 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let generated =
+        model.generate_encoded_greedy(required(&fixture, "generation.input_audio")?, stream)?;
+    compare_tokens(
+        &generated.text_tokens,
+        required(&fixture, "generation.expected_text")?,
+        stream,
+        "generated text",
+    )?;
+    compare_tokens(
+        &generated.audio_tokens,
+        required(&fixture, "generation.expected_audio")?,
+        stream,
+        "generated encoded audio",
+    )?;
+
     println!(
-        "Moshi token parity passed: {} frames, {} tensors, rtol={}, atol={}, worst max_abs={} ({})",
+        "Moshi token parity passed: {} teacher-forced frames, {} tensors, {} generated audio frames, rtol={}, atol={}, worst max_abs={} ({})",
         text.dim(0),
         comparisons,
+        generated.audio_tokens.dim(2),
         rtol,
         atol,
         worst.0,
         worst.1
     );
+    Ok(())
+}
+
+fn compare_tokens(
+    actual: &Array,
+    expected: &Array,
+    stream: &safemlx::Stream,
+    label: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual.shape() == expected.shape(),
+        "{label}: shape mismatch: Rust {:?}, moshi_mlx {:?}",
+        actual.shape(),
+        expected.shape()
+    );
+    let expected = expected.copy(stream)?;
+    let equal = actual.eq(&expected, stream)?.all(None, stream)?;
+    anyhow::ensure!(equal.item::<bool>(stream), "{label}: token mismatch");
     Ok(())
 }
 

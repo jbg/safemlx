@@ -95,14 +95,22 @@ features and valid-frame mask. The optional FFT dependency is only enabled by
 `audio-processing`; callers that provide `Audio/Tensor` and `audio_mask` directly
 do not pay that dependency cost.
 
-## Moshi token parity
+## Moshi encoded audio
 
 The `models::moshi` module implements Moshi's temporal and depth language
-models over pre-tokenized Mimi streams. This first milestone does not include
-Mimi audio encoding/decoding or realtime audio I/O, and currently loads
-unquantized MLX checkpoints (`model.safetensors`). For the original released
-Moshika/Moshiko repositories, the loader uses Moshi's built-in v0.1 config when
-the model directory has no `config.json`.
+models over pre-tokenized Mimi streams. `GenerationState` accepts one
+input-side Mimi frame at a time and returns delay-aligned generated-side Mimi
+frames; `generate_encoded_greedy` is the offline sequence convenience API.
+Sequence tensors use Mimi's `[batch, codebooks, frames]` layout.
+
+Mimi audio encoding/decoding and audio device I/O deliberately remain outside
+`safemlx-lm`. Kyutai publishes a Rust Mimi implementation as the public `mimi`
+module of its [`moshi` crate](https://crates.io/crates/moshi), which callers and
+applications can use at that boundary. It is not a dependency of this crate.
+
+Moshi currently loads unquantized MLX checkpoints (`model.safetensors`). For
+the original released Moshika/Moshiko repositories, the loader uses Moshi's
+built-in v0.1 config when the model directory has no `config.json`.
 
 Generate a deterministic fixture with the upstream `moshi_mlx` package, then
 replay it through Rust:
@@ -126,10 +134,11 @@ It reports the largest absolute difference observed. Pass explicit tolerances
 as the third and fourth arguments.
 
 The fixture contains delayed temporal inputs, teacher-forced depth inputs, the
-normalized temporal states, text logits, and logits from every depth slice. By
-default the exporter creates deterministic synthetic tokens; pass `--inputs`
-with a safetensors file containing `input.text`, `input.audio`, and `input.depth`
-to replay a prerecorded Mimi-token sequence.
+normalized temporal states, text logits, logits from every depth slice, and an
+end-to-end greedy encoded-audio generation sequence. By default the exporter
+creates deterministic synthetic tokens; pass `--inputs` with a safetensors file
+containing `input.text`, `input.audio`, and `input.depth` to replay a prerecorded
+Mimi-token sequence for the teacher-forced portion.
 
 For a lightweight end-to-end check without downloading released weights, add
 `--create-tiny --steps 6`. This creates a deterministic miniature BF16
