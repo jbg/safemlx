@@ -157,6 +157,7 @@ fn generate_bindings(out_path: PathBuf) {
 fn main() {
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=SAFEMLX_SYS_GENERATE_BINDINGS");
+    println!("cargo:rerun-if-changed=src/mlx-c");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     if is_docs_rs() {
