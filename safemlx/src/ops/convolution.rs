@@ -65,8 +65,6 @@ pub fn conv_general<'a>(
 
 /// 1D convolution over an input with several channels returning an error if the inputs are invalid.
 ///
-/// Only the default `groups=1` is currently supported.
-///
 /// # Params
 ///
 /// - array: input array of shape `&[N, H, C_in]`
@@ -187,8 +185,6 @@ pub fn conv3d(
 }
 
 /// 1D transposed convolution over an input with several channels.
-///
-/// Only the default `groups=1` is currently supported.
 ///
 /// # Params
 ///
@@ -392,6 +388,30 @@ mod tests {
 
         let expected = [1.0, 2.5, 4.0, 1.5];
         assert_eq!(result.shape(), &[1, 4, 1]);
+        assert_eq!(crate::array::eval_vec::<f32>(&result), &expected);
+    }
+
+    #[test]
+    fn test_grouped_conv_transpose1d() {
+        let stream = crate::test_stream();
+        // Two independent depthwise channels. Values are interleaved by timestep.
+        let input = Array::from_slice(&[1.0, 10.0, 2.0, 20.0], &[1, 2, 2]);
+        let weights = Array::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2, 1]);
+
+        let result = conv_transpose1d(
+            &input,
+            &weights,
+            Some(1),
+            Some(0),
+            Some(1),
+            None,
+            Some(2),
+            stream,
+        )
+        .unwrap();
+
+        let expected = [1.0, 30.0, 4.0, 100.0, 4.0, 80.0];
+        assert_eq!(result.shape(), &[1, 3, 2]);
         assert_eq!(crate::array::eval_vec::<f32>(&result), &expected);
     }
 

@@ -172,6 +172,29 @@ impl Mimi {
             .into_iter()
             .map(|result| result.map(|(key, value)| (Rc::<str>::from(key), value)))
             .collect::<Result<HashMap<_, _>, _>>()?;
+        let params = model.parameters().flatten();
+        let mut missing = Vec::new();
+        for (key, parameter) in params {
+            match transformed.get(key.as_ref()) {
+                None => missing.push(key.to_string()),
+                Some(value) if value.shape() != parameter.shape() => {
+                    return Err(Error::InvalidShape(format!(
+                        "Mimi checkpoint tensor {key} has shape {:?}, expected {:?}",
+                        value.shape(),
+                        parameter.shape()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            return Err(Error::InvalidShape(format!(
+                "Mimi checkpoint is missing {} model tensors: {}",
+                missing.len(),
+                missing.join(", ")
+            )));
+        }
         model.update_flattened(transformed);
         model.copy_to_stream(stream)?;
         Ok(model)
@@ -286,7 +309,7 @@ fn load_decoder_safetensors_arrays(
 }
 
 fn transform_decoder_key(key: &str) -> Option<String> {
-    if let Some(key) = key.strip_prefix("quantizer.") {
+    if key.starts_with("quantizer.") {
         return Some(key.to_string());
     }
     if key == "downsample.conv.conv.conv.weight" {
@@ -1022,7 +1045,7 @@ impl SeaNetResnetBlock {
     fn unloaded(channels: i32, stream: &Stream) -> Result<Self, Error> {
         Ok(Self {
             block: vec![
-                StreamableConv1d::unloaded(channels, channels / 2, 3, 1, 2, 1, true, stream)?,
+                StreamableConv1d::unloaded(channels, channels / 2, 3, 1, 1, 1, true, stream)?,
                 StreamableConv1d::unloaded(channels / 2, channels, 1, 1, 1, 1, true, stream)?,
             ],
         })
@@ -1665,11 +1688,18 @@ fn validate_codes(codes: &Array, max_codebooks: i32) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioTokenizer, Config, Mimi};
+    use super::{transform_decoder_key, AudioTokenizer, Config, Mimi};
     use safemlx::{
         ops::{concatenate_axis, indexing::TryIndexOp},
+        transforms::eval,
         Array, Device, DeviceType, ExecutionContext,
     };
+
+    #[test]
+    fn checkpoint_quantizer_keys_keep_the_model_root() {
+        let key = "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum";
+        assert_eq!(transform_decoder_key(key).as_deref(), Some(key));
+    }
 
     #[test]
     fn v0_1_config_defaults_to_moshi_active_codebooks() {
@@ -1700,8 +1730,49 @@ mod tests {
         assert_eq!(recoded.shape(), &[1, 8, 2]);
         let pcm = mimi.decode(&codes, stream).unwrap();
         assert_eq!(pcm.shape(), &[1, 1, 3840]);
+        let alternate_codes = Array::ones::<i32>(&[1, 8, 2], stream).unwrap();
+        let alternate_pcm = mimi.decode(&alternate_codes, stream).unwrap();
+        eval([&pcm, &alternate_pcm]).unwrap();
+        stream.synchronize().unwrap();
+        let pcm_values = pcm.evaluated().unwrap();
+        let alternate_values = alternate_pcm.evaluated().unwrap();
+        let difference = pcm_values
+            .as_slice::<f32>()
+            .iter()
+            .zip(alternate_values.as_slice::<f32>())
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f32>();
+        assert!(difference > 1e-3, "Mimi decode ignored token values");
         let encoded = mimi.encode(&pcm, stream).unwrap();
         assert_eq!(encoded.shape(), &[1, 8, 2]);
+
+        // PyTorch Mimi oracle for x[n] = ((n mod 17) - 8) / 64. This catches
+        // architecture drift that a shape-only checkpoint smoke test cannot.
+        let parity_pcm = (0..7680)
+            .map(|sample| ((sample % 17) as f32 - 8.0) / 64.0)
+            .collect::<Vec<_>>();
+        let parity_pcm = Array::from_slice(&parity_pcm, &[1, 1, 7680])
+            .copy(stream)
+            .unwrap();
+        let actual_codes = mimi.encode(&parity_pcm, stream).unwrap();
+        let expected_codes = Array::from_slice(
+            &[
+                1049, 605, 1964, 1964, 74, 712, 712, 712, 1441, 1441, 1441, 1441, 1820, 1820, 1820,
+                1820, 1711, 1711, 1711, 1711, 1386, 818, 818, 1418, 127, 755, 755, 127, 130, 1228,
+                1228, 1115,
+            ],
+            &[1, 8, 4],
+        )
+        .copy(stream)
+        .unwrap();
+        assert!(
+            actual_codes
+                .all_close(&expected_codes, 0.0, 0.0, None, stream)
+                .unwrap()
+                .item::<bool>(stream),
+            "Mimi encode tokens differ from the released PyTorch checkpoint oracle"
+        );
+
         mimi.reset_encode_state();
         let encoded_first = mimi
             .encode_step(
