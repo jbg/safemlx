@@ -1,9 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::File,
     path::{Path, PathBuf},
 };
 
-use safemlx::{module::ModuleParameters, ops::stack_axis, transforms::eval, Array, Stream};
+use memmap2::MmapOptions;
+use safemlx::{
+    module::{FlattenedModuleParamMut, ModuleParameters},
+    ops::stack_axis,
+    transforms::eval,
+    Array, Stream,
+};
+use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::error::Error;
@@ -119,15 +127,15 @@ pub struct StrictLoadReport {
 }
 
 impl StrictLoadReport {
-    fn record_loaded(&mut self, key: String) {
+    pub(crate) fn record_loaded(&mut self, key: String) {
         self.loaded.insert(key);
     }
 
-    fn record_unused(&mut self, key: String) {
+    pub(crate) fn record_unused(&mut self, key: String) {
         self.unused.push(key);
     }
 
-    fn record_shape_mismatch(
+    pub(crate) fn record_shape_mismatch(
         &mut self,
         weight_key: String,
         param_key: String,
@@ -180,8 +188,12 @@ pub fn load_safetensors_strict<M: ModuleParameters>(
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    let loaded = Array::load_safetensors(path, stream)?;
-    load_arrays_strict(model, loaded, config, report)
+    let mut params = model.parameters_mut().flatten();
+
+    for_each_safetensor_array(path, stream, |key, value| {
+        load_array_strict(&mut params, key, value, config, report);
+        Ok(())
+    })
 }
 
 pub(crate) fn load_arrays_strict<M: ModuleParameters>(
@@ -193,31 +205,92 @@ pub(crate) fn load_arrays_strict<M: ModuleParameters>(
     let mut params = model.parameters_mut().flatten();
 
     for (key, value) in loaded {
-        let key = key.to_string();
-        let mut matched = None;
-        for candidate in config.candidates(&key) {
-            if params.contains_key(candidate.as_str()) {
-                matched = Some(candidate);
-                break;
-            }
-        }
+        load_array_strict(&mut params, key, value, config, report);
+    }
 
-        if let Some(candidate) = matched {
-            if let Some(param) = params.get_mut(candidate.as_str()) {
-                let expected_shape = param.shape().to_vec();
-                let actual_shape = value.shape().to_vec();
-                if expected_shape == actual_shape {
-                    **param = value;
-                    report.record_loaded(candidate);
-                } else {
-                    report.record_shape_mismatch(key, candidate, expected_shape, actual_shape);
-                }
-            }
-        } else {
-            report.record_unused(key);
+    Ok(())
+}
+
+pub(crate) fn for_each_safetensor_array<F>(
+    path: impl AsRef<Path>,
+    stream: &Stream,
+    mut f: F,
+) -> Result<(), Error>
+where
+    F: FnMut(String, Array) -> Result<(), Error>,
+{
+    let file = File::open(path)?;
+    // The mmap only has to live until each TensorView is copied into an MLX-owned Array.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|err| Error::Other(Box::new(err)))?;
+
+    for (key, view) in tensors.iter() {
+        let value = Array::try_from(view).map_err(|err| Error::Other(Box::new(err)))?;
+        let value = value.copy(stream)?;
+        f(key.to_string(), value)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn load_array_strict(
+    params: &mut FlattenedModuleParamMut<'_>,
+    key: String,
+    value: Array,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) {
+    let mut matched = None;
+    for candidate in config.candidates(&key) {
+        if params.contains_key(candidate.as_str()) {
+            matched = Some(candidate);
+            break;
         }
     }
 
+    if let Some(candidate) = matched {
+        if let Some(param) = params.get_mut(candidate.as_str()) {
+            let expected_shape = param.shape().to_vec();
+            let actual_shape = value.shape().to_vec();
+            if expected_shape == actual_shape {
+                **param = value;
+                report.record_loaded(candidate);
+            } else {
+                report.record_shape_mismatch(key, candidate, expected_shape, actual_shape);
+            }
+        }
+    } else {
+        report.record_unused(key);
+    }
+}
+
+/// Loads a safetensors file into matching model parameters without strict validation.
+///
+/// This preserves the behavior of `ModuleParametersExt::load_safetensors`, but streams tensors
+/// from a mmap instead of materializing the whole checkpoint file as a `HashMap`.
+pub fn load_safetensors_lenient<M: ModuleParameters>(
+    model: &mut M,
+    path: impl AsRef<Path>,
+    stream: &Stream,
+) -> Result<(), Error> {
+    let mut params = model.parameters_mut().flatten();
+    for_each_safetensor_array(path, stream, |key, value| {
+        if let Some(param) = params.get_mut(key.as_str()) {
+            **param = value;
+        }
+        Ok(())
+    })
+}
+
+/// Loads all safetensors files from `model_dir` into matching parameters without validation.
+pub fn load_safetensors_dir_lenient<M: ModuleParameters>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    stream: &Stream,
+) -> Result<(), Error> {
+    for file in safetensors_files(model_dir)? {
+        load_safetensors_lenient(model, file, stream)?;
+    }
     Ok(())
 }
 
@@ -305,11 +378,10 @@ where
     F: Fn(&str) -> Result<String, Error>,
 {
     let mut expert_parts: HashMap<(String, i32), Relu2ExpertParts> = HashMap::new();
+    let mut params = model.parameters_mut().flatten();
 
     for file in safetensors_files(model_dir)? {
-        let loaded = Array::load_safetensors(file, weights_stream)?;
-        let mut direct = HashMap::new();
-        for (key, value) in loaded {
+        for_each_safetensor_array(file, weights_stream, |key, value| {
             let key = rewrite_key(&key)?;
             if let Some((prefix, expert, projection)) =
                 parse_split_relu2_expert_projection_key(&key)
@@ -320,10 +392,10 @@ where
                     Relu2ExpertProjection::Down => parts.down = Some(value),
                 }
             } else {
-                direct.insert(key, value);
+                load_array_strict(&mut params, key, value, config, report);
             }
-        }
-        load_arrays_strict(model, direct, config, report)?;
+            Ok(())
+        })?;
 
         let mut complete_prefixes = expert_parts
             .keys()
@@ -339,7 +411,9 @@ where
                     num_experts,
                     transform_stream,
                 )?;
-                load_arrays_strict(model, packed, config, report)?;
+                for (key, value) in packed {
+                    load_array_strict(&mut params, key, value, config, report);
+                }
             }
         }
     }

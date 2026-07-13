@@ -1,9 +1,6 @@
 //! Llama decoder-only model implementation.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{collections::HashMap, path::Path};
 
 use safemlx::{
     error::Exception,
@@ -33,6 +30,7 @@ use crate::{
         input,
     },
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
+    weights::load_safetensors_dir_lenient,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -736,22 +734,7 @@ pub fn load_llama_model(
     let model_args = get_llama_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
 
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    if weights_index.exists() {
-        // Sharded weights: read the index to find all weight files
-        let json = std::fs::read_to_string(weights_index)?;
-        let weight_map: WeightMap = serde_json::from_str(&json)?;
-
-        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-        for weight_file in weight_files {
-            let weights_filename = model_dir.join(weight_file);
-            model.load_safetensors(weights_filename, weights_stream)?;
-        }
-    } else {
-        // Single weight file
-        let weights_filename = model_dir.join("model.safetensors");
-        model.load_safetensors(weights_filename, weights_stream)?;
-    }
+    load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
     model.copy_to_stream(stream)?;
 
     Ok(model)

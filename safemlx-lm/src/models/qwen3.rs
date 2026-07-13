@@ -1,9 +1,6 @@
 //! Qwen3 decoder-only model implementation.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{collections::HashMap, path::Path};
 
 use safemlx::{
     error::Exception,
@@ -37,6 +34,7 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
+    weights::load_safetensors_dir_lenient,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,20 +700,7 @@ pub fn load_qwen3_model(
     let model_args = get_qwen3_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
 
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    if weights_index.exists() {
-        let json = std::fs::read_to_string(weights_index)?;
-        let weight_map: WeightMap = serde_json::from_str(&json)?;
-
-        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-
-        for weight_file in weight_files {
-            let weights_filename = model_dir.join(weight_file);
-            model.load_safetensors(weights_filename, weights_stream)?;
-        }
-    } else {
-        model.load_safetensors(model_dir.join("model.safetensors"), weights_stream)?;
-    }
+    load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
     model.copy_to_stream(stream)?;
 
     Ok(model)

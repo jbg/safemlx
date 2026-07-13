@@ -7,7 +7,7 @@ use safemlx::{
     error::Exception,
     fast::{MetalKernel, MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
         broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, grouped_matmul,
@@ -40,8 +40,8 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        load_arrays_strict, load_safetensors_strict, safetensors_files, StrictLoadConfig,
-        StrictLoadReport,
+        for_each_safetensor_array, load_array_strict, load_safetensors_strict, safetensors_files,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -4163,9 +4163,14 @@ fn load_qwen3_5_moe_safetensors_strict(
         return load_safetensors_strict(model, path, weights_stream, config, report);
     }
 
-    let loaded = Array::load_safetensors(path, weights_stream)?;
-    let loaded = transform_qwen3_5_moe_fp8_weights(loaded, &model.args, transform_stream)?;
-    load_arrays_strict(model, loaded, config, report)
+    load_qwen3_5_moe_fp8_safetensors_strict(
+        model,
+        path,
+        weights_stream,
+        transform_stream,
+        config,
+        report,
+    )
 }
 
 #[derive(Default)]
@@ -4178,44 +4183,30 @@ struct Fp8ExpertParts {
     down_scale: Option<Array>,
 }
 
-fn transform_qwen3_5_moe_fp8_weights(
-    loaded: HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<HashMap<String, Array>, Error> {
-    let mut transformed = HashMap::with_capacity(loaded.len());
+fn load_qwen3_5_moe_fp8_safetensors_strict(
+    model: &mut Model,
+    path: impl AsRef<Path>,
+    weights_stream: &Stream,
+    transform_stream: &Stream,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    let num_experts = model.args.num_experts;
     let mut expert_parts: HashMap<(String, i32), Fp8ExpertParts> = HashMap::new();
+    let mut params = model.parameters_mut().flatten();
 
-    for (key, value) in &loaded {
-        if let Some((prefix, expert, projection)) = parse_fp8_expert_projection_key(key) {
-            let scale_key = fp8_scale_key(key);
-            let scale = loaded.get(&scale_key).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 tensor '{key}' is missing sibling scale '{scale_key}'"
-                ))
-            })?;
+    for_each_safetensor_array(path, weights_stream, |key, value| {
+        if let Some((prefix, expert, projection)) = parse_fp8_expert_projection_key(&key) {
             let parts = expert_parts.entry((prefix, expert)).or_default();
-            match projection {
-                Fp8ExpertProjection::Gate => {
-                    parts.gate = Some(value.clone());
-                    parts.gate_scale = Some(scale.clone());
-                }
-                Fp8ExpertProjection::Up => {
-                    parts.up = Some(value.clone());
-                    parts.up_scale = Some(scale.clone());
-                }
-                Fp8ExpertProjection::Down => {
-                    parts.down = Some(value.clone());
-                    parts.down_scale = Some(scale.clone());
-                }
-            }
-            continue;
+            set_fp8_expert_part(parts, projection, value, false);
+        } else if let Some((prefix, expert, projection)) = parse_fp8_expert_scale_key(&key) {
+            let parts = expert_parts.entry((prefix, expert)).or_default();
+            set_fp8_expert_part(parts, projection, value, true);
+        } else {
+            load_array_strict(&mut params, key, value, config, report);
         }
-
-        if parse_fp8_expert_scale_key(key).is_none() {
-            transformed.insert(key.clone(), value.clone());
-        }
-    }
+        Ok(())
+    })?;
 
     let mut layer_prefixes = expert_parts
         .keys()
@@ -4225,76 +4216,107 @@ fn transform_qwen3_5_moe_fp8_weights(
     layer_prefixes.dedup();
 
     for prefix in layer_prefixes {
-        let mut gate_up = Vec::with_capacity(args.num_experts as usize);
-        let mut gate_up_scale = Vec::with_capacity(args.num_experts as usize);
-        let mut down = Vec::with_capacity(args.num_experts as usize);
-        let mut down_scale = Vec::with_capacity(args.num_experts as usize);
-        for expert in 0..args.num_experts {
-            let parts = expert_parts
-                .remove(&(prefix.clone(), expert))
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "Qwen3.5-MoE FP8 checkpoint is missing expert {expert} for '{prefix}'"
-                    ))
-                })?;
-            let gate = parts.gate.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.gate_proj.weight"
-                ))
-            })?;
-            let gate_scale = parts.gate_scale.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.gate_proj.weight_scale_inv"
-                ))
-            })?;
-            let up = parts.up.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.up_proj.weight"
-                ))
-            })?;
-            let up_scale = parts.up_scale.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.up_proj.weight_scale_inv"
-                ))
-            })?;
-            let down_proj = parts.down.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.down_proj.weight"
-                ))
-            })?;
-            let down_proj_scale = parts.down_scale.ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.down_proj.weight_scale_inv"
-                ))
-            })?;
-            let gate_up_proj = concatenate_axis(&[gate, up], 0, stream)?;
-            let gate_up_proj_scale = concatenate_axis(&[gate_scale, up_scale], 0, stream)?;
-            gate_up.push(gate_up_proj);
-            gate_up_scale.push(gate_up_proj_scale);
-            down.push(down_proj);
-            down_scale.push(down_proj_scale);
+        for (key, value) in
+            pack_fp8_expert_prefix(&mut expert_parts, &prefix, num_experts, transform_stream)?
+        {
+            load_array_strict(&mut params, key, value, config, report);
         }
-
-        let gate_up_proj = stack_axis(&gate_up, 0, stream)?;
-        let gate_up_proj_scale = stack_axis(&gate_up_scale, 0, stream)?;
-        let down_proj = stack_axis(&down, 0, stream)?;
-        let down_proj_scale = stack_axis(&down_scale, 0, stream)?;
-        eval([
-            &gate_up_proj,
-            &gate_up_proj_scale,
-            &down_proj,
-            &down_proj_scale,
-        ])?;
-        transformed.insert(format!("{prefix}.gate_up_proj"), gate_up_proj);
-        transformed.insert(
-            format!("{prefix}.gate_up_proj_scale_inv"),
-            gate_up_proj_scale,
-        );
-        transformed.insert(format!("{prefix}.down_proj"), down_proj);
-        transformed.insert(format!("{prefix}.down_proj_scale_inv"), down_proj_scale);
     }
 
-    Ok(transformed)
+    Ok(())
+}
+
+fn set_fp8_expert_part(
+    parts: &mut Fp8ExpertParts,
+    projection: Fp8ExpertProjection,
+    value: Array,
+    is_scale: bool,
+) {
+    match (projection, is_scale) {
+        (Fp8ExpertProjection::Gate, false) => parts.gate = Some(value),
+        (Fp8ExpertProjection::Gate, true) => parts.gate_scale = Some(value),
+        (Fp8ExpertProjection::Up, false) => parts.up = Some(value),
+        (Fp8ExpertProjection::Up, true) => parts.up_scale = Some(value),
+        (Fp8ExpertProjection::Down, false) => parts.down = Some(value),
+        (Fp8ExpertProjection::Down, true) => parts.down_scale = Some(value),
+    }
+}
+
+fn pack_fp8_expert_prefix(
+    expert_parts: &mut HashMap<(String, i32), Fp8ExpertParts>,
+    prefix: &str,
+    num_experts: i32,
+    stream: &Stream,
+) -> Result<HashMap<String, Array>, Error> {
+    let mut gate_up = Vec::with_capacity(num_experts as usize);
+    let mut gate_up_scale = Vec::with_capacity(num_experts as usize);
+    let mut down = Vec::with_capacity(num_experts as usize);
+    let mut down_scale = Vec::with_capacity(num_experts as usize);
+    for expert in 0..num_experts {
+        let parts = expert_parts
+            .remove(&(prefix.to_string(), expert))
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5-MoE FP8 checkpoint is missing expert {expert} for '{prefix}'"
+                ))
+            })?;
+        let gate = parts.gate.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.gate_proj.weight"
+            ))
+        })?;
+        let gate_scale = parts.gate_scale.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.gate_proj.weight_scale_inv"
+            ))
+        })?;
+        let up = parts.up.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.up_proj.weight"
+            ))
+        })?;
+        let up_scale = parts.up_scale.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.up_proj.weight_scale_inv"
+            ))
+        })?;
+        let down_proj = parts.down.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.down_proj.weight"
+            ))
+        })?;
+        let down_proj_scale = parts.down_scale.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.down_proj.weight_scale_inv"
+            ))
+        })?;
+        let gate_up_proj = concatenate_axis(&[gate, up], 0, stream)?;
+        let gate_up_proj_scale = concatenate_axis(&[gate_scale, up_scale], 0, stream)?;
+        gate_up.push(gate_up_proj);
+        gate_up_scale.push(gate_up_proj_scale);
+        down.push(down_proj);
+        down_scale.push(down_proj_scale);
+    }
+
+    let gate_up_proj = stack_axis(&gate_up, 0, stream)?;
+    let gate_up_proj_scale = stack_axis(&gate_up_scale, 0, stream)?;
+    let down_proj = stack_axis(&down, 0, stream)?;
+    let down_proj_scale = stack_axis(&down_scale, 0, stream)?;
+    eval([
+        &gate_up_proj,
+        &gate_up_proj_scale,
+        &down_proj,
+        &down_proj_scale,
+    ])?;
+    Ok(HashMap::from([
+        (format!("{prefix}.gate_up_proj"), gate_up_proj),
+        (
+            format!("{prefix}.gate_up_proj_scale_inv"),
+            gate_up_proj_scale,
+        ),
+        (format!("{prefix}.down_proj"), down_proj),
+        (format!("{prefix}.down_proj_scale_inv"), down_proj_scale),
+    ]))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4325,12 +4347,6 @@ fn parse_fp8_expert_scale_key(key: &str) -> Option<(String, i32, Fp8ExpertProjec
         .strip_suffix(".weight_scale_inv")
         .map(|prefix| format!("{prefix}.weight"))?;
     parse_fp8_expert_projection_key(&weight_key)
-}
-
-fn fp8_scale_key(key: &str) -> String {
-    key.strip_suffix(".weight")
-        .map(|prefix| format!("{prefix}.weight_scale_inv"))
-        .unwrap_or_else(|| format!("{key}_scale_inv"))
 }
 
 fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadConfig {

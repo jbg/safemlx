@@ -40,6 +40,8 @@ idna_adapter = "1"
 thiserror = "2"
 serde_json = "1"
 minijinja = "2"
+safetensors = "0.8"
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
 
