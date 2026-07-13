@@ -1465,6 +1465,12 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn mlx_io_gguf_get_metadata_keys(
+        keys: *mut mlx_vector_string,
+        io: mlx_io_gguf,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn mlx_io_gguf_get_array(
         arr: *mut mlx_array,
         io: mlx_io_gguf,

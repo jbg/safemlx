@@ -1,0 +1,208 @@
+diff --git a/mlx/io/gguf.cpp b/mlx/io/gguf.cpp
+--- a/mlx/io/gguf.cpp
++++ b/mlx/io/gguf.cpp
+@@ -5,6 +5,10 @@
+ #include <fstream>
+ #include <numeric>
+ 
++extern "C" {
++#include "fp16.h"
++}
++
+ #include "mlx/io/gguf.h"
+ #include "mlx/ops.h"
+ 
+@@ -51,6 +55,170 @@ Shape get_shape(const gguf_tensor& tensor) {
+   return shape;
+ }
+ 
++// Decode legacy Q5_0 locally; the pinned gguflib converter returns null.
++void q5_0_to_f16(const gguf_tensor& tensor, uint16_t* output) {
++  constexpr uint64_t weights_per_block = 32;
++  constexpr uint64_t bytes_per_block = 22;
++  if (tensor.weights_data == nullptr ||
++      tensor.num_weights % weights_per_block != 0) {
++    throw std::runtime_error("[load_gguf] invalid Q5_0 tensor data");
++  }
++  const auto* block = static_cast<const uint8_t*>(tensor.weights_data);
++  uint64_t output_index = 0;
++  for (uint64_t offset = 0; offset < tensor.num_weights;
++       offset += weights_per_block, block += bytes_per_block) {
++    const float d = from_half(*reinterpret_cast<const uint16_t*>(block));
++    uint32_t qh;
++    std::memcpy(&qh, block + 2, sizeof(qh));
++    const uint8_t* qs = block + 6;
++    for (int j = 0; j < 16; ++j) {
++      const uint8_t high_low = ((qh >> j) << 4) & 0x10;
++      const uint8_t high_high = (qh >> (j + 12)) & 0x10;
++      const int low = ((qs[j] & 0x0f) | high_low) - 16;
++      const int high = ((qs[j] >> 4) | high_high) - 16;
++      output[output_index + j] = to_half(low * d);
++      output[output_index + j + 16] = to_half(high * d);
++    }
++    output_index += weights_per_block;
++  }
++}
++
++// gguflib does not provide a Q5_1 converter at the pinned revision.
++void q5_1_to_f16(const gguf_tensor& tensor, uint16_t* output) {
++  constexpr uint64_t weights_per_block = 32;
++  constexpr uint64_t bytes_per_block = 24;
++  if (tensor.weights_data == nullptr) {
++    throw std::runtime_error("[load_gguf] NULL Q5_1 tensor data pointer");
++  }
++  if (tensor.num_weights % weights_per_block != 0) {
++    throw std::runtime_error(
++        "[load_gguf] Q5_1 tensor length is not a whole number of blocks");
++  }
++
++  const auto* block = static_cast<const uint8_t*>(tensor.weights_data);
++  uint64_t output_index = 0;
++  for (uint64_t offset = 0; offset < tensor.num_weights;
++       offset += weights_per_block, block += bytes_per_block) {
++    const float d = from_half(*reinterpret_cast<const uint16_t*>(block));
++    const float m = from_half(*reinterpret_cast<const uint16_t*>(block + 2));
++    uint32_t qh;
++    std::memcpy(&qh, block + 4, sizeof(qh));
++    const uint8_t* qs = block + 8;
++    for (int j = 0; j < 16; ++j) {
++      const uint8_t high_low = ((qh >> j) << 4) & 0x10;
++      const uint8_t high_high = (qh >> (j + 12)) & 0x10;
++      const int low = (qs[j] & 0x0f) | high_low;
++      const int high = (qs[j] >> 4) | high_high;
++      output[output_index + j] = to_half(low * d + m);
++      output[output_index + j + 16] = to_half(high * d + m);
++    }
++    output_index += weights_per_block;
++  }
++}
++
++// gguflib at the revision pinned by MLX 0.32.0 knows the Q5_K block size but
++// does not implement its float conversion. Decode that format locally so GGUF
++// files that use Q5_K for an isolated tensor can still be loaded safely.
++void q5_k_to_f16(const gguf_tensor& tensor, uint16_t* output) {
++  constexpr uint64_t weights_per_block = 256;
++  constexpr uint64_t bytes_per_block = 176;
++  if (tensor.weights_data == nullptr) {
++    throw std::runtime_error("[load_gguf] NULL Q5_K tensor data pointer");
++  }
++  if (tensor.num_weights % weights_per_block != 0) {
++    throw std::runtime_error(
++        "[load_gguf] Q5_K tensor length is not a whole number of blocks");
++  }
++
++  const auto* block = static_cast<const uint8_t*>(tensor.weights_data);
++  uint64_t output_index = 0;
++  for (uint64_t offset = 0; offset < tensor.num_weights;
++       offset += weights_per_block, block += bytes_per_block) {
++    const float d = from_half(*reinterpret_cast<const uint16_t*>(block));
++    const float dmin =
++        from_half(*reinterpret_cast<const uint16_t*>(block + 2));
++    const uint8_t* scales = block + 4;
++    const uint8_t* qh = block + 16;
++    const uint8_t* ql = block + 48;
++
++    auto get_scale_min = [scales](int index) {
++      std::pair<uint8_t, uint8_t> result;
++      if (index < 4) {
++        result.first = scales[index] & 0x3f;
++        result.second = scales[index + 4] & 0x3f;
++      } else {
++        result.first =
++            (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4);
++        result.second =
++            (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
++      }
++      return result;
++    };
++
++    int scale_index = 0;
++    uint8_t high_mask_low = 1;
++    uint8_t high_mask_high = 2;
++    for (int group = 0; group < 4; ++group) {
++      auto [scale_low, min_low] = get_scale_min(scale_index);
++      auto [scale_high, min_high] = get_scale_min(scale_index + 1);
++      const float d_low = d * scale_low;
++      const float m_low = dmin * min_low;
++      const float d_high = d * scale_high;
++      const float m_high = dmin * min_high;
++      for (int i = 0; i < 32; ++i) {
++        const int value =
++            (ql[i] & 0x0f) + ((qh[i] & high_mask_low) ? 16 : 0);
++        output[output_index++] = to_half(d_low * value - m_low);
++      }
++      for (int i = 0; i < 32; ++i) {
++        const int value =
++            (ql[i] >> 4) + ((qh[i] & high_mask_high) ? 16 : 0);
++        output[output_index++] = to_half(d_high * value - m_high);
++      }
++      ql += 32;
++      scale_index += 2;
++      high_mask_low <<= 2;
++      high_mask_high <<= 2;
++    }
++  }
++}
++
++// Decode Q6_K locally for mixed Q4 checkpoints with high-precision heads.
++void q6_k_to_f16(const gguf_tensor& tensor, uint16_t* output) {
++  constexpr uint64_t weights_per_block = 256;
++  constexpr uint64_t bytes_per_block = 210;
++  if (tensor.weights_data == nullptr ||
++      tensor.num_weights % weights_per_block != 0) {
++    throw std::runtime_error("[load_gguf] invalid Q6_K tensor data");
++  }
++  const auto* block = static_cast<const uint8_t*>(tensor.weights_data);
++  uint64_t output_index = 0;
++  for (uint64_t offset = 0; offset < tensor.num_weights;
++       offset += weights_per_block, block += bytes_per_block) {
++    const uint8_t* ql = block;
++    const uint8_t* qh = block + 128;
++    const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
++    const float d = from_half(*reinterpret_cast<const uint16_t*>(block + 208));
++    for (int section = 0; section < 2; ++section) {
++      for (int l = 0; l < 32; ++l) {
++        const int scale_index = l / 16;
++        const int q1 = ((ql[l] & 0x0f) | (((qh[l] >> 0) & 3) << 4)) - 32;
++        const int q2 = ((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) - 32;
++        const int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
++        const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
++        output[output_index + l] = to_half(d * scales[scale_index] * q1);
++        output[output_index + l + 32] = to_half(d * scales[scale_index + 2] * q2);
++        output[output_index + l + 64] = to_half(d * scales[scale_index + 4] * q3);
++        output[output_index + l + 96] = to_half(d * scales[scale_index + 6] * q4);
++      }
++      output_index += 128;
++      ql += 64;
++      qh += 32;
++      scales += 8;
++    }
++  }
++}
++
+ std::tuple<allocator::Buffer, Dtype> extract_tensor_data(gguf_tensor* tensor) {
+   if (tensor == nullptr) {
+     throw std::invalid_argument(
+@@ -70,6 +234,22 @@ std::tuple<allocator::Buffer, Dtype> extract_tensor_data(gguf_tensor* tensor) {
+     return {buffer, equivalent_dtype.value()};
+   }
+   // Otherwise, we convert to float16.
++  if (tensor->type == GGUF_TYPE_Q5_0 || tensor->type == GGUF_TYPE_Q5_1 ||
++      tensor->type == GGUF_TYPE_Q5_K || tensor->type == GGUF_TYPE_Q6_K) {
++    const size_t new_size = tensor->num_weights * sizeof(uint16_t);
++    allocator::Buffer buffer = allocator::malloc(new_size);
++    if (tensor->type == GGUF_TYPE_Q5_0) {
++      q5_0_to_f16(*tensor, static_cast<uint16_t*>(buffer.raw_ptr()));
++    } else if (tensor->type == GGUF_TYPE_Q5_1) {
++      q5_1_to_f16(*tensor, static_cast<uint16_t*>(buffer.raw_ptr()));
++    } else if (tensor->type == GGUF_TYPE_Q5_K) {
++      q5_k_to_f16(*tensor, static_cast<uint16_t*>(buffer.raw_ptr()));
++    } else {
++      q6_k_to_f16(*tensor, static_cast<uint16_t*>(buffer.raw_ptr()));
++    }
++    return {buffer, float16};
++  }
++
+   // TODO: Add other dequantization options.
+   int16_t* data = gguf_tensor_to_f16(tensor);
+   if (data == NULL) {

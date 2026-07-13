@@ -12,6 +12,14 @@ const DEFAULT_MODE: &CStr = c"affine";
 const DEFAULT_GROUP_SIZE: i32 = 64;
 const DEFAULT_BITS: i32 = 4;
 
+/// Returns the number of `u32` values used to store one packed quantized row.
+///
+/// MLX packs power-of-two widths directly and packs 3-, 5-, and 6-bit values
+/// into byte groups. Both layouts occupy `dimension * bits` bits overall.
+pub const fn quantized_packed_dimension(dimension: i32, bits: i32) -> i32 {
+    dimension * bits / 32
+}
+
 /// Helper to convert Option<i32> to mlx_optional_int
 fn optional_int(value: Option<i32>, default: i32) -> safemlx_sys::mlx_optional_int {
     safemlx_sys::mlx_optional_int {

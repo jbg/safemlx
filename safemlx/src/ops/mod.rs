@@ -23,6 +23,7 @@ pub use conversion::*;
 pub use convolution::*;
 pub use cumulative::*;
 pub use factory::*;
+pub use io::GgufMetadataValue;
 pub use logical::*;
 pub use moe::*;
 pub use other::*;

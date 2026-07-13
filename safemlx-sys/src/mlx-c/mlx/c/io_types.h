@@ -105,6 +105,7 @@ typedef struct mlx_io_gguf_ {
 mlx_io_gguf mlx_io_gguf_new(void);
 int mlx_io_gguf_free(mlx_io_gguf io);
 int mlx_io_gguf_get_keys(mlx_vector_string* keys, mlx_io_gguf io);
+int mlx_io_gguf_get_metadata_keys(mlx_vector_string* keys, mlx_io_gguf io);
 int mlx_io_gguf_get_array(mlx_array* arr, mlx_io_gguf io, const char* key);
 int mlx_io_gguf_get_metadata_array(
     mlx_array* arr,

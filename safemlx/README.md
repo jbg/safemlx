@@ -4,8 +4,8 @@ Rust bindings for Apple's MLX machine learning framework.
 
 `safemlx` provides a safe, idiomatic Rust interface over the low-level
 `safemlx-sys` bindings. It includes array operations, neural-network building
-blocks, transforms, optimizers, quantization helpers, and optional
-SafeTensors support.
+blocks, transforms, optimizers, quantization helpers, optional SafeTensors
+support, and typed GGUF tensor/metadata loading.
 
 This crate targets Apple platforms supported by MLX. The default feature set
 enables both Accelerate and Metal support.

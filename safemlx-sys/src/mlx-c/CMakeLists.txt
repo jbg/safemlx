@@ -35,7 +35,23 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.32.0)
+    GIT_TAG v0.32.0
+    PATCH_COMMAND
+      ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-q5-k.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-k-quants.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-q6-k.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-q6-prefill.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-q2-q3-k.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
 endif()
 

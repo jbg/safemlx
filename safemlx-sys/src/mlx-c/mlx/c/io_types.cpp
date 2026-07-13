@@ -120,6 +120,23 @@ extern "C" int mlx_io_gguf_get_keys(mlx_vector_string* keys, mlx_io_gguf io) {
 }
 
 extern "C" int
+mlx_io_gguf_get_metadata_keys(mlx_vector_string* keys, mlx_io_gguf io) {
+  try {
+    auto& cpp_map = mlx_io_gguf_get_(io).second;
+    std::vector<std::string> cpp_keys;
+    cpp_keys.reserve(cpp_map.size());
+    for (const auto& [key, value] : cpp_map) {
+      cpp_keys.push_back(key);
+    }
+    mlx_vector_string_set_(*keys, cpp_keys);
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+
+extern "C" int
 mlx_io_gguf_get_array(mlx_array* arr, mlx_io_gguf io, const char* key) {
   try {
     auto& cpp_map = mlx_io_gguf_get_(io).first;

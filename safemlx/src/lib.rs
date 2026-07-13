@@ -260,14 +260,15 @@
 //! See also [MLX python
 //! documentation](https://ml-explore.github.io/mlx/build/html/usage/saving_and_loading.html)
 //!
-//! `mlx-rs` supports loading from `.npy` and `.safetensors` files and saving to
-//! `.safetensors` files. Module parameters and optimizer states can also be saved
-//! and loaded from `.safetensors` files.
+//! `safemlx` supports loading from `.npy`, `.safetensors`, and `.gguf` files and
+//! saving to `.safetensors` files. Module parameters and optimizer states can
+//! also be saved and loaded from `.safetensors` files.
 //!
 //! | type | load function | save function |
 //! |------|---------------|----------------|
 //! | [`Array`] | [`Array::load_numpy`] | [`Array::save_numpy`] |
 //! | `HashMap<String, Array>` | [`Array::load_safetensors`] | [`Array::save_safetensors`] |
+//! | `(HashMap<String, Array>, HashMap<String, ops::GgufMetadataValue>)` | [`Array::load_gguf_with_metadata`] | — |
 //! | [`module::Module`] | [`module::ModuleParametersExt::load_safetensors`] | [`module::ModuleParametersExt::save_safetensors`] |
 //! | [`optimizers::Optimizer`] | [`optimizers::OptimizerState::load_safetensors`] | [`optimizers::OptimizerState::save_safetensors`] |
 //!

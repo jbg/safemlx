@@ -4,7 +4,7 @@ use crate::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     ops::indexing::TryIndexOp,
-    ops::{self, dequantize, quantized_matmul},
+    ops::{self, dequantize, quantized_matmul, quantized_packed_dimension},
     quantization::Quantizable,
     Array, Dtype, Stream,
 };
@@ -181,10 +181,12 @@ impl QuantizedEmbedding {
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
         let stream = stream.as_ref();
-        let packed_per_int = 32 / bits;
         let inner = Embedding {
             weight: Param::<Array>::unloaded(
-                &[embedding_count, dimensions / packed_per_int],
+                &[
+                    embedding_count,
+                    quantized_packed_dimension(dimensions, bits),
+                ],
                 Dtype::Uint32,
                 stream,
             )?,
@@ -450,10 +452,9 @@ impl QuantizedLinear {
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
         let stream = stream.as_ref();
-        let packed_per_int = 32 / bits;
         let inner = Linear {
             weight: Param::<Array>::unloaded(
-                &[output_dims, input_dims / packed_per_int],
+                &[output_dims, quantized_packed_dimension(input_dims, bits)],
                 Dtype::Uint32,
                 stream,
             )?,
@@ -551,7 +552,35 @@ mod tests {
         Dtype,
     };
 
-    use super::{QuantizedEmbeddingBuilder, QuantizedLinear};
+    use super::{QuantizedEmbedding, QuantizedEmbeddingBuilder, QuantizedLinear};
+
+    #[test]
+    fn unloaded_parameters_use_mlx_bit_packing() {
+        let stream = crate::test_stream();
+        let linear = QuantizedLinear::unloaded(1024, 8, 32, 5, false, stream).unwrap();
+        assert_eq!(linear.inner.weight.shape(), &[8, 160]);
+        assert_eq!(linear.scales.shape(), &[8, 32]);
+
+        let embedding = QuantizedEmbedding::unloaded(16, 1024, 32, 5, stream).unwrap();
+        assert_eq!(embedding.inner.weight.shape(), &[16, 160]);
+        assert_eq!(embedding.scales.shape(), &[16, 32]);
+
+        let q6_linear = QuantizedLinear::unloaded(1024, 8, 16, 6, false, stream).unwrap();
+        assert_eq!(q6_linear.inner.weight.shape(), &[8, 192]);
+        assert_eq!(q6_linear.scales.shape(), &[8, 64]);
+
+        let q6_embedding = QuantizedEmbedding::unloaded(16, 1024, 16, 6, stream).unwrap();
+        assert_eq!(q6_embedding.inner.weight.shape(), &[16, 192]);
+        assert_eq!(q6_embedding.scales.shape(), &[16, 64]);
+
+        let q2_linear = QuantizedLinear::unloaded(1024, 8, 16, 2, false, stream).unwrap();
+        assert_eq!(q2_linear.inner.weight.shape(), &[8, 64]);
+        assert_eq!(q2_linear.scales.shape(), &[8, 64]);
+
+        let q3_linear = QuantizedLinear::unloaded(1024, 8, 16, 3, false, stream).unwrap();
+        assert_eq!(q3_linear.inner.weight.shape(), &[8, 96]);
+        assert_eq!(q3_linear.scales.shape(), &[8, 64]);
+    }
 
     #[test]
     fn quantized_linear_new_requires_explicit_stream() {

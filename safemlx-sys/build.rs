@@ -94,8 +94,16 @@ fn build_and_link_mlx_c() {
     let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
+    println!(
+        "cargo:rustc-link-search=native={}/build/_deps/mlx-build/mlx/io",
+        dst.display()
+    );
     println!("cargo:rustc-link-lib=static=mlx");
     println!("cargo:rustc-link-lib=static=mlxc");
+    // MLX links its GGUF parser privately. Static Rust consumers must name the
+    // parser archive as well because CMake's transitive link interface is not
+    // preserved when Cargo links the installed archives directly.
+    println!("cargo:rustc-link-lib=static=gguflib");
 
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=dylib=objc");

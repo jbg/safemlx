@@ -452,6 +452,53 @@ impl Guarded for crate::utils::io::SafeTensors {
     type Guard = MaybeUninitSafeTensors;
 }
 
+pub(crate) struct MaybeUninitGguf {
+    pub(crate) inner: safemlx_sys::mlx_io_gguf,
+    pub(crate) init_success: bool,
+}
+
+impl Default for MaybeUninitGguf {
+    fn default() -> Self {
+        unsafe {
+            Self {
+                inner: safemlx_sys::mlx_io_gguf_new(),
+                init_success: false,
+            }
+        }
+    }
+}
+
+impl Drop for MaybeUninitGguf {
+    fn drop(&mut self) {
+        if !self.init_success {
+            unsafe {
+                safemlx_sys::mlx_io_gguf_free(self.inner);
+            }
+        }
+    }
+}
+
+impl Guard<crate::utils::io::Gguf> for MaybeUninitGguf {
+    type MutRawPtr = *mut safemlx_sys::mlx_io_gguf;
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        &mut self.inner
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.init_success = success;
+    }
+
+    fn try_into_guarded(self) -> Result<crate::utils::io::Gguf, Exception> {
+        debug_assert!(self.init_success);
+        Ok(crate::utils::io::Gguf { inner: self.inner })
+    }
+}
+
+impl Guarded for crate::utils::io::Gguf {
+    type Guard = MaybeUninitGguf;
+}
+
 pub(crate) struct MaybeUninitClosure {
     pub(crate) ptr: safemlx_sys::mlx_closure,
     pub(crate) init_success: bool,

@@ -1,11 +1,22 @@
 use crate::error::IoError;
 use crate::utils::guard::Guarded;
-use crate::utils::io::SafeTensors;
+use crate::utils::io::{Gguf, SafeTensors};
 use crate::utils::SUCCESS;
 use crate::{Array, Stream};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
+
+/// A typed metadata value loaded from a GGUF file.
+#[derive(Debug, Clone)]
+pub enum GgufMetadataValue {
+    /// Numeric or boolean scalar/one-dimensional array metadata.
+    Array(Array),
+    /// UTF-8 string metadata.
+    String(String),
+    /// UTF-8 string-array metadata.
+    Strings(Vec<String>),
+}
 
 fn check_file_extension(path: &Path, expected: &str) -> Result<(), IoError> {
     match path.extension().and_then(|ext| ext.to_str()) {
@@ -68,6 +79,32 @@ impl Array {
         let data = safetensors.data()?;
         let metadata = safetensors.metadata()?;
 
+        Ok((data, metadata))
+    }
+
+    /// Loads all tensors from a GGUF file.
+    ///
+    /// MLX preserves Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors in its packed
+    /// affine representation. Some other GGUF quantization formats are
+    /// converted to floating point by MLX while loading; formats unsupported
+    /// by MLX's bundled GGUF converter return an error.
+    pub fn load_gguf(
+        path: impl AsRef<Path>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<HashMap<String, Array>, IoError> {
+        let gguf = Gguf::load_device(path.as_ref(), stream)?;
+        gguf.data().map_err(Into::into)
+    }
+
+    /// Loads all tensors and typed metadata from a GGUF file.
+    #[allow(clippy::type_complexity)]
+    pub fn load_gguf_with_metadata(
+        path: impl AsRef<Path>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<(HashMap<String, Array>, HashMap<String, GgufMetadataValue>), IoError> {
+        let gguf = Gguf::load_device(path.as_ref(), stream)?;
+        let data = gguf.data()?;
+        let metadata = gguf.metadata()?;
         Ok((data, metadata))
     }
 
@@ -186,7 +223,8 @@ impl Array {
 
 #[cfg(test)]
 mod tests {
-    use crate::Array;
+    use crate::{ops::GgufMetadataValue, transforms::eval, Array};
+    use std::ffi::CString;
 
     #[test]
     fn test_save_arrays() {
@@ -239,5 +277,81 @@ mod tests {
             .all_close(&b, None, None, None, stream)
             .unwrap()
             .item::<bool>(&stream));
+    }
+
+    #[test]
+    fn test_load_gguf_with_metadata() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("test.gguf");
+        let tensor = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
+            .copy(&stream)
+            .unwrap();
+        let answer = Array::from(42i32).copy(&stream).unwrap();
+        eval([&tensor, &answer]).unwrap();
+
+        unsafe {
+            let gguf = safemlx_sys::mlx_io_gguf_new();
+            let tensor_key = CString::new("tensor").unwrap();
+            assert_eq!(
+                safemlx_sys::mlx_io_gguf_set_array(gguf, tensor_key.as_ptr(), tensor.as_ptr()),
+                0
+            );
+            let answer_key = CString::new("answer").unwrap();
+            assert_eq!(
+                safemlx_sys::mlx_io_gguf_set_metadata_array(
+                    gguf,
+                    answer_key.as_ptr(),
+                    answer.as_ptr(),
+                ),
+                0
+            );
+            let name_key = CString::new("general.name").unwrap();
+            let name = CString::new("tiny model").unwrap();
+            assert_eq!(
+                safemlx_sys::mlx_io_gguf_set_metadata_string(
+                    gguf,
+                    name_key.as_ptr(),
+                    name.as_ptr(),
+                ),
+                0
+            );
+            let tags_key = CString::new("general.tags").unwrap();
+            let tags = [CString::new("one").unwrap(), CString::new("two").unwrap()];
+            let mut tag_ptrs = tags.iter().map(|tag| tag.as_ptr()).collect::<Vec<_>>();
+            let tag_vector =
+                safemlx_sys::mlx_vector_string_new_data(tag_ptrs.as_mut_ptr(), tag_ptrs.len());
+            assert_eq!(
+                safemlx_sys::mlx_io_gguf_set_metadata_vector_string(
+                    gguf,
+                    tags_key.as_ptr(),
+                    tag_vector,
+                ),
+                0
+            );
+            assert_eq!(safemlx_sys::mlx_vector_string_free(tag_vector), 0);
+
+            let path = CString::new(path.to_str().unwrap()).unwrap();
+            assert_eq!(safemlx_sys::mlx_save_gguf(path.as_ptr(), gguf), 0);
+            assert_eq!(safemlx_sys::mlx_io_gguf_free(gguf), 0);
+        }
+
+        let (arrays, metadata) = Array::load_gguf_with_metadata(&path, &stream).unwrap();
+        assert_eq!(arrays["tensor"].shape(), &[2, 2]);
+        assert!(arrays["tensor"].clone().try_item::<f32>(&stream).is_err());
+        match &metadata["answer"] {
+            GgufMetadataValue::Array(value) => {
+                assert_eq!(value.clone().item::<i32>(&stream), 42)
+            }
+            value => panic!("unexpected answer metadata: {value:?}"),
+        }
+        match &metadata["general.name"] {
+            GgufMetadataValue::String(value) => assert_eq!(value, "tiny model"),
+            value => panic!("unexpected name metadata: {value:?}"),
+        }
+        match &metadata["general.tags"] {
+            GgufMetadataValue::Strings(value) => assert_eq!(value, &["one", "two"]),
+            value => panic!("unexpected tags metadata: {value:?}"),
+        }
     }
 }

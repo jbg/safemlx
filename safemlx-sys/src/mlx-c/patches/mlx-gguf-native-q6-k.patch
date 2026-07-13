@@ -1,0 +1,217 @@
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -319,6 +319,10 @@ void _qmm_dispatch_group(
+     int group_size,
+     bool transposed_w) {
+   switch (group_size) {
++    case 16:
++      _qmm_dispatch_transpose<T, bits, 16>(
++          result, x, w, scales, biases, M, N, K, transposed_w);
++      break;
+     case 32:
+       _qmm_dispatch_transpose<T, bits, 32>(
+           result, x, w, scales, biases, M, N, K, transposed_w);
+@@ -333,7 +337,7 @@ void _qmm_dispatch_group(
+       break;
+     default:
+       throw std::invalid_argument(
+-          "Quantization group size must be 32, 64 or 128.");
++          "Quantization group size must be 16, 32, 64 or 128.");
+   }
+ }
+diff --git a/mlx/backend/metal/kernels/quantized.metal b/mlx/backend/metal/kernels/quantized.metal
+--- a/mlx/backend/metal/kernels/quantized.metal
++++ b/mlx/backend/metal/kernels/quantized.metal
+@@ -174,10 +174,28 @@
+   instantiate_quantized_groups(6) \
+   instantiate_quantized_groups(8)
+ 
++#define instantiate_q6_group16_type(type) \
++  instantiate_quantized(affine_dequantize, type, 16, 6) \
++  instantiate_quantized(affine_gather_qmv_fast, type, 16, 6) \
++  instantiate_quantized(affine_gather_qmv, type, 16, 6) \
++  instantiate_quantized_batched(affine_qmv_fast, type, 16, 6, 0) \
++  instantiate_quantized_batched(affine_qmv_fast, type, 16, 6, 1) \
++  instantiate_quantized_batched(affine_qmv, type, 16, 6, 0) \
++  instantiate_quantized_batched(affine_qmv, type, 16, 6, 1)
++
++#define instantiate_q6_group16() \
++  instantiate_q6_group16_type(float) \
++  instantiate_q6_group16_type(float16_t) \
++  instantiate_q6_group16_type(bfloat16_t)
++
++instantiate_q6_group16()
+ instantiate_quantized_all() // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1503,6 +1503,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
++  if (group_size_ == 16 && transpose_) {
++    qmv(
++        x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
++    return;
++  }
++
+   // It is a matrix matrix product.
+   if (M >= vector_limit) {
+@@ -1577,6 +1583,24 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+ 
++  if (group_size_ == 16 && transpose_) {
++    gather_qmv(
++        x,
++        w,
++        scales,
++        biases,
++        lhs_indices,
++        rhs_indices,
++        out,
++        group_size_,
++        bits_,
++        M,
++        N,
++        K,
++        d,
++        s,
++        mode);
++    return;
++  }
++
+   // We are walking x in order and w is also in order so we can batch up the
+diff --git a/mlx/io/gguf.cpp b/mlx/io/gguf.cpp
+--- a/mlx/io/gguf.cpp
++++ b/mlx/io/gguf.cpp
+@@ -248,7 +248,8 @@ std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
+   while (gguf_get_tensor(ctx, &tensor)) {
+     if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 ||
+         tensor.type == GGUF_TYPE_Q8_0 || tensor.type == GGUF_TYPE_Q4_K ||
+-        tensor.type == GGUF_TYPE_Q5_K) {
++        tensor.type == GGUF_TYPE_Q5_K || tensor.type == GGUF_TYPE_Q6_K) {
+       gguf_load_quantized(array_map, tensor);
+     } else {
+       std::string name(tensor.name, tensor.namelen);
+diff --git a/mlx/io/gguf_quants.cpp b/mlx/io/gguf_quants.cpp
+--- a/mlx/io/gguf_quants.cpp
++++ b/mlx/io/gguf_quants.cpp
+@@ -117,9 +117,9 @@ std::pair<uint8_t, uint8_t> qk_scale_min(
+       static_cast<uint8_t>(
+           (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4))};
+ }
+ 
+-void pack_32_codes(const uint8_t* codes, int bits, uint32_t* output) {
+-  std::fill_n(output, bits, 0);
++void pack_codes(const uint8_t* codes, int count, int bits, uint32_t* output) {
++  std::fill_n(output, count * bits / 32, 0);
+   const uint32_t mask = (1u << bits) - 1;
+-  for (int i = 0; i < 32; ++i) {
++  for (int i = 0; i < count; ++i) {
+     const int bit_offset = i * bits;
+     const int word = bit_offset / 32;
+     const int shift = bit_offset % 32;
+@@ -178,9 +178,60 @@ void extract_qk_data(
+         const uint8_t high = is_q5 && (qh[i] & high_mask) ? 16 : 0;
+         codes[i] = low | high;
+       }
+-      pack_32_codes(codes, bits, weights);
++      pack_codes(codes, 32, bits, weights);
+       weights += bits;
+     }
+   }
+ }
+ 
++void extract_q6_k_data(
++    const gguf_tensor& tensor,
++    array& weights_arr,
++    array& scales_arr,
++    array& biases_arr) {
++  constexpr uint64_t weights_per_block = 256;
++  constexpr uint64_t bytes_per_block = 210;
++  if (tensor.weights_data == nullptr ||
++      tensor.num_weights % weights_per_block != 0) {
++    throw std::runtime_error("[load_gguf] invalid Q6_K tensor data");
++  }
++
++  const auto* block = static_cast<const uint8_t*>(tensor.weights_data);
++  auto* weights = weights_arr.data<uint32_t>();
++  auto* scales_out = scales_arr.data<float16_t>();
++  auto* biases_out = biases_arr.data<float16_t>();
++  uint8_t values[128];
++  const uint64_t num_blocks = tensor.num_weights / weights_per_block;
++  for (uint64_t block_index = 0; block_index < num_blocks;
++       ++block_index, block += bytes_per_block) {
++    const uint8_t* ql = block;
++    const uint8_t* qh = block + 128;
++    const int8_t* encoded_scales =
++        reinterpret_cast<const int8_t*>(block + 192);
++    uint16_t d_half;
++    std::memcpy(&d_half, block + 208, sizeof(d_half));
++    const float d = from_half(d_half);
++    for (int section = 0; section < 2; ++section) {
++      for (int i = 0; i < 32; ++i) {
++        values[i] = (ql[i] & 0x0f) | (((qh[i] >> 0) & 3) << 4);
++        values[i + 32] =
++            (ql[i + 32] & 0x0f) | (((qh[i] >> 2) & 3) << 4);
++        values[i + 64] = (ql[i] >> 4) | (((qh[i] >> 4) & 3) << 4);
++        values[i + 96] =
++            (ql[i + 32] >> 4) | (((qh[i] >> 6) & 3) << 4);
++      }
++      for (int group = 0; group < 8; ++group) {
++        const float scale = d * encoded_scales[group];
++        *scales_out++ = scale;
++        *biases_out++ = -32 * scale;
++        pack_codes(values + group * 16, 16, 6, weights);
++        weights += 3;
++      }
++      ql += 64;
++      qh += 32;
++      encoded_scales += 8;
++    }
++  }
++}
++
+ void gguf_load_quantized(
+     std::unordered_map<std::string, array>& a,
+     const gguf_tensor& tensor) {
+@@ -196,6 +247,8 @@ void gguf_load_quantized(
+     bits = 4;
+   } else if (tensor.type == GGUF_TYPE_Q5_K) {
+     bits = 5;
++  } else if (tensor.type == GGUF_TYPE_Q6_K) {
++    bits = 6;
+   } else {
+     bits = 8;
+   }
+@@ -203,8 +256,9 @@ void gguf_load_quantized(
+   std::string name(tensor.name, tensor.namelen);
+ 
+   auto shape = get_shape(tensor);
+-  constexpr uint64_t weights_per_block = 32;
+-  if (shape[shape.size() - 1] % weights_per_block != 0) {
++  const uint64_t group_size =
++      tensor.type == GGUF_TYPE_Q6_K ? 16 : 32;
++  if (shape[shape.size() - 1] % group_size != 0) {
+     std::ostringstream msg;
+     msg << "[load_gguf] tensor " << name
+         << "has incompatible last dim shape: " << shape[shape.size() - 1];
+@@ -222,7 +276,7 @@ void gguf_load_quantized(
+   array weights(allocator::malloc(w_nbytes), std::move(weights_shape), uint32);
+ 
+   // For scales and bias
+-  shape[shape.size() - 1] = shape[shape.size() - 1] / weights_per_block;
++  shape[shape.size() - 1] = shape[shape.size() - 1] / group_size;
+   auto sb_nbytes = float16.size() *
+       std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
+ 
+@@ -235,6 +289,8 @@ void gguf_load_quantized(
+     extract_q4_1_data(tensor, weights, scales, biases);
+   } else if (tensor.type == GGUF_TYPE_Q8_0) {
+     extract_q8_0_data(tensor, weights, scales, biases);
++  } else if (tensor.type == GGUF_TYPE_Q6_K) {
++    extract_q6_k_data(tensor, weights, scales, biases);
+   } else {
+     extract_qk_data(tensor, weights, scales, biases);
+   }
