@@ -1,13 +1,19 @@
 //! Qwen3 decoder-only model implementation.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
+    module::{Module, ModuleParametersExt, Param},
     nn,
-    ops::indexing::TryIndexOp,
+    ops::{
+        arange, concatenate_axis, gather_grouped_rows, gather_qmm, grouped_matmul,
+        indexing::TryIndexOp, quantized_packed_dimension, topk_route_plan, GgufMetadataValue,
+    },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -24,8 +30,8 @@ use crate::{
     models::{
         common::{
             self, apply_rope_and_update_cache, attention_probabilities, batch_seq,
-            finish_attention, project_logits_maybe_quantized, reshape_attention_projection,
-            AttentionInput, CausalLm, SwiGluMlp,
+            finish_attention, project_logits_maybe_quantized, reshape_attention_projection, silu,
+            AttentionInput, CausalLm, SwiGluMlp, TopKRouterScoreFunction,
         },
         input,
     },
@@ -36,8 +42,8 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, StrictLoadConfig,
-        StrictLoadReport,
+        load_arrays_strict, load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -76,11 +82,62 @@ pub struct ModelArgs {
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
     #[serde(default)]
     pub quantization_config: Option<AffineQuantization>,
+    /// Optional exact weight names that use affine quantization.
+    ///
+    /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
+    /// loading uses `Some` for checkpoints mixing packed and dense matrices.
+    #[serde(skip)]
+    pub quantized_weights: Option<HashSet<String>>,
+    /// Routed-expert intermediate size for Qwen3 MoE checkpoints.
+    #[serde(default)]
+    pub moe_intermediate_size: i32,
+    /// Number of routed experts. Zero for dense Qwen3 checkpoints.
+    #[serde(default)]
+    pub num_experts: i32,
+    /// Number of experts selected per token.
+    #[serde(default)]
+    pub num_experts_per_tok: i32,
+    /// Whether selected routing probabilities are normalized.
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+    /// Per-weight affine settings for mixed GGUF Q2/Q3/Q4/Q5/Q6/Q8 tensors.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
 }
 
 impl ModelArgs {
     fn affine_quantization(&self) -> Option<AffineQuantization> {
         self.quantization.or(self.quantization_config)
+    }
+
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        if let Some(config) = self
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(weight_name))
+        {
+            return Some(*config);
+        }
+        let quantization = self.affine_quantization()?;
+        match &self.quantized_weights {
+            Some(names) if !names.contains(weight_name) => None,
+            _ => Some(quantization),
+        }
+    }
+
+    fn is_moe(&self) -> bool {
+        self.num_experts > 0
+    }
+}
+
+fn quantization_for(
+    args: &ModelArgs,
+    prefix: Option<&str>,
+    parameter: &str,
+) -> Option<AffineQuantization> {
+    match prefix {
+        Some(prefix) => args.affine_quantization_for(&format!("{prefix}.{parameter}.weight")),
+        None => args.affine_quantization(),
     }
 }
 
@@ -124,6 +181,26 @@ pub struct Attention {
 impl Attention {
     /// Creates an unloaded attention layer from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_prefix(args, None, stream)
+    }
+
+    fn new_for_layer(
+        args: &ModelArgs,
+        layer_index: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Self::new_with_prefix(
+            args,
+            Some(format!("model.layers.{layer_index}.self_attn")),
+            stream,
+        )
+    }
+
+    fn new_with_prefix(
+        args: &ModelArgs,
+        prefix: Option<String>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
@@ -131,33 +208,32 @@ impl Attention {
         let head_dim = args.head_dim;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let quantization = args.affine_quantization();
         let q_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_heads * head_dim,
             false,
-            quantization,
+            quantization_for(args, prefix.as_deref(), "q_proj"),
             stream,
         )?;
         let k_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             false,
-            quantization,
+            quantization_for(args, prefix.as_deref(), "k_proj"),
             stream,
         )?;
         let v_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             false,
-            quantization,
+            quantization_for(args, prefix.as_deref(), "v_proj"),
             stream,
         )?;
         let o_proj = common::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             false,
-            quantization,
+            quantization_for(args, prefix.as_deref(), "o_proj"),
             stream,
         )?;
 
@@ -294,6 +370,312 @@ where
 /// Qwen3 feed-forward block.
 pub type Mlp = SwiGluMlp;
 
+const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
+const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Packed routed-expert bank for Qwen3 MoE.
+pub struct Experts {
+    /// Number of routed experts.
+    pub num_experts: i32,
+    /// Transformer hidden dimension.
+    pub hidden_dim: i32,
+    /// Per-expert intermediate dimension.
+    pub intermediate_dim: i32,
+    /// Optional affine quantization for packed gate/up weights.
+    pub gate_up_affine: Option<AffineQuantization>,
+    /// Optional affine quantization for packed down weights.
+    pub down_affine: Option<AffineQuantization>,
+    #[param]
+    /// Concatenated gate and up weights for all experts.
+    pub gate_up_proj: Param<Array>,
+    #[param]
+    /// Affine scales for gate/up weights.
+    pub gate_up_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Affine biases for gate/up weights.
+    pub gate_up_proj_biases: Param<Option<Array>>,
+    #[param]
+    /// Down-projection weights for all experts.
+    pub down_proj: Param<Array>,
+    #[param]
+    /// Affine scales for down weights.
+    pub down_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Affine biases for down weights.
+    pub down_proj_biases: Param<Option<Array>>,
+}
+
+type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
+
+impl Experts {
+    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("model.layers.{layer_index}.moe.experts");
+        let gate_up_affine = args.affine_quantization_for(&format!("{prefix}.gate_up_proj"));
+        let down_affine = args.affine_quantization_for(&format!("{prefix}.down_proj"));
+        let projection = |out_features: i32,
+                          in_features: i32,
+                          affine: Option<AffineQuantization>|
+         -> Result<ExpertProjectionParams, Exception> {
+            if let Some(affine) = affine {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            quantized_packed_dimension(in_features, affine.bits),
+                        ],
+                        Dtype::Uint32,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            in_features / affine.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            in_features / affine.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                ))
+            } else {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[args.num_experts, out_features, in_features],
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ))
+            }
+        };
+        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = projection(
+            2 * args.moe_intermediate_size,
+            args.hidden_size,
+            gate_up_affine,
+        )?;
+        let (down_proj, down_proj_scales, down_proj_biases) =
+            projection(args.hidden_size, args.moe_intermediate_size, down_affine)?;
+        Ok(Self {
+            num_experts: args.num_experts,
+            hidden_dim: args.hidden_size,
+            intermediate_dim: args.moe_intermediate_size,
+            gate_up_affine,
+            down_affine,
+            gate_up_proj,
+            gate_up_proj_scales,
+            gate_up_proj_biases,
+            down_proj,
+            down_proj_scales,
+            down_proj_biases,
+        })
+    }
+
+    fn affine_grouped_linear(
+        input: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: &Array,
+        group_ids: &Array,
+        affine: AffineQuantization,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let routes = input.dim(0);
+        let out_features = weight.dim(-2);
+        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+        gather_qmm(
+            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+            weight,
+            scales,
+            biases,
+            &lhs_indices,
+            group_ids,
+            true,
+            affine.group_size,
+            affine.bits,
+            true,
+            stream,
+        )?
+        .reshape(&[routes, out_features], stream)
+    }
+
+    fn forward_chunk(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate_up = if let Some(affine) = self.gate_up_affine {
+            Self::affine_grouped_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up scales"),
+                self.gate_up_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up biases"),
+                &plan.sorted_group_ids,
+                affine,
+                stream,
+            )?
+        } else {
+            grouped_matmul(
+                &hidden,
+                &self.gate_up_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        let current = silu(gate, stream)?.multiply(up, stream)?;
+        let route_output = if let Some(affine) = self.down_affine {
+            Self::affine_grouped_linear(
+                &current,
+                self.down_proj.as_ref(),
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down scales"),
+                self.down_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down biases"),
+                &plan.sorted_group_ids,
+                affine,
+                stream,
+            )?
+        } else {
+            grouped_matmul(
+                &current,
+                &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        common::weighted_route_sum(route_output, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
+            return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
+        }
+        let mut outputs = Vec::new();
+        let mut start = 0;
+        while start < num_tokens {
+            let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
+            outputs.push(self.forward_chunk(
+                &hidden_states.try_index_device((start..end, ..), stream)?,
+                &top_k_index.try_index_device((start..end, ..), stream)?,
+                &top_k_weights.try_index_device((start..end, ..), stream)?,
+                stream,
+            )?);
+            start = end;
+        }
+        concatenate_axis(&outputs, 0, stream)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Qwen3 sparse MoE feed-forward block.
+pub struct SparseMoeBlock {
+    #[param]
+    /// Top-k router.
+    pub gate: common::TopKRouter,
+    #[param]
+    /// Routed expert bank.
+    pub experts: Experts,
+}
+
+impl SparseMoeBlock {
+    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
+        Ok(Self {
+            gate: common::TopKRouter::new(
+                common::TopKRouterConfig {
+                    top_k: args.num_experts_per_tok,
+                    num_experts: args.num_experts,
+                    hidden_size: args.hidden_size,
+                    score_function: TopKRouterScoreFunction::Softmax,
+                    norm_topk_prob: args.norm_topk_prob,
+                    normalization_epsilon: 0.0,
+                    routed_scaling_factor: 1.0,
+                    n_group: 1,
+                    topk_group: 1,
+                    score_correction_bias: false,
+                },
+                stream,
+            )?,
+            experts: Experts::new(args, layer_index, stream)?,
+        })
+    }
+
+    fn forward_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let routing =
+            self.gate
+                .forward_with_observer(&flat, stream, &format!("{prefix}.gate"), observer)?;
+        let output = self
+            .experts
+            .forward(&flat, &routing.indices, &routing.weights, stream)?;
+        observer.observe(&format!("{prefix}.experts.output"), &output)?;
+        output.reshape(shape, stream)
+    }
+}
+
+impl Module<&Array> for SparseMoeBlock {
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let shape = input.shape();
+        let flat = input.reshape(&[-1, shape[2]], stream)?;
+        let (indices, weights) = self.gate.forward(&flat, stream)?;
+        self.experts
+            .forward(&flat, &indices, &weights, stream)?
+            .reshape(shape, stream)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.gate.training_mode(mode);
+        self.experts.training_mode(mode);
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Qwen3 decoder block.
 pub struct TransformerBlock {
@@ -310,7 +692,11 @@ pub struct TransformerBlock {
     #[quantizable]
     #[param]
     /// Feed-forward layer.
-    pub mlp: Mlp,
+    pub mlp: Option<Mlp>,
+
+    #[param]
+    /// Sparse routed-expert layer for Qwen3 MoE.
+    pub moe: Option<SparseMoeBlock>,
 
     #[param]
     /// Pre-attention RMSNorm.
@@ -324,17 +710,50 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     /// Creates an unloaded decoder block from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_for_layer(args, 0, stream)
+    }
+
+    fn new_for_layer(
+        args: &ModelArgs,
+        layer_index: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let num_attention_heads = args.num_attention_heads;
         let hidden_size = args.hidden_size;
 
-        let self_attn = Attention::new(args, stream)?;
-        let mlp = SwiGluMlp::unloaded_with_quantization(
-            args.hidden_size,
-            args.intermediate_size,
-            false,
-            args.affine_quantization(),
-            stream,
-        )?;
+        let self_attn = Attention::new_for_layer(args, layer_index, stream)?;
+        let mlp = if args.is_moe() {
+            None
+        } else {
+            let mlp_prefix = format!("model.layers.{layer_index}.mlp");
+            Some(SwiGluMlp {
+                gate_proj: common::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.intermediate_size,
+                    false,
+                    args.affine_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
+                    stream,
+                )?,
+                down_proj: common::unloaded_maybe_quantized_linear(
+                    args.intermediate_size,
+                    args.hidden_size,
+                    false,
+                    args.affine_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
+                    stream,
+                )?,
+                up_proj: common::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.intermediate_size,
+                    false,
+                    args.affine_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
+                    stream,
+                )?,
+            })
+        };
+        let moe = args
+            .is_moe()
+            .then(|| SparseMoeBlock::new(args, layer_index, stream))
+            .transpose()?;
         let input_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let post_attention_layernorm =
@@ -345,6 +764,7 @@ impl TransformerBlock {
             hidden_size,
             self_attn,
             mlp,
+            moe,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -385,23 +805,29 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
         observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
 
-        observer.observe(&format!("{prefix}.residual_before_mlp"), &h)?;
+        let feed_forward_name = if self.moe.is_some() { "moe" } else { "mlp" };
+        observer.observe(&format!("{prefix}.residual_before_{feed_forward_name}"), &h)?;
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
         observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
-        let r = self.mlp.forward_with_observer(
-            &post_normed,
-            stream,
-            &format!("{prefix}.mlp"),
-            observer,
-        )?;
-        observer.observe(&format!("{prefix}.mlp_output"), &r)?;
-        observer.observe(&format!("{prefix}.residual_delta_mlp"), &r)?;
+        let r = if let Some(moe) = &mut self.moe {
+            moe.forward_with_observer(&post_normed, stream, &format!("{prefix}.moe"), observer)?
+        } else {
+            self.mlp
+                .as_mut()
+                .expect("dense Qwen3 MLP")
+                .forward_with_observer(&post_normed, stream, &format!("{prefix}.mlp"), observer)?
+        };
+        observer.observe(&format!("{prefix}.{feed_forward_name}_output"), &r)?;
+        observer.observe(&format!("{prefix}.residual_delta_{feed_forward_name}"), &r)?;
         let output = h.add(r, stream)?;
         let output = observer
             .intervene(&format!("{prefix}.output"), &output)?
             .unwrap_or(output);
         observer.observe(&format!("{prefix}.output"), &output)?;
-        observer.observe(&format!("{prefix}.residual_after_mlp"), &output)?;
+        observer.observe(
+            &format!("{prefix}.residual_after_{feed_forward_name}"),
+            &output,
+        )?;
         Ok(output)
     }
 }
@@ -431,13 +857,25 @@ where
         let h = x.add(r, stream)?;
 
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        let r = self.mlp.forward(&post_normed, stream)?;
+        let r = if let Some(moe) = &mut self.moe {
+            moe.forward(&post_normed, stream)?
+        } else {
+            self.mlp
+                .as_mut()
+                .expect("dense Qwen3 MLP")
+                .forward(&post_normed, stream)?
+        };
         h.add(r, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
         <Attention as Module<AttentionInput<'_, C>>>::training_mode(&mut self.self_attn, mode);
-        self.mlp.training_mode(mode);
+        if let Some(mlp) = &mut self.mlp {
+            mlp.training_mode(mode);
+        }
+        if let Some(moe) = &mut self.moe {
+            moe.training_mode(mode);
+        }
         self.input_layernorm.training_mode(mode);
         self.post_attention_layernorm.training_mode(mode);
     }
@@ -477,11 +915,11 @@ impl Qwen3Model {
         let embed_tokens = common::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization(),
+            args.affine_quantization_for("model.embed_tokens.weight"),
             stream,
         )?;
         let layers = (0..num_hidden_layers)
-            .map(|_| TransformerBlock::new(args, stream))
+            .map(|layer_index| TransformerBlock::new_for_layer(args, layer_index, stream))
             .collect::<Result<Vec<_>, _>>()?;
         let norm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
@@ -503,7 +941,7 @@ impl Qwen3Model {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache,
+        C: KeyValueCache + Default,
     {
         let ModelInput {
             inputs,
@@ -529,7 +967,7 @@ impl Qwen3Model {
         }
 
         if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| None).collect();
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
@@ -564,7 +1002,7 @@ pub struct ModelInput<'a, C> {
 
 impl<C> Module<ModelInput<'_, C>> for Qwen3Model
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Output = Array;
 
@@ -595,7 +1033,7 @@ where
         };
 
         if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| None).collect();
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
@@ -645,7 +1083,7 @@ impl Model {
                 common::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.affine_quantization(),
+                    args.affine_quantization_for("lm_head.weight"),
                     stream,
                 )?,
             )
@@ -673,7 +1111,7 @@ impl Model {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache,
+        C: KeyValueCache + Default,
     {
         let out = self.model.forward_with_observer(input, stream, observer)?;
         observer.observe("model.output", &out)?;
@@ -690,7 +1128,7 @@ impl Model {
 
 impl<C> Module<ModelInput<'_, C>> for Model
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     type Output = Array;
 
@@ -731,6 +1169,436 @@ pub fn get_qwen3_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Er
     let model_args: ModelArgs = serde_json::from_reader(file)?;
 
     Ok(model_args)
+}
+
+pub(crate) struct LoadedQwen3Gguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads a Qwen3 GGUF checkpoint.
+///
+/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
+/// supported. The quantized formats are consumed in the packed affine
+/// representation emitted by MLX's GGUF loader.
+pub fn load_qwen3_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_qwen3_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_qwen3_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3Gguf, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    load_qwen3_gguf_data(arrays, metadata, stream, weights_stream)
+}
+
+pub(crate) fn load_qwen3_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3Gguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "qwen3" | "qwen3moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports qwen3 and qwen3moe"
+        )));
+    }
+    let is_moe = architecture == "qwen3moe";
+
+    let mut args = qwen3_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
+    let mut translated = HashMap::with_capacity(arrays.len());
+    for (name, value) in arrays {
+        let name = if is_moe {
+            translate_qwen3_gguf_weight_name(&name, true)
+        } else {
+            translate_gguf_weight_name(&name)
+        };
+        if translated.insert(name.clone(), value).is_some() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen3 GGUF tensors collide after translating {name:?}"
+            )));
+        }
+    }
+    if is_moe {
+        pack_qwen3_moe_expert_banks(&mut translated, &args, weights_stream)?;
+    }
+    let configs = qwen3_gguf_quantized_weight_configs(&translated)?;
+    args.quantized_weights = Some(configs.keys().cloned().collect());
+    args.quantized_weight_configs = Some(configs);
+    args.quantization = None;
+
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    let eos_token_ids =
+        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+
+    Ok(LoadedQwen3Gguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn qwen3_args_from_gguf(
+    arrays: &HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let is_moe = architecture == "qwen3moe";
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("GGUF KV-head count exceeds i32".into()))?
+        .unwrap_or(num_attention_heads);
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
+        })?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+    };
+
+    Ok(ModelArgs {
+        model_type: if is_moe { "qwen3_moe" } else { "qwen3" }.to_string(),
+        hidden_size,
+        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
+        intermediate_size: if is_moe {
+            gguf_optional_i64(metadata, &key("feed_forward_length"), stream)?
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|_| {
+                    Error::UnsupportedArchitecture("GGUF feed-forward length exceeds i32".into())
+                })?
+                .unwrap_or(0)
+        } else {
+            gguf_i32(metadata, &key("feed_forward_length"), stream)?
+        },
+        num_attention_heads,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
+        vocab_size,
+        num_key_value_heads,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
+            .unwrap_or(1_000_000.0),
+        head_dim,
+        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        rope_scaling: gguf_rope_scaling(metadata, architecture, stream)?,
+        quantization: None,
+        quantization_config: None,
+        quantized_weights: None,
+        moe_intermediate_size: if is_moe {
+            gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+        } else {
+            0
+        },
+        num_experts: if is_moe {
+            gguf_i32(metadata, &key("expert_count"), stream)?
+        } else {
+            0
+        },
+        num_experts_per_tok: if is_moe {
+            gguf_i32(metadata, &key("expert_used_count"), stream)?
+        } else {
+            0
+        },
+        norm_topk_prob: is_moe,
+        quantized_weight_configs: None,
+    })
+}
+
+fn gguf_rope_scaling(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    stream: &Stream,
+) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
+    let scaling_type_key = format!("{architecture}.rope.scaling.type");
+    let Some(scaling_type) = gguf_optional_string(metadata, &scaling_type_key)? else {
+        return Ok(None);
+    };
+    match scaling_type.as_str() {
+        "none" | "default" => Ok(None),
+        "linear" => {
+            let factor_key = format!("{architecture}.rope.scaling.factor");
+            let factor = gguf_optional_f32(metadata, &factor_key, stream)?.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "linear GGUF RoPE scaling is missing qwen3.rope.scaling.factor".into(),
+                )
+            })?;
+            Ok(Some(HashMap::from([
+                (
+                    "rope_type".to_string(),
+                    FloatOrString::String("linear".to_string()),
+                ),
+                ("factor".to_string(), FloatOrString::Float(factor)),
+            ])))
+        }
+        other => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF RoPE scaling type {other:?} is not supported by the Qwen3 GGUF loader"
+        ))),
+    }
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    translate_qwen3_gguf_weight_name(name, false)
+}
+
+fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
+    const ROOTS: [(&str, &str); 3] = [
+        ("token_embd", "model.embed_tokens"),
+        ("output_norm", "model.norm"),
+        ("output", "lm_head"),
+    ];
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    if is_moe {
+        const MOE_PARAMETERS: [(&str, &str); 4] = [
+            ("ffn_gate_inp", "moe.gate"),
+            ("ffn_gate_exps", "moe.experts.gate_proj"),
+            ("ffn_up_exps", "moe.experts.up_proj"),
+            ("ffn_down_exps", "moe.experts.down_proj"),
+        ];
+        for (source, target) in MOE_PARAMETERS {
+            if parameter == source || parameter.starts_with(&format!("{source}.")) {
+                let mut suffix = parameter.strip_prefix(source).unwrap_or_default();
+                if target.starts_with("moe.experts.") {
+                    suffix = match suffix {
+                        ".weight" => "",
+                        ".scales" => "_scales",
+                        ".biases" => "_biases",
+                        other => other,
+                    };
+                }
+                return format!("model.layers.{layer}.{target}{suffix}");
+            }
+        }
+    }
+
+    const PARAMETERS: [(&str, &str); 12] = [
+        ("attn_q_norm", "self_attn.q_norm"),
+        ("attn_k_norm", "self_attn.k_norm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("attn_norm", "input_layernorm"),
+        ("ffn_norm", "post_attention_layernorm"),
+        ("ffn_gate", "mlp.gate_proj"),
+        ("ffn_down", "mlp.down_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("rope_freqs", "rope_freqs"),
+    ];
+    for (source, target) in PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    name.to_string()
+}
+
+fn pack_qwen3_moe_expert_banks(
+    arrays: &mut HashMap<String, Array>,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<(), Error> {
+    for layer in 0..args.num_hidden_layers {
+        let prefix = format!("model.layers.{layer}.moe.experts");
+        let affine = arrays.contains_key(&format!("{prefix}.gate_proj_scales"))
+            || arrays.contains_key(&format!("{prefix}.up_proj_scales"));
+        let suffixes: &[&str] = if affine {
+            &["", "_scales", "_biases"]
+        } else {
+            &[""]
+        };
+        for suffix in suffixes {
+            let gate_name = format!("{prefix}.gate_proj{suffix}");
+            let up_name = format!("{prefix}.up_proj{suffix}");
+            let gate = arrays.remove(&gate_name).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3 MoE GGUF is missing expert tensor {gate_name:?}"
+                ))
+            })?;
+            let up = arrays.remove(&up_name).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3 MoE GGUF is missing expert tensor {up_name:?}"
+                ))
+            })?;
+            if gate.shape().len() != 3
+                || gate.shape()[0] != args.num_experts
+                || gate.shape()[0] != up.shape()[0]
+                || gate.shape()[2] != up.shape()[2]
+            {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3 MoE gate/up expert shapes are incompatible: {:?} and {:?}",
+                    gate.shape(),
+                    up.shape()
+                )));
+            }
+            arrays.insert(
+                format!("{prefix}.gate_up_proj{suffix}"),
+                concatenate_axis(&[gate, up], 1, stream)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn qwen3_gguf_quantized_weight_configs(
+    arrays: &HashMap<String, Array>,
+) -> Result<HashMap<String, AffineQuantization>, Error> {
+    let mut configs = HashMap::new();
+    for (scales_name, scales) in arrays {
+        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
+            format!("{prefix}.weight")
+        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
+            prefix.to_string()
+        } else {
+            continue;
+        };
+        let Some(weight) = arrays.get(&weight_name) else {
+            continue;
+        };
+        let config = qwen3_gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
+        configs.insert(weight_name, config);
+    }
+    Ok(configs)
+}
+
+fn qwen3_gguf_affine_quantization(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    weight_name: &str,
+) -> Result<AffineQuantization, Error> {
+    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
+}
+
+fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+    gguf_optional_string(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    let value = gguf_i64(metadata, key, stream)?;
+    i32::try_from(value).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
+}
+
+fn gguf_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<i64>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<f32>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -794,7 +1662,7 @@ pub fn load_qwen3_model_quantized(
 
 impl<C> CausalLm<Vec<Option<C>>> for Model
 where
-    C: KeyValueCache,
+    C: KeyValueCache + Default,
 {
     fn prefill_input_logits(
         &mut self,
@@ -838,18 +1706,428 @@ pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use safemlx::{
+        module::ModuleParameters,
         ops::indexing::{NewAxis, TryIndexOp},
+        ops::GgufMetadataValue,
         transforms::eval,
         Array,
     };
 
     use crate::{
-        cache::ConcatKeyValueCache,
+        cache::{ConcatKeyValueCache, KeyValueCache},
+        models::common::CausalLm,
         models::qwen3::{load_qwen3_model, load_qwen3_tokenizer},
+        quantization::AffineQuantization,
     };
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
+
+    fn tiny_args() -> super::ModelArgs {
+        super::ModelArgs {
+            model_type: "qwen3".into(),
+            hidden_size: 32,
+            num_hidden_layers: 1,
+            intermediate_size: 64,
+            num_attention_heads: 1,
+            rms_norm_eps: 1e-6,
+            vocab_size: 32,
+            num_key_value_heads: 1,
+            max_position_embeddings: 128,
+            rope_theta: 1_000_000.0,
+            head_dim: 32,
+            tie_word_embeddings: true,
+            rope_scaling: None,
+            quantization: None,
+            quantization_config: None,
+            quantized_weights: None,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            norm_topk_prob: false,
+            quantized_weight_configs: None,
+        }
+    }
+
+    #[test]
+    fn translates_gguf_qwen3_weight_names() {
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.attn_q.weight"),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.attn_q_norm.weight"),
+            "model.layers.3.self_attn.q_norm.weight"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.attn_k_norm.weight"),
+            "model.layers.3.self_attn.k_norm.weight"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("token_embd.weight"),
+            "model.embed_tokens.weight"
+        );
+    }
+
+    #[test]
+    fn translates_qwen3_moe_experts_and_mixed_affine_shapes() {
+        assert_eq!(
+            super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_inp.weight", true),
+            "model.layers.3.moe.gate.weight"
+        );
+        assert_eq!(
+            super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_exps.scales", true),
+            "model.layers.3.moe.experts.gate_proj_scales"
+        );
+        assert_eq!(
+            super::translate_qwen3_gguf_weight_name("blk.3.ffn_down_exps.weight", true),
+            "model.layers.3.moe.experts.down_proj"
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[4096, 256], &[4096, 64], "q_proj").unwrap(),
+            AffineQuantization::new(32, 4).unwrap()
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[512, 512], &[512, 64], "k_proj").unwrap(),
+            AffineQuantization::new(32, 8).unwrap()
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[4096, 320], &[4096, 64], "v_proj").unwrap(),
+            AffineQuantization::new(32, 5).unwrap()
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[1024, 192], &[1024, 64], "down_proj").unwrap(),
+            AffineQuantization::new(16, 6).unwrap()
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[1024, 64], &[1024, 64], "q2_proj").unwrap(),
+            AffineQuantization::new(16, 2).unwrap()
+        );
+        assert_eq!(
+            super::qwen3_gguf_affine_quantization(&[1024, 96], &[1024, 64], "q3_proj").unwrap(),
+            AffineQuantization::new(16, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn qwen3_moe_builds_packed_expert_parameter_tree() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut args = tiny_args();
+        args.model_type = "qwen3_moe".into();
+        args.intermediate_size = 0;
+        args.moe_intermediate_size = 8;
+        args.num_experts = 4;
+        args.num_experts_per_tok = 2;
+        args.norm_topk_prob = true;
+        args.quantized_weight_configs = Some(HashMap::from([
+            (
+                "model.layers.0.moe.experts.gate_up_proj".into(),
+                AffineQuantization::new(32, 4).unwrap(),
+            ),
+            (
+                "model.layers.0.moe.experts.down_proj".into(),
+                AffineQuantization::new(32, 4).unwrap(),
+            ),
+        ]));
+        let model = super::Model::new(args, ctx.stream()).unwrap();
+        let params = model.parameters().flatten();
+        assert!(params.contains_key("model.layers.0.moe.gate.weight"));
+        assert_eq!(
+            params["model.layers.0.moe.experts.gate_up_proj"].shape(),
+            &[4, 16, 4]
+        );
+        assert_eq!(
+            params["model.layers.0.moe.experts.down_proj"].shape(),
+            &[4, 32, 1]
+        );
+        assert!(!params.contains_key("model.layers.0.mlp.gate_proj.weight"));
+    }
+
+    #[test]
+    fn mixed_quantization_builds_only_selected_qwen3_parameters() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut args = tiny_args();
+        args.quantization = Some(AffineQuantization::new(32, 4).unwrap());
+        args.quantized_weights = Some(HashSet::from([
+            "model.layers.0.self_attn.q_proj.weight".to_string()
+        ]));
+
+        let model = super::Model::new(args, ctx.stream()).unwrap();
+        let params = model.parameters().flatten();
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
+        assert!(params.contains_key("model.layers.0.self_attn.k_proj.weight"));
+        assert!(!params.contains_key("model.layers.0.self_attn.k_proj.scales"));
+    }
+
+    #[test]
+    fn parses_qwen3_gguf_metadata_with_explicit_head_dim() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let metadata = HashMap::from([
+            (
+                "qwen3.embedding_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1024u32], &[1])),
+            ),
+            (
+                "qwen3.block_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[28u32], &[1])),
+            ),
+            (
+                "qwen3.feed_forward_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[3072u32], &[1])),
+            ),
+            (
+                "qwen3.attention.head_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[16u32], &[1])),
+            ),
+            (
+                "qwen3.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[8u32], &[1])),
+            ),
+            (
+                "qwen3.attention.key_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[128u32], &[1])),
+            ),
+            (
+                "qwen3.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Array(Array::from(1e-6f32)),
+            ),
+            (
+                "qwen3.context_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[40960u32], &[1])),
+            ),
+            (
+                "qwen3.rope.freq_base".into(),
+                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+            ),
+        ]);
+        let args =
+            super::qwen3_args_from_gguf(&HashMap::new(), &metadata, "qwen3", stream).unwrap();
+
+        assert_eq!(args.head_dim, 128);
+        assert_eq!(args.num_key_value_heads, 8);
+        assert_eq!(args.vocab_size, 32);
+        assert!(args.tie_word_embeddings);
+    }
+
+    #[test]
+    fn loads_dense_qwen3_from_gguf_named_arrays() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let source = super::Model::new(tiny_args(), stream).unwrap();
+        let arrays = source
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let name = name
+                    .replace("model.layers.", "blk.")
+                    .replace("self_attn.q_norm", "attn_q_norm")
+                    .replace("self_attn.k_norm", "attn_k_norm")
+                    .replace("self_attn.q_proj", "attn_q")
+                    .replace("self_attn.k_proj", "attn_k")
+                    .replace("self_attn.v_proj", "attn_v")
+                    .replace("self_attn.o_proj", "attn_output")
+                    .replace("input_layernorm", "attn_norm")
+                    .replace("post_attention_layernorm", "ffn_norm")
+                    .replace("mlp.gate_proj", "ffn_gate")
+                    .replace("mlp.down_proj", "ffn_down")
+                    .replace("mlp.up_proj", "ffn_up")
+                    .replace("model.embed_tokens", "token_embd")
+                    .replace("model.norm", "output_norm");
+                (name, value.clone())
+            })
+            .collect();
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen3".into()),
+            ),
+            (
+                "qwen3.embedding_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[32u32], &[1])),
+            ),
+            (
+                "qwen3.block_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+            ),
+            (
+                "qwen3.feed_forward_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[64u32], &[1])),
+            ),
+            (
+                "qwen3.attention.head_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+            ),
+            (
+                "qwen3.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+            ),
+            (
+                "qwen3.attention.key_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[32u32], &[1])),
+            ),
+            (
+                "qwen3.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Array(Array::from(1e-6f32)),
+            ),
+            (
+                "qwen3.context_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[128u32], &[1])),
+            ),
+            (
+                "qwen3.rope.freq_base".into(),
+                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+            ),
+        ]);
+
+        let loaded = super::load_qwen3_gguf_data(arrays, metadata, stream, stream).unwrap();
+        assert_eq!(loaded.model.args.head_dim, 32);
+        assert_eq!(loaded.eos_token_ids, vec![1]);
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_MOE_GGUF and Metal"]
+    fn strict_loads_and_runs_real_qwen3_moe_gguf() {
+        let gguf_file = std::path::PathBuf::from(
+            std::env::var("QWEN3_MOE_GGUF")
+                .expect("set QWEN3_MOE_GGUF to a local Qwen3 MoE checkpoint"),
+        );
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let weights_ctx =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        assert_eq!(model.model_type(), "qwen3_moe");
+        assert_eq!(model.args.num_hidden_layers, 48);
+        assert_eq!(model.args.num_experts, 128);
+        assert_eq!(model.args.num_experts_per_tok, 8);
+
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            crate::models::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, 151936]);
+        assert_eq!(cache.len(), 48);
+        assert!(cache
+            .iter()
+            .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 2)));
+
+        let next = Array::from_slice(&[151667_u32], &[1, 1]);
+        let logits = CausalLm::decode_logits(&mut model, &next, &mut cache, stream).unwrap();
+        assert_eq!(logits.shape(), &[1, 151936]);
+        assert!(cache
+            .iter()
+            .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 3)));
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_Q4_K_M_GGUF and Metal"]
+    fn strict_loads_and_runs_real_qwen3_q4_k_m_gguf() {
+        let gguf_file = std::path::PathBuf::from(
+            std::env::var("QWEN3_Q4_K_M_GGUF")
+                .expect("set QWEN3_Q4_K_M_GGUF to a local Qwen3 checkpoint"),
+        );
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let weights_ctx =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        assert!(model
+            .args
+            .quantized_weight_configs
+            .as_ref()
+            .is_some_and(|configs| configs.values().any(|config| config.bits == 4)));
+
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            crate::models::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
+        assert_eq!(cache.len(), model.args.num_hidden_layers as usize);
+    }
+
+    fn strict_loads_and_runs_real_qwen3_group16_gguf(env_var: &str, bits: i32) {
+        let gguf_file = std::path::PathBuf::from(std::env::var(env_var).unwrap_or_else(|_| {
+            panic!("set {env_var} to a local Qwen3 group-16 K-quant checkpoint")
+        }));
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let weights_ctx =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        assert!(model
+            .args
+            .quantized_weight_configs
+            .as_ref()
+            .is_some_and(|configs| configs
+                .values()
+                .any(|config| config.group_size == 16 && config.bits == bits)));
+
+        // Keep this above every QMV/QMM crossover so the real-checkpoint test
+        // exercises the tiled group-16 prefill kernels in every projection.
+        let token_ids = vec![1_u32; 64];
+        let tokens = Array::from_slice(&token_ids, &[1, 64]);
+        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            crate::models::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
+        assert_eq!(cache.len(), model.args.num_hidden_layers as usize);
+        assert!(cache
+            .iter()
+            .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 64)));
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_Q2_K_GGUF and Metal"]
+    fn strict_loads_and_runs_real_qwen3_q2_k_gguf() {
+        strict_loads_and_runs_real_qwen3_group16_gguf("QWEN3_Q2_K_GGUF", 2);
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_Q3_K_GGUF and Metal"]
+    fn strict_loads_and_runs_real_qwen3_q3_k_gguf() {
+        strict_loads_and_runs_real_qwen3_group16_gguf("QWEN3_Q3_K_GGUF", 3);
+    }
+
+    #[test]
+    #[ignore = "requires QWEN3_Q6_K_GGUF and Metal"]
+    fn strict_loads_and_runs_real_qwen3_q6_k_gguf() {
+        strict_loads_and_runs_real_qwen3_group16_gguf("QWEN3_Q6_K_GGUF", 6);
+    }
 
     #[test]
     #[ignore = "requires local model files"]

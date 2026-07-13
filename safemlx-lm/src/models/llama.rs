@@ -1,6 +1,9 @@
 //! Llama decoder-only model implementation.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use safemlx::{
     error::Exception,
@@ -8,6 +11,7 @@ use safemlx::{
     module::{Module, ModuleParametersExt},
     nn,
     ops::indexing::TryIndexOp,
+    ops::GgufMetadataValue,
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -32,8 +36,8 @@ use crate::{
     quantization::AffineQuantization,
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
     weights::{
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, StrictLoadConfig,
-        StrictLoadReport,
+        load_arrays_strict, load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -64,6 +68,9 @@ pub struct ModelArgs {
     /// RoPE base frequency.
     pub rope_theta: f32,
     #[serde(default)]
+    /// Whether RoPE uses adjacent-pair ordering instead of split-half ordering.
+    pub rope_traditional: bool,
+    #[serde(default)]
     /// Per-head attention dimension.
     pub head_dim: i32,
     #[serde(default = "default_true")]
@@ -83,11 +90,36 @@ pub struct ModelArgs {
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
     #[serde(default)]
     pub quantization_config: Option<AffineQuantization>,
+    /// Optional exact weight names that use affine quantization.
+    ///
+    /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
+    /// loading uses `Some` to represent files containing a mixture of packed
+    /// and dense matrices.
+    #[serde(skip)]
+    pub quantized_weights: Option<HashSet<String>>,
+    /// Exact affine settings for mixed GGUF tensors.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
 }
 
 impl ModelArgs {
     fn affine_quantization(&self) -> Option<AffineQuantization> {
         self.quantization.or(self.quantization_config)
+    }
+
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        if let Some(config) = self
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(weight_name))
+        {
+            return Some(*config);
+        }
+        let quantization = self.affine_quantization()?;
+        match &self.quantized_weights {
+            Some(names) if !names.contains(weight_name) => None,
+            _ => Some(quantization),
+        }
     }
 }
 
@@ -133,6 +165,26 @@ pub struct Attention {
 impl Attention {
     /// Creates an unloaded attention layer from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_prefix(args, None, stream)
+    }
+
+    fn new_for_layer(
+        args: &ModelArgs,
+        layer_index: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Self::new_with_prefix(
+            args,
+            Some(format!("model.layers.{layer_index}.self_attn")),
+            stream,
+        )
+    }
+
+    fn new_with_prefix(
+        args: &ModelArgs,
+        prefix: Option<String>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
@@ -144,35 +196,67 @@ impl Attention {
             dim,
             n_heads * head_dim,
             args.attention_bias,
-            args.affine_quantization(),
+            prefix
+                .as_ref()
+                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.q_proj.weight")))
+                .or_else(|| {
+                    prefix
+                        .is_none()
+                        .then(|| args.affine_quantization())
+                        .flatten()
+                }),
             stream,
         )?;
         let k_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
-            args.affine_quantization(),
+            prefix
+                .as_ref()
+                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.k_proj.weight")))
+                .or_else(|| {
+                    prefix
+                        .is_none()
+                        .then(|| args.affine_quantization())
+                        .flatten()
+                }),
             stream,
         )?;
         let v_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
-            args.affine_quantization(),
+            prefix
+                .as_ref()
+                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.v_proj.weight")))
+                .or_else(|| {
+                    prefix
+                        .is_none()
+                        .then(|| args.affine_quantization())
+                        .flatten()
+                }),
             stream,
         )?;
         let o_proj = common::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             args.attention_bias,
-            args.affine_quantization(),
+            prefix
+                .as_ref()
+                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.o_proj.weight")))
+                .or_else(|| {
+                    prefix
+                        .is_none()
+                        .then(|| args.affine_quantization())
+                        .flatten()
+                }),
             stream,
         )?;
 
         let rope = initialize_rope(
             head_dim,
             args.rope_theta,
-            false,
+            args.rope_traditional,
             &args.rope_scaling,
             args.max_position_embeddings,
             stream,
@@ -313,17 +397,42 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     /// Creates an unloaded decoder block from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_for_layer(args, 0, stream)
+    }
+
+    fn new_for_layer(
+        args: &ModelArgs,
+        layer_index: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let num_attention_heads = args.num_attention_heads;
         let hidden_size = args.hidden_size;
 
-        let self_attn = Attention::new(args, stream)?;
-        let mlp = SwiGluMlp::unloaded_with_quantization(
-            args.hidden_size,
-            args.intermediate_size,
-            args.mlp_bias,
-            args.affine_quantization(),
-            stream,
-        )?;
+        let self_attn = Attention::new_for_layer(args, layer_index, stream)?;
+        let mlp_prefix = format!("model.layers.{layer_index}.mlp");
+        let mlp = SwiGluMlp {
+            gate_proj: common::unloaded_maybe_quantized_linear(
+                args.hidden_size,
+                args.intermediate_size,
+                args.mlp_bias,
+                args.affine_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
+                stream,
+            )?,
+            down_proj: common::unloaded_maybe_quantized_linear(
+                args.intermediate_size,
+                args.hidden_size,
+                args.mlp_bias,
+                args.affine_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
+                stream,
+            )?,
+            up_proj: common::unloaded_maybe_quantized_linear(
+                args.hidden_size,
+                args.intermediate_size,
+                args.mlp_bias,
+                args.affine_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
+                stream,
+            )?,
+        };
         let input_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let post_attention_layernorm =
@@ -466,11 +575,11 @@ impl LlamaModel {
         let embed_tokens = common::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization(),
+            args.affine_quantization_for("model.embed_tokens.weight"),
             stream,
         )?;
         let layers = (0..num_hidden_layers)
-            .map(|_| TransformerBlock::new(args, stream))
+            .map(|layer_index| TransformerBlock::new_for_layer(args, layer_index, stream))
             .collect::<Result<Vec<_>, _>>()?;
         let norm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
@@ -642,7 +751,7 @@ impl Model {
                 common::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.affine_quantization(),
+                    args.affine_quantization_for("lm_head.weight"),
                     stream,
                 )?,
             )
@@ -737,6 +846,316 @@ pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Er
     }
 
     Ok(model_args)
+}
+
+pub(crate) struct LoadedLlamaGguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads a Llama-family GGUF checkpoint.
+///
+/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
+/// supported. Quantized formats are consumed in the packed affine
+/// representation emitted by MLX's GGUF loader.
+pub fn load_llama_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_llama_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_llama_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedLlamaGguf, Error> {
+    let gguf_file = gguf_file.as_ref();
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    load_llama_gguf_data(arrays, metadata, stream, weights_stream)
+}
+
+pub(crate) fn load_llama_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedLlamaGguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if architecture != "llama" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; the initial GGUF loader supports only llama"
+        )));
+    }
+
+    let mut args = llama_args_from_gguf(&arrays, &metadata, weights_stream)?;
+    let translated = arrays
+        .into_iter()
+        .map(|(name, value)| (translate_gguf_weight_name(&name), value))
+        .collect::<HashMap<_, _>>();
+
+    let quantized_weight_configs = llama_gguf_quantized_weight_configs(&translated)?;
+    args.quantized_weights = Some(
+        translated
+            .keys()
+            .filter_map(|name| {
+                name.strip_suffix(".scales")
+                    .map(|prefix| format!("{prefix}.weight"))
+            })
+            .collect(),
+    );
+    args.quantization = None;
+    args.quantized_weight_configs = Some(quantized_weight_configs);
+
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    let eos_token_ids =
+        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+
+    Ok(LoadedLlamaGguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn llama_gguf_quantized_weight_configs(
+    arrays: &HashMap<String, Array>,
+) -> Result<HashMap<String, AffineQuantization>, Error> {
+    let mut configs = HashMap::new();
+    for (scales_name, scales) in arrays {
+        let Some(prefix) = scales_name.strip_suffix(".scales") else {
+            continue;
+        };
+        let weight_name = format!("{prefix}.weight");
+        let Some(weight) = arrays.get(&weight_name) else {
+            continue;
+        };
+        let config = crate::quantization::gguf_affine_quantization(
+            weight.shape(),
+            scales.shape(),
+            &weight_name,
+        )?;
+        configs.insert(weight_name, config);
+    }
+    Ok(configs)
+}
+
+fn llama_args_from_gguf(
+    arrays: &HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let hidden_size = gguf_i32(metadata, "llama.embedding_length", stream)?;
+    let num_attention_heads = gguf_i32(metadata, "llama.attention.head_count", stream)?;
+    let num_key_value_heads = gguf_optional_i64(metadata, "llama.attention.head_count_kv", stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("GGUF KV-head count exceeds i32".into()))?
+        .unwrap_or(num_attention_heads);
+    let head_dim = gguf_optional_i64(metadata, "llama.attention.key_length", stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
+        })?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let rope_theta = gguf_optional_f32(metadata, "llama.rope.freq_base", stream)?
+        .unwrap_or_else(default_rope_theta);
+    let rope_scaling = gguf_rope_scaling(metadata, stream)?;
+    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => gguf_i32(metadata, "llama.vocab_size", stream)?,
+    };
+
+    Ok(ModelArgs {
+        model_type: "llama".to_string(),
+        hidden_size,
+        num_hidden_layers: gguf_i32(metadata, "llama.block_count", stream)?,
+        intermediate_size: gguf_i32(metadata, "llama.feed_forward_length", stream)?,
+        num_attention_heads,
+        rms_norm_eps: gguf_f32(metadata, "llama.attention.layer_norm_rms_epsilon", stream)?,
+        vocab_size,
+        num_key_value_heads,
+        max_position_embeddings: gguf_i32(metadata, "llama.context_length", stream)?,
+        rope_theta,
+        rope_traditional: true,
+        head_dim,
+        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        attention_bias: arrays.keys().any(|name| {
+            name.starts_with("blk.")
+                && matches!(
+                    name.rsplit_once('.'),
+                    Some((prefix, "bias")) if prefix.ends_with("attn_q")
+                        || prefix.ends_with("attn_k")
+                        || prefix.ends_with("attn_v")
+                        || prefix.ends_with("attn_output")
+                )
+        }),
+        mlp_bias: arrays.keys().any(|name| {
+            name.starts_with("blk.")
+                && matches!(
+                    name.rsplit_once('.'),
+                    Some((prefix, "bias")) if prefix.ends_with("ffn_gate")
+                        || prefix.ends_with("ffn_down")
+                        || prefix.ends_with("ffn_up")
+                )
+        }),
+        rope_scaling,
+        quantization: None,
+        quantization_config: None,
+        quantized_weights: None,
+        quantized_weight_configs: None,
+    })
+}
+
+fn gguf_rope_scaling(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
+    let Some(scaling_type) = gguf_optional_string(metadata, "llama.rope.scaling.type")? else {
+        return Ok(None);
+    };
+    match scaling_type.as_str() {
+        "none" | "default" => Ok(None),
+        "linear" => {
+            let factor = gguf_optional_f32(metadata, "llama.rope.scaling.factor", stream)?
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "linear GGUF RoPE scaling is missing llama.rope.scaling.factor".into(),
+                    )
+                })?;
+            Ok(Some(HashMap::from([
+                (
+                    "rope_type".to_string(),
+                    FloatOrString::String("linear".to_string()),
+                ),
+                ("factor".to_string(), FloatOrString::Float(factor)),
+            ])))
+        }
+        other => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF RoPE scaling type {other:?} is not supported by the initial GGUF loader"
+        ))),
+    }
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    name.replace("blk.", "model.layers.")
+        .replace("ffn_gate", "mlp.gate_proj")
+        .replace("ffn_down", "mlp.down_proj")
+        .replace("ffn_up", "mlp.up_proj")
+        .replace("attn_q", "self_attn.q_proj")
+        .replace("attn_k", "self_attn.k_proj")
+        .replace("attn_v", "self_attn.v_proj")
+        .replace("attn_output", "self_attn.o_proj")
+        .replace("attn_norm", "input_layernorm")
+        .replace("ffn_norm", "post_attention_layernorm")
+        .replace("token_embd", "model.embed_tokens")
+        .replace("output_norm", "model.norm")
+        .replace("output", "lm_head")
+}
+
+fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+    gguf_optional_string(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    let value = gguf_i64(metadata, key, stream)?;
+    i32::try_from(value).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
+}
+
+fn gguf_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<i64>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<f32>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -844,7 +1263,7 @@ pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use std::{env::home_dir, fs};
+    use std::{collections::HashSet, env::home_dir, fs};
 
     use lazy_static::lazy_static;
     use safemlx::{
@@ -856,7 +1275,64 @@ mod tests {
     use crate::{
         cache::ConcatKeyValueCache,
         models::llama::{load_llama_model, load_llama_tokenizer},
+        quantization::AffineQuantization,
     };
+
+    #[test]
+    fn translates_gguf_llama_weight_names() {
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.attn_q.weight"),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.1.ffn_down.scales"),
+            "model.layers.1.mlp.down_proj.scales"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("token_embd.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("output_norm.weight"),
+            "model.norm.weight"
+        );
+    }
+
+    #[test]
+    fn mixed_quantization_builds_only_selected_llama_parameters() {
+        use safemlx::module::ModuleParameters;
+
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let selected = HashSet::from(["model.layers.0.self_attn.q_proj.weight".to_string()]);
+        let args = super::ModelArgs {
+            model_type: "llama".into(),
+            hidden_size: 32,
+            num_hidden_layers: 1,
+            intermediate_size: 32,
+            num_attention_heads: 1,
+            rms_norm_eps: 1e-5,
+            vocab_size: 32,
+            num_key_value_heads: 1,
+            max_position_embeddings: 128,
+            rope_theta: 10_000.0,
+            rope_traditional: true,
+            head_dim: 32,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            mlp_bias: false,
+            rope_scaling: None,
+            quantization: Some(AffineQuantization::new(32, 4).unwrap()),
+            quantization_config: None,
+            quantized_weights: Some(selected),
+            quantized_weight_configs: None,
+        };
+        let model = super::Model::new(args, ctx.stream()).unwrap();
+        let params = model.parameters().flatten();
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
+        assert!(params.contains_key("model.layers.0.self_attn.k_proj.weight"));
+        assert!(!params.contains_key("model.layers.0.self_attn.k_proj.scales"));
+    }
 
     /// Resolve the HuggingFace cache directory to the actual snapshot path.
     /// The structure is:

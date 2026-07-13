@@ -59,15 +59,15 @@ impl AffineQuantization {
                 "only MLX affine quantization is currently supported".into(),
             ));
         }
-        if self.group_size <= 0 || self.group_size % 32 != 0 {
+        if self.group_size != 16 && (self.group_size <= 0 || self.group_size % 32 != 0) {
             return Err(Error::Quantization(format!(
-                "group_size must be a positive multiple of 32, got {}",
+                "group_size must be 16 or a positive multiple of 32, got {}",
                 self.group_size
             )));
         }
-        if !matches!(self.bits, 2 | 4 | 8) {
+        if !matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) {
             return Err(Error::Quantization(format!(
-                "bits must be one of 2, 4, or 8, got {}",
+                "bits must be one of 2, 3, 4, 5, 6, or 8, got {}",
                 self.bits
             )));
         }
@@ -93,6 +93,37 @@ pub(crate) fn should_quantize_on_load(
             existing.group_size, existing.bits, requested.group_size, requested.bits
         ))),
     }
+}
+
+/// Infers the exact affine layout emitted by the native GGUF converters.
+pub(crate) fn gguf_affine_quantization(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    weight_name: &str,
+) -> Result<AffineQuantization, Error> {
+    let Some((&packed_columns, &scale_columns)) = weight_shape.last().zip(scales_shape.last())
+    else {
+        return Err(Error::Quantization(format!(
+            "GGUF quantized tensor {weight_name:?} has an invalid rank"
+        )));
+    };
+    if packed_columns <= 0 || scale_columns <= 0 {
+        return Err(Error::Quantization(format!(
+            "GGUF quantized tensor {weight_name:?} has incompatible weight/scales shapes {weight_shape:?} and {scales_shape:?}"
+        )));
+    }
+
+    for (group_size, bits) in [(16, 2), (16, 3), (16, 6), (32, 4), (32, 5), (32, 8)] {
+        if i64::from(packed_columns) * 32
+            == i64::from(scale_columns) * i64::from(group_size) * i64::from(bits)
+        {
+            return AffineQuantization::new(group_size, bits);
+        }
+    }
+
+    Err(Error::Quantization(format!(
+        "GGUF quantized tensor {weight_name:?} has unsupported weight/scales shapes {weight_shape:?} and {scales_shape:?}"
+    )))
 }
 
 fn default_affine_mode() -> AffineQuantizationMode {
@@ -497,6 +528,14 @@ mod tests {
         let error = should_quantize_on_load("test", Some(q4), q8).unwrap_err();
         assert!(error.to_string().contains("already affine-quantized"));
         assert!(error.to_string().contains("requested group_size=64 bits=8"));
+    }
+
+    #[test]
+    fn affine_config_accepts_mlx_non_power_of_two_widths() {
+        assert!(AffineQuantization::new(32, 3).is_ok());
+        assert!(AffineQuantization::new(32, 5).is_ok());
+        assert!(AffineQuantization::new(32, 6).is_ok());
+        assert!(AffineQuantization::new(32, 7).is_err());
     }
 
     #[test]

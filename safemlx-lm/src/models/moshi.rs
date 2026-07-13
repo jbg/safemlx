@@ -16,8 +16,8 @@ use safemlx::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        addmm, dequantize, indexing::TryIndexOp, matmul, maximum, quantized_matmul, r#where, split,
-        zeros_like,
+        addmm, dequantize, indexing::TryIndexOp, matmul, maximum, quantized_matmul,
+        quantized_packed_dimension, r#where, split, zeros_like,
     },
     random::RandomState,
     transforms::compile::{
@@ -310,7 +310,8 @@ impl ScaledEmbedding {
         quantization: Option<AffineQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let packed_dim = quantization.map_or(dim, |config| dim / (32 / config.bits));
+        let packed_dim =
+            quantization.map_or(dim, |config| quantized_packed_dimension(dim, config.bits));
         Ok(Self {
             weight: Param::<Array>::unloaded(
                 &[vocab, packed_dim],
@@ -417,8 +418,9 @@ impl MoshiLinear {
         quantization: Option<AffineQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let packed_input_dims =
-            quantization.map_or(input_dims, |config| input_dims / (32 / config.bits));
+        let packed_input_dims = quantization.map_or(input_dims, |config| {
+            quantized_packed_dimension(input_dims, config.bits)
+        });
         Ok(Self {
             weight: Param::<Array>::unloaded(
                 &[output_dims, packed_input_dims],

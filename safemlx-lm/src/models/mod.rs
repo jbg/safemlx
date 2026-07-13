@@ -10,6 +10,7 @@ use std::path::Path;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
+    ops::GgufMetadataValue,
     Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
@@ -539,7 +540,7 @@ where
     }
 }
 
-/// A model directory loaded together with its tokenizer and chat template.
+/// A model directory or GGUF file loaded together with its tokenizer and chat template.
 ///
 /// This is the most convenient entry point for text generation: it owns the
 /// architecture-specific [`Model`], tokenizer, optional chat template, model id
@@ -555,7 +556,7 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// Loads a supported model directory, tokenizer, optional chat template, and weights.
+    /// Loads a supported model directory or GGUF file with its sidecar tokenizer.
     pub fn load(
         model_dir: impl AsRef<Path>,
         stream: &Stream,
@@ -577,6 +578,26 @@ impl LoadedModel {
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
+        if is_gguf_file(model_dir) {
+            let sidecar_dir = gguf_sidecar_dir(model_dir);
+            let LoadedGgufModel {
+                model,
+                eos_token_ids,
+                chat_template,
+            } = load_gguf_model_data(model_dir, stream, weights_stream)?;
+            let mut tokenizer = ChatTokenizer::from_tokenizer(load_gguf_tokenizer(sidecar_dir)?);
+            tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(sidecar_dir)?);
+            let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
+            return Ok(Self {
+                model,
+                #[cfg(feature = "media-processing")]
+                processor: None,
+                tokenizer,
+                chat_template,
+                model_id: model_dir.display().to_string(),
+                eos_token_ids,
+            });
+        }
         let metadata = read_model_metadata(model_dir)?;
         let model_type = effective_model_type(&metadata);
         let kind = ModelKind::from_model_type(&model_type)?;
@@ -896,6 +917,98 @@ fn final_token_logits(logits: &Array, stream: &Stream) -> Result<Array, Exceptio
     }
 }
 
+struct LoadedGgufModel {
+    model: Model,
+    eos_token_ids: Vec<u32>,
+    chat_template: Option<String>,
+}
+
+fn load_gguf_model_data(
+    gguf_file: &Path,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedGgufModel, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    let architecture = match metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) => architecture.as_str(),
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key \"general.architecture\" has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata is missing required key \"general.architecture\"".into(),
+            ));
+        }
+    };
+    let chat_template = match metadata.get("tokenizer.chat_template") {
+        Some(GgufMetadataValue::String(template)) => Some(template.clone()),
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key \"tokenizer.chat_template\" has the wrong type".into(),
+            ));
+        }
+        None => None,
+    };
+
+    match architecture {
+        "gemma4" => {
+            let loaded = gemma4::load_gemma4_gguf_data(arrays, metadata, stream, weights_stream)?;
+            Ok(LoadedGgufModel {
+                model: Model::Gemma4(loaded.model),
+                eos_token_ids: loaded.eos_token_ids,
+                chat_template,
+            })
+        }
+        "llama" => {
+            let loaded = llama::load_llama_gguf_data(arrays, metadata, stream, weights_stream)?;
+            Ok(LoadedGgufModel {
+                model: Model::Llama(loaded.model),
+                eos_token_ids: loaded.eos_token_ids,
+                chat_template,
+            })
+        }
+        "nemotron_h" | "nemotron_h_moe" => {
+            let loaded = nemotron_h::load_nemotron_h_gguf_data(
+                arrays,
+                metadata,
+                stream,
+                weights_stream,
+            )?;
+            Ok(LoadedGgufModel {
+                model: Model::NemotronH(loaded.model),
+                eos_token_ids: loaded.eos_token_ids,
+                chat_template,
+            })
+        }
+        "qwen3" | "qwen3moe" => {
+            let loaded = qwen3::load_qwen3_gguf_data(arrays, metadata, stream, weights_stream)?;
+            Ok(LoadedGgufModel {
+                model: Model::Qwen3(loaded.model),
+                eos_token_ids: loaded.eos_token_ids,
+                chat_template,
+            })
+        }
+        "qwen35" | "qwen35moe" => {
+            let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_data(
+                arrays,
+                metadata,
+                stream,
+                weights_stream,
+            )?;
+            Ok(LoadedGgufModel {
+                model: Model::Qwen35Moe(loaded.model),
+                eos_token_ids: loaded.eos_token_ids,
+                chat_template,
+            })
+        }
+        other => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen35, and qwen35moe"
+        ))),
+    }
+}
+
 /// Loads only the model weights and architecture from a model directory.
 pub fn load_model(
     model_dir: impl AsRef<Path>,
@@ -918,6 +1031,9 @@ pub fn load_model_with_options(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    if is_gguf_file(model_dir) {
+        return Ok(load_gguf_model_data(model_dir, stream, weights_stream)?.model);
+    }
     let metadata = read_model_metadata(model_dir)?;
     let kind = ModelKind::from_model_type(&effective_model_type(&metadata))?;
     match kind {
@@ -1008,6 +1124,9 @@ fn load_model_for_kind(
 /// Loads only the tokenizer from a supported model directory.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let model_dir = model_dir.as_ref();
+    if is_gguf_file(model_dir) {
+        return load_gguf_tokenizer(gguf_sidecar_dir(model_dir));
+    }
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
@@ -1025,7 +1144,12 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 ///
 /// This reads tokenizer/chat-template metadata only and does not load model weights.
 pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, Error> {
-    let model_dir = model_dir.as_ref();
+    let submitted_path = model_dir.as_ref();
+    let model_dir = if is_gguf_file(submitted_path) {
+        gguf_sidecar_dir(submitted_path)
+    } else {
+        submitted_path
+    };
     let Some(template) = load_chat_template(model_dir)? else {
         return Ok(Vec::new());
     };
@@ -1041,6 +1165,20 @@ fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
+}
+
+fn is_gguf_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn gguf_sidecar_dir(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+fn load_gguf_tokenizer(sidecar_dir: &Path) -> Result<Tokenizer, Error> {
+    Tokenizer::from_file(sidecar_dir.join("tokenizer.json")).map_err(Into::into)
 }
 
 fn effective_model_type(metadata: &ModelMetadata) -> String {
@@ -1075,6 +1213,10 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
     let jinja_path = model_dir.join("chat_template.jinja");
     if jinja_path.exists() {
         return Ok(Some(std::fs::read_to_string(jinja_path)?));
+    }
+
+    if !model_dir.join("config.json").exists() {
+        return Ok(None);
     }
 
     let metadata = read_model_metadata(model_dir)?;

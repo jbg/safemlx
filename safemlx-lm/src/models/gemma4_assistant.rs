@@ -102,9 +102,7 @@ impl DraftInner {
         let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
             args.hidden_size,
-            args.quantized,
-            args.quantization_group_size,
-            args.quantization_bits,
+            args.quantization_for("embed_tokens.weight"),
             stream,
         )?;
         let layers = (0..args.num_hidden_layers)

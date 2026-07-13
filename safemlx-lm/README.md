@@ -13,6 +13,50 @@ contributors.
 This fork adds model/runtime support including Gemma 4 loading, Gemma 4
 assistant drafting, expanded model dispatch, and related generation utilities.
 
+## GGUF models
+
+The standard `models::load_model` and `models::LoadedModel::load` entry points
+accept Gemma 4, Llama, dense and sparse-MoE Nemotron-H, Qwen3, and Qwen3.5 MoE
+`.gguf` files as well as Hugging Face-style model directories. Put
+`tokenizer.json` next to the GGUF file when using `LoadedModel` or
+`load_tokenizer`; adjacent
+`tokenizer_config.json` and `chat_template.jinja` files are used when present.
+
+```rust,ignore
+use safemlx_lm::models::LoadedModel;
+
+let model = LoadedModel::load(
+    "/path/to/model.gguf",
+    execution_stream,
+    cpu_weights_stream,
+)?;
+```
+
+Dense GGUF tensors are loaded directly. MLX-native packed loading is enabled
+for Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0, including checkpoints
+that mix packed and dense matrices. Q4_K and Q5_K are losslessly repacked to
+MLX's 32-value affine groups, while Q2_K, Q3_K, and Q6_K map exactly to
+16-value affine groups. Group-16 K-quants use tiled quantized matrix kernels for
+prefill and the corresponding vector kernels for decode. These formats execute
+without expanding matrix weights to float16.
+Q5_0 and Q5_1 tensors are converted to float16 while loading; other GGUF
+quantization types use MLX's bundled converter when
+supported, and unsupported tensor types return an error. Model dispatch uses
+`general.architecture`; the current GGUF adapters support text-only `gemma4`,
+`llama`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`,
+and `qwen35moe` architectures.
+Nemotron-H routed expert banks retain Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 packed weights
+and execute through selected-expert quantized matrix multiplication. Qwen3 MoE
+uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6/Q8
+settings. Dense Qwen3.5 uses the hybrid linear/full-attention runtime with
+conventional SwiGLU layers; Qwen3.5 MoE keeps its
+Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 routed expert banks packed while loading mixed
+quantization types. Gemma 4
+multimodal projectors, MoE, and assistant-drafter files are separate formats
+and are not handled by the initial Gemma 4 adapter. Nemotron-H latent-space MoE and
+Omni/multimodal checkpoints remain separate formats. Qwen3-VL and Qwen3.5-VL
+GGUF files are not handled by these text-only adapters.
+
 ## Usage
 
 ```toml

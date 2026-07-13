@@ -10,10 +10,11 @@ use safemlx::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, gather_qmm,
-        grouped_matmul,
+        arange, broadcast_to, concatenate_axis, conv1d, dequantize, exp, gather_grouped_rows,
+        gather_qmm, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        matmul, quantized_matmul, sigmoid, stack_axis, sum_axis, topk_route_plan, zeros,
+        matmul, quantized_matmul, quantized_packed_dimension, sigmoid, stack_axis, sum_axis,
+        topk_route_plan, zeros, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -44,7 +45,8 @@ use crate::{
     },
     weights::{
         for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
-        load_safetensors_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
+        load_arrays_strict, load_safetensors_strict, safetensors_files, StrictLoadConfig,
+        StrictLoadReport,
     },
 };
 
@@ -254,6 +256,9 @@ pub struct ModelArgs {
     #[serde(default = "default_linear_num_value_heads")]
     /// Number of value heads in linear-attention layers.
     pub linear_num_value_heads: i32,
+    #[serde(default)]
+    /// Dense SwiGLU intermediate size. Zero for MoE checkpoints.
+    pub intermediate_size: i32,
     #[serde(default = "default_moe_intermediate_size")]
     /// Routed-expert intermediate size.
     pub moe_intermediate_size: i32,
@@ -281,6 +286,9 @@ pub struct ModelArgs {
     #[serde(default)]
     /// Optional FP8 quantization configuration.
     pub quantization_config: Option<QwenFp8QuantizationConfig>,
+    #[serde(skip)]
+    /// Exact GGUF affine settings keyed by runtime weight name.
+    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -548,6 +556,16 @@ fn ceil_div(lhs: i32, rhs: i32) -> i32 {
 impl ModelArgs {
     fn uses_fp8(&self) -> bool {
         self.quantization_config.is_some()
+    }
+
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(weight_name).copied())
+    }
+
+    fn is_moe(&self) -> bool {
+        self.num_experts > 0
     }
 
     fn layer_type(&self, index: usize) -> LayerType {
@@ -901,37 +919,6 @@ fn grouped_fp8_linear(
     grouped_fp8_linear_scalar(
         input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn grouped_affine_linear(
-    input: &Array,
-    weight: &Array,
-    scales: &Array,
-    biases: &Array,
-    group_ids: &Array,
-    group_size: i32,
-    bits: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let routes = input.dim(0);
-    let in_dim = input.dim(-1);
-    let out_dim = weight.dim(1);
-    let input = input.reshape(&[routes, 1, in_dim], stream)?;
-    gather_qmm(
-        &input,
-        weight,
-        scales,
-        biases,
-        None::<&Array>,
-        group_ids,
-        true,
-        group_size,
-        bits,
-        true,
-        stream,
-    )?
-    .reshape(&[routes, out_dim], stream)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2956,6 +2943,24 @@ impl Mlp {
         self.down_proj.forward(&down_proj_input, stream)
     }
 
+    fn forward_with_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let gate = self.gate_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
+        let up = self.up_proj.forward(input, stream)?;
+        observer.observe(&format!("{prefix}.up_proj"), &up)?;
+        let hidden = silu(gate, stream)?.multiply(up, stream)?;
+        observer.observe(&format!("{prefix}.down_proj_input"), &hidden)?;
+        let output = self.down_proj.forward(&hidden, stream)?;
+        observer.observe(&format!("{prefix}.down_proj"), &output)?;
+        Ok(output)
+    }
+
     fn training_mode(&mut self, mode: bool) {
         self.gate_proj.training_mode(mode);
         self.up_proj.training_mode(mode);
@@ -2974,12 +2979,10 @@ pub struct Experts {
     pub intermediate_dim: i32,
     /// Whether expert weights are stored as FP8.
     pub use_fp8: bool,
-    /// Whether expert weights use MLX affine packed storage.
-    pub use_affine: bool,
-    /// Affine quantization group size.
-    pub group_size: i32,
-    /// Affine quantization bit width.
-    pub bits: i32,
+    /// Optional affine quantization for the packed gate/up bank.
+    pub gate_up_affine: Option<AffineQuantization>,
+    /// Optional affine quantization for the packed down bank.
+    pub down_affine: Option<AffineQuantization>,
     #[param]
     /// Packed gate and up projection weights for all experts.
     pub gate_up_proj: Param<Array>,
@@ -3006,41 +3009,100 @@ pub struct Experts {
     pub down_proj_biases: Param<Option<Array>>,
 }
 
+type AffineExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
+
 impl Experts {
     /// Creates an unloaded routed expert bank.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(
+            args,
+            layer_idx,
+            QwenWeightFormat::for_text(args, None),
+            stream,
+        )
     }
 
     fn new_with_format(
         args: &ModelArgs,
+        layer_idx: usize,
         format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let (packed_per_int, expert_weight_dtype) = match format {
-            QwenWeightFormat::Dense => (1, Dtype::Float32),
-            QwenWeightFormat::Fp8 => (1, Dtype::Uint8),
-            QwenWeightFormat::Affine(quantization) => (32 / quantization.bits, Dtype::Uint32),
+        let prefix = format!("model.layers.{layer_idx}.mlp.experts");
+        let gate_up_affine = args
+            .affine_quantization_for(&format!("{prefix}.gate_up_proj"))
+            .or_else(|| format.affine());
+        let down_affine = args
+            .affine_quantization_for(&format!("{prefix}.down_proj"))
+            .or_else(|| format.affine());
+        let use_fp8 = format == QwenWeightFormat::Fp8;
+        let expert_weight_dtype = if use_fp8 {
+            Dtype::Uint8
+        } else {
+            Dtype::Float32
         };
-        let affine = format.affine();
+        let projection = |out_features: i32,
+                          in_features: i32,
+                          affine: Option<AffineQuantization>|
+         -> Result<AffineExpertProjectionParams, Exception> {
+            if let Some(affine) = affine {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            quantized_packed_dimension(in_features, affine.bits),
+                        ],
+                        Dtype::Uint32,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            in_features / affine.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            in_features / affine.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                ))
+            } else {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[args.num_experts, out_features, in_features],
+                        expert_weight_dtype,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ))
+            }
+        };
+        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = projection(
+            2 * args.moe_intermediate_size,
+            args.hidden_size,
+            gate_up_affine,
+        )?;
+        let (down_proj, down_proj_scales, down_proj_biases) =
+            projection(args.hidden_size, args.moe_intermediate_size, down_affine)?;
         Ok(Self {
             num_experts: args.num_experts,
             hidden_dim: args.hidden_size,
             intermediate_dim: args.moe_intermediate_size,
-            use_fp8: format == QwenWeightFormat::Fp8,
-            use_affine: affine.is_some(),
-            group_size: affine.map_or(0, |value| value.group_size),
-            bits: affine.map_or(0, |value| value.bits),
-            gate_up_proj: Param::<Array>::unloaded(
-                &[
-                    args.num_experts,
-                    2 * args.moe_intermediate_size,
-                    args.hidden_size / packed_per_int,
-                ],
-                expert_weight_dtype,
-                stream,
-            )?,
-            gate_up_proj_scale_inv: if format == QwenWeightFormat::Fp8 {
+            use_fp8,
+            gate_up_affine,
+            down_affine,
+            gate_up_proj,
+            gate_up_proj_scale_inv: if use_fp8 {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
@@ -3053,42 +3115,10 @@ impl Experts {
             } else {
                 Param::new(None)
             },
-            gate_up_proj_scales: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
-                    &[
-                        args.num_experts,
-                        2 * args.moe_intermediate_size,
-                        args.hidden_size / quantization.group_size,
-                    ],
-                    Dtype::Float32,
-                    stream,
-                )?
-            } else {
-                Param::new(None)
-            },
-            gate_up_proj_biases: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
-                    &[
-                        args.num_experts,
-                        2 * args.moe_intermediate_size,
-                        args.hidden_size / quantization.group_size,
-                    ],
-                    Dtype::Float32,
-                    stream,
-                )?
-            } else {
-                Param::new(None)
-            },
-            down_proj: Param::<Array>::unloaded(
-                &[
-                    args.num_experts,
-                    args.hidden_size,
-                    args.moe_intermediate_size / packed_per_int,
-                ],
-                expert_weight_dtype,
-                stream,
-            )?,
-            down_proj_scale_inv: if format == QwenWeightFormat::Fp8 {
+            gate_up_proj_scales,
+            gate_up_proj_biases,
+            down_proj,
+            down_proj_scale_inv: if use_fp8 {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
@@ -3101,33 +3131,37 @@ impl Experts {
             } else {
                 Param::new(None)
             },
-            down_proj_scales: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
-                    &[
-                        args.num_experts,
-                        args.hidden_size,
-                        args.moe_intermediate_size / quantization.group_size,
-                    ],
-                    Dtype::Float32,
-                    stream,
-                )?
-            } else {
-                Param::new(None)
-            },
-            down_proj_biases: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
-                    &[
-                        args.num_experts,
-                        args.hidden_size,
-                        args.moe_intermediate_size / quantization.group_size,
-                    ],
-                    Dtype::Float32,
-                    stream,
-                )?
-            } else {
-                Param::new(None)
-            },
+            down_proj_scales,
+            down_proj_biases,
         })
+    }
+
+    fn affine_grouped_linear(
+        input: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: &Array,
+        group_ids: &Array,
+        affine: AffineQuantization,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let routes = input.dim(0);
+        let out_features = weight.dim(-2);
+        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+        gather_qmm(
+            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+            weight,
+            scales,
+            biases,
+            &lhs_indices,
+            group_ids,
+            true,
+            affine.group_size,
+            affine.bits,
+            true,
+            stream,
+        )?
+        .reshape(&[routes, out_features], stream)
     }
 
     /// Evaluates routed experts for flattened token hidden states.
@@ -3138,7 +3172,7 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if self.use_fp8 || self.use_affine {
+        if self.use_fp8 || self.gate_up_affine.is_some() || self.down_affine.is_some() {
             return self.forward_expert_major_chunk(
                 hidden_states,
                 top_k_index,
@@ -3273,7 +3307,7 @@ impl Experts {
         observer.observe(&format!("{prefix}.input"), hidden_states)?;
         observer.observe(&format!("{prefix}.top_k_experts"), top_k_index)?;
         observer.observe(&format!("{prefix}.top_k_weights"), top_k_weights)?;
-        if self.use_fp8 || self.use_affine {
+        if self.use_fp8 || self.gate_up_affine.is_some() || self.down_affine.is_some() {
             return self.forward_expert_major_chunk_with_observer(
                 hidden_states,
                 top_k_index,
@@ -3336,18 +3370,20 @@ impl Experts {
         let num_tokens = hidden_states.shape()[0];
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let (Some(scales), Some(biases)) = (
-            self.gate_up_proj_scales.as_ref(),
-            self.gate_up_proj_biases.as_ref(),
-        ) {
-            grouped_affine_linear(
+        let gate_up = if let Some(affine) = self.gate_up_affine {
+            Self::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
-                scales,
-                biases,
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up scales"),
+                self.gate_up_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up biases"),
                 &plan.sorted_group_ids,
-                self.group_size,
-                self.bits,
+                affine,
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
@@ -3372,18 +3408,20 @@ impl Experts {
         let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
         let current = silu(gate, stream)?.multiply(up, stream)?;
 
-        let current = if let (Some(scales), Some(biases)) = (
-            self.down_proj_scales.as_ref(),
-            self.down_proj_biases.as_ref(),
-        ) {
-            grouped_affine_linear(
+        let current = if let Some(affine) = self.down_affine {
+            Self::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
-                scales,
-                biases,
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down scales"),
+                self.down_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down biases"),
                 &plan.sorted_group_ids,
-                self.group_size,
-                self.bits,
+                affine,
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
@@ -3427,18 +3465,20 @@ impl Experts {
         )?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         observer.observe(&format!("{prefix}.expert_major_input"), &hidden)?;
-        let gate_up = if let (Some(scales), Some(biases)) = (
-            self.gate_up_proj_scales.as_ref(),
-            self.gate_up_proj_biases.as_ref(),
-        ) {
-            grouped_affine_linear(
+        let gate_up = if let Some(affine) = self.gate_up_affine {
+            Self::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
-                scales,
-                biases,
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up scales"),
+                self.gate_up_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine gate/up biases"),
                 &plan.sorted_group_ids,
-                self.group_size,
-                self.bits,
+                affine,
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
@@ -3472,18 +3512,20 @@ impl Experts {
         let current = gate_activation.multiply(up, stream)?;
         observer.observe(&format!("{prefix}.expert_major_down_proj_input"), &current)?;
 
-        let route_output = if let (Some(scales), Some(biases)) = (
-            self.down_proj_scales.as_ref(),
-            self.down_proj_biases.as_ref(),
-        ) {
-            grouped_affine_linear(
+        let route_output = if let Some(affine) = self.down_affine {
+            Self::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
-                scales,
-                biases,
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down scales"),
+                self.down_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("affine down biases"),
                 &plan.sorted_group_ids,
-                self.group_size,
-                self.bits,
+                affine,
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
@@ -3540,12 +3582,18 @@ pub struct SparseMoeBlock {
 
 impl SparseMoeBlock {
     /// Creates an unloaded sparse MoE block.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(
+            args,
+            layer_idx,
+            QwenWeightFormat::for_text(args, None),
+            stream,
+        )
     }
 
     fn new_with_format(
         args: &ModelArgs,
+        layer_idx: usize,
         format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -3565,7 +3613,7 @@ impl SparseMoeBlock {
                 },
                 stream,
             )?,
-            experts: Experts::new_with_format(args, format, stream)?,
+            experts: Experts::new_with_format(args, layer_idx, format, stream)?,
             shared_expert: Mlp::new(
                 args.hidden_size,
                 args.shared_expert_intermediate_size,
@@ -3702,8 +3750,11 @@ pub struct TransformerBlock {
     /// Linear-attention layer when `layer_type` is [`LayerType::LinearAttention`].
     pub linear_attn: Option<LinearAttention>,
     #[param]
-    /// Sparse MoE feed-forward block.
-    pub mlp: SparseMoeBlock,
+    /// Sparse MoE feed-forward block, for `qwen35moe` checkpoints.
+    pub mlp: Option<SparseMoeBlock>,
+    #[param]
+    /// Dense SwiGLU block, for `qwen35` checkpoints.
+    pub dense_mlp: Option<Mlp>,
     #[param]
     /// Pre-attention normalization.
     pub input_layernorm: Qwen3NextRmsNorm,
@@ -3742,7 +3793,21 @@ impl TransformerBlock {
             } else {
                 None
             },
-            mlp: SparseMoeBlock::new_with_format(args, format, stream)?,
+            mlp: args
+                .is_moe()
+                .then(|| SparseMoeBlock::new_with_format(args, layer_idx, format, stream))
+                .transpose()?,
+            dense_mlp: (!args.is_moe())
+                .then(|| {
+                    Mlp::new(
+                        args.hidden_size,
+                        args.intermediate_size,
+                        false,
+                        format,
+                        stream,
+                    )
+                })
+                .transpose()?,
             input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
             post_attention_layernorm: Qwen3NextRmsNorm::new(
                 args.hidden_size,
@@ -3824,7 +3889,14 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         let h = residual.add(h, stream)?;
         let residual = h.clone();
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        let h = self.mlp.forward(&post_normed, stream)?;
+        let h = if let Some(mlp) = &mut self.mlp {
+            mlp.forward(&post_normed, stream)?
+        } else {
+            self.dense_mlp
+                .as_mut()
+                .expect("dense Qwen3.5 MLP")
+                .forward(&post_normed, stream)?
+        };
         residual.add(h, stream)
     }
 
@@ -3835,7 +3907,12 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         if let Some(linear_attention) = &mut self.linear_attn {
             linear_attention.training_mode(mode);
         }
-        self.mlp.training_mode(mode);
+        if let Some(mlp) = &mut self.mlp {
+            mlp.training_mode(mode);
+        }
+        if let Some(mlp) = &mut self.dense_mlp {
+            mlp.training_mode(mode);
+        }
         self.input_layernorm.training_mode(mode);
         self.post_attention_layernorm.training_mode(mode);
     }
@@ -3919,24 +3996,30 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
         observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
 
-        observer.observe(&format!("{prefix}.residual_before_moe"), &h)?;
+        let feed_forward_name = if self.mlp.is_some() { "moe" } else { "mlp" };
+        observer.observe(&format!("{prefix}.residual_before_{feed_forward_name}"), &h)?;
         let residual = h.clone();
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
         observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
-        let h = self.mlp.forward_with_observer(
-            &post_normed,
-            stream,
-            &format!("{prefix}.moe"),
-            observer,
-        )?;
-        observer.observe(&format!("{prefix}.moe_output"), &h)?;
-        observer.observe(&format!("{prefix}.residual_delta_moe"), &h)?;
+        let h = if let Some(mlp) = &mut self.mlp {
+            mlp.forward_with_observer(&post_normed, stream, &format!("{prefix}.moe"), observer)?
+        } else {
+            self.dense_mlp
+                .as_mut()
+                .expect("dense Qwen3.5 MLP")
+                .forward_with_observer(&post_normed, stream, &format!("{prefix}.mlp"), observer)?
+        };
+        observer.observe(&format!("{prefix}.{feed_forward_name}_output"), &h)?;
+        observer.observe(&format!("{prefix}.residual_delta_{feed_forward_name}"), &h)?;
         let output = residual.add(h, stream)?;
         let output = observer
             .intervene(&format!("{prefix}.output"), &output)?
             .unwrap_or(output);
         observer.observe(&format!("{prefix}.output"), &output)?;
-        observer.observe(&format!("{prefix}.residual_after_moe"), &output)?;
+        observer.observe(
+            &format!("{prefix}.residual_after_{feed_forward_name}"),
+            &output,
+        )?;
         Ok(output)
     }
 }
@@ -4367,6 +4450,642 @@ impl Module<ModelInput<'_>> for Model {
         if let Some(lm_head) = &mut self.lm_head {
             lm_head.training_mode(mode);
         }
+    }
+}
+
+pub(crate) struct LoadedQwen35Gguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads a text-only dense or MoE Qwen3.5 model from a GGUF checkpoint.
+pub fn load_qwen3_5_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_qwen3_5_moe_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+}
+
+/// Backward-compatible name for loading a Qwen3.5 GGUF checkpoint.
+pub fn load_qwen3_5_moe_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    load_qwen3_5_gguf(gguf_file, stream, weights_stream)
+}
+
+pub(crate) fn load_qwen3_5_moe_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen35Gguf, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    load_qwen3_5_moe_gguf_data(arrays, metadata, stream, weights_stream)
+}
+
+pub(crate) fn load_qwen3_5_moe_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen35Gguf, Error> {
+    let architecture = qwen35_gguf_string(&metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports qwen35 and qwen35moe"
+        )));
+    }
+    let is_moe = architecture == "qwen35moe";
+    if arrays
+        .keys()
+        .any(|name| name.starts_with("v.") || name.starts_with("mm."))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "multimodal Qwen3.5 GGUF checkpoints are not supported; load a text-only qwen35 or qwen35moe checkpoint"
+                .into(),
+        ));
+    }
+
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let block_count = qwen35_gguf_i32(&metadata, &key("block_count"), weights_stream)?;
+    let nextn_layers =
+        qwen35_gguf_optional_i64(&metadata, &key("nextn_predict_layers"), weights_stream)?
+            .unwrap_or(0);
+    let nextn_layers = i32::try_from(nextn_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(
+            "Qwen3.5 next-token prediction layer count exceeds i32".into(),
+        )
+    })?;
+    if nextn_layers < 0 || nextn_layers >= block_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF has invalid block_count {block_count} and nextn_predict_layers {nextn_layers}"
+        )));
+    }
+    let num_hidden_layers = block_count - nextn_layers;
+
+    // Released Qwen3.5 GGUF files append MTP tensors as additional blk.N entries.
+    // The text runtime, like the safetensors loader, intentionally ignores them.
+    let arrays = arrays
+        .into_iter()
+        .filter(|(name, _)| {
+            qwen35_gguf_block_index(name).is_none_or(|index| index < num_hidden_layers)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut args = qwen35_args_from_gguf(
+        &arrays,
+        &metadata,
+        &architecture,
+        num_hidden_layers,
+        weights_stream,
+    )?;
+
+    let arrays = qwen35_dequantize_non_experts(arrays, weights_stream)?;
+    let mut translated = HashMap::with_capacity(arrays.len());
+    for (name, value) in arrays {
+        let (name, value) = qwen35_translate_gguf_weight(name, value, &args, weights_stream)?;
+        if translated.insert(name.clone(), value).is_some() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen3.5 GGUF tensors collide after translating {name:?}"
+            )));
+        }
+    }
+    if is_moe {
+        qwen35_pack_expert_banks(&mut translated, &args, weights_stream)?;
+    }
+    let quantized_weight_configs = qwen35_gguf_quantized_weight_configs(&translated)?;
+    args.quantized_weight_configs = Some(quantized_weight_configs);
+
+    let mut model = Model::new(args, None, None, None, stream)?;
+    let config = qwen3_5_moe_strict_load_config(false).allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    let eos_token_ids =
+        qwen35_gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+    Ok(LoadedQwen35Gguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn qwen35_args_from_gguf(
+    arrays: &HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    num_hidden_layers: i32,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let is_moe = architecture == "qwen35moe";
+    let hidden_size = qwen35_gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let num_attention_heads = qwen35_gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let num_key_value_heads = qwen35_gguf_i32(metadata, &key("attention.head_count_kv"), stream)?;
+    let head_dim = qwen35_gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("Qwen3.5 head size exceeds i32".into()))?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let rope_dims = qwen35_gguf_optional_i64(metadata, &key("rope.dimension_count"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("Qwen3.5 RoPE dimension exceeds i32".into()))?
+        .unwrap_or(head_dim / 4);
+    let full_attention_interval =
+        qwen35_gguf_optional_i64(metadata, &key("full_attention_interval"), stream)?.unwrap_or(4);
+    let full_attention_interval = usize::try_from(full_attention_interval).map_err(|_| {
+        Error::UnsupportedArchitecture("Qwen3.5 full attention interval must be positive".into())
+    })?;
+    if full_attention_interval == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "Qwen3.5 full attention interval must be positive".into(),
+        ));
+    }
+    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => qwen35_gguf_i32(metadata, &key("vocab_size"), stream)?,
+    };
+    let rope_theta =
+        qwen35_gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?.unwrap_or(10_000_000.0);
+    let mut rope_parameters = HashMap::new();
+    rope_parameters.insert("rope_theta".into(), serde_json::json!(rope_theta));
+    rope_parameters.insert(
+        "partial_rotary_factor".into(),
+        serde_json::json!(rope_dims as f32 / head_dim as f32),
+    );
+
+    Ok(ModelArgs {
+        model_type: if is_moe {
+            "qwen3_5_moe_text".into()
+        } else {
+            "qwen3_5_text".into()
+        },
+        vocab_size,
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        max_position_embeddings: qwen35_gguf_i32(metadata, &key("context_length"), stream)?,
+        rms_norm_eps: qwen35_gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
+        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        attention_bias: arrays.keys().any(|name| {
+            name.ends_with("attn_q.bias")
+                || name.ends_with("attn_k.bias")
+                || name.ends_with("attn_v.bias")
+                || name.ends_with("attn_output.bias")
+        }),
+        hidden_act: "silu".into(),
+        linear_conv_kernel_dim: qwen35_gguf_i32(metadata, &key("ssm.conv_kernel"), stream)?,
+        linear_key_head_dim: qwen35_gguf_i32(metadata, &key("ssm.state_size"), stream)?,
+        linear_value_head_dim: qwen35_gguf_i32(metadata, &key("ssm.state_size"), stream)?,
+        linear_num_key_heads: qwen35_gguf_i32(metadata, &key("ssm.group_count"), stream)?,
+        linear_num_value_heads: qwen35_gguf_i32(metadata, &key("ssm.time_step_rank"), stream)?,
+        intermediate_size: if is_moe {
+            0
+        } else {
+            qwen35_gguf_i32(metadata, &key("feed_forward_length"), stream)?
+        },
+        moe_intermediate_size: if is_moe {
+            qwen35_gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+        } else {
+            0
+        },
+        shared_expert_intermediate_size: if is_moe {
+            qwen35_gguf_i32(metadata, &key("expert_shared_feed_forward_length"), stream)?
+        } else {
+            0
+        },
+        num_experts_per_tok: if is_moe {
+            qwen35_gguf_i32(metadata, &key("expert_used_count"), stream)?
+        } else {
+            0
+        },
+        num_experts: if is_moe {
+            qwen35_gguf_i32(metadata, &key("expert_count"), stream)?
+        } else {
+            0
+        },
+        norm_topk_prob: true,
+        layer_types: (0..num_hidden_layers as usize)
+            .map(|index| {
+                if (index + 1) % full_attention_interval == 0 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
+            .collect(),
+        rope_parameters: Some(rope_parameters),
+        rope_scaling: None,
+        quantization_config: None,
+        quantized_weight_configs: None,
+    })
+}
+
+fn qwen35_gguf_block_index(name: &str) -> Option<i32> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+fn qwen35_is_routed_expert_weight(name: &str) -> bool {
+    name.contains(".ffn_gate_exps.")
+        || name.contains(".ffn_up_exps.")
+        || name.contains(".ffn_down_exps.")
+}
+
+fn qwen35_dequantize_non_experts(
+    mut arrays: HashMap<String, Array>,
+    stream: &Stream,
+) -> Result<HashMap<String, Array>, Error> {
+    let scale_names = arrays
+        .keys()
+        .filter(|name| name.ends_with(".scales"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for scales_name in scale_names {
+        if qwen35_is_routed_expert_weight(&scales_name) {
+            continue;
+        }
+        let prefix = scales_name
+            .strip_suffix(".scales")
+            .expect("filtered GGUF scale suffix");
+        let weight_name = format!("{prefix}.weight");
+        let biases_name = format!("{prefix}.biases");
+        let scales = arrays.remove(&scales_name).ok_or_else(|| {
+            Error::Quantization(format!("missing GGUF scales tensor {scales_name:?}"))
+        })?;
+        let weight = arrays.remove(&weight_name).ok_or_else(|| {
+            Error::Quantization(format!(
+                "GGUF quantization scales {scales_name:?} have no matching weight"
+            ))
+        })?;
+        let biases = arrays.remove(&biases_name).ok_or_else(|| {
+            Error::Quantization(format!(
+                "GGUF quantized tensor {weight_name:?} is missing affine biases"
+            ))
+        })?;
+        let config = qwen35_gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
+        let value = dequantize(
+            &weight,
+            &scales,
+            &biases,
+            config.group_size,
+            config.bits,
+            stream,
+        )?;
+        arrays.insert(weight_name, value);
+    }
+    Ok(arrays)
+}
+
+fn qwen35_translate_gguf_weight(
+    name: String,
+    mut value: Array,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<(String, Array), Error> {
+    if name.ends_with(".attn_qkv.weight") {
+        value = qwen35_restore_v_tail(
+            value,
+            2 * args.linear_num_key_heads * args.linear_key_head_dim,
+            0,
+            args,
+            stream,
+        )?;
+    } else if name.ends_with(".ssm_conv1d.weight") {
+        value = qwen35_restore_v_tail(
+            value,
+            2 * args.linear_num_key_heads * args.linear_key_head_dim,
+            0,
+            args,
+            stream,
+        )?;
+        value = value.reshape(&[value.dim(0), 1, value.dim(1)], stream)?;
+    } else if name.ends_with(".attn_gate.weight") {
+        value = qwen35_restore_v_head_order(value, 0, args.linear_value_head_dim, args, stream)?;
+    } else if name.ends_with(".ssm_alpha.weight")
+        || name.ends_with(".ssm_beta.weight")
+        || name.ends_with(".ssm_dt.bias")
+    {
+        value = qwen35_restore_v_head_order(value, 0, 1, args, stream)?;
+    } else if name.ends_with(".ssm_a") {
+        value = qwen35_restore_v_head_order(value, 0, 1, args, stream)?
+            .multiply(Array::from_f32(-1.0), stream)?
+            .log(stream)?;
+    } else if name.ends_with(".ssm_out.weight") {
+        value = qwen35_restore_v_head_order(value, 1, args.linear_value_head_dim, args, stream)?;
+    } else if name.ends_with(".ffn_gate_inp_shexp.weight") && value.ndim() == 1 {
+        value = value.reshape(&[1, value.dim(0)], stream)?;
+    }
+
+    if qwen35_is_offset_norm(&name) {
+        value = value.subtract(Array::from_f32(1.0), stream)?;
+    }
+    Ok((qwen35_translate_gguf_weight_name(&name), value))
+}
+
+fn qwen35_restore_v_tail(
+    value: Array,
+    prefix: i32,
+    axis: usize,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    if axis != 0 || value.ndim() != 2 {
+        return Err(Error::UnsupportedArchitecture(
+            "Qwen3.5 GGUF value-tail restoration expects a rank-2 row projection".into(),
+        ));
+    }
+    if prefix <= 0 || prefix >= value.dim(0) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF value-tail split {prefix} is invalid for shape {:?}",
+            value.shape()
+        )));
+    }
+    let leading = value.try_index_device((..prefix, ..), stream)?;
+    let tail = value.try_index_device((prefix.., ..), stream)?;
+    let tail = qwen35_restore_v_head_order(tail, 0, args.linear_value_head_dim, args, stream)?;
+    Ok(concatenate_axis(&[leading, tail], 0, stream)?)
+}
+
+fn qwen35_restore_v_head_order(
+    value: Array,
+    axis: usize,
+    head_dim: i32,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let num_k = args.linear_num_key_heads;
+    let num_v = args.linear_num_value_heads;
+    if num_k <= 0 || num_v % num_k != 0 || axis >= value.ndim() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "invalid Qwen3.5 GGUF value-head layout: {num_v} value heads, {num_k} key heads"
+        )));
+    }
+    let original_shape = value.shape().to_vec();
+    if original_shape[axis] != num_v * head_dim {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF value-head axis has length {}, expected {} in shape {:?}",
+            original_shape[axis],
+            num_v * head_dim,
+            original_shape
+        )));
+    }
+    let repeats = num_v / num_k;
+    let mut expanded_shape = original_shape.clone();
+    expanded_shape.splice(axis..=axis, [repeats, num_k, head_dim]);
+    let expanded = value.reshape(&expanded_shape, stream)?;
+    let mut axes = (0..expanded_shape.len() as i32).collect::<Vec<_>>();
+    axes.swap(axis, axis + 1);
+    Ok(expanded
+        .transpose_axes(&axes, stream)?
+        .reshape(&original_shape, stream)?)
+}
+
+fn qwen35_is_offset_norm(name: &str) -> bool {
+    name == "output_norm.weight"
+        || (name.starts_with("blk.")
+            && name.ends_with("_norm.weight")
+            && !name.ends_with("ssm_norm.weight"))
+}
+
+fn qwen35_translate_gguf_weight_name(name: &str) -> String {
+    const ROOTS: [(&str, &str); 3] = [
+        ("token_embd", "model.embed_tokens"),
+        ("output_norm", "model.norm"),
+        ("output", "lm_head"),
+    ];
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    const PARAMETERS: [(&str, &str); 29] = [
+        ("attn_norm", "input_layernorm"),
+        ("post_attention_norm", "post_attention_layernorm"),
+        ("attn_q_norm", "self_attn.q_norm"),
+        ("attn_k_norm", "self_attn.k_norm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("attn_qkv", "linear_attn.in_proj_qkv"),
+        ("attn_gate", "linear_attn.in_proj_z"),
+        ("ssm_beta", "linear_attn.in_proj_b"),
+        ("ssm_alpha", "linear_attn.in_proj_a"),
+        ("ssm_conv1d", "linear_attn.conv1d"),
+        ("ssm_dt.bias", "linear_attn.dt_bias"),
+        ("ssm_a", "linear_attn.A_log"),
+        ("ssm_norm", "linear_attn.norm"),
+        ("ssm_out", "linear_attn.out_proj"),
+        ("ffn_gate_inp_shexp", "mlp.shared_expert_gate"),
+        ("ffn_gate_inp", "mlp.gate"),
+        ("ffn_gate_shexp", "mlp.shared_expert.gate_proj"),
+        ("ffn_up_shexp", "mlp.shared_expert.up_proj"),
+        ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
+        ("ffn_gate_exps", "mlp.experts.gate_proj"),
+        ("ffn_up_exps", "mlp.experts.up_proj"),
+        ("ffn_down_exps", "mlp.experts.down_proj"),
+        ("ffn_gate", "dense_mlp.gate_proj"),
+        ("ffn_up", "dense_mlp.up_proj"),
+        ("ffn_down", "dense_mlp.down_proj"),
+        ("rope_freqs", "rope_freqs"),
+    ];
+    for (source, target) in PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let mut suffix = parameter.strip_prefix(source).unwrap_or_default();
+            if target.starts_with("mlp.experts.") {
+                suffix = match suffix {
+                    ".weight" => "",
+                    ".scales" => "_scales",
+                    ".biases" => "_biases",
+                    other => other,
+                };
+            }
+            return format!("model.layers.{layer}.{target}{suffix}");
+        }
+    }
+    name.to_string()
+}
+
+fn qwen35_pack_expert_banks(
+    arrays: &mut HashMap<String, Array>,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<(), Error> {
+    for layer in 0..args.num_hidden_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        for suffix in ["", "_scales", "_biases"] {
+            let gate_name = format!("{prefix}.gate_proj{suffix}");
+            let up_name = format!("{prefix}.up_proj{suffix}");
+            let gate = arrays.remove(&gate_name).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 GGUF is missing routed expert tensor {gate_name:?}"
+                ))
+            })?;
+            let up = arrays.remove(&up_name).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 GGUF is missing routed expert tensor {up_name:?}"
+                ))
+            })?;
+            if gate.shape().len() != 3 || gate.shape()[0] != args.num_experts {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 GGUF expert tensor {gate_name:?} has invalid shape {:?}",
+                    gate.shape()
+                )));
+            }
+            if gate.shape()[0] != up.shape()[0] || gate.shape()[2] != up.shape()[2] {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 GGUF gate/up expert tensor shapes are incompatible: {:?} and {:?}",
+                    gate.shape(),
+                    up.shape()
+                )));
+            }
+            arrays.insert(
+                format!("{prefix}.gate_up_proj{suffix}"),
+                concatenate_axis(&[gate, up], 1, stream)?,
+            );
+        }
+        for suffix in ["", "_scales", "_biases"] {
+            let source = format!("{prefix}.down_proj{suffix}");
+            let value = arrays.remove(&source).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 GGUF is missing routed expert tensor {source:?}"
+                ))
+            })?;
+            arrays.insert(source, value);
+        }
+    }
+    Ok(())
+}
+
+fn qwen35_gguf_quantized_weight_configs(
+    arrays: &HashMap<String, Array>,
+) -> Result<HashMap<String, AffineQuantization>, Error> {
+    let mut configs = HashMap::new();
+    for (scales_name, scales) in arrays {
+        let Some(weight_name) = scales_name.strip_suffix("_scales") else {
+            continue;
+        };
+        let Some(weight) = arrays.get(weight_name) else {
+            continue;
+        };
+        let config = qwen35_gguf_affine_quantization(weight.shape(), scales.shape(), weight_name)?;
+        configs.insert(weight_name.to_string(), config);
+    }
+    Ok(configs)
+}
+
+fn qwen35_gguf_affine_quantization(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    weight_name: &str,
+) -> Result<AffineQuantization, Error> {
+    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
+}
+
+fn qwen35_gguf_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<String, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata is missing required key {key:?}"
+        ))),
+    }
+}
+
+fn qwen35_gguf_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    i32::try_from(qwen35_gguf_i64(metadata, key, stream)?).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
+}
+
+fn qwen35_gguf_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i64, Error> {
+    qwen35_gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn qwen35_gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => Ok(Some(
+            value
+                .clone()
+                .as_dtype(Dtype::Int64, stream)?
+                .try_item::<i64>(stream)?,
+        )),
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn qwen35_gguf_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<f32, Error> {
+    qwen35_gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn qwen35_gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<f32>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
     }
 }
 
@@ -5034,8 +5753,10 @@ pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a,
 #[cfg(test)]
 mod tests {
     use super::{
-        default_layer_type, get_qwen3_5_moe_model_args, load_qwen3_5_moe_model,
+        default_layer_type, get_qwen3_5_moe_model_args, load_qwen3_5_gguf, load_qwen3_5_moe_model,
         load_qwen3_5_moe_tokenizer, parse_fp8_expert_projection_key,
+        qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
+        qwen35_restore_v_head_order, qwen35_translate_gguf_weight_name,
         qwen3_5_moe_strict_load_config, reverse_permutation, vision_window_index,
         Fp8ExpertProjection, FullAttention, FullAttentionInput, LayerType, LinearAttention,
         LinearAttentionInput, Model, ModelArgs, SparseMoeBlock, VisionConfig,
@@ -5046,6 +5767,7 @@ mod tests {
         error::Error,
         inspection::ActivationRecorder,
         models::{common::CausalLm, input as runtime_input, Model as AnyModel, ModelCache},
+        quantization::AffineQuantization,
         weights::{load_safetensors_strict, StrictLoadReport},
     };
     use safemlx::{
@@ -5113,6 +5835,7 @@ mod tests {
             linear_value_head_dim: 4,
             linear_num_key_heads: 2,
             linear_num_value_heads: 2,
+            intermediate_size: 0,
             moe_intermediate_size: 4,
             shared_expert_intermediate_size: 4,
             num_experts_per_tok: 2,
@@ -5122,6 +5845,7 @@ mod tests {
             rope_parameters: None,
             rope_scaling: None,
             quantization_config: None,
+            quantized_weight_configs: None,
         }
     }
 
@@ -5239,11 +5963,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut dense = super::Experts::new(&args, stream).unwrap();
+        let mut dense = super::Experts::new(&args, 0, stream).unwrap();
         dense.gate_up_proj = Param::new(gate_up_dequantized);
         dense.down_proj = Param::new(down_dequantized);
         let mut affine = super::Experts::new_with_format(
             &args,
+            0,
             super::QwenWeightFormat::Affine(quantization),
             stream,
         )
@@ -5272,6 +5997,89 @@ mod tests {
             .all_close(&affine_output, 1e-4, 1e-4, None, stream)
             .unwrap()
             .item::<bool>(stream));
+    }
+
+    #[test]
+    fn qwen35_gguf_names_and_affine_shapes_translate() {
+        assert_eq!(
+            qwen35_gguf_block_index("blk.40.nextn_norm.weight"),
+            Some(40)
+        );
+        assert_eq!(qwen35_gguf_block_index("output.weight"), None);
+        assert_eq!(
+            qwen35_translate_gguf_weight_name("blk.7.attn_qkv.weight"),
+            "model.layers.7.linear_attn.in_proj_qkv.weight"
+        );
+        assert_eq!(
+            qwen35_translate_gguf_weight_name("blk.3.ffn_gate_exps.scales"),
+            "model.layers.3.mlp.experts.gate_proj_scales"
+        );
+        assert_eq!(
+            qwen35_translate_gguf_weight_name("blk.3.ffn_gate_inp_shexp.weight"),
+            "model.layers.3.mlp.shared_expert_gate.weight"
+        );
+        assert_eq!(
+            qwen35_translate_gguf_weight_name("blk.3.ffn_gate.weight"),
+            "model.layers.3.dense_mlp.gate_proj.weight"
+        );
+        assert!(qwen35_is_offset_norm("blk.3.attn_q_norm.weight"));
+        assert!(!qwen35_is_offset_norm("blk.3.ssm_norm.weight"));
+        assert_eq!(
+            qwen35_gguf_affine_quantization(&[256, 1024, 256], &[256, 1024, 64], "expert").unwrap(),
+            AffineQuantization::new(32, 4).unwrap()
+        );
+        assert_eq!(
+            qwen35_gguf_affine_quantization(&[256, 2048, 128], &[256, 2048, 16], "expert").unwrap(),
+            AffineQuantization::new(32, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn qwen35_gguf_restores_grouped_value_head_order() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_args(vec![LayerType::LinearAttention]);
+        args.linear_num_key_heads = 2;
+        args.linear_num_value_heads = 4;
+        args.linear_value_head_dim = 1;
+        let llama_order = Array::from_slice(&[0i32, 2, 1, 3], &[4]);
+        let restored = qwen35_restore_v_head_order(llama_order, 0, 1, &args, stream).unwrap();
+        eval([&restored]).unwrap();
+        assert_eq!(
+            restored.evaluated().unwrap().as_slice::<i32>(),
+            &[0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires QWEN35_GGUF and Metal"]
+    fn strict_loads_and_runs_real_dense_qwen35_gguf() {
+        let _guard = mlx_runtime_test_guard();
+        let gguf_file = std::path::PathBuf::from(
+            std::env::var("QWEN35_GGUF").expect("set QWEN35_GGUF to a local checkpoint"),
+        );
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = load_qwen3_5_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+
+        assert_eq!(model.model_type(), "qwen3_5_text");
+        assert_eq!(model.args.num_hidden_layers, 32);
+        assert_eq!(model.args.intermediate_size, 12288);
+        assert_eq!(model.args.num_experts, 0);
+
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [runtime_input::InputPart::text_token_ids(&tokens)];
+        let mut cache = model.new_cache();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            runtime_input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, 248320]);
     }
 
     #[test]
@@ -5522,7 +6330,7 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let mut moe = SparseMoeBlock::new(&args, stream).unwrap();
+        let mut moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let gate_values = (0..args.num_experts)
             .flat_map(|expert| {
                 (0..args.hidden_size).map(move |hidden| ((expert + 1) * (hidden + 1)) as f32 * 0.01)
@@ -5550,7 +6358,7 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let args = tiny_args(vec![LayerType::LinearAttention]);
-        let mut moe = SparseMoeBlock::new(&args, stream).unwrap();
+        let mut moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let gate_values = (0..args.num_experts)
             .flat_map(|expert| {
                 (0..args.hidden_size).map(move |hidden| ((expert + 1) * (hidden + 1)) as f32 * 0.01)

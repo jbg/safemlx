@@ -1,17 +1,22 @@
 //! Nemotron-H configuration parsing, runtime blocks, and strict checkpoint loading.
 
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use safemlx::{
     error::Exception,
-    macros::ModuleParameters,
+    macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        broadcast_to, clip, concatenate_axis, conv1d, exp,
+        arange, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, gather_qmm,
+        grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        sigmoid, sum_axis, zeros,
+        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufMetadataValue,
     },
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -23,16 +28,16 @@ use crate::{
     error::Error,
     models::{
         common::{
-            self, apply_rope_and_update_cache, batch_seq, finish_attention, project_logits_dense,
-            relu2, reshape_attention_projection, CausalLm, PackedRelu2Experts,
-            TopKRouterScoreFunction,
+            self, batch_seq, finish_attention, project_logits_maybe_quantized, relu2,
+            reshape_attention_projection, weighted_route_sum, CausalLm, TopKRouterScoreFunction,
         },
         input,
     },
-    utils::{create_attention_mask, rope::initialize_rope, AttentionMask},
+    quantization::AffineQuantization,
+    utils::{create_attention_mask, AttentionMask},
     weights::{
-        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
-        StrictLoadConfig, StrictLoadReport,
+        load_arrays_strict, load_safetensors_dir_strict_with_split_relu2_experts,
+        transform_split_relu2_experts, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -200,9 +205,29 @@ pub struct ModelArgs {
     /// Torch dtype string from the Hugging Face config.
     #[serde(default)]
     pub torch_dtype: Option<String>,
+    /// Optional MLX affine quantization metadata.
+    #[serde(default)]
+    pub quantization: Option<AffineQuantization>,
+    /// Optional exact weight names that use affine quantization.
+    #[serde(skip)]
+    pub quantized_weights: Option<HashSet<String>>,
+    /// Per-weight affine settings for GGUF files with mixed Q2/Q3/Q4/Q5/Q6/Q8 tensors.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
 }
 
 impl ModelArgs {
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        if let Some(configs) = &self.quantized_weight_configs {
+            return configs.get(weight_name).copied();
+        }
+        let quantization = self.quantization?;
+        match &self.quantized_weights {
+            Some(names) if !names.contains(weight_name) => None,
+            _ => Some(quantization),
+        }
+    }
+
     /// Returns the parsed layer kinds from `hybrid_override_pattern`.
     pub fn layer_block_types(&self) -> Result<Vec<LayerBlockType>, Error> {
         self.hybrid_override_pattern
@@ -404,10 +429,11 @@ impl MambaRmsNormGated {
         })
     }
 
-    /// Applies grouped RMS normalization followed by SiLU gate modulation.
+    /// Applies SiLU gate modulation followed by grouped RMS normalization.
     pub fn forward(&self, x: &Array, gate: &Array, stream: &Stream) -> Result<Array, Exception> {
         let original_shape = x.shape().to_vec();
-        let grouped = x.reshape(&[-1, self.n_groups, self.group_size], stream)?;
+        let gated = x.multiply(silu(gate.clone(), stream)?, stream)?;
+        let grouped = gated.reshape(&[-1, self.n_groups, self.group_size], stream)?;
         let variance = safemlx::ops::mean_axis(&grouped.square(stream)?, -1, true, stream)?;
         let normalized = grouped
             .multiply(
@@ -415,24 +441,24 @@ impl MambaRmsNormGated {
                 stream,
             )?
             .reshape(&original_shape, stream)?;
-        normalized
-            .multiply(&*self.weight, stream)?
-            .multiply(silu(gate.clone(), stream)?, stream)
+        normalized.multiply(&*self.weight, stream)
     }
 
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Dense Nemotron-H feed-forward block using `relu2(up_proj(x))`.
 pub struct Mlp {
+    #[quantizable]
     #[param]
     /// Up projection.
-    pub up_proj: nn::Linear,
+    pub up_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
     /// Down projection.
-    pub down_proj: nn::Linear,
+    pub down_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Mlp {
@@ -441,21 +467,22 @@ impl Mlp {
         hidden_size: i32,
         intermediate_size: i32,
         bias: bool,
+        quantization: [Option<AffineQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            up_proj: nn::Linear::unloaded(
+            up_proj: common::unloaded_maybe_quantized_linear(
                 hidden_size,
                 intermediate_size,
                 bias,
-                Dtype::Float32,
+                quantization[0],
                 stream,
             )?,
-            down_proj: nn::Linear::unloaded(
+            down_proj: common::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 hidden_size,
                 bias,
-                Dtype::Float32,
+                quantization[1],
                 stream,
             )?,
         })
@@ -480,8 +507,209 @@ impl Module<&Array> for Mlp {
 /// Sigmoid top-k router used by Nemotron-H MoE layers.
 pub type TopKRouter = common::TopKRouter;
 
-/// Packed routed expert bank for Nemotron-H MoE layers.
-pub type Experts = PackedRelu2Experts;
+#[derive(Debug, Clone, ModuleParameters)]
+/// Packed routed ReLU2 expert bank for Nemotron-H MoE layers.
+pub struct Experts {
+    /// Number of routed experts.
+    pub num_experts: i32,
+    /// Model hidden dimension.
+    pub hidden_size: i32,
+    /// Per-expert intermediate dimension.
+    pub intermediate_size: i32,
+    /// Optional affine settings for the up-projection bank.
+    pub up_quantization: Option<AffineQuantization>,
+    /// Optional affine settings for the down-projection bank.
+    pub down_quantization: Option<AffineQuantization>,
+    #[param]
+    /// Expert up-projection weights.
+    pub up_proj: Param<Array>,
+    #[param]
+    /// Expert up-projection affine scales.
+    pub up_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Expert up-projection affine biases.
+    pub up_proj_biases: Param<Option<Array>>,
+    #[param]
+    /// Expert down-projection weights.
+    pub down_proj: Param<Array>,
+    #[param]
+    /// Expert down-projection affine scales.
+    pub down_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Expert down-projection affine biases.
+    pub down_proj_biases: Param<Option<Array>>,
+}
+
+impl Experts {
+    /// Creates an unloaded dense or affine-quantized expert bank.
+    pub fn new(
+        num_experts: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        quantization: [Option<AffineQuantization>; 2],
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let projection = |out_features: i32,
+                          in_features: i32,
+                          quantization: Option<AffineQuantization>|
+         -> Result<
+            (Param<Array>, Param<Option<Array>>, Param<Option<Array>>),
+            Exception,
+        > {
+            match quantization {
+                Some(quantization) => Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            quantized_packed_dimension(in_features, quantization.bits),
+                        ],
+                        Dtype::Uint32,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / quantization.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / quantization.group_size,
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?,
+                )),
+                None => Ok((
+                    Param::<Array>::unloaded(
+                        &[num_experts, out_features, in_features],
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                )),
+            }
+        };
+        let (up_proj, up_proj_scales, up_proj_biases) =
+            projection(intermediate_size, hidden_size, quantization[0])?;
+        let (down_proj, down_proj_scales, down_proj_biases) =
+            projection(hidden_size, intermediate_size, quantization[1])?;
+        Ok(Self {
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            up_quantization: quantization[0],
+            down_quantization: quantization[1],
+            up_proj,
+            up_proj_scales,
+            up_proj_biases,
+            down_proj,
+            down_proj_scales,
+            down_proj_biases,
+        })
+    }
+
+    fn quantized_grouped_matmul(
+        inputs: &Array,
+        weights: &Array,
+        scales: &Array,
+        biases: &Array,
+        group_ids: &Array,
+        quantization: AffineQuantization,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let routes = inputs.dim(0);
+        let out_features = weights.dim(-2);
+        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+        gather_qmm(
+            inputs.reshape(&[routes, 1, inputs.dim(-1)], stream)?,
+            weights,
+            scales,
+            biases,
+            &lhs_indices,
+            group_ids,
+            true,
+            quantization.group_size,
+            quantization.bits,
+            true,
+            stream,
+        )?
+        .reshape(&[routes, out_features], stream)
+    }
+
+    /// Evaluates routed experts and reduces route outputs back to tokens.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let hidden = match self.up_quantization {
+            Some(quantization) => Self::quantized_grouped_matmul(
+                &hidden,
+                &self.up_proj,
+                self.up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized expert scales"),
+                self.up_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized expert biases"),
+                &plan.sorted_group_ids,
+                quantization,
+                stream,
+            )?,
+            None => grouped_matmul(
+                &hidden,
+                &self.up_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?,
+        };
+        let hidden = relu2(hidden, stream)?;
+        let current = match self.down_quantization {
+            Some(quantization) => Self::quantized_grouped_matmul(
+                &hidden,
+                &self.down_proj,
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized expert scales"),
+                self.down_proj_biases
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized expert biases"),
+                &plan.sorted_group_ids,
+                quantization,
+                stream,
+            )?,
+            None => grouped_matmul(
+                &hidden,
+                &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?,
+        };
+        weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    /// Sets training mode.
+    pub fn training_mode(&mut self, _mode: bool) {}
+}
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Sparse MoE block with routed experts plus one shared dense expert.
@@ -499,7 +727,8 @@ pub struct SparseMoeBlock {
 
 impl SparseMoeBlock {
     /// Creates an unloaded sparse MoE block.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("model.layers.{layer_idx}.moe");
         Ok(Self {
             gate: TopKRouter::new(
                 common::TopKRouterConfig {
@@ -520,12 +749,24 @@ impl SparseMoeBlock {
                 args.n_routed_experts,
                 args.hidden_size,
                 args.moe_intermediate_size,
+                [
+                    args.affine_quantization_for(&format!("{prefix}.experts.up_proj")),
+                    args.affine_quantization_for(&format!("{prefix}.experts.down_proj")),
+                ],
                 stream,
             )?,
             shared_experts: Mlp::new(
                 args.hidden_size,
                 args.moe_shared_expert_intermediate_size,
                 args.mlp_bias,
+                [
+                    args.affine_quantization_for(&format!(
+                        "{prefix}.shared_experts.up_proj.weight"
+                    )),
+                    args.affine_quantization_for(&format!(
+                        "{prefix}.shared_experts.down_proj.weight"
+                    )),
+                ],
                 stream,
             )?,
         })
@@ -561,7 +802,7 @@ impl Module<&Array> for SparseMoeBlock {
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Grouped-query self-attention layer used by `*` Nemotron-H blocks.
 pub struct Attention {
     /// Number of query heads.
@@ -570,64 +811,58 @@ pub struct Attention {
     pub n_kv_heads: i32,
     /// Attention scale.
     pub scale: f32,
+    #[quantizable]
     #[param]
     /// Query projection.
-    pub q_proj: nn::Linear,
+    pub q_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
     /// Key projection.
-    pub k_proj: nn::Linear,
+    pub k_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
     /// Value projection.
-    pub v_proj: nn::Linear,
+    pub v_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
     /// Output projection.
-    pub o_proj: nn::Linear,
-    #[param]
-    /// Rotary position embedding module.
-    pub rope: crate::utils::rope::RopeVariant,
+    pub o_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Attention {
     /// Creates an unloaded attention layer.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("model.layers.{layer_idx}.attention");
         Ok(Self {
             n_heads: args.num_attention_heads,
             n_kv_heads: args.num_key_value_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
-            q_proj: nn::Linear::unloaded(
+            q_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 args.attention_bias,
-                Dtype::Float32,
+                args.affine_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
-            k_proj: nn::Linear::unloaded(
+            k_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                Dtype::Float32,
+                args.affine_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
-            v_proj: nn::Linear::unloaded(
+            v_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                Dtype::Float32,
+                args.affine_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
-            o_proj: nn::Linear::unloaded(
+            o_proj: common::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
-                Dtype::Float32,
-                stream,
-            )?,
-            rope: initialize_rope(
-                args.head_dim,
-                args.rope_theta,
-                false,
-                &None,
-                args.max_position_embeddings,
+                args.affine_quantization_for(&format!("{prefix}.o_proj.weight")),
                 stream,
             )?,
         })
@@ -662,22 +897,23 @@ impl Module<AttentionInput<'_>> for Attention {
             self.n_heads,
             stream,
         )?;
-        let keys = reshape_attention_projection(
+        let mut keys = reshape_attention_projection(
             self.k_proj.forward(x, stream)?,
             batch,
             seq_len,
             self.n_kv_heads,
             stream,
         )?;
-        let values = reshape_attention_projection(
+        let mut values = reshape_attention_projection(
             self.v_proj.forward(x, stream)?,
             batch,
             seq_len,
             self.n_kv_heads,
             stream,
         )?;
-        let (queries, keys, values) =
-            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
+        if let Some(cache) = cache.as_mut() {
+            (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+        }
         let out = finish_attention(
             queries,
             keys,
@@ -697,10 +933,6 @@ impl Module<AttentionInput<'_>> for Attention {
         self.k_proj.training_mode(mode);
         self.v_proj.training_mode(mode);
         self.o_proj.training_mode(mode);
-        <crate::utils::rope::RopeVariant as Module<nn::RopeInput>>::training_mode(
-            &mut self.rope,
-            mode,
-        );
     }
 }
 
@@ -746,7 +978,7 @@ pub struct Mamba2Cache {
 }
 
 #[allow(non_snake_case)]
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Mamba2 mixer used by `M` Nemotron-H blocks.
 pub struct Mamba2Mixer {
     /// Number of Mamba heads.
@@ -765,15 +997,12 @@ pub struct Mamba2Mixer {
     pub conv_kernel_size: i32,
     /// Unused MLP branch size from the reference split.
     pub d_mlp: i32,
-    /// Minimum timestep clamp.
-    pub time_step_min: f32,
-    /// Maximum timestep clamp.
-    pub time_step_max: f32,
     /// Number of tokens per prefill scan chunk.
     pub chunk_size: i32,
+    #[quantizable]
     #[param]
     /// Joint input projection.
-    pub in_proj: nn::Linear,
+    pub in_proj: MaybeQuantized<nn::Linear>,
     #[param]
     /// Depthwise causal convolution.
     pub conv1d: DepthwiseConv1d,
@@ -789,14 +1018,15 @@ pub struct Mamba2Mixer {
     #[param]
     /// Gated RMSNorm.
     pub norm: MambaRmsNormGated,
+    #[quantizable]
     #[param]
     /// Output projection.
-    pub out_proj: nn::Linear,
+    pub out_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Mamba2Mixer {
     /// Creates an unloaded Mamba2 mixer.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         let intermediate_size = args.mamba_num_heads * args.mamba_head_dim;
         let conv_dim = intermediate_size + 2 * args.n_groups * args.ssm_state_size;
         let projection_size = intermediate_size + conv_dim + args.mamba_num_heads;
@@ -814,14 +1044,14 @@ impl Mamba2Mixer {
             conv_dim,
             conv_kernel_size: args.conv_kernel,
             d_mlp,
-            time_step_min: args.time_step_min,
-            time_step_max: args.time_step_max,
             chunk_size: args.chunk_size,
-            in_proj: nn::Linear::unloaded(
+            in_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 projection_size,
                 args.use_bias,
-                Dtype::Float32,
+                args.affine_quantization_for(&format!(
+                    "model.layers.{layer_idx}.mamba.in_proj.weight"
+                )),
                 stream,
             )?,
             conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
@@ -834,11 +1064,13 @@ impl Mamba2Mixer {
                 args.layer_norm_epsilon,
                 stream,
             )?,
-            out_proj: nn::Linear::unloaded(
+            out_proj: common::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 args.hidden_size,
                 args.use_bias,
-                Dtype::Float32,
+                args.affine_quantization_for(&format!(
+                    "model.layers.{layer_idx}.mamba.out_proj.weight"
+                )),
                 stream,
             )?,
         })
@@ -936,7 +1168,6 @@ impl Mamba2Mixer {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let batch = x_t.dim(0);
-        let dt_t = clip(&dt_t, (self.time_step_min, self.time_step_max), stream)?;
         let d_a = exp(
             dt_t.reshape(&[batch, self.num_heads, 1, 1], stream)?
                 .multiply(a, stream)?,
@@ -1168,7 +1399,7 @@ pub enum LayerCache {
     Moe,
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Pattern-selected Nemotron-H block.
 pub struct TransformerBlock {
     /// Layer block type.
@@ -1176,12 +1407,15 @@ pub struct TransformerBlock {
     #[param]
     /// Pre-mixer RMSNorm.
     pub norm: nn::RmsNorm,
+    #[quantizable]
     #[param]
     /// Mamba2 mixer for `M` layers.
     pub mamba: Option<Mamba2Mixer>,
+    #[quantizable]
     #[param]
     /// GQA attention mixer for `*` layers.
     pub attention: Option<Attention>,
+    #[quantizable]
     #[param]
     /// Dense MLP mixer for `-` layers.
     pub mlp: Option<Mlp>,
@@ -1203,27 +1437,32 @@ impl TransformerBlock {
                 stream,
             )?,
             mamba: if block_type == LayerBlockType::Mamba {
-                Some(Mamba2Mixer::new(args, stream)?)
+                Some(Mamba2Mixer::new(args, layer_idx, stream)?)
             } else {
                 None
             },
             attention: if block_type == LayerBlockType::Attention {
-                Some(Attention::new(args, stream)?)
+                Some(Attention::new(args, layer_idx, stream)?)
             } else {
                 None
             },
             mlp: if block_type == LayerBlockType::Mlp {
+                let prefix = format!("model.layers.{layer_idx}.mlp");
                 Some(Mlp::new(
                     args.hidden_size,
                     args.intermediate_size,
                     args.mlp_bias,
+                    [
+                        args.affine_quantization_for(&format!("{prefix}.up_proj.weight")),
+                        args.affine_quantization_for(&format!("{prefix}.down_proj.weight")),
+                    ],
                     stream,
                 )?)
             } else {
                 None
             },
             moe: if block_type == LayerBlockType::Moe {
-                Some(SparseMoeBlock::new(args, stream)?)
+                Some(SparseMoeBlock::new(args, layer_idx, stream)?)
             } else {
                 None
             },
@@ -1359,16 +1598,18 @@ impl Cache {
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Nemotron-H transformer body without the language-model head.
 pub struct NemotronHModel {
     /// Token vocabulary size.
     pub vocab_size: i32,
     /// Number of hybrid layers.
     pub num_hidden_layers: i32,
+    #[quantizable]
     #[param]
     /// Token embedding table.
-    pub embeddings: nn::Embedding,
+    pub embeddings: MaybeQuantized<nn::Embedding>,
+    #[quantizable]
     #[param]
     /// Hybrid transformer blocks.
     pub layers: Vec<TransformerBlock>,
@@ -1380,8 +1621,12 @@ pub struct NemotronHModel {
 impl NemotronHModel {
     /// Creates an unloaded Nemotron-H transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embeddings =
-            nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
+        let embeddings = common::unloaded_maybe_quantized_embedding(
+            args.vocab_size,
+            args.hidden_size,
+            args.affine_quantization_for("model.embeddings.weight"),
+            stream,
+        )?;
         let layers = (0..args.num_hidden_layers)
             .map(|idx| TransformerBlock::new(args, idx as usize, stream))
             .collect::<Result<Vec<_>, _>>()
@@ -1503,17 +1748,19 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Nemotron-H causal language model.
 pub struct Model {
     /// Model configuration.
     pub args: ModelArgs,
+    #[quantizable]
     #[param]
     /// Transformer body.
     pub model: NemotronHModel,
+    #[quantizable]
     #[param]
     /// Optional untied language-model head.
-    pub lm_head: Option<nn::Linear>,
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
@@ -1521,11 +1768,11 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = NemotronHModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(nn::Linear::unloaded(
+            Some(common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                Dtype::Float32,
+                args.affine_quantization_for("lm_head.weight"),
                 stream,
             )?)
         } else {
@@ -1553,9 +1800,9 @@ impl Model {
         hidden_states: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        project_logits_dense(
+        project_logits_maybe_quantized(
             &mut self.lm_head,
-            &self.model.embeddings,
+            &mut self.model.embeddings,
             hidden_states,
             stream,
         )
@@ -1636,6 +1883,585 @@ impl CausalLm<Cache> for Model {
 
 /// Nemotron-H token generation iterator.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+
+pub(crate) struct LoadedNemotronHGguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads a dense or sparse-MoE Nemotron-H text model from a GGUF checkpoint.
+pub fn load_nemotron_h_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_nemotron_h_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_nemotron_h_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedNemotronHGguf, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    load_nemotron_h_gguf_data(arrays, metadata, stream, weights_stream)
+}
+
+pub(crate) fn load_nemotron_h_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedNemotronHGguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "nemotron_h" | "nemotron_h_moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
+        )));
+    }
+    let is_moe = architecture == "nemotron_h_moe";
+    let metadata_prefix = architecture.as_str();
+    let expert_count_key = format!("{metadata_prefix}.expert_count");
+    let has_experts = gguf_optional_i64(&metadata, &expert_count_key, weights_stream)?.unwrap_or(0)
+        > 0
+        || arrays.keys().any(|name| name.contains("_exps"));
+    if !is_moe && has_experts {
+        return Err(Error::UnsupportedArchitecture(
+            "dense nemotron_h GGUF metadata contains MoE expert tensors".into(),
+        ));
+    }
+    if is_moe && !has_experts {
+        return Err(Error::UnsupportedArchitecture(
+            "nemotron_h_moe GGUF metadata does not contain routed experts".into(),
+        ));
+    }
+    let latent_size_key = format!("{metadata_prefix}.moe_latent_size");
+    if gguf_optional_i64(&metadata, &latent_size_key, weights_stream)?.unwrap_or(0) > 0
+        || arrays.keys().any(|name| name.contains("ffn_latent_"))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
+        ));
+    }
+
+    let mut args = nemotron_h_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
+    let mut translated = HashMap::with_capacity(arrays.len());
+    for (name, value) in arrays {
+        let (name, value) = translate_gguf_weight(name, value, weights_stream)?;
+        translated.insert(name, value);
+    }
+
+    let quantized_weight_configs = gguf_quantized_weight_configs(&translated)?;
+    let quantized_weights = quantized_weight_configs
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    args.quantized_weights = Some(quantized_weights);
+    args.quantization = None;
+    args.quantized_weight_configs = Some(quantized_weight_configs);
+
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    let eos_token_ids =
+        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+    Ok(LoadedNemotronHGguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn nemotron_h_args_from_gguf(
+    arrays: &HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let is_moe = architecture == "nemotron_h_moe";
+    let num_hidden_layers = gguf_i32(metadata, &key("block_count"), stream)?;
+    let feed_forward_lengths = expand_layer_values(
+        &key("feed_forward_length"),
+        gguf_i64_values(metadata, &key("feed_forward_length"), stream)?,
+        num_hidden_layers,
+    )?;
+    let kv_head_counts = expand_layer_values(
+        &key("attention.head_count_kv"),
+        gguf_i64_values(metadata, &key("attention.head_count_kv"), stream)?,
+        num_hidden_layers,
+    )?;
+    let hybrid_override_pattern =
+        hybrid_pattern_from_gguf_layers(&feed_forward_lengths, &kv_head_counts, is_moe);
+    let intermediate_size =
+        unique_nonzero_layer_value(&key("feed_forward_length"), &feed_forward_lengths)?;
+    let num_key_value_heads =
+        unique_nonzero_layer_value(&key("attention.head_count_kv"), &kv_head_counts)?;
+
+    let inner_size = gguf_i32(metadata, &key("ssm.inner_size"), stream)?;
+    let mamba_num_heads = gguf_i32(metadata, &key("ssm.time_step_rank"), stream)?;
+    if inner_size % mamba_num_heads != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Nemotron-H SSM inner size {inner_size} is not divisible by {mamba_num_heads} heads"
+        )));
+    }
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("Nemotron-H head size exceeds i32".into()))?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let norm_eps = gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?;
+    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+    };
+
+    let n_routed_experts = if is_moe {
+        gguf_i32(metadata, &key("expert_count"), stream)?
+    } else {
+        default_n_routed_experts()
+    };
+    let n_shared_experts = if is_moe {
+        gguf_optional_i64(metadata, &key("expert_shared_count"), stream)?
+            .unwrap_or(1)
+            .try_into()
+            .map_err(|_| Error::UnsupportedArchitecture("expert_shared_count exceeds i32".into()))?
+    } else {
+        default_n_shared_experts()
+    };
+    let moe_intermediate_size = if is_moe {
+        gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+    } else {
+        default_moe_intermediate_size()
+    };
+    let moe_shared_expert_intermediate_size = if is_moe {
+        gguf_i32(metadata, &key("expert_shared_feed_forward_length"), stream)?
+    } else {
+        default_moe_shared_expert_intermediate_size()
+    };
+    let num_experts_per_tok = if is_moe {
+        gguf_i32(metadata, &key("expert_used_count"), stream)?
+    } else {
+        default_num_experts_per_tok()
+    };
+
+    Ok(ModelArgs {
+        model_type: "nemotron_h".into(),
+        vocab_size,
+        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        hidden_size,
+        intermediate_size,
+        num_hidden_layers,
+        hybrid_override_pattern,
+        num_attention_heads,
+        head_dim,
+        num_key_value_heads,
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
+            .unwrap_or_else(default_rope_theta),
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        attention_bias: arrays.keys().any(|name| {
+            name.ends_with("attn_q.bias")
+                || name.ends_with("attn_k.bias")
+                || name.ends_with("attn_v.bias")
+                || name.ends_with("attn_output.bias")
+        }),
+        mlp_bias: arrays
+            .keys()
+            .any(|name| name.ends_with("ffn_up.bias") || name.ends_with("ffn_down.bias")),
+        use_bias: arrays
+            .keys()
+            .any(|name| name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")),
+        layer_norm_epsilon: norm_eps,
+        norm_eps,
+        residual_in_fp32: false,
+        num_logits_to_keep: 1,
+        sliding_window: gguf_optional_i64(metadata, &key("attention.sliding_window"), stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture("Nemotron-H sliding window exceeds i32".into())
+            })?,
+        ssm_state_size: gguf_i32(metadata, &key("ssm.state_size"), stream)?,
+        mamba_num_heads,
+        n_groups: gguf_i32(metadata, &key("ssm.group_count"), stream)?,
+        mamba_head_dim: inner_size / mamba_num_heads,
+        conv_kernel: gguf_i32(metadata, &key("ssm.conv_kernel"), stream)?,
+        expand: 2,
+        mamba_hidden_act: "silu".into(),
+        time_step_min: default_time_step_min(),
+        time_step_max: default_time_step_max(),
+        time_step_floor: default_time_step_floor(),
+        use_conv_bias: arrays.keys().any(|name| name.ends_with("ssm_conv1d.bias")),
+        mamba_proj_bias: arrays
+            .keys()
+            .any(|name| name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")),
+        chunk_size: default_chunk_size(),
+        rescale_prenorm_residual: true,
+        mlp_hidden_act: "relu2".into(),
+        n_routed_experts,
+        n_shared_experts,
+        moe_intermediate_size,
+        moe_shared_expert_intermediate_size,
+        num_experts_per_tok,
+        routed_scaling_factor: if is_moe {
+            gguf_optional_f32(metadata, &key("expert_weights_scale"), stream)?.unwrap_or(1.0)
+        } else {
+            default_routed_scaling_factor()
+        },
+        n_group: if is_moe {
+            gguf_optional_i64(metadata, &key("expert_group_count"), stream)?
+                .unwrap_or(1)
+                .try_into()
+                .map_err(|_| {
+                    Error::UnsupportedArchitecture("expert_group_count exceeds i32".into())
+                })?
+        } else {
+            default_n_group()
+        },
+        topk_group: if is_moe {
+            gguf_optional_i64(metadata, &key("expert_group_used_count"), stream)?
+                .unwrap_or(1)
+                .try_into()
+                .map_err(|_| {
+                    Error::UnsupportedArchitecture("expert_group_used_count exceeds i32".into())
+                })?
+        } else {
+            default_topk_group()
+        },
+        norm_topk_prob: if is_moe {
+            gguf_optional_i64(metadata, &key("expert_weights_norm"), stream)?.unwrap_or(1) != 0
+        } else {
+            true
+        },
+        torch_dtype: None,
+        quantization: None,
+        quantized_weights: None,
+        quantized_weight_configs: None,
+    })
+}
+
+fn gguf_quantized_weight_configs(
+    arrays: &HashMap<String, Array>,
+) -> Result<HashMap<String, AffineQuantization>, Error> {
+    let mut configs = HashMap::new();
+    for (scales_name, scales) in arrays {
+        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
+            format!("{prefix}.weight")
+        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
+            prefix.to_string()
+        } else {
+            continue;
+        };
+        let Some(weight) = arrays.get(&weight_name) else {
+            continue;
+        };
+        let config = gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
+        configs.insert(weight_name, config);
+    }
+    Ok(configs)
+}
+
+fn gguf_affine_quantization(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    weight_name: &str,
+) -> Result<AffineQuantization, Error> {
+    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
+}
+
+fn expand_layer_values(
+    key: &str,
+    values: Vec<i64>,
+    num_hidden_layers: i32,
+) -> Result<Vec<i32>, Error> {
+    let values = if values.len() == 1 {
+        vec![values[0]; num_hidden_layers as usize]
+    } else if values.len() == num_hidden_layers as usize {
+        values
+    } else {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has {} values for {num_hidden_layers} layers",
+            values.len()
+        )));
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            i32::try_from(value).map_err(|_| {
+                Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+            })
+        })
+        .collect()
+}
+
+fn hybrid_pattern_from_gguf_layers(
+    feed_forward_lengths: &[i32],
+    kv_head_counts: &[i32],
+    is_moe: bool,
+) -> String {
+    feed_forward_lengths
+        .iter()
+        .zip(kv_head_counts)
+        .map(|(feed_forward, kv_heads)| {
+            if *feed_forward > 0 {
+                if is_moe {
+                    'E'
+                } else {
+                    '-'
+                }
+            } else if *kv_heads > 0 {
+                '*'
+            } else {
+                'M'
+            }
+        })
+        .collect()
+}
+
+fn unique_nonzero_layer_value(key: &str, values: &[i32]) -> Result<i32, Error> {
+    let Some(value) = values.iter().copied().find(|value| *value > 0) else {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has no non-zero layer value"
+        )));
+    };
+    if values.iter().any(|other| *other > 0 && *other != value) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has non-uniform non-zero layer values"
+        )));
+    }
+    Ok(value)
+}
+
+fn translate_gguf_weight(
+    name: String,
+    value: Array,
+    stream: &Stream,
+) -> Result<(String, Array), Error> {
+    let translated = translate_gguf_weight_name(&name);
+    let value = if name.ends_with(".ssm_conv1d.weight") {
+        value.reshape(&[value.shape()[0], 1, value.shape()[1]], stream)?
+    } else if name.ends_with(".ssm_a") {
+        value
+            .multiply(Array::from_f32(-1.0), stream)?
+            .log(stream)?
+            .reshape(&[-1], stream)?
+    } else if name.ends_with(".ssm_d") || name.ends_with(".ssm_norm.weight") {
+        value.reshape(&[-1], stream)?
+    } else {
+        value
+    };
+    Ok((translated, value))
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    const ROOTS: [(&str, &str); 3] = [
+        ("token_embd", "model.embeddings"),
+        ("output_norm", "model.norm_f"),
+        ("output", "lm_head"),
+    ];
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+
+    const MOE_PARAMETERS: [(&str, &str); 7] = [
+        ("ffn_gate_inp", "gate"),
+        ("exp_probs_b", "gate.e_score_correction_bias"),
+        ("ffn_up_exps", "experts.up_proj"),
+        ("ffn_down_exps", "experts.down_proj"),
+        ("ffn_up_shexp", "shared_experts.up_proj"),
+        ("ffn_down_shexp", "shared_experts.down_proj"),
+        ("ffn_exp_probs_b", "gate.e_score_correction_bias"),
+    ];
+    for (source, target) in MOE_PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let suffix = parameter.strip_prefix(source).unwrap_or_default();
+            let suffix = if target == "gate.e_score_correction_bias" && suffix == ".bias" {
+                ""
+            } else if target.starts_with("experts.") {
+                match suffix {
+                    ".weight" => "",
+                    ".scales" => "_scales",
+                    ".biases" => "_biases",
+                    other => other,
+                }
+            } else {
+                suffix
+            };
+            return format!("model.layers.{layer}.moe.{target}{suffix}");
+        }
+    }
+
+    const PARAMETERS: [(&str, &str); 16] = [
+        ("attn_norm", "norm"),
+        ("attn_q", "attention.q_proj"),
+        ("attn_k", "attention.k_proj"),
+        ("attn_v", "attention.v_proj"),
+        ("attn_output", "attention.o_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("ffn_down", "mlp.down_proj"),
+        ("ssm_in", "mamba.in_proj"),
+        ("ssm_conv1d", "mamba.conv1d"),
+        ("ssm_dt.bias", "mamba.dt_bias"),
+        ("ssm_a", "mamba.A_log"),
+        ("ssm_d", "mamba.D"),
+        ("ssm_norm", "mamba.norm"),
+        ("ssm_out", "mamba.out_proj"),
+        ("rope_freqs", "rope_freqs"),
+        ("ffn_norm", "ffn_norm"),
+    ];
+    for (source, target) in PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    name.to_string()
+}
+
+fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata is missing required key {key:?}"
+        ))),
+    }
+}
+
+fn gguf_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    i32::try_from(gguf_i64(metadata, key, stream)?).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
+}
+
+fn gguf_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    let Some(values) = gguf_optional_i64_values(metadata, key, stream)? else {
+        return Ok(None);
+    };
+    if values.len() != 1 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        )));
+    }
+    Ok(values.into_iter().next())
+}
+
+fn gguf_i64_values(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Vec<i64>, Error> {
+    gguf_optional_i64_values(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64_values(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<Vec<i64>>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() > 0 => {
+            let value = value.as_dtype(Dtype::Int64, stream)?;
+            if value.size() == 1 {
+                return Ok(Some(vec![value.try_item::<i64>(stream)?]));
+            }
+            let value = value.flatten(None, None, stream)?;
+            let mut values = Vec::with_capacity(value.size());
+            for index in 0..value.size() {
+                values.push(
+                    value
+                        .try_index_device(index as i32, stream)?
+                        .try_item::<i64>(stream)?,
+                );
+            }
+            Ok(Some(values))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must not be empty"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<f32>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
 
 /// Loads `tokenizer.json` from a Nemotron-H model directory.
 pub fn load_nemotron_h_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
@@ -1812,11 +2638,16 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_nemotron_h_model, load_nemotron_h_safetensors_strict, rewrite_nemotron_h_weight_key,
+        expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
+        load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
+        rewrite_nemotron_h_weight_key, translate_gguf_weight_name, unique_nonzero_layer_value,
         validate_model_config_value, LayerBlockType, Model, ModelArgs, SparseMoeBlock,
     };
-    use crate::models::common::{CausalLm, TopKRouterScoreFunction};
     use crate::weights::{StrictLoadConfig, StrictLoadReport};
+    use crate::{
+        models::common::{CausalLm, TopKRouterScoreFunction},
+        quantization::AffineQuantization,
+    };
     use safemlx::{module::ModuleParameters, ops::indexing::TryIndexOp, Array, ExecutionContext};
     use serde_json::json;
     use std::{
@@ -1994,6 +2825,89 @@ mod tests {
     }
 
     #[test]
+    fn translates_nemotron_h_gguf_tensor_names() {
+        assert_eq!(
+            translate_gguf_weight_name("token_embd.weight"),
+            "model.embeddings.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.12.attn_q.scales"),
+            "model.layers.12.attention.q_proj.scales"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.0.ssm_conv1d.weight"),
+            "model.layers.0.mamba.conv1d.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.0.ssm_dt.bias"),
+            "model.layers.0.mamba.dt_bias"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_down.weight"),
+            "model.layers.1.mlp.down_proj.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("output.weight"),
+            "lm_head.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_gate_inp.weight"),
+            "model.layers.1.moe.gate.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.exp_probs_b.bias"),
+            "model.layers.1.moe.gate.e_score_correction_bias"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_up_exps.weight"),
+            "model.layers.1.moe.experts.up_proj"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_up_exps.scales"),
+            "model.layers.1.moe.experts.up_proj_scales"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_down_exps.biases"),
+            "model.layers.1.moe.experts.down_proj_biases"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.1.ffn_up_shexp.weight"),
+            "model.layers.1.moe.shared_experts.up_proj.weight"
+        );
+    }
+
+    #[test]
+    fn reconstructs_dense_hybrid_layer_metadata() {
+        let feed_forward =
+            expand_layer_values("nemotron_h.feed_forward_length", vec![0, 12544, 0, 0], 4).unwrap();
+        let kv_heads =
+            expand_layer_values("nemotron_h.attention.head_count_kv", vec![0, 0, 0, 8], 4).unwrap();
+        let pattern = hybrid_pattern_from_gguf_layers(&feed_forward, &kv_heads, false);
+        assert_eq!(pattern, "M-M*");
+        assert_eq!(
+            hybrid_pattern_from_gguf_layers(&feed_forward, &kv_heads, true),
+            "MEM*"
+        );
+        assert_eq!(
+            unique_nonzero_layer_value("feed_forward", &feed_forward).unwrap(),
+            12544
+        );
+    }
+
+    #[test]
+    fn infers_mixed_q4_and_q8_affine_packing_per_tensor() {
+        assert_eq!(
+            gguf_affine_quantization(&[17504, 392], &[17504, 98], "ssm_in.weight").unwrap(),
+            AffineQuantization::new(32, 4).unwrap()
+        );
+        assert_eq!(
+            gguf_affine_quantization(&[131072, 784], &[131072, 98], "lm_head.weight").unwrap(),
+            AffineQuantization::new(32, 8).unwrap()
+        );
+        assert!(gguf_affine_quantization(&[16, 196], &[16, 98], "bad.weight").is_err());
+    }
+
+    #[test]
     #[ignore = "requires MLX runtime execution"]
     fn strict_load_packs_public_split_moe_expert_weights() {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -2042,7 +2956,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut moe = SparseMoeBlock::new(&args, stream).unwrap();
+        let mut moe = SparseMoeBlock::new(&args, 1, stream).unwrap();
         let config = StrictLoadConfig::default().rewrite_prefix("backbone.layers.1.moe.", "");
         let mut report = StrictLoadReport::default();
         load_nemotron_h_safetensors_strict(
@@ -2205,12 +3119,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NEMOTRON_H_MOE_GGUF and Metal"]
+    fn strict_loads_and_runs_real_nemotron_h_moe_gguf() {
+        let gguf_file = PathBuf::from(
+            std::env::var("NEMOTRON_H_MOE_GGUF")
+                .expect("set NEMOTRON_H_MOE_GGUF to a local checkpoint"),
+        );
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut model = load_nemotron_h_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+
+        assert_eq!(model.args.num_hidden_layers, 52);
+        assert_eq!(model.args.n_routed_experts, 128);
+        assert_eq!(model.args.num_experts_per_tok, 6);
+        assert!(model
+            .args
+            .layer_block_types()
+            .unwrap()
+            .contains(&LayerBlockType::Moe));
+
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let mut cache = model.new_cache();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            crate::models::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, 131072]);
+    }
+
+    #[test]
     #[ignore = "requires MLX runtime execution"]
     fn moe_parameter_tree_uses_nemotron_weight_names_and_policy() {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let args: ModelArgs = serde_json::from_value(nemotron_nano_config()).unwrap();
-        let moe = SparseMoeBlock::new(&args, stream).unwrap();
+        let moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let params = moe.parameters().flatten();
 
         assert_eq!(moe.gate.top_k, 6);

@@ -10,14 +10,15 @@ use std::{
 use safemlx::{
     builder::Builder,
     error::Exception,
-    fast::{MetalKernel, MetalKernelConfig, ScaledDotProductAttentionMask},
+    fast::ScaledDotProductAttentionMask,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
         concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        mean_axis, quantized_matmul, r#where, rsqrt, tanh,
+        mean_axis, quantized_matmul, quantized_packed_dimension, r#where, rsqrt, tanh,
+        GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -51,8 +52,8 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
-        StrictLoadReport,
+        load_arrays_strict, load_safetensors_quantized_strict, load_safetensors_strict,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -113,7 +114,6 @@ enum PerfComponent {
 
 thread_local! {
     static PERF_STATS: RefCell<Option<PerfStats>> = const { RefCell::new(None) };
-    static GELU_MUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
 /// Enables or disables per-thread Gemma 4 profiling.
@@ -156,55 +156,6 @@ fn profile_arrays(component: PerfComponent, arrays: &[&Array]) -> Result<(), Exc
 
 fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exception> {
     profile_arrays(component, &[array])
-}
-
-fn gelu_mul_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "gemma4_gelu_mul",
-        ["fused"],
-        ["out"],
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint col = elem % HIDDEN_DIM;",
-            "uint row = elem / HIDDEN_DIM;",
-            "uint base = row * HIDDEN_DIM * 2;",
-            "float gate = float(fused[base + col]);",
-            "float up = float(fused[base + HIDDEN_DIM + col]);",
-            "float x3 = gate * gate * gate;",
-            "float inner = 0.7978845608028654f * (gate + 0.044715f * x3);",
-            "float gelu = 0.5f * gate * (1.0f + metal::tanh(inner));",
-            "out[elem] = T(gelu * up);"
-        ),
-        "",
-        true,
-        false,
-    )
-}
-
-fn gelu_mul_fused(fused: &Array, hidden_dim: i32, stream: &Stream) -> Result<Array, Exception> {
-    let mut output_shape = fused.shape().to_vec();
-    let Some(last) = output_shape.last_mut() else {
-        return Err(Exception::custom(
-            "fused Gemma 4 MLP output has no dimensions",
-        ));
-    };
-    *last = hidden_dim;
-
-    GELU_MUL_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(gelu_mul_kernel()?);
-        }
-        let config = MetalKernelConfig::new()
-            .with_template_arg_dtype("T", fused.dtype())
-            .with_template_arg_int("HIDDEN_DIM", hidden_dim)
-            .with_grid([output_shape.iter().product(), 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg(output_shape, fused.dtype());
-        cell.borrow()
-            .as_ref()
-            .expect("Gemma 4 GELU/mul kernel initialized")
-            .apply_one_device([fused], &config, stream)
-    })
 }
 
 fn sliding_window_prefill_attention(
@@ -297,6 +248,12 @@ pub struct ModelArgs {
     pub num_hidden_layers: i32,
     /// Dense MLP intermediate size.
     pub intermediate_size: i32,
+    #[serde(default)]
+    /// Whether the final shared-KV layers use twice the base MLP width.
+    pub use_double_wide_mlp: bool,
+    #[serde(skip)]
+    /// Optional GGUF-provided per-layer MLP widths.
+    pub feed_forward_lengths: Option<Vec<i32>>,
     /// Number of query attention heads.
     pub num_attention_heads: i32,
     /// RMSNorm epsilon.
@@ -333,6 +290,12 @@ pub struct ModelArgs {
     #[serde(skip)]
     /// Whether Gemma-specific quantized tensors are expected.
     pub quantized: bool,
+    #[serde(skip)]
+    /// Optional set of parameter weights that are quantized in a mixed checkpoint.
+    pub quantized_weights: Option<HashSet<String>>,
+    #[serde(skip)]
+    /// Exact affine settings for mixed GGUF tensors.
+    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
     #[serde(skip)]
     /// Quantization group size for quantized weights.
     pub quantization_group_size: i32,
@@ -442,6 +405,42 @@ impl ModelArgs {
         })
     }
 
+    pub(crate) fn quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        if let Some(config) = self
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(weight_name))
+        {
+            return Some(*config);
+        }
+        self.is_quantized(weight_name)
+            .then(|| AffineQuantization::new(self.quantization_group_size, self.quantization_bits))
+            .and_then(Result::ok)
+    }
+
+    fn is_quantized(&self, weight_name: &str) -> bool {
+        self.quantized
+            && self
+                .quantized_weights
+                .as_ref()
+                .is_none_or(|weights| weights.contains(weight_name))
+    }
+
+    fn feed_forward_length_for_layer(&self, layer_index: usize) -> i32 {
+        if let Some(lengths) = &self.feed_forward_lengths {
+            return lengths
+                .get(layer_index)
+                .copied()
+                .unwrap_or(self.intermediate_size);
+        }
+        let first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers;
+        if self.use_double_wide_mlp && layer_index as i32 >= first_shared_layer {
+            self.intermediate_size * 2
+        } else {
+            self.intermediate_size
+        }
+    }
+
     fn for_layer(&self, layer_type: LayerType) -> Self {
         let mut args = self.clone();
         if layer_type == LayerType::FullAttention {
@@ -515,23 +514,29 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)
 }
 
-pub(super) fn maybe_quantized_linear(
-    quantized: bool,
+fn maybe_quantized_linear_with_config(
     input_dims: i32,
     output_dims: i32,
-    group_size: i32,
-    bits: i32,
+    quantization: Option<AffineQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    maybe_quantized_linear_with_bias(
-        quantized,
-        input_dims,
-        output_dims,
-        group_size,
-        bits,
-        false,
-        stream,
-    )
+    match quantization {
+        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
+            input_dims,
+            output_dims,
+            config.group_size,
+            config.bits,
+            false,
+            stream,
+        )?)),
+        None => Ok(MaybeQuantized::Original(nn::Linear::unloaded(
+            input_dims,
+            output_dims,
+            false,
+            Dtype::Float32,
+            stream,
+        )?)),
+    }
 }
 
 pub(super) fn maybe_quantized_linear_with_bias(
@@ -647,44 +652,37 @@ impl Attention {
             false
         };
 
-        let q_proj = maybe_quantized_linear(
-            args.quantized,
+        let prefix = format!("model.language_model.layers.{layer_idx}.self_attn");
+        let q_proj = maybe_quantized_linear_with_config(
             dim,
             n_heads * head_dim,
-            args.quantization_group_size,
-            args.quantization_bits,
+            args.quantization_for(&format!("{prefix}.q_proj.weight")),
             stream,
         )?;
         let k_proj = if is_kv_shared_layer {
             None
         } else {
-            Some(maybe_quantized_linear(
-                args.quantized,
+            Some(maybe_quantized_linear_with_config(
                 dim,
                 n_kv_heads * head_dim,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?)
         };
         let v_proj = if is_kv_shared_layer || attention_k_eq_v {
             None
         } else {
-            Some(maybe_quantized_linear(
-                args.quantized,
+            Some(maybe_quantized_linear_with_config(
                 dim,
                 n_kv_heads * head_dim,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?)
         };
-        let o_proj = maybe_quantized_linear(
-            args.quantized,
+        let o_proj = maybe_quantized_linear_with_config(
             n_heads * head_dim,
             dim,
-            args.quantization_group_size,
-            args.quantization_bits,
+            args.quantization_for(&format!("{prefix}.o_proj.weight")),
             stream,
         )?;
 
@@ -1075,23 +1073,6 @@ pub struct Mlp {
     #[param]
     /// Up projection.
     pub up_proj: MaybeQuantized<nn::Linear>,
-    /// Lazily fused quantized gate/up projection.
-    pub fused_gate_up: Option<FusedQuantizedGateUp>,
-}
-
-#[derive(Debug, Clone)]
-/// Packed gate/up projection used by quantized Gemma 4 MLPs.
-pub struct FusedQuantizedGateUp {
-    /// Concatenated packed gate/up weights.
-    pub weight: Array,
-    /// Concatenated quantization scales.
-    pub scales: Array,
-    /// Concatenated quantization biases.
-    pub biases: Array,
-    /// Quantization group size.
-    pub group_size: i32,
-    /// Quantization bit width.
-    pub bits: i32,
 }
 
 impl Mlp {
@@ -1104,71 +1085,39 @@ impl Mlp {
         bits: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let quantization = if quantized {
+            Some(
+                AffineQuantization::new(group_size, bits)
+                    .map_err(|err| Exception::custom(err.to_string()))?,
+            )
+        } else {
+            None
+        };
+        Self::new_selective(dim, hidden_dim, [quantization; 3], stream)
+    }
+
+    fn new_selective(
+        dim: i32,
+        hidden_dim: i32,
+        quantization: [Option<AffineQuantization>; 3],
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             hidden_dim,
-            gate_proj: maybe_quantized_linear(
-                quantized, dim, hidden_dim, group_size, bits, stream,
+            gate_proj: maybe_quantized_linear_with_config(
+                dim,
+                hidden_dim,
+                quantization[0],
+                stream,
             )?,
-            down_proj: maybe_quantized_linear(
-                quantized, hidden_dim, dim, group_size, bits, stream,
+            down_proj: maybe_quantized_linear_with_config(
+                hidden_dim,
+                dim,
+                quantization[1],
+                stream,
             )?,
-            up_proj: maybe_quantized_linear(quantized, dim, hidden_dim, group_size, bits, stream)?,
-            fused_gate_up: None,
+            up_proj: maybe_quantized_linear_with_config(dim, hidden_dim, quantization[2], stream)?,
         })
-    }
-
-    fn ensure_fused_gate_up(
-        &mut self,
-        stream: &Stream,
-    ) -> Result<Option<&FusedQuantizedGateUp>, Exception> {
-        if self.fused_gate_up.is_none() {
-            let (MaybeQuantized::Quantized(gate), MaybeQuantized::Quantized(up)) =
-                (&self.gate_proj, &self.up_proj)
-            else {
-                return Ok(None);
-            };
-            if gate.group_size != up.group_size
-                || gate.bits != up.bits
-                || gate.inner.bias.as_ref().is_some()
-                || up.inner.bias.as_ref().is_some()
-            {
-                return Ok(None);
-            }
-
-            self.fused_gate_up = Some(FusedQuantizedGateUp {
-                weight: concatenate_axis(
-                    &[gate.inner.weight.as_ref(), up.inner.weight.as_ref()],
-                    0,
-                    stream,
-                )?,
-                scales: concatenate_axis(&[gate.scales.as_ref(), up.scales.as_ref()], 0, stream)?,
-                biases: concatenate_axis(&[gate.biases.as_ref(), up.biases.as_ref()], 0, stream)?,
-                group_size: gate.group_size,
-                bits: gate.bits,
-            });
-        }
-        Ok(self.fused_gate_up.as_ref())
-    }
-
-    fn fused_gate_up_forward(
-        &mut self,
-        input: &Array,
-        stream: &Stream,
-    ) -> Result<Option<Array>, Exception> {
-        let Some(fused) = self.ensure_fused_gate_up(stream)? else {
-            return Ok(None);
-        };
-        let output = quantized_matmul(
-            input,
-            &fused.weight,
-            &fused.scales,
-            Some(&fused.biases),
-            true,
-            fused.group_size,
-            fused.bits,
-            stream,
-        )?;
-        Ok(Some(gelu_mul_fused(&output, self.hidden_dim, stream)?))
     }
 }
 
@@ -1177,21 +1126,13 @@ impl Module<&Array> for Mlp {
     type Error = Exception;
 
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
-        let down_proj_input = match self.fused_gate_up_forward(input, stream)? {
-            Some(down_proj_input) => down_proj_input,
-            None => {
-                let gate = self.gate_proj.forward(input, stream)?;
-                let up = self.up_proj.forward(input, stream)?;
-                nn::gelu_approximate(gate, stream)?.multiply(up, stream)?
-            }
-        };
+        let gate = self.gate_proj.forward(input, stream)?;
+        let up = self.up_proj.forward(input, stream)?;
+        let down_proj_input = nn::gelu_approximate(gate, stream)?.multiply(up, stream)?;
         self.down_proj.forward(&down_proj_input, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
-        if mode {
-            self.fused_gate_up = None;
-        }
         self.gate_proj.training_mode(mode);
         self.down_proj.training_mode(mode);
         self.up_proj.training_mode(mode);
@@ -1252,19 +1193,16 @@ impl Gemma4Embedding {
     pub fn unloaded(
         vocab_size: i32,
         hidden_size: i32,
-        quantized: bool,
-        group_size: i32,
-        bits: i32,
+        quantization: Option<AffineQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let packed_per_int = 32 / bits;
+        let quantized = quantization.is_some();
+        let group_size = quantization.map_or(64, |config| config.group_size);
+        let bits = quantization.map_or(4, |config| config.bits);
+        let packed_dim = quantized_packed_dimension(hidden_size, bits);
         Ok(Self {
             weight: if quantized {
-                Param::<Array>::unloaded(
-                    &[vocab_size, hidden_size / packed_per_int],
-                    Dtype::Uint32,
-                    stream,
-                )?
+                Param::<Array>::unloaded(&[vocab_size, packed_dim], Dtype::Uint32, stream)?
             } else {
                 Param::<Array>::unloaded(&[vocab_size, hidden_size], Dtype::Float32, stream)?
             },
@@ -1304,8 +1242,11 @@ impl Gemma4Embedding {
         Ok(Self {
             weight: Param::new(if quantized {
                 Array::from_slice(
-                    &vec![0u32; (vocab_size * (hidden_size / (32 / bits))) as usize],
-                    &[vocab_size, hidden_size / (32 / bits)],
+                    &vec![
+                        0u32;
+                        (vocab_size * quantized_packed_dimension(hidden_size, bits)) as usize
+                    ],
+                    &[vocab_size, quantized_packed_dimension(hidden_size, bits)],
                 )
             } else {
                 nn::Embedding::new(vocab_size, hidden_size)?.weight.value
@@ -1457,12 +1398,15 @@ impl TransformerBlock {
     ) -> Result<Self, Exception> {
         let layer_args = args.for_layer(layer_type);
         let self_attn = Attention::new(&layer_args, layer_type, layer_idx, stream)?;
-        let mlp = Mlp::new(
+        let prefix = format!("model.language_model.layers.{layer_idx}");
+        let mlp = Mlp::new_selective(
             args.hidden_size,
-            args.intermediate_size,
-            args.quantized,
-            args.quantization_group_size,
-            args.quantization_bits,
+            args.feed_forward_length_for_layer(layer_idx),
+            [
+                args.quantization_for(&format!("{prefix}.mlp.gate_proj.weight")),
+                args.quantization_for(&format!("{prefix}.mlp.down_proj.weight")),
+                args.quantization_for(&format!("{prefix}.mlp.up_proj.weight")),
+            ],
             stream,
         )?;
         let input_layernorm =
@@ -1474,24 +1418,20 @@ impl TransformerBlock {
         let post_feedforward_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let per_layer_input_gate = if args.hidden_size_per_layer_input > 0 {
-            Some(maybe_quantized_linear(
-                args.quantized,
+            Some(maybe_quantized_linear_with_config(
                 args.hidden_size,
                 args.hidden_size_per_layer_input,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for(&format!("{prefix}.per_layer_input_gate.weight")),
                 stream,
             )?)
         } else {
             None
         };
         let per_layer_projection = if args.hidden_size_per_layer_input > 0 {
-            Some(maybe_quantized_linear(
-                args.quantized,
+            Some(maybe_quantized_linear_with_config(
                 args.hidden_size_per_layer_input,
                 args.hidden_size,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for(&format!("{prefix}.per_layer_projection.weight")),
                 stream,
             )?)
         } else {
@@ -1788,30 +1728,24 @@ impl Gemma4TextModel {
         let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
             args.hidden_size,
-            args.quantized,
-            args.quantization_group_size,
-            args.quantization_bits,
+            args.quantization_for("model.language_model.embed_tokens.weight"),
             stream,
         )?;
         let embed_tokens_per_layer = if args.hidden_size_per_layer_input > 0 {
             Some(Gemma4Embedding::unloaded(
                 args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
                 args.num_hidden_layers * args.hidden_size_per_layer_input,
-                args.quantized,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for("model.language_model.embed_tokens_per_layer.weight"),
                 stream,
             )?)
         } else {
             None
         };
         let per_layer_model_projection = if args.hidden_size_per_layer_input > 0 {
-            Some(maybe_quantized_linear(
-                args.quantized,
+            Some(maybe_quantized_linear_with_config(
                 args.hidden_size,
                 args.num_hidden_layers * args.hidden_size_per_layer_input,
-                args.quantization_group_size,
-                args.quantization_bits,
+                args.quantization_for("model.language_model.per_layer_model_projection.weight"),
                 stream,
             )?)
         } else {
@@ -2395,14 +2329,12 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(
-                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
-                    args.hidden_size,
-                    args.vocab_size,
-                    args.affine_quantization(),
-                    stream,
-                )?,
-            )
+            Some(maybe_quantized_linear_with_config(
+                args.hidden_size,
+                args.vocab_size,
+                args.quantization_for("lm_head.weight"),
+                stream,
+            )?)
         } else {
             None
         };
@@ -2432,14 +2364,12 @@ impl Model {
             stream,
         )?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(
-                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
-                    args.hidden_size,
-                    args.vocab_size,
-                    args.affine_quantization(),
-                    stream,
-                )?,
-            )
+            Some(maybe_quantized_linear_with_config(
+                args.hidden_size,
+                args.vocab_size,
+                args.quantization_for("lm_head.weight"),
+                stream,
+            )?)
         } else {
             None
         };
@@ -2642,6 +2572,531 @@ where
 pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
+}
+
+pub(crate) struct LoadedGemma4Gguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads the text model from a Gemma 4 GGUF checkpoint.
+///
+/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
+/// supported. Vision, audio, MoE, assistant-drafter, and separate multimodal
+/// projector GGUF files are intentionally outside this first text-only adapter.
+pub fn load_gemma4_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_gemma4_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_gemma4_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedGemma4Gguf, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    load_gemma4_gguf_data(arrays, metadata, stream, weights_stream)
+}
+
+pub(crate) fn load_gemma4_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedGemma4Gguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if architecture != "gemma4" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports only gemma4"
+        )));
+    }
+
+    let mut args = gemma4_args_from_gguf(&arrays, &metadata, weights_stream)?;
+    let translated = arrays
+        .into_iter()
+        .map(|(name, value)| (translate_gguf_weight_name(&name), value))
+        .collect::<HashMap<_, _>>();
+    let quantized_weights = translated
+        .keys()
+        .filter_map(|name| {
+            name.strip_suffix(".scales")
+                .map(|prefix| format!("{prefix}.weight"))
+        })
+        .collect::<HashSet<_>>();
+    let quantized_weight_configs = gemma4_gguf_quantized_weight_configs(&translated)?;
+    let has_quantized_tensors = !quantized_weights.is_empty();
+    args.quantized_weights = Some(quantized_weights);
+    args.quantized_weight_configs = Some(quantized_weight_configs);
+    if has_quantized_tensors {
+        args.quantized = true;
+    }
+
+    let mut model = Model::new(args, stream)?;
+    let mut config = StrictLoadConfig::default()
+        .allow_unused_prefix("rope_freqs.")
+        .allow_missing_suffix(".bias");
+    let first_shared_layer =
+        (model.args.num_hidden_layers - model.args.num_kv_shared_layers).max(0);
+    for layer in first_shared_layer..model.args.num_hidden_layers {
+        let prefix = format!("model.language_model.layers.{layer}.self_attn");
+        config = config
+            .allow_unused_prefix(format!("{prefix}.k_proj."))
+            .allow_unused_prefix(format!("{prefix}.v_proj."))
+            .allow_unused_prefix(format!("{prefix}.k_norm."));
+    }
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    let eos_token_ids =
+        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+
+    Ok(LoadedGemma4Gguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn gemma4_gguf_quantized_weight_configs(
+    arrays: &HashMap<String, Array>,
+) -> Result<HashMap<String, AffineQuantization>, Error> {
+    let mut configs = HashMap::new();
+    for (scales_name, scales) in arrays {
+        let Some(prefix) = scales_name.strip_suffix(".scales") else {
+            continue;
+        };
+        let weight_name = format!("{prefix}.weight");
+        let Some(weight) = arrays.get(&weight_name) else {
+            continue;
+        };
+        let config = crate::quantization::gguf_affine_quantization(
+            weight.shape(),
+            scales.shape(),
+            &weight_name,
+        )?;
+        configs.insert(weight_name, config);
+    }
+    Ok(configs)
+}
+
+fn gemma4_args_from_gguf(
+    arrays: &HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    if gguf_optional_i64(metadata, "gemma4.expert_count", stream)?.unwrap_or(0) > 0
+        || arrays.keys().any(|name| name.contains("_exps."))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 MoE GGUF checkpoints are not supported yet".into(),
+        ));
+    }
+
+    let num_hidden_layers = gguf_i32(metadata, "gemma4.block_count", stream)?;
+    let layer_pattern =
+        gguf_optional_i64_values(metadata, "gemma4.attention.sliding_window_pattern", stream)?
+            .unwrap_or_else(|| vec![0; num_hidden_layers as usize]);
+    if layer_pattern.len() != num_hidden_layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Gemma 4 sliding-window pattern has {} entries for {num_hidden_layers} layers",
+            layer_pattern.len()
+        )));
+    }
+    let layer_types = layer_pattern
+        .into_iter()
+        .map(|is_sliding| {
+            if is_sliding != 0 {
+                LayerType::SlidingAttention
+            } else {
+                LayerType::FullAttention
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let feed_forward_values = gguf_i64_values(metadata, "gemma4.feed_forward_length", stream)?;
+    let feed_forward_lengths = expand_layer_values(
+        "gemma4.feed_forward_length",
+        feed_forward_values,
+        num_hidden_layers,
+    )?;
+    let intermediate_size = feed_forward_lengths[0];
+
+    let kv_head_values = gguf_i64_values(metadata, "gemma4.attention.head_count_kv", stream)?;
+    let kv_head_values = expand_layer_values(
+        "gemma4.attention.head_count_kv",
+        kv_head_values,
+        num_hidden_layers,
+    )?;
+    let sliding_kv_heads = layer_types
+        .iter()
+        .zip(&kv_head_values)
+        .find_map(|(kind, value)| (*kind == LayerType::SlidingAttention).then_some(*value))
+        .unwrap_or(kv_head_values[0]);
+    let full_kv_heads = layer_types
+        .iter()
+        .zip(&kv_head_values)
+        .find_map(|(kind, value)| (*kind == LayerType::FullAttention).then_some(*value))
+        .unwrap_or(sliding_kv_heads);
+    for (kind, value) in layer_types.iter().zip(&kv_head_values) {
+        let expected = if *kind == LayerType::FullAttention {
+            full_kv_heads
+        } else {
+            sliding_kv_heads
+        };
+        if *value != expected {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 GGUF uses non-uniform KV-head counts within one attention type".into(),
+            ));
+        }
+    }
+
+    let hidden_size = gguf_i32(metadata, "gemma4.embedding_length", stream)?;
+    let num_attention_heads = gguf_i32(metadata, "gemma4.attention.head_count", stream)?;
+    let global_head_dim = gguf_i32(metadata, "gemma4.attention.key_length", stream)?;
+    let head_dim = gguf_optional_i64(metadata, "gemma4.attention.key_length_swa", stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("Gemma 4 SWA head size exceeds i32".into()))?
+        .unwrap_or(global_head_dim);
+    let num_kv_shared_layers =
+        gguf_optional_i64(metadata, "gemma4.attention.shared_kv_layers", stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture("Gemma 4 shared-KV layer count exceeds i32".into())
+            })?
+            .unwrap_or(0);
+    let hidden_size_per_layer_input =
+        gguf_optional_i64(metadata, "gemma4.embedding_length_per_layer_input", stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture(
+                    "Gemma 4 per-layer embedding size exceeds i32".into(),
+                )
+            })?
+            .unwrap_or(0);
+    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
+        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => gguf_i32(metadata, "gemma4.vocab_size", stream)?,
+    };
+
+    let full_rope_theta =
+        gguf_optional_f32(metadata, "gemma4.rope.freq_base", stream)?.unwrap_or(1_000_000.0);
+    let sliding_rope_theta =
+        gguf_optional_f32(metadata, "gemma4.rope.freq_base_swa", stream)?.unwrap_or(10_000.0);
+    let rope_parameters = Some(HashMap::from([
+        (
+            "full_attention".into(),
+            HashMap::from([
+                (
+                    "rope_type".into(),
+                    FloatOrString::String("proportional".into()),
+                ),
+                ("partial_rotary_factor".into(), FloatOrString::Float(0.25)),
+                ("rope_theta".into(), FloatOrString::Float(full_rope_theta)),
+            ]),
+        ),
+        (
+            "sliding_attention".into(),
+            HashMap::from([
+                ("rope_type".into(), FloatOrString::String("default".into())),
+                (
+                    "rope_theta".into(),
+                    FloatOrString::Float(sliding_rope_theta),
+                ),
+            ]),
+        ),
+    ]));
+
+    let first_shared_layer = num_hidden_layers - num_kv_shared_layers;
+    let attention_k_eq_v = layer_types
+        .iter()
+        .enumerate()
+        .find(|(index, kind)| {
+            **kind == LayerType::FullAttention && *index < first_shared_layer.max(0) as usize
+        })
+        .is_some_and(|(index, _)| {
+            arrays.contains_key(&format!("blk.{index}.attn_k.weight"))
+                && !arrays.contains_key(&format!("blk.{index}.attn_v.weight"))
+        });
+
+    Ok(ModelArgs {
+        model_type: "gemma4".into(),
+        hidden_size,
+        num_hidden_layers,
+        intermediate_size,
+        use_double_wide_mlp: false,
+        feed_forward_lengths: Some(feed_forward_lengths),
+        num_attention_heads,
+        rms_norm_eps: gguf_f32(metadata, "gemma4.attention.layer_norm_rms_epsilon", stream)?,
+        vocab_size,
+        pad_token_id: gguf_optional_i64(metadata, "tokenizer.ggml.padding_token_id", stream)?
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0),
+        num_key_value_heads: sliding_kv_heads,
+        num_global_key_value_heads: (full_kv_heads != sliding_kv_heads).then_some(full_kv_heads),
+        max_position_embeddings: gguf_i32(metadata, "gemma4.context_length", stream)?,
+        rope_theta: sliding_rope_theta,
+        head_dim,
+        global_head_dim: (global_head_dim != head_dim).then_some(global_head_dim),
+        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        attention_bias: arrays.keys().any(|name| {
+            name.ends_with("attn_q.bias")
+                || name.ends_with("attn_k.bias")
+                || name.ends_with("attn_v.bias")
+                || name.ends_with("attn_output.bias")
+        }),
+        attention_k_eq_v,
+        quantized: false,
+        quantized_weights: None,
+        quantized_weight_configs: None,
+        quantization_group_size: 64,
+        quantization_bits: 4,
+        hidden_size_per_layer_input,
+        vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
+        num_kv_shared_layers,
+        layer_types,
+        sliding_window: gguf_optional_i64(metadata, "gemma4.attention.sliding_window", stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture("Gemma 4 sliding window exceeds i32".into())
+            })?,
+        final_logit_softcapping: gguf_optional_f32(
+            metadata,
+            "gemma4.final_logit_softcapping",
+            stream,
+        )?,
+        enable_moe_block: false,
+        num_experts: None,
+        top_k_experts: None,
+        moe_intermediate_size: None,
+        rope_scaling: None,
+        rope_parameters,
+    })
+}
+
+fn expand_layer_values(
+    key: &str,
+    values: Vec<i64>,
+    num_hidden_layers: i32,
+) -> Result<Vec<i32>, Error> {
+    let values = if values.len() == 1 {
+        vec![values[0]; num_hidden_layers as usize]
+    } else if values.len() == num_hidden_layers as usize {
+        values
+    } else {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has {} values for {num_hidden_layers} layers",
+            values.len()
+        )));
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            i32::try_from(value).map_err(|_| {
+                Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+            })
+        })
+        .collect()
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    const ROOTS: [(&str, &str); 6] = [
+        (
+            "per_layer_token_embd",
+            "model.language_model.embed_tokens_per_layer",
+        ),
+        (
+            "per_layer_model_proj",
+            "model.language_model.per_layer_model_projection",
+        ),
+        (
+            "per_layer_proj_norm",
+            "model.language_model.per_layer_projection_norm",
+        ),
+        ("token_embd", "model.language_model.embed_tokens"),
+        ("output_norm", "model.language_model.norm"),
+        ("output", "lm_head"),
+    ];
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    if parameter == "layer_output_scale.weight" {
+        return format!("model.language_model.layers.{layer}.layer_scalar");
+    }
+    const BLOCK_PARAMETERS: [(&str, &str); 18] = [
+        ("attn_q_norm", "self_attn.q_norm"),
+        ("attn_k_norm", "self_attn.k_norm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("attn_norm", "input_layernorm"),
+        ("post_attention_norm", "post_attention_layernorm"),
+        ("ffn_norm", "pre_feedforward_layernorm"),
+        ("post_ffw_norm", "post_feedforward_layernorm"),
+        ("ffn_gate", "mlp.gate_proj"),
+        ("ffn_down", "mlp.down_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("inp_gate", "per_layer_input_gate"),
+        ("proj", "per_layer_projection"),
+        ("post_norm", "post_per_layer_input_norm"),
+        ("layer_output_scale", "layer_scalar"),
+        ("layer_output_norm", "layer_output_norm"),
+    ];
+    for (source, target) in BLOCK_PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.language_model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    name.to_string()
+}
+
+fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata is missing required key {key:?}"
+        ))),
+    }
+}
+
+fn gguf_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    i32::try_from(gguf_i64(metadata, key, stream)?).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
+}
+
+fn gguf_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    let Some(values) = gguf_optional_i64_values(metadata, key, stream)? else {
+        return Ok(None);
+    };
+    if values.len() != 1 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        )));
+    }
+    Ok(values.into_iter().next())
+}
+
+fn gguf_i64_values(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Vec<i64>, Error> {
+    gguf_optional_i64_values(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_i64_values(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<Vec<i64>>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() > 0 => {
+            let value = value.as_dtype(Dtype::Int64, stream)?;
+            if value.size() == 1 {
+                return Ok(Some(vec![value.try_item::<i64>(stream)?]));
+            }
+            let value = value.flatten(None, None, stream)?;
+            let mut values = Vec::with_capacity(value.size());
+            for index in 0..value.size() {
+                values.push(
+                    value
+                        .try_index_device(index as i32, stream)?
+                        .try_item::<i64>(stream)?,
+                );
+            }
+            Ok(Some(values))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must not be empty"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
+            Ok(Some(value.clone().try_item::<f32>(stream)?))
+        }
+        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be scalar"
+        ))),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
 }
 
 fn quantization_i32(config: &Option<Value>, key: &str, default: i32) -> i32 {
@@ -3145,7 +3600,10 @@ pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a,
 mod tests {
     use std::collections::HashMap;
 
-    use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext, Stream};
+    use safemlx::{
+        module::ModuleParameters, ops::GgufMetadataValue, Array, Device, DeviceType,
+        ExecutionContext, Stream,
+    };
 
     use super::{
         load_gemma4_model, partial_rotary_dims, Attention, Cache, FloatOrString, LayerType,
@@ -3166,6 +3624,8 @@ mod tests {
             hidden_size: 8,
             num_hidden_layers: 1,
             intermediate_size: 16,
+            use_double_wide_mlp: false,
+            feed_forward_lengths: None,
             num_attention_heads: 2,
             rms_norm_eps: 0.00001,
             vocab_size: 32,
@@ -3180,6 +3640,8 @@ mod tests {
             attention_bias: false,
             attention_k_eq_v,
             quantized: false,
+            quantized_weights: None,
+            quantized_weight_configs: None,
             quantization_group_size: 64,
             quantization_bits: 4,
             hidden_size_per_layer_input: 0,
@@ -3333,6 +3795,117 @@ mod tests {
     #[test]
     fn rotary_dims_default_to_full_head() {
         assert_eq!(partial_rotary_dims(256, &None), 256);
+    }
+
+    #[test]
+    fn translates_gguf_gemma4_weight_names() {
+        let cases = [
+            (
+                "token_embd.weight",
+                "model.language_model.embed_tokens.weight",
+            ),
+            (
+                "per_layer_token_embd.weight",
+                "model.language_model.embed_tokens_per_layer.weight",
+            ),
+            (
+                "per_layer_model_proj.weight",
+                "model.language_model.per_layer_model_projection.weight",
+            ),
+            (
+                "blk.3.attn_q.weight",
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+            ),
+            (
+                "blk.3.post_ffw_norm.weight",
+                "model.language_model.layers.3.post_feedforward_layernorm.weight",
+            ),
+            (
+                "blk.20.layer_output_scale.weight",
+                "model.language_model.layers.20.layer_scalar",
+            ),
+        ];
+
+        for (gguf, model) in cases {
+            assert_eq!(super::translate_gguf_weight_name(gguf), model);
+        }
+    }
+
+    #[test]
+    fn parses_gemma4_gguf_layer_metadata() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let metadata = HashMap::from([
+            (
+                "gemma4.embedding_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1536u32], &[1])),
+            ),
+            (
+                "gemma4.block_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[2u32], &[1])),
+            ),
+            (
+                "gemma4.feed_forward_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[6144u32, 12288], &[2])),
+            ),
+            (
+                "gemma4.attention.head_count".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[8u32], &[1])),
+            ),
+            (
+                "gemma4.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32, 2], &[2])),
+            ),
+            (
+                "gemma4.attention.key_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[512u32], &[1])),
+            ),
+            (
+                "gemma4.attention.key_length_swa".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[256u32], &[1])),
+            ),
+            (
+                "gemma4.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32, 0], &[2])),
+            ),
+            (
+                "gemma4.attention.shared_kv_layers".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+            ),
+            (
+                "gemma4.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Array(Array::from(1e-6f32)),
+            ),
+            (
+                "gemma4.context_length".into(),
+                GgufMetadataValue::Array(Array::from_slice(&[131072u32], &[1])),
+            ),
+            (
+                "gemma4.rope.freq_base".into(),
+                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+            ),
+            (
+                "gemma4.rope.freq_base_swa".into(),
+                GgufMetadataValue::Array(Array::from(10_000f32)),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+            ),
+        ]);
+
+        let args = super::gemma4_args_from_gguf(&HashMap::new(), &metadata, stream).unwrap();
+        assert_eq!(args.feed_forward_lengths, Some(vec![6144, 12288]));
+        assert_eq!(
+            args.layer_types,
+            vec![LayerType::SlidingAttention, LayerType::FullAttention]
+        );
+        assert_eq!(args.head_dim, 256);
+        assert_eq!(args.global_head_dim, Some(512));
+        assert_eq!(args.num_key_value_heads, 1);
+        assert_eq!(args.num_global_key_value_heads, Some(2));
+        assert_eq!(args.num_kv_shared_layers, 1);
+        assert_eq!(args.vocab_size, 32);
     }
 
     #[test]
