@@ -77,12 +77,21 @@ pub struct ConcatKeyValueCache {
     keys: Option<Array>,
     values: Option<Array>,
     offset: i32,
+    max_size: Option<i32>,
 }
 
 impl ConcatKeyValueCache {
     /// Creates an empty concatenating key/value cache.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty concatenating cache that retains at most `max_size` tokens.
+    pub fn new_with_max_size(max_size: i32) -> Self {
+        Self {
+            max_size: Some(max_size),
+            ..Self::default()
+        }
     }
 
     /// Truncates the cache to `len` tokens.
@@ -101,6 +110,13 @@ impl ConcatKeyValueCache {
     pub fn arrays(&self) -> impl Iterator<Item = &Array> {
         self.keys.iter().chain(self.values.iter())
     }
+
+    /// Clears cached arrays while preserving cache configuration.
+    pub fn clear(&mut self) {
+        self.keys = None;
+        self.values = None;
+        self.offset = 0;
+    }
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
@@ -109,7 +125,7 @@ impl KeyValueCache for ConcatKeyValueCache {
     }
 
     fn max_size(&self) -> Option<i32> {
-        None
+        self.max_size
     }
 
     fn update_and_fetch(
@@ -118,6 +134,7 @@ impl KeyValueCache for ConcatKeyValueCache {
         values: Array,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
+        let new_tokens = keys.dim(-2);
         match (self.keys.take(), self.values.take()) {
             (Some(k), Some(v)) => {
                 self.keys = Some(concatenate_axis(&[k, keys], -2, stream)?);
@@ -128,8 +145,26 @@ impl KeyValueCache for ConcatKeyValueCache {
                 self.values = Some(values);
             }
         }
-        let shape = self.keys.as_ref().expect("Keys cannot be None").shape();
-        self.offset = shape[shape.len() - 2];
+        self.offset += new_tokens;
+
+        if let Some(max_size) = self.max_size {
+            let len = self.keys.as_ref().expect("Keys cannot be None").dim(-2);
+            if len > max_size {
+                let start = len - max_size;
+                self.keys = Some(
+                    self.keys
+                        .take()
+                        .expect("Keys cannot be None")
+                        .try_index_device((.., .., start.., ..), stream)?,
+                );
+                self.values = Some(
+                    self.values
+                        .take()
+                        .expect("Values cannot be None")
+                        .try_index_device((.., .., start.., ..), stream)?,
+                );
+            }
+        }
 
         Ok((
             self.keys.clone().expect("Keys cannot be None"),

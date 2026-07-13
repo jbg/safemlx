@@ -47,6 +47,12 @@ pub mod llama;
 pub mod moshi;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
 pub mod nemotron_h;
+/// PersonaPlex realtime speech-to-speech token model support.
+///
+/// This module operates on pre-tokenized Mimi streams and hybrid prompt tokens.
+/// It intentionally does not implement audio encoding, decoding, or realtime
+/// device I/O.
+pub mod personaplex;
 /// Qwen3 decoder-only model support.
 pub mod qwen3;
 /// Qwen3.5 MoE text model support.
@@ -93,6 +99,8 @@ pub enum ModelKind {
     Llama,
     /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
     NemotronH,
+    /// PersonaPlex realtime speech-to-speech architecture.
+    PersonaPlex,
     /// Qwen3 decoder architecture.
     Qwen3,
     /// Qwen3.5 mixture-of-experts architecture.
@@ -105,6 +113,7 @@ impl ModelKind {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "nemotron_h" => Ok(Self::NemotronH),
+            "personaplex" => Ok(Self::PersonaPlex),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
@@ -215,6 +224,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
             Ok(())
         }
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
+        ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
         ModelKind::Qwen3 => {
             serde_json::from_value::<qwen3::ModelArgs>(config.clone()).map_err(|error| {
                 Error::UnsupportedArchitecture(format!("invalid qwen3 config: {error}"))
@@ -553,6 +563,11 @@ impl LoadedModel {
                 stream,
                 weights_stream,
             )?),
+            ModelKind::PersonaPlex => {
+                return Err(Error::UnsupportedArchitecture(
+                    "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex instead of LoadedModel".into(),
+                ));
+            }
             ModelKind::Qwen3 => {
                 Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream, weights_stream)?)
             }
@@ -889,6 +904,9 @@ pub fn load_model(
             stream,
             weights_stream,
         )?)),
+        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex::load_model".into(),
+        )),
         ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(
             model_dir,
             stream,
@@ -910,6 +928,9 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
+        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex uses the released SentencePiece tokenizer; load it outside the chat tokenizer API".into(),
+        )),
         ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
         ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
     }

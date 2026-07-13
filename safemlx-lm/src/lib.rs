@@ -22,6 +22,8 @@ pub mod models;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;
+/// Codec-free realtime speech-to-speech token APIs.
+pub mod realtime;
 /// Token sampling strategies.
 pub mod sampler;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
@@ -32,6 +34,9 @@ pub mod weights;
 pub use models::{
     check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
     SupportedModelConfig,
+};
+pub use realtime::{
+    load_model as load_realtime_model, LoadedRealtimeModel, RealtimeModelKind, RealtimeState,
 };
 
 use safemlx::Array;
