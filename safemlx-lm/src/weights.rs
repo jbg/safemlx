@@ -15,6 +15,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::error::Error;
+use crate::quantization::{quantize_tensor, AffineQuantization};
 
 /// Options for strict checkpoint loading.
 ///
@@ -97,6 +98,9 @@ impl StrictLoadConfig {
             expanded.push(candidate.clone());
             if let Some(inner_key) = candidate.strip_suffix(".weight") {
                 expanded.push(format!("{inner_key}.inner.weight"));
+            }
+            if let Some(inner_key) = candidate.strip_suffix(".bias") {
+                expanded.push(format!("{inner_key}.inner.bias"));
             }
             if let Some(rest) = candidate.strip_prefix("model.language_model.embed_tokens.") {
                 expanded.push(format!("model.language_model.embed_tokens.inner.{rest}"));
@@ -274,12 +278,119 @@ pub fn load_safetensors_lenient<M: ModuleParameters>(
     stream: &Stream,
 ) -> Result<(), Error> {
     let mut params = model.parameters_mut().flatten();
+    let config = StrictLoadConfig::default();
     for_each_safetensor_array(path, stream, |key, value| {
-        if let Some(param) = params.get_mut(key.as_str()) {
-            **param = value;
+        for candidate in config.candidates(&key) {
+            if let Some(param) = params.get_mut(candidate.as_str()) {
+                **param = value;
+                break;
+            }
         }
         Ok(())
     })
+}
+
+/// Strict-loads a dense safetensors file into a model whose selected parameters
+/// use the standard MLX affine quantized layout.
+///
+/// Dense matrices are quantized and materialized one at a time as they are
+/// read, bounding the lazy graph and active allocation peak. A target module is
+/// recognized either by the standard safemlx `inner.weight` parameter plus
+/// sibling `scales`/`biases`, or by a packed `weight` with those siblings.
+pub fn load_safetensors_quantized_strict<M: ModuleParameters>(
+    model: &mut M,
+    path: impl AsRef<Path>,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: AffineQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    quantization.validate()?;
+    let mut params = model.parameters_mut().flatten();
+    for_each_safetensor_array(path, weights_stream, |key, value| {
+        load_array_quantized_strict(
+            &mut params,
+            key,
+            value,
+            quantization_stream,
+            quantization,
+            config,
+            report,
+        )
+    })
+}
+
+pub(crate) fn load_array_quantized_strict(
+    params: &mut FlattenedModuleParamMut<'_>,
+    key: String,
+    value: Array,
+    quantization_stream: &Stream,
+    quantization: AffineQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    if let Some(prefix) = key.strip_suffix(".weight") {
+        let scales_key = format!("{prefix}.scales");
+        let biases_key = format!("{prefix}.biases");
+        let inner_weight_key = format!("{prefix}.inner.weight");
+        let direct_weight_key = key.clone();
+        let target_weight_key = if params.contains_key(inner_weight_key.as_str())
+            && params.contains_key(scales_key.as_str())
+            && params.contains_key(biases_key.as_str())
+        {
+            Some(inner_weight_key)
+        } else if params.contains_key(direct_weight_key.as_str())
+            && params.contains_key(scales_key.as_str())
+            && params.contains_key(biases_key.as_str())
+            && params
+                .get(direct_weight_key.as_str())
+                .is_some_and(|target| target.shape() != value.shape())
+        {
+            Some(direct_weight_key)
+        } else {
+            None
+        };
+
+        if let Some(weight_key) = target_weight_key {
+            let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
+            // MLX quantization is lazy. Materialize this tensor before the
+            // source value leaves the streaming callback so subsequent
+            // weights do not accumulate a checkpoint-sized dense graph.
+            eval([&quantized.weight, &quantized.scales, &quantized.biases])?;
+            quantization_stream.synchronize()?;
+            load_array_strict(params, weight_key, quantized.weight, config, report);
+            load_array_strict(params, scales_key, quantized.scales, config, report);
+            load_array_strict(params, biases_key, quantized.biases, config, report);
+            return Ok(());
+        }
+    }
+    load_array_strict(params, key, value, config, report);
+    Ok(())
+}
+
+/// Strict-loads and quantizes every safetensors shard in a model directory.
+pub fn load_safetensors_dir_quantized_strict<M: ModuleParameters>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: AffineQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    for file in safetensors_files(model_dir)? {
+        load_safetensors_quantized_strict(
+            model,
+            file,
+            weights_stream,
+            quantization_stream,
+            quantization,
+            config,
+            report,
+        )?;
+    }
+    Ok(())
 }
 
 /// Loads all safetensors files from `model_dir` into matching parameters without validation.

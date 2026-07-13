@@ -301,6 +301,7 @@ pub mod fast;
 pub mod fft;
 pub mod linalg;
 pub mod losses;
+pub mod memory;
 pub mod module;
 pub mod nested;
 pub mod nn;

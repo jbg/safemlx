@@ -15,10 +15,14 @@ use safemlx::{
     macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
-    ops::{addmm, indexing::TryIndexOp, matmul, maximum, r#where, split, zeros_like},
+    ops::{
+        addmm, dequantize, indexing::TryIndexOp, matmul, maximum, quantized_matmul, r#where, split,
+        zeros_like,
+    },
     random::RandomState,
     transforms::compile::{
-        compile_unary_with_stream_and_captures, CompiledUnaryWithStreamAndCaptures,
+        compile_binary_with_stream_and_captures, compile_unary_with_stream_and_captures,
+        CompiledBinaryWithStreamAndCaptures, CompiledUnaryWithStreamAndCaptures,
     },
     Array, Dtype, Stream,
 };
@@ -28,19 +32,23 @@ use serde_json::Value;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
+    quantization::AffineQuantization,
     realtime::{
         self, RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
     },
     sampler::{DefaultSampler, Sampler},
     weights::{
-        for_each_safetensor_array, load_array_strict, load_safetensors_strict, StrictLoadConfig,
-        StrictLoadReport,
+        for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
+        load_safetensors_dir_strict, load_safetensors_quantized_strict, load_safetensors_strict,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
 const RMS_NORM_EPS: f32 = 1e-8;
 
 type MoshiMlpFn = fn(&Array, &[Array], &Stream) -> Result<Array, Exception>;
+type MoshiLayerPreFn = fn(&Array, &[Array], &Stream) -> Result<Array, Exception>;
+type MoshiLayerPostFn = fn((&Array, &Array), &[Array], &Stream) -> Result<Array, Exception>;
 
 fn default_true() -> bool {
     true
@@ -135,6 +143,9 @@ pub struct ModelArgs {
     /// Optional extra output heads.
     #[serde(default)]
     pub extra_heads_num_heads: i32,
+    /// Optional MLX affine checkpoint quantization settings.
+    #[serde(default)]
+    pub quantization: Option<AffineQuantization>,
 }
 
 impl ModelArgs {
@@ -170,6 +181,7 @@ impl ModelArgs {
             demux_second_stream: false,
             depformer_low_rank_embeddings: None,
             extra_heads_num_heads: 0,
+            quantization: None,
         }
     }
 
@@ -199,6 +211,9 @@ impl ModelArgs {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        if let Some(quantization) = self.quantization {
+            quantization.validate()?;
+        }
         if self.dim <= 0
             || self.text_card <= 0
             || self.n_q <= 0
@@ -281,19 +296,91 @@ impl ModelArgs {
 struct ScaledEmbedding {
     #[param]
     weight: Param<Array>,
+    #[param]
+    scales: Param<Option<Array>>,
+    #[param]
+    biases: Param<Option<Array>>,
+    quantization: Option<AffineQuantization>,
 }
 
 impl ScaledEmbedding {
-    fn unloaded(vocab: i32, dim: i32, stream: &Stream) -> Result<Self, Exception> {
+    fn unloaded(
+        vocab: i32,
+        dim: i32,
+        quantization: Option<AffineQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let packed_dim = quantization.map_or(dim, |config| dim / (32 / config.bits));
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[vocab, dim], Dtype::Float32, stream)?,
+            weight: Param::<Array>::unloaded(
+                &[vocab, packed_dim],
+                if quantization.is_some() {
+                    Dtype::Uint32
+                } else {
+                    Dtype::Float32
+                },
+                stream,
+            )?,
+            scales: Param::new(
+                quantization
+                    .map(|config| {
+                        Param::<Array>::unloaded(
+                            &[vocab, dim / config.group_size],
+                            Dtype::Float32,
+                            stream,
+                        )
+                        .map(|param| param.value)
+                    })
+                    .transpose()?,
+            ),
+            biases: Param::new(
+                quantization
+                    .map(|config| {
+                        Param::<Array>::unloaded(
+                            &[vocab, dim / config.group_size],
+                            Dtype::Float32,
+                            stream,
+                        )
+                        .map(|param| param.value)
+                    })
+                    .transpose()?,
+            ),
+            quantization,
         })
+    }
+
+    fn selected_rows(&self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let weight = self.weight.try_index_device(tokens, stream)?;
+        if let Some(config) = self.quantization {
+            let scales = self
+                .scales
+                .value
+                .as_ref()
+                .expect("quantized embedding scales")
+                .try_index_device(tokens, stream)?;
+            let biases = self
+                .biases
+                .value
+                .as_ref()
+                .expect("quantized embedding biases")
+                .try_index_device(tokens, stream)?;
+            dequantize(
+                &weight,
+                &scales,
+                &biases,
+                config.group_size,
+                config.bits,
+                stream,
+            )
+        } else {
+            Ok(weight)
+        }
     }
 
     fn forward(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
         let zero_mask = tokens.eq(Array::from_int(-1), stream)?;
         let safe_tokens = maximum(tokens, Array::from_int(0), stream)?;
-        let embedded = self.weight.try_index_device(&safe_tokens, stream)?;
+        let embedded = self.selected_rows(&safe_tokens, stream)?;
         r#where(
             &zero_mask.expand_dims(-1, stream)?,
             zeros_like(&embedded, stream)?,
@@ -303,7 +390,7 @@ impl ScaledEmbedding {
     }
 
     fn forward_nonnegative(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Exception> {
-        self.weight.try_index_device(tokens, stream)
+        self.selected_rows(tokens, stream)
     }
 }
 
@@ -313,6 +400,11 @@ struct MoshiLinear {
     weight: Param<Array>,
     #[param]
     bias: Param<Option<Array>>,
+    #[param]
+    scales: Param<Option<Array>>,
+    #[param]
+    biases: Param<Option<Array>>,
+    quantization: Option<AffineQuantization>,
     weight_t: Option<Array>,
 }
 
@@ -322,20 +414,72 @@ impl MoshiLinear {
         output_dims: i32,
         bias: bool,
         dtype: Dtype,
+        quantization: Option<AffineQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let packed_input_dims =
+            quantization.map_or(input_dims, |config| input_dims / (32 / config.bits));
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[output_dims, input_dims], dtype, stream)?,
+            weight: Param::<Array>::unloaded(
+                &[output_dims, packed_input_dims],
+                if quantization.is_some() {
+                    Dtype::Uint32
+                } else {
+                    dtype
+                },
+                stream,
+            )?,
             bias: if bias {
                 Param::<Option<Array>>::unloaded_some(&[output_dims], dtype, stream)?
             } else {
                 Param::new(None)
             },
+            scales: Param::new(
+                quantization
+                    .map(|config| {
+                        Param::<Array>::unloaded(
+                            &[output_dims, input_dims / config.group_size],
+                            Dtype::Float32,
+                            stream,
+                        )
+                        .map(|param| param.value)
+                    })
+                    .transpose()?,
+            ),
+            biases: Param::new(
+                quantization
+                    .map(|config| {
+                        Param::<Array>::unloaded(
+                            &[output_dims, input_dims / config.group_size],
+                            Dtype::Float32,
+                            stream,
+                        )
+                        .map(|param| param.value)
+                    })
+                    .transpose()?,
+            ),
+            quantization,
             weight_t: None,
         })
     }
 
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if let Some(config) = self.quantization {
+            let output = quantized_matmul(
+                x,
+                &self.weight,
+                self.scales.value.as_ref().expect("quantized linear scales"),
+                self.biases.value.as_ref(),
+                true,
+                config.group_size,
+                config.bits,
+                stream,
+            )?;
+            return match &self.bias.value {
+                Some(bias) => output.add(bias, stream),
+                None => Ok(output),
+            };
+        }
         let weight_t = self.weight_t(stream)?.clone();
         match &self.bias.value {
             Some(bias) => addmm(bias, x, &weight_t, None, None, stream),
@@ -344,10 +488,19 @@ impl MoshiLinear {
     }
 
     fn weight_t(&mut self, stream: &Stream) -> Result<&Array, Exception> {
+        if self.quantization.is_some() {
+            return Err(Exception::custom(
+                "packed affine weights do not have a dense transpose",
+            ));
+        }
         if self.weight_t.is_none() {
             self.weight_t = Some(self.weight.value.transpose(stream)?);
         }
         Ok(self.weight_t.as_ref().expect("cached transpose is set"))
+    }
+
+    fn is_quantized(&self) -> bool {
+        self.quantization.is_some()
     }
 }
 
@@ -382,29 +535,40 @@ impl MoshiAttention {
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
             context: cfg.context,
-            in_proj: MoshiLinear::unloaded(cfg.dim, 3 * cfg.dim, false, Dtype::Float32, stream)?,
-            out_proj: MoshiLinear::unloaded(cfg.dim, cfg.dim, false, Dtype::Float32, stream)?,
+            in_proj: MoshiLinear::unloaded(
+                cfg.dim,
+                3 * cfg.dim,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
+            out_proj: MoshiLinear::unloaded(
+                cfg.dim,
+                cfg.dim,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
             rope,
         })
     }
 
-    fn forward(
+    fn attend_projected(
         &mut self,
-        x: &Array,
+        qkv: Array,
         cache: &mut ConcatKeyValueCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
+        let shape = qkv.shape();
         if shape.len() != 3 || shape[1] != 1 {
             return Err(Exception::custom(
-                "Moshi token inference currently requires [batch, 1, dim] steps",
+                "Moshi projected attention currently requires [batch, 1, 3 * dim] steps",
             ));
         }
-        let (batch, seq, dim) = (shape[0], shape[1], shape[2]);
-        let qkv = self
-            .in_proj
-            .forward(x, stream)?
-            .reshape(&[batch, seq, 3, self.num_heads, self.head_dim], stream)?;
+        let (batch, seq, dim) = (shape[0], shape[1], shape[2] / 3);
+        let qkv = qkv.reshape(&[batch, seq, 3, self.num_heads, self.head_dim], stream)?;
         let mut q = qkv
             .try_index_device((.., .., 0, .., ..), stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
@@ -426,9 +590,19 @@ impl MoshiAttention {
             k = k.try_index_device((.., .., start.., ..), stream)?;
             v = v.try_index_device((.., .., start.., ..), stream)?;
         }
-        let attended = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None, stream)?
+        scaled_dot_product_attention(&q, &k, &v, self.scale, None, None, stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?
-            .reshape(&[batch, seq, dim], stream)?;
+            .reshape(&[batch, seq, dim], stream)
+    }
+
+    fn forward(
+        &mut self,
+        x: &Array,
+        cache: &mut ConcatKeyValueCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let projected = self.in_proj.forward(x, stream)?;
+        let attended = self.attend_projected(projected, cache, stream)?;
         self.out_proj.forward(&attended, stream)
     }
 
@@ -503,6 +677,7 @@ struct TransformerConfig {
     context: i32,
     max_period: f32,
     rope: bool,
+    quantization: Option<AffineQuantization>,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -522,13 +697,35 @@ impl MoshiMlp {
             2 * cfg.feed_forward / 3
         };
         Ok(Self {
-            linear_in: MoshiLinear::unloaded(cfg.dim, 2 * hidden, false, Dtype::Float32, stream)?,
-            linear_out: MoshiLinear::unloaded(hidden, cfg.dim, false, Dtype::Float32, stream)?,
+            linear_in: MoshiLinear::unloaded(
+                cfg.dim,
+                2 * hidden,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
+            linear_out: MoshiLinear::unloaded(
+                hidden,
+                cfg.dim,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
             compiled: compile_unary_with_stream_and_captures(moshi_mlp as MoshiMlpFn, [], false),
         })
     }
 
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if self.linear_in.is_quantized() {
+            let projected = self.linear_in.forward(x, stream)?;
+            let mut parts = split(projected, 2, -1, stream)?;
+            let gate = nn::silu(parts.remove(0), stream)?;
+            return self
+                .linear_out
+                .forward(&gate.multiply(parts.remove(0), stream)?, stream);
+        }
         if self.compiled.captures().is_empty() {
             self.compiled.set_captures([
                 self.linear_in.weight_t(stream)?.clone(),
@@ -560,6 +757,8 @@ struct MoshiTransformerLayer {
     self_attn: MoshiAttention,
     #[param]
     gating: MoshiMlp,
+    compiled_pre: CompiledUnaryWithStreamAndCaptures<MoshiLayerPreFn>,
+    compiled_post: CompiledBinaryWithStreamAndCaptures<MoshiLayerPostFn>,
 }
 
 impl MoshiTransformerLayer {
@@ -569,6 +768,16 @@ impl MoshiTransformerLayer {
             norm2: nn::RmsNorm::unloaded(cfg.dim, RMS_NORM_EPS, Dtype::Float32, stream)?,
             self_attn: MoshiAttention::unloaded(cfg, stream)?,
             gating: MoshiMlp::unloaded(cfg, stream)?,
+            compiled_pre: compile_unary_with_stream_and_captures(
+                moshi_layer_pre as MoshiLayerPreFn,
+                [],
+                false,
+            ),
+            compiled_post: compile_binary_with_stream_and_captures(
+                moshi_layer_post as MoshiLayerPostFn,
+                [],
+                false,
+            ),
         })
     }
 
@@ -578,12 +787,33 @@ impl MoshiTransformerLayer {
         cache: &mut ConcatKeyValueCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let n1 = self.norm1.forward(&x, stream)?;
-        let attn = self.self_attn.forward(&n1, cache, stream)?;
-        let x = x.add(attn, stream)?;
-        let n2 = self.norm2.forward(&x, stream)?;
-        let mlp = self.gating.forward(&n2, stream)?;
-        x.add(mlp, stream)
+        if self.self_attn.in_proj.is_quantized() {
+            let norm1 = self.norm1.forward(&x, stream)?;
+            let attention = self.self_attn.forward(&norm1, cache, stream)?;
+            let post_attention = x.add(attention, stream)?;
+            let norm2 = self.norm2.forward(&post_attention, stream)?;
+            let mlp = self.gating.forward(&norm2, stream)?;
+            return post_attention.add(mlp, stream);
+        }
+        if self.compiled_pre.captures().is_empty() {
+            let in_proj = self.self_attn.in_proj.weight_t(stream)?.clone();
+            self.compiled_pre
+                .set_captures([self.norm1.weight.value.clone(), in_proj]);
+        }
+        if self.compiled_post.captures().is_empty() {
+            let out_proj = self.self_attn.out_proj.weight_t(stream)?.clone();
+            let mlp_in = self.gating.linear_in.weight_t(stream)?.clone();
+            let mlp_out = self.gating.linear_out.weight_t(stream)?.clone();
+            self.compiled_post.set_captures([
+                out_proj,
+                self.norm2.weight.value.clone(),
+                mlp_in,
+                mlp_out,
+            ]);
+        }
+        let qkv = self.compiled_pre.call(&x, stream)?;
+        let attended = self.self_attn.attend_projected(qkv, cache, stream)?;
+        self.compiled_post.call(&x, &attended, stream)
     }
 
     fn forward_traced(
@@ -612,6 +842,29 @@ impl MoshiTransformerLayer {
             output,
         })
     }
+}
+
+fn moshi_layer_pre(x: &Array, captures: &[Array], stream: &Stream) -> Result<Array, Exception> {
+    let normalized = safemlx::fast::rms_norm(x, &captures[0], RMS_NORM_EPS, stream)?;
+    matmul(&normalized, &captures[1], stream)
+}
+
+fn moshi_layer_post(
+    (residual, attended): (&Array, &Array),
+    captures: &[Array],
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let x = residual.add(matmul(attended, &captures[0], stream)?, stream)?;
+    let normalized = safemlx::fast::rms_norm(&x, &captures[1], RMS_NORM_EPS, stream)?;
+    let projected = matmul(&normalized, &captures[2], stream)?;
+    let mut parts = split(projected, 2, -1, stream)?;
+    let gate = nn::silu(parts.remove(0), stream)?;
+    let mlp = matmul(
+        &gate.multiply(parts.remove(0), stream)?,
+        &captures[3],
+        stream,
+    )?;
+    x.add(mlp, stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -683,13 +936,21 @@ impl DepFormerSlice {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            emb: ScaledEmbedding::unloaded(input_vocab, cfg.dim, stream)?,
-            linear_in: MoshiLinear::unloaded(main_dim, cfg.dim, false, Dtype::Float32, stream)?,
+            emb: ScaledEmbedding::unloaded(input_vocab, cfg.dim, cfg.quantization, stream)?,
+            linear_in: MoshiLinear::unloaded(
+                main_dim,
+                cfg.dim,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
             linear_out: MoshiLinear::unloaded(
                 cfg.dim,
                 audio_vocab - 1,
                 false,
                 Dtype::Float32,
+                cfg.quantization,
                 stream,
             )?,
             transformer: MoshiTransformer::unloaded(cfg, stream)?,
@@ -751,6 +1012,20 @@ pub type GreedyStepOutput = SampleStepOutput;
 
 /// Output from one encoded-audio generation step.
 pub type GenerationStepOutput = realtime::RealtimeStepOutput;
+
+/// Realtime generation output with the distributions used for its decisions.
+///
+/// The first PersonaPlex delayed-stream step initializes state and therefore
+/// has no logits. Later steps contain one text distribution and one audio
+/// distribution per depth codebook.
+pub struct GenerationStepWithLogits {
+    /// Normal realtime tokens and optional delay-aligned output frame.
+    pub output: GenerationStepOutput,
+    /// Text logits shaped `[batch, 1, text_card]`, absent during initialization.
+    pub text_logits: Option<Array>,
+    /// Audio logits ordered by depth codebook.
+    pub audio_logits: Vec<Array>,
+}
 
 /// Delayed-stream state for an encoded-audio Moshi inference session.
 ///
@@ -841,6 +1116,7 @@ impl Model {
             context: args.context,
             max_period: args.max_period,
             rope: true,
+            quantization: args.quantization,
         };
         let depth_cfg = TransformerConfig {
             dim: args.depformer_dim,
@@ -852,6 +1128,7 @@ impl Model {
             context: args.depformer_context.unwrap_or(args.dep_q),
             max_period: args.depformer_max_period.unwrap_or(8.0),
             rope: false,
+            quantization: args.quantization,
         };
         let mut slices = Vec::with_capacity(args.dep_q as usize);
         for index in 0..args.dep_q {
@@ -869,18 +1146,24 @@ impl Model {
             )?);
         }
         let audio_embs = (0..args.n_q)
-            .map(|_| ScaledEmbedding::unloaded(args.card + 1, args.dim, stream))
+            .map(|_| ScaledEmbedding::unloaded(args.card + 1, args.dim, args.quantization, stream))
             .collect::<Result<_, _>>()?;
         Ok(Self {
             transformer: MoshiTransformer::unloaded(temporal_cfg, stream)?,
             depformer: DepFormer { slices },
-            text_emb: ScaledEmbedding::unloaded(args.text_card + 1, args.dim, stream)?,
+            text_emb: ScaledEmbedding::unloaded(
+                args.text_card + 1,
+                args.dim,
+                args.quantization,
+                stream,
+            )?,
             out_norm: nn::RmsNorm::unloaded(args.dim, RMS_NORM_EPS, Dtype::Float32, stream)?,
             text_linear: MoshiLinear::unloaded(
                 args.dim,
                 args.text_card,
                 false,
                 Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
             audio_embs,
@@ -892,7 +1175,10 @@ impl Model {
     pub fn new_cache(&self) -> MoshiCache {
         MoshiCache {
             temporal: vec![
-                ConcatKeyValueCache::new_with_max_size(self.args.context + 1);
+                ConcatKeyValueCache::new_with_max_size_and_step(
+                    self.args.context + 1,
+                    256
+                );
                 self.args.num_layers as usize
             ],
             depth: vec![ConcatKeyValueCache::new(); self.args.depformer_num_layers as usize],
@@ -1119,6 +1405,7 @@ impl Model {
             None,
             None,
             prng_state.as_deref_mut(),
+            false,
             stream,
         )
     }
@@ -1137,6 +1424,7 @@ impl Model {
         forced_audio_tokens: Option<&Array>,
         forced_audio_codebooks: Option<&[bool]>,
         mut prng_state: Option<&mut RandomState>,
+        retain_forced_logits: bool,
         stream: &Stream,
     ) -> Result<(Array, Array, Vec<Array>), Exception> {
         if audio_samplers.len() != self.args.dep_q as usize {
@@ -1198,7 +1486,10 @@ impl Model {
             .enumerate()
         {
             if let (Some(tokens), Some(mask)) = (forced_audio_tokens, forced_audio_codebooks) {
-                if mask[index] && mask[index..].iter().all(|forced| *forced) {
+                if !retain_forced_logits
+                    && mask[index]
+                    && mask[index..].iter().all(|forced| *forced)
+                {
                     for tail in index..self.args.dep_q as usize {
                         predicted.push(tokens.try_index_device((.., tail as i32), stream)?);
                     }
@@ -1210,15 +1501,28 @@ impl Model {
                 .forward(temporal_output, stream)?
                 .add(slice.emb.forward_nonnegative(&previous, stream)?, stream)?;
             let x = slice.transformer.forward(x, &mut cache.depth, stream)?;
-            if let (Some(tokens), Some(mask)) = (forced_audio_tokens, forced_audio_codebooks) {
-                if mask[index] {
-                    let token = tokens.try_index_device((.., index as i32), stream)?;
+            let forced_token = match (forced_audio_tokens, forced_audio_codebooks) {
+                (Some(tokens), Some(mask)) if mask[index] => {
+                    Some(tokens.try_index_device((.., index as i32), stream)?)
+                }
+                _ => None,
+            };
+            if let Some(token) = &forced_token {
+                if !retain_forced_logits {
                     previous = token.expand_dims(1, stream)?;
-                    predicted.push(token);
+                    predicted.push(token.clone());
                     continue;
                 }
             }
             let logits = slice.linear_out.forward(&x, stream)?;
+            if retain_forced_logits {
+                audio_logits.push(logits.clone());
+            }
+            if let Some(token) = forced_token {
+                previous = token.expand_dims(1, stream)?;
+                predicted.push(token);
+                continue;
+            }
             let sampled = sampler.sample(
                 &logits,
                 audio_temperature,
@@ -1227,7 +1531,9 @@ impl Model {
             )?;
             previous = sampled;
             predicted.push(previous.squeeze_axes(&[-1], stream)?);
-            audio_logits.push(logits);
+            if !retain_forced_logits {
+                audio_logits.push(logits);
+            }
         }
         let audio_tokens = safemlx::ops::stack_axis(&predicted, 1, stream)?;
         Ok((text, audio_tokens, audio_logits))
@@ -1308,8 +1614,8 @@ impl Model {
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<GenerationStepOutput, Exception> {
-        if self.args.existing_text_padding_id.is_some() && self.args.dep_q == self.args.n_q {
-            return self.generate_step_pytorch_style(
+        Ok(self
+            .generate_step_forced_internal(
                 state,
                 input_audio_tokens,
                 forced_generated_audio_tokens,
@@ -1319,6 +1625,73 @@ impl Model {
                 text_temperature,
                 audio_temperature,
                 prng_state,
+                false,
+                stream,
+            )?
+            .output)
+    }
+
+    /// Advances realtime generation and retains the decision logits.
+    ///
+    /// This diagnostic path supports teacher-forced quantization evaluation;
+    /// latency-sensitive callers should continue using [`Self::generate_step`]
+    /// or [`Self::generate_step_forced`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_step_forced_with_logits<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepWithLogits, Exception> {
+        self.generate_step_forced_internal(
+            state,
+            input_audio_tokens,
+            forced_generated_audio_tokens,
+            forced_text_token,
+            text_sampler,
+            audio_samplers,
+            text_temperature,
+            audio_temperature,
+            prng_state,
+            true,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_step_forced_internal<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        retain_forced_logits: bool,
+        stream: &Stream,
+    ) -> Result<GenerationStepWithLogits, Exception> {
+        if self.args.existing_text_padding_id.is_some() && self.args.dep_q == self.args.n_q {
+            return self.generate_step_pytorch_style_with_logits(
+                state,
+                input_audio_tokens,
+                forced_generated_audio_tokens,
+                forced_text_token,
+                text_sampler,
+                audio_samplers,
+                text_temperature,
+                audio_temperature,
+                prng_state,
+                retain_forced_logits,
                 stream,
             );
         }
@@ -1425,7 +1798,7 @@ impl Model {
         } else {
             Some(safemlx::ops::stack_axis(&forced_depth_tokens, 1, stream)?)
         };
-        let (text_token, sampled_audio_tokens, _) = self.sample_temporal_output_forced(
+        let (text_token, sampled_audio_tokens, audio_logits) = self.sample_temporal_output_forced(
             &temporal_output,
             &text_logits,
             &mut state.cache,
@@ -1439,6 +1812,7 @@ impl Model {
                 .as_ref()
                 .map(|_| forced_depth_mask.as_slice()),
             prng_state,
+            retain_forced_logits,
             stream,
         )?;
 
@@ -1481,10 +1855,14 @@ impl Model {
 
         state.previous_text = Some(text_token.clone());
         state.step += 1;
-        Ok(GenerationStepOutput {
-            text_token,
-            sampled_audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: GenerationStepOutput {
+                text_token,
+                sampled_audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(text_logits),
+            audio_logits,
         })
     }
 
@@ -1547,7 +1925,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_step_pytorch_style<TS: Sampler, AS: Sampler>(
+    fn generate_step_pytorch_style_with_logits<TS: Sampler, AS: Sampler>(
         &mut self,
         state: &mut GenerationState,
         input_audio_tokens: &Array,
@@ -1558,8 +1936,9 @@ impl Model {
         text_temperature: f32,
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
+        retain_forced_logits: bool,
         stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception> {
+    ) -> Result<GenerationStepWithLogits, Exception> {
         let input_codebooks = self.args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
             return Err(Exception::custom(format!(
@@ -1641,18 +2020,22 @@ impl Model {
 
         if offset == 0 {
             state.step += 1;
-            return Ok(GenerationStepOutput {
-                text_token: Array::full::<i32>(
-                    &[batch, 1],
-                    Array::from_int(self.args.text_card),
-                    stream,
-                )?,
-                sampled_audio_tokens: Array::full::<i32>(
-                    &[batch, self.args.dep_q],
-                    Array::from_int(self.args.audio_padding_token()),
-                    stream,
-                )?,
-                output_audio_tokens: None,
+            return Ok(GenerationStepWithLogits {
+                output: GenerationStepOutput {
+                    text_token: Array::full::<i32>(
+                        &[batch, 1],
+                        Array::from_int(self.args.text_card),
+                        stream,
+                    )?,
+                    sampled_audio_tokens: Array::full::<i32>(
+                        &[batch, self.args.dep_q],
+                        Array::from_int(self.args.audio_padding_token()),
+                        stream,
+                    )?,
+                    output_audio_tokens: None,
+                },
+                text_logits: None,
+                audio_logits: Vec::new(),
             });
         }
 
@@ -1681,7 +2064,7 @@ impl Model {
             }
         }
         let forced_depth_tokens = safemlx::ops::stack_axis(&forced_depth_tokens, 1, stream)?;
-        let (text_token, sampled_audio_tokens, _) = self.sample_temporal_output_forced(
+        let (text_token, sampled_audio_tokens, audio_logits) = self.sample_temporal_output_forced(
             &temporal_output,
             &text_logits,
             &mut state.cache,
@@ -1693,6 +2076,7 @@ impl Model {
             Some(&forced_depth_tokens),
             Some(&forced_depth_mask),
             prng_state,
+            retain_forced_logits,
             stream,
         )?;
 
@@ -1726,10 +2110,14 @@ impl Model {
 
         state.previous_text = Some(text_token.clone());
         state.step += 1;
-        Ok(GenerationStepOutput {
-            text_token,
-            sampled_audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: GenerationStepOutput {
+                text_token,
+                sampled_audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(text_logits),
+            audio_logits,
         })
     }
 }
@@ -1821,11 +2209,7 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     Ok(args)
 }
 
-/// Loads a BF16/FP16 Moshi MLX checkpoint for token-only inference.
-///
-/// Quantized `model.q4.safetensors` and `model.q8.safetensors` checkpoints are
-/// intentionally rejected until Moshi's module-specific quantization layout is
-/// represented in `safemlx-lm`.
+/// Loads a dense or MLX affine-quantized Moshi checkpoint for token-only inference.
 pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -1837,21 +2221,78 @@ pub fn load_model(
         .moshi_name
         .clone()
         .unwrap_or_else(|| "model.safetensors".to_string());
-    if weights_name.contains(".q4.") || weights_name.contains(".q8.") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "quantized Moshi checkpoint {weights_name} is not supported; use the MLX BF16 checkpoint"
-        )));
-    }
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    load_safetensors_strict(
-        &mut model,
-        model_dir.join(&weights_name),
-        weights_stream,
-        &config,
-        &mut report,
-    )?;
+    if weights_name == "model.safetensors"
+        && model_dir.join("model.safetensors.index.json").exists()
+    {
+        load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
+    } else {
+        load_safetensors_strict(
+            &mut model,
+            model_dir.join(&weights_name),
+            weights_stream,
+            &config,
+            &mut report,
+        )?;
+    }
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
+/// Loads a dense Moshi checkpoint while quantizing each matrix as it is read.
+///
+/// This is the experimental, no-conversion counterpart to
+/// [`crate::quantization::quantize_checkpoint`]. Both paths call the same
+/// affine tensor transform and produce the same in-memory parameter layout.
+pub fn load_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+    let mut args = get_model_args(model_dir)?;
+    if args.quantization.is_some() {
+        return Err(Error::Quantization(
+            "on-the-fly quantization requires a dense source checkpoint".into(),
+        ));
+    }
+    args.quantization = Some(quantization);
+    let weights_name = args
+        .moshi_name
+        .clone()
+        .unwrap_or_else(|| "model.safetensors".to_string());
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    if weights_name == "model.safetensors"
+        && model_dir.join("model.safetensors.index.json").exists()
+    {
+        for file in crate::weights::safetensors_files(model_dir)? {
+            load_safetensors_quantized_strict(
+                &mut model,
+                file,
+                weights_stream,
+                stream,
+                quantization,
+                &config,
+                &mut report,
+            )?;
+        }
+    } else {
+        load_safetensors_quantized_strict(
+            &mut model,
+            model_dir.join(weights_name),
+            weights_stream,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
@@ -1881,15 +2322,65 @@ pub fn load_pytorch_safetensors_strict(
     path: impl AsRef<Path>,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
+    load_pytorch_safetensors_files_strict(model, [path.as_ref()], weights_stream)
+}
+
+/// Strict-loads one or more PyTorch Moshi-family safetensors shards.
+pub fn load_pytorch_safetensors_files_strict<P, I>(
+    model: &mut Model,
+    paths: I,
+    weights_stream: &Stream,
+) -> Result<(), Error>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = P>,
+{
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
     let args = model.args.clone();
-    {
+    for path in paths {
         let mut params = model.parameters_mut().flatten();
-        for_each_safetensor_array(path, weights_stream, |source_key, value| {
+        for_each_safetensor_array(path.as_ref(), weights_stream, |source_key, value| {
             let transformed = transform_pytorch_tensor(&args, &source_key, value, weights_stream)?;
             for (key, value) in transformed {
                 load_array_strict(&mut params, key, value, &config, &mut report);
+            }
+            Ok(())
+        })?;
+    }
+    report.finish(model, &config)
+}
+
+/// Loads dense PyTorch Moshi-family shards while quantizing transformed tensors.
+pub fn load_pytorch_safetensors_files_quantized_strict<P, I>(
+    model: &mut Model,
+    paths: I,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: AffineQuantization,
+) -> Result<(), Error>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = P>,
+{
+    quantization.validate()?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    let args = model.args.clone();
+    for path in paths {
+        let mut params = model.parameters_mut().flatten();
+        for_each_safetensor_array(path.as_ref(), weights_stream, |source_key, value| {
+            let transformed = transform_pytorch_tensor(&args, &source_key, value, weights_stream)?;
+            for (key, value) in transformed {
+                load_array_quantized_strict(
+                    &mut params,
+                    key,
+                    value,
+                    quantization_stream,
+                    quantization,
+                    &config,
+                    &mut report,
+                )?;
             }
             Ok(())
         })?;
@@ -1903,29 +2394,32 @@ fn transform_pytorch_tensor(
     value: Array,
     stream: &Stream,
 ) -> Result<Vec<(String, Array)>, Error> {
-    if let Some(index) = parse_indexed_weight(key, "emb") {
-        return Ok(vec![(format!("audio_embs.{index}.weight"), value)]);
+    if let Some((index, suffix)) = parse_indexed_tensor(key, "emb") {
+        return Ok(vec![(format!("audio_embs.{index}.{suffix}"), value)]);
     }
-    if let Some(index) = parse_indexed_weight(key, "depformer_in") {
+    if let Some((index, suffix)) = parse_indexed_tensor(key, "depformer_in") {
         return Ok(vec![(
-            format!("depformer.slices.{index}.linear_in.weight"),
+            format!("depformer.slices.{index}.linear_in.{suffix}"),
             value,
         )]);
     }
-    if let Some(index) = parse_indexed_weight(key, "linears") {
+    if let Some((index, suffix)) = parse_indexed_tensor(key, "linears") {
         return Ok(vec![(
-            format!("depformer.slices.{index}.linear_out.weight"),
+            format!("depformer.slices.{index}.linear_out.{suffix}"),
             value,
         )]);
     }
-    if let Some(index) = parse_indexed_weight(key, "depformer_emb") {
+    if let Some((index, suffix)) = parse_indexed_tensor(key, "depformer_emb") {
         return Ok(vec![(
-            format!("depformer.slices.{}.emb.weight", index + 1),
+            format!("depformer.slices.{}.emb.{suffix}", index + 1),
             value,
         )]);
     }
-    if key == "depformer_text_emb.weight" {
-        return Ok(vec![("depformer.slices.0.emb.weight".to_string(), value)]);
+    if let Some(suffix) = key
+        .strip_prefix("depformer_text_emb.")
+        .and_then(tensor_suffix)
+    {
+        return Ok(vec![(format!("depformer.slices.0.emb.{suffix}"), value)]);
     }
     if key == "out_norm.alpha" {
         return Ok(vec![(
@@ -1948,8 +2442,8 @@ fn transform_pytorch_tensor(
             value,
         )]);
     }
-    if key == "text_emb.weight"
-        || key == "text_linear.weight"
+    if key.starts_with("text_emb.")
+        || key.starts_with("text_linear.")
         || key.starts_with("transformer.layers.")
     {
         return Ok(vec![(key.to_string(), value)]);
@@ -1978,7 +2472,7 @@ fn transform_pytorch_tensor(
     }
     if let Some((layer, slice, linear)) = parse_depformer_gating_weight(key) {
         return Ok(vec![(
-            format!("depformer.slices.{slice}.transformer.layers.{layer}.gating.{linear}.weight"),
+            format!("depformer.slices.{slice}.transformer.layers.{layer}.gating.{linear}"),
             value,
         )]);
     }
@@ -2009,10 +2503,14 @@ fn split_first_axis(
     value.try_index_device((start..end, ..), stream)
 }
 
-fn parse_indexed_weight(key: &str, prefix: &str) -> Option<i32> {
+fn tensor_suffix(suffix: &str) -> Option<&str> {
+    matches!(suffix, "weight" | "scales" | "biases").then_some(suffix)
+}
+
+fn parse_indexed_tensor<'a>(key: &'a str, prefix: &str) -> Option<(i32, &'a str)> {
     let rest = key.strip_prefix(prefix)?.strip_prefix('.')?;
     let (index, suffix) = rest.split_once('.')?;
-    (suffix == "weight").then(|| index.parse().ok()).flatten()
+    Some((index.parse().ok()?, tensor_suffix(suffix)?))
 }
 
 fn parse_norm_alpha(key: &str, prefix: &str) -> Option<(i32, &'static str)> {
@@ -2032,6 +2530,11 @@ fn parse_depformer_attention_weight(key: &str) -> Option<(i32, &'static str)> {
     let suffix = match suffix {
         "self_attn.in_proj_weight" => "in_proj.weight",
         "self_attn.out_proj.weight" => "out_proj.weight",
+        "self_attn.in_proj.weight" => "in_proj.weight",
+        "self_attn.in_proj.scales" => "in_proj.scales",
+        "self_attn.in_proj.biases" => "in_proj.biases",
+        "self_attn.out_proj.scales" => "out_proj.scales",
+        "self_attn.out_proj.biases" => "out_proj.biases",
         _ => return None,
     };
     Some((layer.parse().ok()?, suffix))
@@ -2042,8 +2545,12 @@ fn parse_depformer_gating_weight(key: &str) -> Option<(i32, i32, &'static str)> 
     let (layer, rest) = rest.split_once(".gating.")?;
     let (slice, suffix) = rest.split_once('.')?;
     let linear = match suffix {
-        "linear_in.weight" => "linear_in",
-        "linear_out.weight" => "linear_out",
+        "linear_in.weight" => "linear_in.weight",
+        "linear_out.weight" => "linear_out.weight",
+        "linear_in.scales" => "linear_in.scales",
+        "linear_in.biases" => "linear_in.biases",
+        "linear_out.scales" => "linear_out.scales",
+        "linear_out.biases" => "linear_out.biases",
         _ => return None,
     };
     Some((layer.parse().ok()?, slice.parse().ok()?, linear))
@@ -2117,11 +2624,11 @@ mod tests {
         );
         assert_eq!(
             parse_depformer_gating_weight("depformer.layers.4.gating.15.linear_in.weight"),
-            Some((4, 15, "linear_in"))
+            Some((4, 15, "linear_in.weight"))
         );
         assert_eq!(
             parse_depformer_gating_weight("depformer.layers.4.gating.15.linear_out.weight"),
-            Some((4, 15, "linear_out"))
+            Some((4, 15, "linear_out.weight"))
         );
     }
 

@@ -24,6 +24,7 @@ use crate::{
     cache::KeyValueCache,
     inspection::ActivationObserver,
     models::input,
+    quantization::AffineQuantization,
     sampler::{DefaultSampler, Sampler},
     utils::{rope::RopeVariant, scaled_dot_product_attention},
 };
@@ -78,28 +79,33 @@ impl SwiGluMlp {
         bias: bool,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::unloaded_with_quantization(dim, hidden_dim, bias, None, stream)
+    }
+
+    /// Creates an unloaded SwiGLU MLP with optional MLX affine projections.
+    pub fn unloaded_with_quantization(
+        dim: i32,
+        hidden_dim: i32,
+        bias: bool,
+        quantization: Option<AffineQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: MaybeQuantized::Original(nn::Linear::unloaded(
+            gate_proj: unloaded_maybe_quantized_linear(
                 dim,
                 hidden_dim,
                 bias,
-                Dtype::Float32,
+                quantization,
                 stream,
-            )?),
-            down_proj: MaybeQuantized::Original(nn::Linear::unloaded(
+            )?,
+            down_proj: unloaded_maybe_quantized_linear(
                 hidden_dim,
                 dim,
                 bias,
-                Dtype::Float32,
+                quantization,
                 stream,
-            )?),
-            up_proj: MaybeQuantized::Original(nn::Linear::unloaded(
-                dim,
-                hidden_dim,
-                bias,
-                Dtype::Float32,
-                stream,
-            )?),
+            )?,
+            up_proj: unloaded_maybe_quantized_linear(dim, hidden_dim, bias, quantization, stream)?,
         })
     }
 
@@ -554,11 +560,68 @@ pub fn build_unloaded_maybe_quantized_lm_head(
     vocab_size: i32,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    Ok(MaybeQuantized::Original(build_unloaded_lm_head(
-        hidden_size,
-        vocab_size,
-        stream,
-    )?))
+    unloaded_maybe_quantized_linear(hidden_size, vocab_size, false, None, stream)
+}
+
+/// Creates an unloaded linear using the standard dense or affine parameter tree.
+pub fn unloaded_maybe_quantized_linear(
+    input_dims: i32,
+    output_dims: i32,
+    bias: bool,
+    quantization: Option<AffineQuantization>,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    match quantization {
+        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
+            input_dims,
+            output_dims,
+            config.group_size,
+            config.bits,
+            bias,
+            stream,
+        )?)),
+        None => Ok(MaybeQuantized::Original(nn::Linear::unloaded(
+            input_dims,
+            output_dims,
+            bias,
+            Dtype::Float32,
+            stream,
+        )?)),
+    }
+}
+
+/// Creates an unloaded embedding using the standard dense or affine parameter tree.
+pub fn unloaded_maybe_quantized_embedding(
+    embedding_count: i32,
+    dimensions: i32,
+    quantization: Option<AffineQuantization>,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
+    match quantization {
+        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedEmbedding::unloaded(
+            embedding_count,
+            dimensions,
+            config.group_size,
+            config.bits,
+            stream,
+        )?)),
+        None => Ok(MaybeQuantized::Original(nn::Embedding::unloaded(
+            embedding_count,
+            dimensions,
+            Dtype::Float32,
+            stream,
+        )?)),
+    }
+}
+
+/// Builds an unloaded language-model head with optional affine quantization.
+pub fn build_unloaded_maybe_quantized_lm_head_with_quantization(
+    hidden_size: i32,
+    vocab_size: i32,
+    quantization: Option<AffineQuantization>,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    unloaded_maybe_quantized_linear(hidden_size, vocab_size, false, quantization, stream)
 }
 
 /// Projects hidden states to logits, using tied embeddings when `lm_head` is absent.

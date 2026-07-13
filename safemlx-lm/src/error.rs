@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid or unsupported checkpoint quantization request.
+    #[error("checkpoint quantization error: {0}")]
+    Quantization(String),
+
     /// The `model_type` in `config.json` is not supported by this crate.
     #[error("unsupported model type: {0}")]
     UnsupportedModelType(String),

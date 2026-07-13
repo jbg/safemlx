@@ -22,6 +22,8 @@ pub mod models;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;
+/// Generic affine checkpoint quantization and conversion utilities.
+pub mod quantization;
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;
 /// Token sampling strategies.

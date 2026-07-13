@@ -29,8 +29,12 @@ use crate::{
         },
         input,
     },
+    quantization::AffineQuantization,
     utils::rope::{initialize_rope, FloatOrString, RopeVariant},
-    weights::load_safetensors_dir_lenient,
+    weights::{
+        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +77,18 @@ pub struct ModelArgs {
     pub mlp_bias: bool,
     /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    /// Preferred MLX-LM affine quantization metadata.
+    #[serde(default)]
+    pub quantization: Option<AffineQuantization>,
+    /// Hugging Face-compatible alias emitted by MLX-LM converters.
+    #[serde(default)]
+    pub quantization_config: Option<AffineQuantization>,
+}
+
+impl ModelArgs {
+    fn affine_quantization(&self) -> Option<AffineQuantization> {
+        self.quantization.or(self.quantization_config)
+    }
 }
 
 fn default_true() -> bool {
@@ -124,32 +140,32 @@ impl Attention {
         let head_dim = args.head_dim;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let q_proj = nn::Linear::unloaded(
+        let q_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_heads * head_dim,
             args.attention_bias,
-            Dtype::Float32,
+            args.affine_quantization(),
             stream,
         )?;
-        let k_proj = nn::Linear::unloaded(
+        let k_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
-            Dtype::Float32,
+            args.affine_quantization(),
             stream,
         )?;
-        let v_proj = nn::Linear::unloaded(
+        let v_proj = common::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
-            Dtype::Float32,
+            args.affine_quantization(),
             stream,
         )?;
-        let o_proj = nn::Linear::unloaded(
+        let o_proj = common::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             args.attention_bias,
-            Dtype::Float32,
+            args.affine_quantization(),
             stream,
         )?;
 
@@ -166,10 +182,10 @@ impl Attention {
             n_heads,
             n_kv_heads,
             scale,
-            q_proj: MaybeQuantized::Original(q_proj),
-            k_proj: MaybeQuantized::Original(k_proj),
-            v_proj: MaybeQuantized::Original(v_proj),
-            o_proj: MaybeQuantized::Original(o_proj),
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             rope,
         })
     }
@@ -301,10 +317,11 @@ impl TransformerBlock {
         let hidden_size = args.hidden_size;
 
         let self_attn = Attention::new(args, stream)?;
-        let mlp = SwiGluMlp::unloaded(
+        let mlp = SwiGluMlp::unloaded_with_quantization(
             args.hidden_size,
             args.intermediate_size,
             args.mlp_bias,
+            args.affine_quantization(),
             stream,
         )?;
         let input_layernorm =
@@ -446,8 +463,12 @@ impl LlamaModel {
         let vocab_size = args.vocab_size;
         let num_hidden_layers = args.num_hidden_layers;
 
-        let embed_tokens =
-            nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
+        let embed_tokens = common::unloaded_maybe_quantized_embedding(
+            args.vocab_size,
+            args.hidden_size,
+            args.affine_quantization(),
+            stream,
+        )?;
         let layers = (0..num_hidden_layers)
             .map(|_| TransformerBlock::new(args, stream))
             .collect::<Result<Vec<_>, _>>()?;
@@ -457,7 +478,7 @@ impl LlamaModel {
         Ok(Self {
             vocab_size,
             num_hidden_layers,
-            embed_tokens: MaybeQuantized::Original(embed_tokens),
+            embed_tokens,
             layers,
             norm,
         })
@@ -617,11 +638,14 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = LlamaModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_unloaded_maybe_quantized_lm_head(
-                args.hidden_size,
-                args.vocab_size,
-                stream,
-            )?)
+            Some(
+                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    args.affine_quantization(),
+                    stream,
+                )?,
+            )
         } else {
             None
         };
@@ -737,6 +761,39 @@ pub fn load_llama_model(
     load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
     model.copy_to_stream(stream)?;
 
+    Ok(model)
+}
+
+/// Loads a dense Llama checkpoint while quantizing matrices tensor-by-tensor.
+pub fn load_llama_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    quantization.validate()?;
+    let model_dir = model_dir.as_ref();
+    let mut model_args = get_llama_model_args(model_dir)?;
+    if model_args.affine_quantization().is_some() {
+        return Err(Error::Quantization(
+            "on-the-fly quantization requires a dense source checkpoint".into(),
+        ));
+    }
+    model_args.quantization = Some(quantization);
+    let mut model = Model::new(model_args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    load_safetensors_dir_quantized_strict(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        quantization,
+        &config,
+        &mut report,
+    )?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
     Ok(model)
 }
 

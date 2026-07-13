@@ -160,9 +160,48 @@ building blocks, including Mimi checkpoint loading, PCM encode/decode,
 residual-vector quantization, and stateful tokens-to-PCM decode. Audio device
 I/O remains optional codec surface rather than an `safemlx-lm` dependency.
 
-Moshi currently loads unquantized MLX checkpoints (`model.safetensors`). For
-the original released Moshika/Moshiko repositories, the loader uses Moshi's
-built-in v0.1 config when the model directory has no `config.json`.
+Moshi loads dense and MLX affine-quantized checkpoints. For the original
+released Moshika/Moshiko repositories, the loader uses Moshi's built-in v0.1
+config when the model directory has no `config.json`.
+
+## Checkpoint quantization
+
+The generic checkpoint converter quantizes eligible two-dimensional
+`*.weight` tensors one at a time, writes bounded-size safetensors shards, and
+copies tokenizer and other model assets. Its output follows the MLX-LM affine
+convention: packed `weight` tensors have sibling `scales` and `biases`, while
+`config.json` contains identical `quantization` and `quantization_config`
+objects.
+
+```sh
+cargo run --release -p safemlx-lm --example quantize_checkpoint -- \
+  /path/to/dense-model /path/to/model-4bit \
+  --group-size 64 --bits 4
+```
+
+Use repeatable `--include` and `--exclude` substring filters to experiment on
+part of any safetensors checkpoint, `--minimum-elements` to leave small
+matrices dense, and `--shard-size-mib` to control peak buffered output and
+shard size. The output directory must not already exist.
+
+Library callers can use `quantization::quantize_checkpoint` for conversion or
+`weights::load_safetensors_dir_quantized_strict` to populate any model that
+exposes the standard packed parameter tree. Llama, Qwen3, and Moshi also expose
+model-specific `load_*_model_quantized` helpers for direct on-the-fly
+experiments. Both modes call `quantization::quantize_tensor` with a caller-owned
+explicit stream, so saving and direct loading use the same numerical transform.
+Direct loading materializes each packed weight/scale/bias triple before reading
+the next dense tensor. This prevents MLX's lazy graphs from retaining the whole
+dense checkpoint during conversion while preserving exact parity with a saved
+quantized checkpoint.
+
+To include direct Q4 conversion in a PersonaPlex load/step benchmark, use the
+dense checkpoint with `--quantize-on-load`:
+
+```sh
+cargo run --release -p safemlx-lm --example personaplex_step_bench -- \
+  /path/to/personaplex-dense 64 --quantize-on-load
+```
 
 Generate a deterministic fixture with the upstream `moshi_mlx` package, then
 replay it through Rust:

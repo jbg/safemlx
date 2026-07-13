@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::{
     error::Error,
     models::moshi,
+    quantization::AffineQuantization,
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -46,6 +47,9 @@ pub struct ModelMetadata {
     /// Released model version, for example `7b-v1`.
     #[serde(default)]
     pub version: Option<String>,
+    /// Optional MLX affine checkpoint quantization settings.
+    #[serde(default)]
+    pub quantization: Option<AffineQuantization>,
 }
 
 /// PersonaPlex uses the Moshi-family token model implementation.
@@ -89,6 +93,7 @@ pub fn model_args_7b_v1() -> moshi::ModelArgs {
         demux_second_stream: false,
         depformer_low_rank_embeddings: None,
         extra_heads_num_heads: 0,
+        quantization: None,
     }
 }
 
@@ -132,19 +137,34 @@ pub fn load_native_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let _ = get_model_metadata(&model_dir)?;
+    let metadata = get_model_metadata(&model_dir)?;
     let mut args = model_args_7b_v1();
     args.moshi_name = Some(MODEL_SAFETENSORS.to_string());
+    args.quantization = metadata.quantization;
     let mut model = moshi::Model::new(args, stream)?;
     let config = crate::weights::StrictLoadConfig::default();
     let mut report = crate::weights::StrictLoadReport::default();
-    crate::weights::load_safetensors_strict(
-        &mut model,
-        model_dir.as_ref().join(MODEL_SAFETENSORS),
-        weights_stream,
-        &config,
-        &mut report,
-    )?;
+    if model_dir
+        .as_ref()
+        .join("model.safetensors.index.json")
+        .exists()
+    {
+        crate::weights::load_safetensors_dir_strict(
+            &mut model,
+            &model_dir,
+            weights_stream,
+            &config,
+            &mut report,
+        )?;
+    } else {
+        crate::weights::load_safetensors_strict(
+            &mut model,
+            model_dir.as_ref().join(MODEL_SAFETENSORS),
+            weights_stream,
+            &config,
+            &mut report,
+        )?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
@@ -156,13 +176,57 @@ pub fn load_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let _ = get_model_metadata(&model_dir)?;
-    moshi::load_pytorch_safetensors_model(
-        model_args_7b_v1(),
-        model_dir.as_ref().join(MODEL_SAFETENSORS),
-        stream,
+    let metadata = get_model_metadata(&model_dir)?;
+    let mut args = model_args_7b_v1();
+    args.quantization = metadata.quantization;
+    if metadata.quantization.is_some()
+        || model_dir
+            .as_ref()
+            .join("model.safetensors.index.json")
+            .exists()
+    {
+        let mut model = moshi::Model::new(args, stream)?;
+        let files = crate::weights::safetensors_files(&model_dir)?;
+        moshi::load_pytorch_safetensors_files_strict(&mut model, files, weights_stream)?;
+        model.copy_to_stream(stream)?;
+        Ok(model)
+    } else {
+        moshi::load_pytorch_safetensors_model(
+            args,
+            model_dir.as_ref().join(MODEL_SAFETENSORS),
+            stream,
+            weights_stream,
+        )
+    }
+}
+
+/// Loads the dense released PersonaPlex checkpoint with on-the-fly affine quantization.
+pub fn load_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let metadata = get_model_metadata(&model_dir)?;
+    if metadata.quantization.is_some() {
+        return Err(Error::Quantization(
+            "on-the-fly quantization requires a dense source checkpoint".into(),
+        ));
+    }
+    quantization.validate()?;
+    let mut args = model_args_7b_v1();
+    args.quantization = Some(quantization);
+    let mut model = moshi::Model::new(args, stream)?;
+    let files = crate::weights::safetensors_files(&model_dir)?;
+    moshi::load_pytorch_safetensors_files_quantized_strict(
+        &mut model,
+        files,
         weights_stream,
-    )
+        stream,
+        quantization,
+    )?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
 }
 
 /// One forced system-prompt frame expressed entirely in codec/text tokens.
@@ -402,6 +466,24 @@ mod tests {
         let model = super::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
         assert_eq!(model.args.dep_q, 16);
         assert_eq!(model.args.generated_audio_codebooks(), 8);
+    }
+
+    #[test]
+    #[ignore = "requires SAFEMLX_PERSONAPLEX_DIR with the dense released checkpoint and Metal"]
+    fn local_released_checkpoint_on_the_fly_q4_loads() {
+        let model_dir = std::env::var("SAFEMLX_PERSONAPLEX_DIR")
+            .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let model = super::load_model_quantized(
+            &model_dir,
+            crate::quantization::AffineQuantization::default(),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(model.args.quantization.unwrap().bits, 4);
+        assert_eq!(model.args.dep_q, 16);
     }
 
     #[test]
