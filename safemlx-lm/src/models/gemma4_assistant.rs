@@ -12,6 +12,7 @@ use safemlx::{
         indexing::{put_along_axis, NewAxis, TryIndexOp},
         lt, matmul, which,
     },
+    quantization::MaybeQuantized,
     random::RandomState,
     Array, Dtype, Stream,
 };
@@ -20,8 +21,16 @@ use serde_json::Value;
 
 use crate::{
     error::Error,
-    models::gemma4::{sample, Gemma4Embedding, LayerType, Model, ModelArgs, TransformerBlock},
-    weights::{load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
+    models::{
+        common,
+        gemma4::{sample, Gemma4Embedding, LayerType, Model, ModelArgs, TransformerBlock},
+        ModelLoadOptions,
+    },
+    quantization::AffineQuantization,
+    weights::{
+        load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +58,9 @@ pub struct Gemma4AssistantConfig {
     pub block_size: usize,
     /// Text model configuration for the assistant body.
     pub text_config: ModelArgs,
+    #[serde(default)]
+    /// Optional MLX affine checkpoint metadata.
+    pub quantization: Option<AffineQuantization>,
 }
 
 fn default_model_type() -> String {
@@ -90,7 +102,7 @@ impl DraftInner {
         let embed_tokens = Gemma4Embedding::unloaded(
             args.vocab_size,
             args.hidden_size,
-            false,
+            args.quantized,
             args.quantization_group_size,
             args.quantization_bits,
             stream,
@@ -215,13 +227,13 @@ pub struct Gemma4AssistantDraftModel {
     pub model: DraftInner,
     #[param]
     /// Projection from target hidden state plus token embedding into assistant hidden size.
-    pub pre_projection: nn::Linear,
+    pub pre_projection: MaybeQuantized<nn::Linear>,
     #[param]
     /// Projection from assistant hidden size back to target hidden size.
-    pub post_projection: nn::Linear,
+    pub post_projection: MaybeQuantized<nn::Linear>,
     #[param]
     /// Optional untied language-model head.
-    pub lm_head: Option<nn::Linear>,
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     /// Optional masked embedding head.
     pub masked_embedding: Option<MaskedEmbedder>,
@@ -233,38 +245,47 @@ pub struct Gemma4AssistantDraftModel {
 impl Gemma4AssistantDraftModel {
     /// Creates an unloaded Gemma 4 assistant draft model.
     pub fn new(mut config: Gemma4AssistantConfig, stream: &Stream) -> Result<Self, Exception> {
+        if config.quantization.is_some() && config.use_ordered_embeddings {
+            return Err(Exception::custom(
+                "Gemma 4 assistant affine quantization does not support ordered masked embeddings because that head indexes raw dense embedding rows",
+            ));
+        }
         config.text_config.model_type = "gemma4".to_string();
-        config.text_config.quantized = false;
-        config.text_config.quantization_group_size = 64;
-        config.text_config.quantization_bits = 4;
+        config.text_config.quantized = config.quantization.is_some();
+        config.text_config.quantization_group_size = config
+            .quantization
+            .map_or(64, |quantization| quantization.group_size);
+        config.text_config.quantization_bits = config
+            .quantization
+            .map_or(4, |quantization| quantization.bits);
         if config.text_config.num_kv_shared_layers == 0 {
             config.text_config.num_kv_shared_layers = config.text_config.num_hidden_layers;
         }
 
         let text_config = &config.text_config;
         let model = DraftInner::new(text_config, stream)?;
-        let pre_projection = nn::Linear::unloaded(
+        let pre_projection = common::unloaded_maybe_quantized_linear(
             2 * config.backbone_hidden_size,
             text_config.hidden_size,
             false,
-            Dtype::Float32,
+            config.quantization,
             stream,
         )?;
-        let post_projection = nn::Linear::unloaded(
+        let post_projection = common::unloaded_maybe_quantized_linear(
             text_config.hidden_size,
             config.backbone_hidden_size,
             false,
-            Dtype::Float32,
+            config.quantization,
             stream,
         )?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(nn::Linear::unloaded(
+            Some(common::unloaded_maybe_quantized_linear(
                 text_config.hidden_size,
                 text_config.vocab_size,
                 false,
-                Dtype::Float32,
+                config.quantization,
                 stream,
             )?)
         };
@@ -451,9 +472,40 @@ pub fn load_gemma4_assistant_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantDraftModel, Error> {
+    load_gemma4_assistant_model_with_options(
+        model_dir,
+        ModelLoadOptions::default(),
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads a Gemma 4 assistant draft model using shared model-load options.
+pub fn load_gemma4_assistant_model_with_options(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4AssistantDraftModel, Error> {
     let model_dir = model_dir.as_ref();
     let file = std::fs::File::open(model_dir.join("config.json"))?;
-    let config: Gemma4AssistantConfig = serde_json::from_reader(file)?;
+    let mut config: Gemma4AssistantConfig = serde_json::from_reader(file)?;
+    let quantize_on_load = if let Some(quantization) = options.quantization {
+        if config.use_ordered_embeddings {
+            return Err(Error::Quantization(
+                "Gemma 4 assistant affine quantization does not support ordered masked embeddings because that head indexes raw dense embedding rows".into(),
+            ));
+        }
+        let quantize = crate::quantization::should_quantize_on_load(
+            "Gemma 4 assistant",
+            config.quantization,
+            quantization,
+        )?;
+        config.quantization = Some(quantization);
+        quantize
+    } else {
+        false
+    };
     let mut model = Gemma4AssistantDraftModel::new(config, stream)?;
     let load_config = StrictLoadConfig::default()
         .allow_missing_suffix(".bias")
@@ -468,24 +520,143 @@ pub fn load_gemma4_assistant_model(
         let weight_files: std::collections::HashSet<&String> =
             weight_map.weight_map.values().collect();
         for weight_file in weight_files {
-            load_safetensors_strict(
+            let path = model_dir.join(weight_file);
+            if quantize_on_load {
+                load_safetensors_quantized_strict(
+                    &mut model,
+                    path,
+                    weights_stream,
+                    stream,
+                    options.quantization.expect("quantization requested"),
+                    &load_config,
+                    &mut report,
+                )?;
+            } else {
+                load_safetensors_strict(
+                    &mut model,
+                    path,
+                    weights_stream,
+                    &load_config,
+                    &mut report,
+                )?;
+            }
+        }
+    } else {
+        let path = model_dir.join("model.safetensors");
+        if quantize_on_load {
+            load_safetensors_quantized_strict(
                 &mut model,
-                model_dir.join(weight_file),
+                path,
                 weights_stream,
+                stream,
+                options.quantization.expect("quantization requested"),
                 &load_config,
                 &mut report,
             )?;
+        } else {
+            load_safetensors_strict(&mut model, path, weights_stream, &load_config, &mut report)?;
         }
-    } else {
-        load_safetensors_strict(
-            &mut model,
-            model_dir.join("model.safetensors"),
-            weights_stream,
-            &load_config,
-            &mut report,
-        )?;
     }
     report.finish(&model, &load_config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext};
+
+    use crate::{models::ModelLoadOptions, quantization::AffineQuantization};
+
+    const CONFIG: &str = r#"{
+      "model_type":"gemma4_assistant",
+      "backbone_hidden_size":32,
+      "use_ordered_embeddings":false,
+      "tie_word_embeddings":false,
+      "block_size":4,
+      "text_config":{
+        "model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,
+        "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+        "head_dim":8,"rms_norm_eps":0.00001,"vocab_size":32,
+        "max_position_embeddings":128,"tie_word_embeddings":false,
+        "attention_k_eq_v":false,"layer_types":["full_attention"]
+      }
+    }"#;
+
+    #[test]
+    fn tiny_assistant_quantizes_through_shared_options() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "safemlx-assistant-quantization-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), CONFIG).unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let config: super::Gemma4AssistantConfig = serde_json::from_str(CONFIG).unwrap();
+        let dense = super::Gemma4AssistantDraftModel::new(config, stream).unwrap();
+        let parameters = dense.parameters().flatten();
+        let arrays = parameters
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.to_string(),
+                    Array::zeros::<f32>(parameter.shape(), stream).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, array)| (name.as_str(), array)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let quantization = AffineQuantization::new(32, 4).unwrap();
+        let model = super::load_gemma4_assistant_model_with_options(
+            &dir,
+            ModelLoadOptions::with_quantization(quantization),
+            stream,
+            weights_context.stream(),
+        )
+        .unwrap();
+        assert!(model.pre_projection.is_quantized());
+        assert!(model.post_projection.is_quantized());
+        assert!(model.lm_head.as_ref().unwrap().is_quantized());
+        assert!(model.model.embed_tokens.quantized);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordered_assistant_head_reports_affine_capability_error() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["use_ordered_embeddings"] = true.into();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "safemlx-assistant-capability-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), serde_json::to_vec(&value).unwrap()).unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let error = super::load_gemma4_assistant_model_with_options(
+            &dir,
+            ModelLoadOptions::with_quantization(AffineQuantization::default()),
+            context.stream(),
+            context.stream(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ordered masked embeddings"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

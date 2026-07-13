@@ -2255,10 +2255,8 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut args = get_model_args(model_dir)?;
-    if args.quantization.is_some() {
-        return Err(Error::Quantization(
-            "on-the-fly quantization requires a dense source checkpoint".into(),
-        ));
+    if !crate::quantization::should_quantize_on_load("Moshi", args.quantization, quantization)? {
+        return load_model(model_dir, stream, weights_stream);
     }
     args.quantization = Some(quantization);
     let weights_name = args

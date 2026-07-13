@@ -35,10 +35,11 @@ pub mod weights;
 
 pub use models::{
     check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
-    SupportedModelConfig,
+    ModelLoadOptions, SupportedModelConfig,
 };
 pub use realtime::{
-    load_model as load_realtime_model, LoadedRealtimeModel, RealtimeModelKind, RealtimeState,
+    load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
+    LoadedRealtimeModel, RealtimeModelKind, RealtimeState,
 };
 
 use safemlx::Array;

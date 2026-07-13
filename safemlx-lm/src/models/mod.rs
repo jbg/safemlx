@@ -24,6 +24,7 @@ use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
+use crate::quantization::AffineQuantization;
 use crate::sampler::{DefaultSampler, Sampler};
 use crate::{cache::ConcatKeyValueCache, error::Error};
 
@@ -105,6 +106,26 @@ pub enum ModelKind {
     Qwen3,
     /// Qwen3.5 mixture-of-experts architecture.
     Qwen35Moe,
+}
+
+/// Architecture-independent options for loading model weights.
+///
+/// When `quantization` is set for a dense checkpoint, eligible parameters are
+/// affine-quantized and materialized one tensor at a time. Checkpoints already
+/// carrying matching affine metadata are loaded directly without requantizing.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ModelLoadOptions {
+    /// Optional MLX affine quantization requested during dense checkpoint loading.
+    pub quantization: Option<AffineQuantization>,
+}
+
+impl ModelLoadOptions {
+    /// Creates load options that affine-quantize eligible dense weights on load.
+    pub fn with_quantization(quantization: AffineQuantization) -> Self {
+        Self {
+            quantization: Some(quantization),
+        }
+    }
 }
 
 impl ModelKind {
@@ -540,6 +561,21 @@ impl LoadedModel {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
+        Self::load_with_options(
+            model_dir,
+            ModelLoadOptions::default(),
+            stream,
+            weights_stream,
+        )
+    }
+
+    /// Loads a supported model using architecture-independent weight options.
+    pub fn load_with_options(
+        model_dir: impl AsRef<Path>,
+        options: ModelLoadOptions,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let metadata = read_model_metadata(model_dir)?;
         let model_type = effective_model_type(&metadata);
@@ -550,32 +586,12 @@ impl LoadedModel {
         #[cfg(feature = "media-processing")]
         let processor = load_processor(model_dir)?;
         let model = match kind {
-            ModelKind::Gemma4 => Model::Gemma4(gemma4::load_gemma4_model(
-                model_dir,
-                stream,
-                weights_stream,
-            )?),
-            ModelKind::Llama => {
-                Model::Llama(llama::load_llama_model(model_dir, stream, weights_stream)?)
-            }
-            ModelKind::NemotronH => Model::NemotronH(nemotron_h::load_nemotron_h_model(
-                model_dir,
-                stream,
-                weights_stream,
-            )?),
             ModelKind::PersonaPlex => {
                 return Err(Error::UnsupportedArchitecture(
                     "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex instead of LoadedModel".into(),
                 ));
             }
-            ModelKind::Qwen3 => {
-                Model::Qwen3(qwen3::load_qwen3_model(model_dir, stream, weights_stream)?)
-            }
-            ModelKind::Qwen35Moe => Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
-                model_dir,
-                stream,
-                weights_stream,
-            )?),
+            _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream)?,
         };
         let eos_token_ids = metadata
             .eos_token_id
@@ -886,9 +902,78 @@ pub fn load_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    load_model_with_options(
+        model_dir,
+        ModelLoadOptions::default(),
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads only the model weights and architecture using shared load options.
+pub fn load_model_with_options(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let metadata = read_model_metadata(model_dir)?;
-    match ModelKind::from_model_type(&effective_model_type(&metadata))? {
+    let kind = ModelKind::from_model_type(&effective_model_type(&metadata))?;
+    match kind {
+        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex::load_model".into(),
+        )),
+        _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream),
+    }
+}
+
+fn load_model_for_kind(
+    kind: ModelKind,
+    model_dir: &Path,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    if let Some(quantization) = options.quantization {
+        quantization.validate()?;
+        return match kind {
+            ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model_quantized(
+                model_dir,
+                quantization,
+                stream,
+                weights_stream,
+            )?)),
+            ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model_quantized(
+                model_dir,
+                quantization,
+                stream,
+                weights_stream,
+            )?)),
+            ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model_quantized(
+                model_dir,
+                quantization,
+                stream,
+                weights_stream,
+            )?)),
+            ModelKind::NemotronH => Err(Error::Quantization(
+                "Nemotron-H affine on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without an affine grouped-matmul implementation".into(),
+            )),
+            ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(
+                qwen3_5_moe::load_qwen3_5_moe_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+                "PersonaPlex must be loaded through the realtime API".into(),
+            )),
+        };
+    }
+
+    match kind {
         ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(
             model_dir,
             stream,
@@ -904,9 +989,6 @@ pub fn load_model(
             stream,
             weights_stream,
         )?)),
-        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex::load_model".into(),
-        )),
         ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(
             model_dir,
             stream,
@@ -917,6 +999,9 @@ pub fn load_model(
             stream,
             weights_stream,
         )?)),
+        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex must be loaded through the realtime API".into(),
+        )),
     }
 }
 
@@ -1034,9 +1119,17 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 mod tests {
     use super::{
         chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
-        load_chat_template, load_tokenizer, load_tokenizer_template_kwargs, LoadedModel,
+        load_chat_template, load_model_with_options, load_tokenizer,
+        load_tokenizer_template_kwargs, LoadedModel, ModelLoadOptions,
     };
-    use crate::inspection::ActivationRecorder;
+    use crate::{
+        error::Error,
+        inspection::ActivationRecorder,
+        quantization::{AffineQuantization, CheckpointQuantizationOptions},
+    };
+    use safemlx::{
+        argmax_axis, module::ModuleParameters, Array, Device, DeviceType, ExecutionContext, Stream,
+    };
     use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
     use serde_json::json;
     use std::{
@@ -1113,6 +1206,163 @@ mod tests {
         dir
     }
 
+    fn save_zero_checkpoint<M: ModuleParameters>(
+        model: &M,
+        dir: &std::path::Path,
+        stream: &Stream,
+    ) {
+        let parameters = model.parameters().flatten();
+        let arrays = parameters
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.to_string(),
+                    Array::zeros::<f32>(parameter.shape(), stream).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, array)| (name.as_str(), array)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn tiny_text_families_quantize_through_high_level_dispatch() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let fixtures = [
+            (
+                r#"{
+                  "model_type":"llama","hidden_size":32,"num_hidden_layers":1,
+                  "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+                  "head_dim":8,"rms_norm_eps":0.00001,"vocab_size":32,
+                  "max_position_embeddings":128,"tie_word_embeddings":true,
+                  "rope_scaling":null
+                }"#,
+                "llama",
+            ),
+            (
+                r#"{
+                  "model_type":"qwen3","hidden_size":32,"num_hidden_layers":1,
+                  "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+                  "head_dim":8,"rms_norm_eps":0.00001,"vocab_size":32,
+                  "max_position_embeddings":128,"rope_theta":10000.0,
+                  "tie_word_embeddings":true,"rope_scaling":null
+                }"#,
+                "qwen3",
+            ),
+            (
+                r#"{
+                  "model_type":"gemma4",
+                  "tie_word_embeddings":true,
+                  "text_config":{
+                    "model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,
+                    "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+                    "head_dim":8,"rms_norm_eps":0.00001,"vocab_size":32,
+                    "max_position_embeddings":128,"tie_word_embeddings":true,
+                    "attention_k_eq_v":false,"layer_types":["full_attention"]
+                  }
+                }"#,
+                "gemma4",
+            ),
+        ];
+
+        for (config, family) in fixtures {
+            let dir = temp_model_dir(config);
+            match family {
+                "llama" => {
+                    let args = super::llama::get_llama_model_args(&dir).unwrap();
+                    save_zero_checkpoint(
+                        &super::llama::Model::new(args, stream).unwrap(),
+                        &dir,
+                        stream,
+                    );
+                }
+                "qwen3" => {
+                    let args = super::qwen3::get_qwen3_model_args(&dir).unwrap();
+                    save_zero_checkpoint(
+                        &super::qwen3::Model::new(args, stream).unwrap(),
+                        &dir,
+                        stream,
+                    );
+                }
+                "gemma4" => {
+                    let args = super::gemma4::get_gemma4_model_args(&dir).unwrap();
+                    save_zero_checkpoint(
+                        &super::gemma4::Model::new(args, stream).unwrap(),
+                        &dir,
+                        stream,
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            let mut dense =
+                load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
+                    .unwrap();
+            let quantization = AffineQuantization::new(32, 4).unwrap();
+            let mut quantized = load_model_with_options(
+                &dir,
+                ModelLoadOptions::with_quantization(quantization),
+                stream,
+                weights_stream,
+            )
+            .unwrap();
+            let saved_dir = dir.with_extension("q4");
+            crate::quantization::quantize_checkpoint(
+                &dir,
+                &saved_dir,
+                &CheckpointQuantizationOptions {
+                    quantization,
+                    ..Default::default()
+                },
+                stream,
+            )
+            .unwrap();
+            let mut saved_quantized = load_model_with_options(
+                &saved_dir,
+                ModelLoadOptions::with_quantization(quantization),
+                stream,
+                weights_stream,
+            )
+            .unwrap();
+            let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+            let parts = [super::input::InputPart::text_token_ids(&tokens)];
+            let input = super::input::ModelInput::new(&parts);
+            let mut dense_cache = dense.new_cache();
+            let dense_logits = dense
+                .prefill_input_with_cache(input, &mut dense_cache, stream)
+                .unwrap();
+            let mut quantized_cache = quantized.new_cache();
+            let quantized_logits = quantized
+                .prefill_input_with_cache(input, &mut quantized_cache, stream)
+                .unwrap();
+            assert_eq!(dense_logits.shape(), quantized_logits.shape());
+            let dense_token = argmax_axis!(&dense_logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream);
+            let quantized_token = argmax_axis!(&quantized_logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream);
+            assert_eq!(dense_token, quantized_token, "{family}");
+            let mut saved_cache = saved_quantized.new_cache();
+            let saved_logits = saved_quantized
+                .prefill_input_with_cache(input, &mut saved_cache, stream)
+                .unwrap();
+            let saved_token = argmax_axis!(&saved_logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream);
+            assert_eq!(quantized_token, saved_token, "saved {family}");
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_dir_all(saved_dir).unwrap();
+        }
+    }
+
     #[test]
     fn load_tokenizer_accepts_top_level_qwen3_5_moe_metadata() {
         let dir = temp_model_dir(
@@ -1125,6 +1375,100 @@ mod tests {
         );
         let tokenizer = load_tokenizer(&dir).unwrap();
         assert_eq!(tokenizer.get_vocab_size(false), 0);
+    }
+
+    #[test]
+    fn load_options_reject_unsupported_nemotron_packed_expert_affine_path() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let options = ModelLoadOptions::with_quantization(AffineQuantization::default());
+        let dir = temp_model_dir(r#"{"model_type":"nemotron_h"}"#);
+        let error = load_model_with_options(&dir, options, context.stream(), context.stream())
+            .err()
+            .expect("affine loading should be rejected before weight loading");
+        assert!(matches!(error, Error::Quantization(_)));
+        assert!(error.to_string().contains("packed rank-3"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tiny_qwen35_moe_quantizes_packed_experts_through_high_level_dispatch() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let config = r#"{
+          "model_type":"qwen3_5_moe",
+          "tie_word_embeddings":false,
+          "text_config":{
+            "model_type":"qwen3_5_moe_text","vocab_size":32,"hidden_size":32,
+            "num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":8,"max_position_embeddings":128,"rms_norm_eps":0.000001,
+            "tie_word_embeddings":false,"attention_bias":false,"hidden_act":"silu",
+            "moe_intermediate_size":32,"shared_expert_intermediate_size":32,
+            "num_experts_per_tok":2,"num_experts":4,"norm_topk_prob":true,
+            "layer_types":["full_attention"]
+          }
+        }"#;
+        let dir = temp_model_dir(config);
+        let (args, image_token_id, video_token_id, vision_config) =
+            super::qwen3_5_moe::get_qwen3_5_moe_model_args(&dir).unwrap();
+        save_zero_checkpoint(
+            &super::qwen3_5_moe::Model::new(
+                args,
+                image_token_id,
+                video_token_id,
+                vision_config,
+                stream,
+            )
+            .unwrap(),
+            &dir,
+            stream,
+        );
+
+        let mut dense =
+            load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
+                .unwrap();
+        let mut quantized = load_model_with_options(
+            &dir,
+            ModelLoadOptions::with_quantization(AffineQuantization::new(32, 4).unwrap()),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let super::Model::Qwen35Moe(quantized_model) = &quantized else {
+            panic!("expected Qwen3.5-MoE model");
+        };
+        let params = quantized_model.parameters().flatten();
+        let expert_weight = params
+            .get("model.layers.0.mlp.experts.gate_up_proj")
+            .unwrap();
+        assert_eq!(expert_weight.dtype(), safemlx::Dtype::Uint32);
+        assert_eq!(expert_weight.shape(), &[4, 64, 4]);
+        assert!(params.contains_key("model.layers.0.mlp.experts.gate_up_proj_scales"));
+        assert!(params.contains_key("model.layers.0.mlp.experts.gate_up_proj_biases"));
+        drop(params);
+
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [super::input::InputPart::text_token_ids(&tokens)];
+        let input = super::input::ModelInput::new(&parts);
+        let mut dense_cache = dense.new_cache();
+        let dense_logits = dense
+            .prefill_input_with_cache(input, &mut dense_cache, stream)
+            .unwrap();
+        let mut quantized_cache = quantized.new_cache();
+        let quantized_logits = quantized
+            .prefill_input_with_cache(input, &mut quantized_cache, stream)
+            .unwrap();
+        assert_eq!(dense_logits.shape(), quantized_logits.shape());
+        assert_eq!(
+            argmax_axis!(&dense_logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream),
+            argmax_axis!(&quantized_logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

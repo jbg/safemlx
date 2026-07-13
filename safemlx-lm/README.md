@@ -20,6 +20,43 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 safemlx-lm = { version = "0.4", features = ["image-processing"] }
 ```
 
+Dense checkpoints can be affine-quantized while loading through the same
+architecture-dispatched API used for ordinary loading:
+
+```rust,ignore
+use safemlx_lm::{
+    models::{LoadedModel, ModelLoadOptions},
+    quantization::AffineQuantization,
+};
+
+let options = ModelLoadOptions::with_quantization(AffineQuantization::new(64, 4)?);
+let model = LoadedModel::load_with_options(model_dir, options, stream, weights_stream)?;
+```
+
+The realtime counterpart is `load_realtime_model_with_options`. Both APIs
+recognize matching pre-quantized checkpoints and load them directly rather
+than quantizing them again. A requested format that differs from existing
+checkpoint metadata is an error.
+
+### Quantized loading coverage
+
+| Architecture | Dense | Existing quantized | Affine on load | High-level dispatch | Special policy |
+|---|---:|---:|---:|---:|---|
+| Llama | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Qwen3 | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
+| Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
+| Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
+| Qwen3.5/3.6-MoE | yes | block FP8 | yes, from dense checkpoints | `LoadedModel` (dense/FP8/affine) | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints cannot be requantized to affine on load |
+| Moshi | yes | MLX affine | yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |
+| PersonaPlex | yes, transformed PyTorch layout | MLX affine | yes | realtime loader | Preserves per-depth checkpoint transformation; no codec dependency |
+
+On-load selection is driven by the target module parameter tree, not by
+blindly quantizing every rank-2 checkpoint tensor. Therefore specialized
+convolutions, modality towers, routers, and packed expert banks stay dense only
+when the architecture explicitly supports that policy, or the request is
+rejected before weights are loaded.
+
 For Gemma 4 or Qwen image prompts, pass text and media as ordered processor
 segments. Media is inserted where the segment appears; callers do not put
 image/video/audio media tokens in rendered prompt text:
@@ -184,12 +221,13 @@ part of any safetensors checkpoint, `--minimum-elements` to leave small
 matrices dense, and `--shard-size-mib` to control peak buffered output and
 shard size. The output directory must not already exist.
 
-Library callers can use `quantization::quantize_checkpoint` for conversion or
-`weights::load_safetensors_dir_quantized_strict` to populate any model that
-exposes the standard packed parameter tree. Llama, Qwen3, and Moshi also expose
-model-specific `load_*_model_quantized` helpers for direct on-the-fly
-experiments. Both modes call `quantization::quantize_tensor` with a caller-owned
-explicit stream, so saving and direct loading use the same numerical transform.
+Library callers can use `quantization::quantize_checkpoint` for conversion,
+the shared `ModelLoadOptions` APIs for architecture dispatch, or
+`weights::load_safetensors_dir_quantized_strict` to populate a model that
+exposes the standard packed parameter tree. Model-specific
+`load_*_model_quantized` helpers remain available. All modes call
+`quantization::quantize_tensor` with a caller-owned explicit stream, so saving
+and direct loading use the same numerical transform.
 Direct loading materializes each packed weight/scale/bias triple before reading
 the next dense tensor. This prevents MLX's lazy graphs from retaining the whole
 dense checkpoint during conversion while preserving exact parity with a saved

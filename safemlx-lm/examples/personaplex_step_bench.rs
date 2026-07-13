@@ -2,8 +2,8 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
-    load_realtime_model,
-    models::personaplex,
+    load_realtime_model, load_realtime_model_with_options,
+    models::{personaplex, ModelLoadOptions},
     quantization::AffineQuantization,
     realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
     sampler::DefaultSampler,
@@ -38,9 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if quantize_on_load {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
-        let mut model = personaplex::load_model_quantized(
+        let mut model = load_realtime_model_with_options(
             &model_dir,
-            AffineQuantization::default(),
+            ModelLoadOptions::with_quantization(AffineQuantization::default()),
             stream,
             weights_stream,
         )?;

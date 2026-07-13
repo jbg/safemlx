@@ -330,29 +330,31 @@ pub(crate) fn load_array_quantized_strict(
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    if let Some(prefix) = key.strip_suffix(".weight") {
-        let scales_key = format!("{prefix}.scales");
-        let biases_key = format!("{prefix}.biases");
-        let inner_weight_key = format!("{prefix}.inner.weight");
-        let direct_weight_key = key.clone();
-        let target_weight_key = if params.contains_key(inner_weight_key.as_str())
-            && params.contains_key(scales_key.as_str())
-            && params.contains_key(biases_key.as_str())
-        {
-            Some(inner_weight_key)
-        } else if params.contains_key(direct_weight_key.as_str())
-            && params.contains_key(scales_key.as_str())
-            && params.contains_key(biases_key.as_str())
-            && params
-                .get(direct_weight_key.as_str())
-                .is_some_and(|target| target.shape() != value.shape())
-        {
-            Some(direct_weight_key)
-        } else {
-            None
-        };
+    if key.ends_with(".weight") {
+        let target = config.candidates(&key).into_iter().find_map(|candidate| {
+            let (prefix, weight_key) = if let Some(prefix) = candidate.strip_suffix(".inner.weight")
+            {
+                (prefix.to_string(), candidate)
+            } else if let Some(prefix) = candidate.strip_suffix(".weight") {
+                (prefix.to_string(), candidate)
+            } else {
+                return None;
+            };
+            let scales_key = format!("{prefix}.scales");
+            let biases_key = format!("{prefix}.biases");
+            let has_affine_parameters = params.contains_key(weight_key.as_str())
+                && params.contains_key(scales_key.as_str())
+                && params.contains_key(biases_key.as_str());
+            let packed_direct_weight = !weight_key.ends_with(".inner.weight")
+                && params
+                    .get(weight_key.as_str())
+                    .is_some_and(|target| target.shape() != value.shape());
+            (has_affine_parameters
+                && (weight_key.ends_with(".inner.weight") || packed_direct_weight))
+                .then_some((weight_key, scales_key, biases_key))
+        });
 
-        if let Some(weight_key) = target_weight_key {
+        if let Some((weight_key, scales_key, biases_key)) = target {
             let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
             // MLX quantization is lazy. Materialize this tensor before the
             // source value leaves the streaming callback so subsequent
@@ -656,4 +658,90 @@ fn pack_split_relu2_expert_prefix(
         (format!("{prefix}.up_proj"), up_proj),
         (format!("{prefix}.down_proj"), down_proj),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use safemlx::{
+        macros::ModuleParameters, quantization::MaybeQuantized, Array, Device, DeviceType,
+        ExecutionContext,
+    };
+
+    use crate::{
+        models::common::unloaded_maybe_quantized_linear,
+        quantization::{quantize_tensor, AffineQuantization},
+    };
+
+    use super::{load_safetensors_quantized_strict, StrictLoadConfig, StrictLoadReport};
+
+    #[derive(Debug, Clone, ModuleParameters)]
+    struct RewrittenLinear {
+        #[param]
+        projection: MaybeQuantized<safemlx::nn::Linear>,
+    }
+
+    #[test]
+    fn quantized_strict_load_applies_key_rewrites_before_target_selection() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights_stream = weights_context.stream();
+        let quantization = AffineQuantization::default();
+        let mut model = RewrittenLinear {
+            projection: unloaded_maybe_quantized_linear(64, 8, false, Some(quantization), stream)
+                .unwrap(),
+        };
+        let values = (0..(8 * 64))
+            .map(|index| (index as f32 - 255.5) / 64.0)
+            .collect::<Vec<_>>();
+        let dense = Array::from_slice(&values, &[8, 64]);
+        let expected = quantize_tensor(&dense, quantization, stream).unwrap();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "safemlx-rewritten-quantized-load-{}-{suffix}.safetensors",
+            std::process::id()
+        ));
+        Array::save_safetensors([("checkpoint.projection.weight", &dense)], None, &path).unwrap();
+
+        let config = StrictLoadConfig::default().rewrite_prefix("checkpoint.", "");
+        let mut report = StrictLoadReport::default();
+        load_safetensors_quantized_strict(
+            &mut model,
+            &path,
+            weights_stream,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )
+        .unwrap();
+        report.finish(&model, &config).unwrap();
+
+        let MaybeQuantized::Quantized(projection) = model.projection else {
+            panic!("target projection should use affine storage")
+        };
+        assert_eq!(
+            projection
+                .inner
+                .weight
+                .evaluated()
+                .unwrap()
+                .as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+        assert_eq!(
+            projection.scales.evaluated().unwrap().as_slice::<f32>(),
+            expected.scales.evaluated().unwrap().as_slice::<f32>()
+        );
+        assert_eq!(
+            projection.biases.evaluated().unwrap().as_slice::<f32>(),
+            expected.biases.evaluated().unwrap().as_slice::<f32>()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

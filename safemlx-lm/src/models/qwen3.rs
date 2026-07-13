@@ -765,13 +765,14 @@ pub fn load_qwen3_model_quantized(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    quantization.validate()?;
     let model_dir = model_dir.as_ref();
     let mut model_args = get_qwen3_model_args(model_dir)?;
-    if model_args.affine_quantization().is_some() {
-        return Err(Error::Quantization(
-            "on-the-fly quantization requires a dense source checkpoint".into(),
-        ));
+    if !crate::quantization::should_quantize_on_load(
+        "Qwen3",
+        model_args.affine_quantization(),
+        quantization,
+    )? {
+        return load_qwen3_model(model_dir, stream, weights_stream);
     }
     model_args.quantization = Some(quantization);
     let mut model = Model::new(model_args, stream)?;

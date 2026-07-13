@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::{
     error::Error,
-    models::{moshi, personaplex},
+    models::{moshi, personaplex, ModelLoadOptions},
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -192,14 +192,38 @@ pub fn load_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedRealtimeModel, Error> {
+    load_model_with_options(
+        model_dir,
+        ModelLoadOptions::default(),
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads a realtime model using the shared architecture-independent options.
+pub fn load_model_with_options(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedRealtimeModel, Error> {
     match realtime_model_kind(&model_dir)? {
-        RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::Moshi(moshi::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
+        RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::Moshi(match options.quantization {
+            Some(quantization) => {
+                moshi::load_model_quantized(model_dir, quantization, stream, weights_stream)?
+            }
+            None => moshi::load_model(model_dir, stream, weights_stream)?,
+        })),
         RealtimeModelKind::PersonaPlex => Ok(LoadedRealtimeModel::PersonaPlex(
-            personaplex::load_model(model_dir, stream, weights_stream)?,
+            match options.quantization {
+                Some(quantization) => personaplex::load_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+                None => personaplex::load_model(model_dir, stream, weights_stream)?,
+            },
         )),
     }
 }

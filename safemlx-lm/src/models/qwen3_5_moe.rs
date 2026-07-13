@@ -10,10 +10,12 @@ use safemlx::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, grouped_matmul,
+        broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, gather_qmm,
+        grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        matmul, sigmoid, stack_axis, sum_axis, topk_route_plan, zeros,
+        matmul, quantized_matmul, sigmoid, stack_axis, sum_axis, topk_route_plan, zeros,
     },
+    quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
 };
@@ -29,19 +31,20 @@ use crate::{
     inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
         common::{
-            self, attention_probabilities, project_logits_dense, silu, CausalLm,
+            self, attention_probabilities, project_logits_maybe_quantized, silu, CausalLm,
             TopKRouterScoreFunction,
         },
         input as runtime_input,
     },
+    quantization::{quantize_tensor, AffineQuantization, QuantizedTensor},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        for_each_safetensor_array, load_array_strict, load_safetensors_strict, safetensors_files,
-        StrictLoadConfig, StrictLoadReport,
+        for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
+        load_safetensors_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -587,8 +590,32 @@ impl ModelArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum QwenWeightFormat {
+    Dense,
+    Fp8,
+    Affine(AffineQuantization),
+}
+
+impl QwenWeightFormat {
+    fn for_text(args: &ModelArgs, affine: Option<AffineQuantization>) -> Self {
+        match affine {
+            Some(affine) => Self::Affine(affine),
+            None if args.uses_fp8() => Self::Fp8,
+            None => Self::Dense,
+        }
+    }
+
+    fn affine(self) -> Option<AffineQuantization> {
+        match self {
+            Self::Affine(affine) => Some(affine),
+            Self::Dense | Self::Fp8 => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
-/// Linear layer that can hold dense or Qwen FP8 weights.
+/// Linear layer that can hold dense, Qwen FP8, or MLX affine weights.
 pub struct QwenLinear {
     /// Input feature dimension.
     pub input_dims: i32,
@@ -601,8 +628,18 @@ pub struct QwenLinear {
     /// Optional FP8 inverse scale tensor.
     pub weight_scale_inv: Param<Option<Array>>,
     #[param]
+    /// Optional affine quantization scales.
+    pub scales: Param<Option<Array>>,
+    #[param]
+    /// Optional affine quantization biases.
+    pub biases: Param<Option<Array>>,
+    #[param]
     /// Optional bias tensor.
     pub bias: Param<Option<Array>>,
+    /// Affine quantization group size, or zero for dense/FP8 storage.
+    pub group_size: i32,
+    /// Affine quantization bit width, or zero for dense/FP8 storage.
+    pub bits: i32,
 }
 
 impl QwenLinear {
@@ -610,17 +647,42 @@ impl QwenLinear {
         input_dims: i32,
         output_dims: i32,
         bias: bool,
-        fp8: bool,
+        format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let weight_dtype = if fp8 { Dtype::Uint8 } else { Dtype::Float32 };
+        let (weight_shape, weight_dtype) = match format {
+            QwenWeightFormat::Dense => (vec![output_dims, input_dims], Dtype::Float32),
+            QwenWeightFormat::Fp8 => (vec![output_dims, input_dims], Dtype::Uint8),
+            QwenWeightFormat::Affine(quantization) => (
+                vec![output_dims, input_dims / (32 / quantization.bits)],
+                Dtype::Uint32,
+            ),
+        };
         Ok(Self {
             input_dims,
             output_dims,
-            weight: Param::<Array>::unloaded(&[output_dims, input_dims], weight_dtype, stream)?,
-            weight_scale_inv: if fp8 {
+            weight: Param::<Array>::unloaded(&weight_shape, weight_dtype, stream)?,
+            weight_scale_inv: if format == QwenWeightFormat::Fp8 {
                 Param::<Option<Array>>::unloaded_some(
                     &[ceil_div(output_dims, 128), ceil_div(input_dims, 128)],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            scales: if let Some(quantization) = format.affine() {
+                Param::<Option<Array>>::unloaded_some(
+                    &[output_dims, input_dims / quantization.group_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            biases: if let Some(quantization) = format.affine() {
+                Param::<Option<Array>>::unloaded_some(
+                    &[output_dims, input_dims / quantization.group_size],
                     Dtype::Float32,
                     stream,
                 )?
@@ -632,15 +694,29 @@ impl QwenLinear {
             } else {
                 Param::new(None)
             },
+            group_size: format.affine().map_or(0, |value| value.group_size),
+            bits: format.affine().map_or(0, |value| value.bits),
         })
     }
 
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let mut output = if let Some(scale) = self.weight_scale_inv.as_ref() {
-            fp8_linear(input, self.weight.as_ref(), scale, stream)?
-        } else {
-            matmul(input, self.weight.as_ref().transpose(stream)?, stream)?
-        };
+        let mut output =
+            if let (Some(scales), Some(biases)) = (self.scales.as_ref(), self.biases.as_ref()) {
+                quantized_matmul(
+                    input,
+                    self.weight.as_ref(),
+                    scales,
+                    biases,
+                    true,
+                    self.group_size,
+                    self.bits,
+                    stream,
+                )?
+            } else if let Some(scale) = self.weight_scale_inv.as_ref() {
+                fp8_linear(input, self.weight.as_ref(), scale, stream)?
+            } else {
+                matmul(input, self.weight.as_ref().transpose(stream)?, stream)?
+            };
         if let Some(bias) = self.bias.as_ref() {
             output = output.add(bias, stream)?;
         }
@@ -825,6 +901,37 @@ fn grouped_fp8_linear(
     grouped_fp8_linear_scalar(
         input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_affine_linear(
+    input: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_ids: &Array,
+    group_size: i32,
+    bits: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let routes = input.dim(0);
+    let in_dim = input.dim(-1);
+    let out_dim = weight.dim(1);
+    let input = input.reshape(&[routes, 1, in_dim], stream)?;
+    gather_qmm(
+        &input,
+        weight,
+        scales,
+        biases,
+        None::<&Array>,
+        group_ids,
+        true,
+        group_size,
+        bits,
+        true,
+        stream,
+    )?
+    .reshape(&[routes, out_dim], stream)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1964,33 +2071,46 @@ pub struct FullAttention {
 impl FullAttention {
     /// Creates an unloaded full-attention layer.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let hidden = args.hidden_size;
         let n_heads = args.num_attention_heads;
         let n_kv_heads = args.num_key_value_heads;
         let head_dim = args.head_dim;
-        let fp8 = args.uses_fp8();
         let q_proj = QwenLinear::new(
             hidden,
             n_heads * head_dim * 2,
             args.attention_bias,
-            fp8,
+            format,
             stream,
         )?;
         let k_proj = QwenLinear::new(
             hidden,
             n_kv_heads * head_dim,
             args.attention_bias,
-            fp8,
+            format,
             stream,
         )?;
         let v_proj = QwenLinear::new(
             hidden,
             n_kv_heads * head_dim,
             args.attention_bias,
-            fp8,
+            format,
             stream,
         )?;
-        let o_proj = QwenLinear::new(n_heads * head_dim, hidden, args.attention_bias, fp8, stream)?;
+        let o_proj = QwenLinear::new(
+            n_heads * head_dim,
+            hidden,
+            args.attention_bias,
+            format,
+            stream,
+        )?;
         let rope_config = args.rope_config();
         let rope = initialize_rope(
             args.rope_dims(),
@@ -2254,6 +2374,14 @@ pub struct LinearAttention {
 impl LinearAttention {
     /// Creates an unloaded linear-attention layer.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let num_v_heads = args.linear_num_value_heads;
         let num_k_heads = args.linear_num_key_heads;
         let head_k_dim = args.linear_key_head_dim;
@@ -2276,18 +2404,24 @@ impl LinearAttention {
                 args.hidden_size,
                 projection_size_qkv,
                 false,
-                args.uses_fp8(),
+                format,
                 stream,
             )?,
-            in_proj_z: QwenLinear::new(
+            in_proj_z: QwenLinear::new(args.hidden_size, value_dim, false, format, stream)?,
+            in_proj_b: QwenLinear::new(
                 args.hidden_size,
-                value_dim,
+                num_v_heads,
                 false,
-                args.uses_fp8(),
+                QwenWeightFormat::Dense,
                 stream,
             )?,
-            in_proj_b: QwenLinear::new(args.hidden_size, num_v_heads, false, false, stream)?,
-            in_proj_a: QwenLinear::new(args.hidden_size, num_v_heads, false, false, stream)?,
+            in_proj_a: QwenLinear::new(
+                args.hidden_size,
+                num_v_heads,
+                false,
+                QwenWeightFormat::Dense,
+                stream,
+            )?,
             dt_bias: Param::new(Array::from_slice(
                 &vec![1.0f32; num_v_heads as usize],
                 &[num_v_heads],
@@ -2297,7 +2431,7 @@ impl LinearAttention {
                 &[num_v_heads],
             )),
             norm: Qwen3NextRmsNormGated::new(head_v_dim, args.rms_norm_eps, stream)?,
-            out_proj: QwenLinear::new(value_dim, args.hidden_size, false, args.uses_fp8(), stream)?,
+            out_proj: QwenLinear::new(value_dim, args.hidden_size, false, format, stream)?,
         })
     }
 
@@ -2806,13 +2940,13 @@ impl Mlp {
         dim: i32,
         hidden_dim: i32,
         bias: bool,
-        fp8: bool,
+        format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: QwenLinear::new(dim, hidden_dim, bias, fp8, stream)?,
-            up_proj: QwenLinear::new(dim, hidden_dim, bias, fp8, stream)?,
-            down_proj: QwenLinear::new(hidden_dim, dim, bias, fp8, stream)?,
+            gate_proj: QwenLinear::new(dim, hidden_dim, bias, format, stream)?,
+            up_proj: QwenLinear::new(dim, hidden_dim, bias, format, stream)?,
+            down_proj: QwenLinear::new(hidden_dim, dim, bias, format, stream)?,
         })
     }
 
@@ -2840,6 +2974,12 @@ pub struct Experts {
     pub intermediate_dim: i32,
     /// Whether expert weights are stored as FP8.
     pub use_fp8: bool,
+    /// Whether expert weights use MLX affine packed storage.
+    pub use_affine: bool,
+    /// Affine quantization group size.
+    pub group_size: i32,
+    /// Affine quantization bit width.
+    pub bits: i32,
     #[param]
     /// Packed gate and up projection weights for all experts.
     pub gate_up_proj: Param<Array>,
@@ -2847,36 +2987,60 @@ pub struct Experts {
     /// Optional FP8 inverse scales for gate/up projection weights.
     pub gate_up_proj_scale_inv: Param<Option<Array>>,
     #[param]
+    /// Optional affine scales for gate/up projection weights.
+    pub gate_up_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Optional affine biases for gate/up projection weights.
+    pub gate_up_proj_biases: Param<Option<Array>>,
+    #[param]
     /// Down projection weights for all experts.
     pub down_proj: Param<Array>,
     #[param]
     /// Optional FP8 inverse scales for down projection weights.
     pub down_proj_scale_inv: Param<Option<Array>>,
+    #[param]
+    /// Optional affine scales for down projection weights.
+    pub down_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Optional affine biases for down projection weights.
+    pub down_proj_biases: Param<Option<Array>>,
 }
 
 impl Experts {
     /// Creates an unloaded routed expert bank.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let expert_weight_dtype = if args.uses_fp8() {
-            Dtype::Uint8
-        } else {
-            Dtype::Float32
+        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let (packed_per_int, expert_weight_dtype) = match format {
+            QwenWeightFormat::Dense => (1, Dtype::Float32),
+            QwenWeightFormat::Fp8 => (1, Dtype::Uint8),
+            QwenWeightFormat::Affine(quantization) => (32 / quantization.bits, Dtype::Uint32),
         };
+        let affine = format.affine();
         Ok(Self {
             num_experts: args.num_experts,
             hidden_dim: args.hidden_size,
             intermediate_dim: args.moe_intermediate_size,
-            use_fp8: args.uses_fp8(),
+            use_fp8: format == QwenWeightFormat::Fp8,
+            use_affine: affine.is_some(),
+            group_size: affine.map_or(0, |value| value.group_size),
+            bits: affine.map_or(0, |value| value.bits),
             gate_up_proj: Param::<Array>::unloaded(
                 &[
                     args.num_experts,
                     2 * args.moe_intermediate_size,
-                    args.hidden_size,
+                    args.hidden_size / packed_per_int,
                 ],
                 expert_weight_dtype,
                 stream,
             )?,
-            gate_up_proj_scale_inv: if args.uses_fp8() {
+            gate_up_proj_scale_inv: if format == QwenWeightFormat::Fp8 {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
@@ -2889,21 +3053,73 @@ impl Experts {
             } else {
                 Param::new(None)
             },
+            gate_up_proj_scales: if let Some(quantization) = affine {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.num_experts,
+                        2 * args.moe_intermediate_size,
+                        args.hidden_size / quantization.group_size,
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            gate_up_proj_biases: if let Some(quantization) = affine {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.num_experts,
+                        2 * args.moe_intermediate_size,
+                        args.hidden_size / quantization.group_size,
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             down_proj: Param::<Array>::unloaded(
                 &[
                     args.num_experts,
                     args.hidden_size,
-                    args.moe_intermediate_size,
+                    args.moe_intermediate_size / packed_per_int,
                 ],
                 expert_weight_dtype,
                 stream,
             )?,
-            down_proj_scale_inv: if args.uses_fp8() {
+            down_proj_scale_inv: if format == QwenWeightFormat::Fp8 {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         args.num_experts,
                         ceil_div(args.hidden_size, 128),
                         ceil_div(args.moe_intermediate_size, 128),
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            down_proj_scales: if let Some(quantization) = affine {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.num_experts,
+                        args.hidden_size,
+                        args.moe_intermediate_size / quantization.group_size,
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            down_proj_biases: if let Some(quantization) = affine {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.num_experts,
+                        args.hidden_size,
+                        args.moe_intermediate_size / quantization.group_size,
                     ],
                     Dtype::Float32,
                     stream,
@@ -2922,7 +3138,7 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if self.use_fp8 {
+        if self.use_fp8 || self.use_affine {
             return self.forward_expert_major_chunk(
                 hidden_states,
                 top_k_index,
@@ -3057,7 +3273,7 @@ impl Experts {
         observer.observe(&format!("{prefix}.input"), hidden_states)?;
         observer.observe(&format!("{prefix}.top_k_experts"), top_k_index)?;
         observer.observe(&format!("{prefix}.top_k_weights"), top_k_weights)?;
-        if self.use_fp8 {
+        if self.use_fp8 || self.use_affine {
             return self.forward_expert_major_chunk_with_observer(
                 hidden_states,
                 top_k_index,
@@ -3120,7 +3336,21 @@ impl Experts {
         let num_tokens = hidden_states.shape()[0];
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
+        let gate_up = if let (Some(scales), Some(biases)) = (
+            self.gate_up_proj_scales.as_ref(),
+            self.gate_up_proj_biases.as_ref(),
+        ) {
+            grouped_affine_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                scales,
+                biases,
+                &plan.sorted_group_ids,
+                self.group_size,
+                self.bits,
+                stream,
+            )?
+        } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
             grouped_fp8_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -3142,7 +3372,21 @@ impl Experts {
         let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
         let current = silu(gate, stream)?.multiply(up, stream)?;
 
-        let current = if let Some(scale) = self.down_proj_scale_inv.as_ref() {
+        let current = if let (Some(scales), Some(biases)) = (
+            self.down_proj_scales.as_ref(),
+            self.down_proj_biases.as_ref(),
+        ) {
+            grouped_affine_linear(
+                &current,
+                self.down_proj.as_ref(),
+                scales,
+                biases,
+                &plan.sorted_group_ids,
+                self.group_size,
+                self.bits,
+                stream,
+            )?
+        } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
             grouped_fp8_linear(
                 &current,
                 self.down_proj.as_ref(),
@@ -3183,7 +3427,21 @@ impl Experts {
         )?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         observer.observe(&format!("{prefix}.expert_major_input"), &hidden)?;
-        let gate_up = if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
+        let gate_up = if let (Some(scales), Some(biases)) = (
+            self.gate_up_proj_scales.as_ref(),
+            self.gate_up_proj_biases.as_ref(),
+        ) {
+            grouped_affine_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                scales,
+                biases,
+                &plan.sorted_group_ids,
+                self.group_size,
+                self.bits,
+                stream,
+            )?
+        } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
             grouped_fp8_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -3214,7 +3472,21 @@ impl Experts {
         let current = gate_activation.multiply(up, stream)?;
         observer.observe(&format!("{prefix}.expert_major_down_proj_input"), &current)?;
 
-        let route_output = if let Some(scale) = self.down_proj_scale_inv.as_ref() {
+        let route_output = if let (Some(scales), Some(biases)) = (
+            self.down_proj_scales.as_ref(),
+            self.down_proj_biases.as_ref(),
+        ) {
+            grouped_affine_linear(
+                &current,
+                self.down_proj.as_ref(),
+                scales,
+                biases,
+                &plan.sorted_group_ids,
+                self.group_size,
+                self.bits,
+                stream,
+            )?
+        } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
             grouped_fp8_linear(
                 &current,
                 self.down_proj.as_ref(),
@@ -3269,6 +3541,14 @@ pub struct SparseMoeBlock {
 impl SparseMoeBlock {
     /// Creates an unloaded sparse MoE block.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             gate: TopKRouter::new(
                 common::TopKRouterConfig {
@@ -3285,15 +3565,21 @@ impl SparseMoeBlock {
                 },
                 stream,
             )?,
-            experts: Experts::new(args, stream)?,
+            experts: Experts::new_with_format(args, format, stream)?,
             shared_expert: Mlp::new(
                 args.hidden_size,
                 args.shared_expert_intermediate_size,
                 false,
-                args.uses_fp8(),
+                format,
                 stream,
             )?,
-            shared_expert_gate: QwenLinear::new(args.hidden_size, 1, false, false, stream)?,
+            shared_expert_gate: QwenLinear::new(
+                args.hidden_size,
+                1,
+                false,
+                QwenWeightFormat::Dense,
+                stream,
+            )?,
         })
     }
 
@@ -3429,20 +3715,34 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     /// Creates an unloaded transformer block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_format(
+            args,
+            layer_idx,
+            QwenWeightFormat::for_text(args, None),
+            stream,
+        )
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        layer_idx: usize,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let layer_type = args.layer_type(layer_idx);
         Ok(Self {
             layer_type,
             self_attn: if layer_type == LayerType::FullAttention {
-                Some(FullAttention::new(args, stream)?)
+                Some(FullAttention::new_with_format(args, format, stream)?)
             } else {
                 None
             },
             linear_attn: if layer_type == LayerType::LinearAttention {
-                Some(LinearAttention::new(args, stream)?)
+                Some(LinearAttention::new_with_format(args, format, stream)?)
             } else {
                 None
             },
-            mlp: SparseMoeBlock::new(args, stream)?,
+            mlp: SparseMoeBlock::new_with_format(args, format, stream)?,
             input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
             post_attention_layernorm: Qwen3NextRmsNorm::new(
                 args.hidden_size,
@@ -3650,7 +3950,7 @@ pub struct Qwen35MoeTextModel {
     pub num_hidden_layers: i32,
     #[param]
     /// Token embedding table.
-    pub embed_tokens: nn::Embedding,
+    pub embed_tokens: MaybeQuantized<nn::Embedding>,
     #[param]
     /// Transformer blocks.
     pub layers: Vec<TransformerBlock>,
@@ -3662,10 +3962,22 @@ pub struct Qwen35MoeTextModel {
 impl Qwen35MoeTextModel {
     /// Creates an unloaded Qwen3.5 MoE text transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embed_tokens =
-            nn::Embedding::unloaded(args.vocab_size, args.hidden_size, Dtype::Float32, stream)?;
+        Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
+    }
+
+    fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let embed_tokens = common::unloaded_maybe_quantized_embedding(
+            args.vocab_size,
+            args.hidden_size,
+            format.affine(),
+            stream,
+        )?;
         let layers = (0..args.num_hidden_layers)
-            .map(|idx| TransformerBlock::new(args, idx as usize, stream))
+            .map(|idx| TransformerBlock::new_with_format(args, idx as usize, format, stream))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             vocab_size: args.vocab_size,
@@ -3888,7 +4200,7 @@ pub struct Model {
     pub model: Qwen35MoeTextModel,
     #[param]
     /// Optional untied language-model head.
-    pub lm_head: Option<nn::Linear>,
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
@@ -3900,19 +4212,39 @@ impl Model {
         vision_args: Option<VisionConfig>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let model = Qwen35MoeTextModel::new(&args, stream)?;
+        Self::new_with_affine(
+            args,
+            image_token_id,
+            video_token_id,
+            vision_args,
+            None,
+            stream,
+        )
+    }
+
+    fn new_with_affine(
+        args: ModelArgs,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        vision_args: Option<VisionConfig>,
+        affine: Option<AffineQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let format = QwenWeightFormat::for_text(&args, affine);
+        let model = Qwen35MoeTextModel::new_with_format(&args, format, stream)?;
         let visual = vision_args
             .clone()
             .map(|vision_args| QwenVisionTransformer::new(vision_args, stream))
             .transpose()?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(nn::Linear::unloaded(
-                args.hidden_size,
-                args.vocab_size,
-                false,
-                Dtype::Float32,
-                stream,
-            )?)
+            Some(
+                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    format.affine(),
+                    stream,
+                )?,
+            )
         } else {
             None
         };
@@ -3973,9 +4305,9 @@ impl Model {
         hidden_states: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let logits = project_logits_dense(
+        let logits = project_logits_maybe_quantized(
             &mut self.lm_head,
-            &self.model.embed_tokens,
+            &mut self.model.embed_tokens,
             hidden_states,
             stream,
         )?;
@@ -4147,6 +4479,134 @@ pub fn load_qwen3_5_moe_model(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
+}
+
+/// Loads a dense Qwen3.5/3.6 MoE checkpoint while affine-quantizing eligible
+/// text weights, including the packed rank-3 routed expert banks.
+pub fn load_qwen3_5_moe_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    quantization.validate()?;
+    let model_dir = model_dir.as_ref();
+    let (args, image_token_id, video_token_id, vision_config) =
+        get_qwen3_5_moe_model_args(model_dir)?;
+    if args.quantization_config.is_some() {
+        return Err(Error::Quantization(
+            "Qwen3.5/3.6 MoE affine on-load quantization requires a dense checkpoint; native FP8 checkpoints cannot be requantized to affine Q4".into(),
+        ));
+    }
+    let load_visual = vision_config.is_some();
+    let mut model = Model::new_with_affine(
+        args,
+        image_token_id,
+        video_token_id,
+        vision_config,
+        Some(quantization),
+        stream,
+    )?;
+    let config = qwen3_5_moe_strict_load_config(load_visual);
+    let mut report = StrictLoadReport::default();
+    for weight_file in safetensors_files(model_dir)? {
+        load_qwen3_5_moe_affine_safetensors_strict(
+            &mut model,
+            weight_file,
+            weights_stream,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    }
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
+fn is_packed_expert_weight(key: &str) -> bool {
+    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
+}
+
+fn quantize_packed_expert_tensor(
+    value: &Array,
+    quantization: AffineQuantization,
+    stream: &Stream,
+) -> Result<QuantizedTensor, Error> {
+    if value.ndim() != 3 || !value.dtype().is_float() {
+        return Err(Error::Quantization(format!(
+            "expected a floating-point rank-3 expert bank, got shape {:?} and dtype {:?}",
+            value.shape(),
+            value.dtype()
+        )));
+    }
+    let shape = value.shape();
+    let experts = shape[0];
+    let output_dims = shape[1];
+    let input_dims = shape[2];
+    let matrix = value.reshape(&[experts * output_dims, input_dims], stream)?;
+    let quantized = quantize_tensor(&matrix, quantization, stream)?;
+    let packed_per_int = 32 / quantization.bits;
+    Ok(QuantizedTensor {
+        weight: quantized
+            .weight
+            .reshape(&[experts, output_dims, input_dims / packed_per_int], stream)?,
+        scales: quantized.scales.reshape(
+            &[experts, output_dims, input_dims / quantization.group_size],
+            stream,
+        )?,
+        biases: quantized.biases.reshape(
+            &[experts, output_dims, input_dims / quantization.group_size],
+            stream,
+        )?,
+    })
+}
+
+fn load_qwen3_5_moe_affine_safetensors_strict(
+    model: &mut Model,
+    path: impl AsRef<Path>,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: AffineQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    let mut params = model.parameters_mut().flatten();
+    for_each_safetensor_array(path, weights_stream, |key, value| {
+        if is_packed_expert_weight(&key) {
+            let quantized =
+                quantize_packed_expert_tensor(&value, quantization, quantization_stream)?;
+            eval([&quantized.weight, &quantized.scales, &quantized.biases])?;
+            quantization_stream.synchronize()?;
+            load_array_strict(&mut params, key.clone(), quantized.weight, config, report);
+            load_array_strict(
+                &mut params,
+                format!("{key}_scales"),
+                quantized.scales,
+                config,
+                report,
+            );
+            load_array_strict(
+                &mut params,
+                format!("{key}_biases"),
+                quantized.biases,
+                config,
+                report,
+            );
+            Ok(())
+        } else {
+            load_array_quantized_strict(
+                &mut params,
+                key,
+                value,
+                quantization_stream,
+                quantization,
+                config,
+                report,
+            )
+        }
+    })
 }
 
 fn load_qwen3_5_moe_safetensors_strict(
@@ -4737,6 +5197,84 @@ mod tests {
     }
 
     #[test]
+    fn affine_packed_experts_match_explicitly_dequantized_routing() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_args(vec![LayerType::FullAttention]);
+        args.hidden_size = 32;
+        args.num_attention_heads = 4;
+        args.num_key_value_heads = 2;
+        args.moe_intermediate_size = 32;
+        args.shared_expert_intermediate_size = 32;
+        let quantization = crate::quantization::AffineQuantization::new(32, 4).unwrap();
+
+        let gate_up_values = (0..(4 * 64 * 32))
+            .map(|index| ((index % 97) as f32 - 48.0) / 64.0)
+            .collect::<Vec<_>>();
+        let down_values = (0..(4 * 32 * 32))
+            .map(|index| ((index % 71) as f32 - 35.0) / 48.0)
+            .collect::<Vec<_>>();
+        let gate_up = Array::from_slice(&gate_up_values, &[4, 64, 32]);
+        let down = Array::from_slice(&down_values, &[4, 32, 32]);
+        let gate_up_q =
+            super::quantize_packed_expert_tensor(&gate_up, quantization, stream).unwrap();
+        let down_q = super::quantize_packed_expert_tensor(&down, quantization, stream).unwrap();
+        let gate_up_dequantized = safemlx::ops::dequantize(
+            &gate_up_q.weight,
+            &gate_up_q.scales,
+            &gate_up_q.biases,
+            32,
+            4,
+            stream,
+        )
+        .unwrap();
+        let down_dequantized = safemlx::ops::dequantize(
+            &down_q.weight,
+            &down_q.scales,
+            &down_q.biases,
+            32,
+            4,
+            stream,
+        )
+        .unwrap();
+
+        let mut dense = super::Experts::new(&args, stream).unwrap();
+        dense.gate_up_proj = Param::new(gate_up_dequantized);
+        dense.down_proj = Param::new(down_dequantized);
+        let mut affine = super::Experts::new_with_format(
+            &args,
+            super::QwenWeightFormat::Affine(quantization),
+            stream,
+        )
+        .unwrap();
+        affine.gate_up_proj = Param::new(gate_up_q.weight);
+        affine.gate_up_proj_scales = Param::new(Some(gate_up_q.scales));
+        affine.gate_up_proj_biases = Param::new(Some(gate_up_q.biases));
+        affine.down_proj = Param::new(down_q.weight);
+        affine.down_proj_scales = Param::new(Some(down_q.scales));
+        affine.down_proj_biases = Param::new(Some(down_q.biases));
+
+        let hidden_values = (0..(3 * 32))
+            .map(|index| ((index % 29) as f32 - 14.0) / 32.0)
+            .collect::<Vec<_>>();
+        let hidden = Array::from_slice(&hidden_values, &[3, 32]);
+        let expert_ids = Array::from_slice(&[0u32, 2, 1, 3, 2, 0], &[3, 2]);
+        let route_weights = Array::from_slice(&[0.7f32, 0.3, 0.6, 0.4, 0.8, 0.2], &[3, 2]);
+        let dense_output = dense
+            .forward(&hidden, &expert_ids, &route_weights, stream)
+            .unwrap();
+        let affine_output = affine
+            .forward(&hidden, &expert_ids, &route_weights, stream)
+            .unwrap();
+
+        assert!(dense_output
+            .all_close(&affine_output, 1e-4, 1e-4, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
     fn parses_top_level_qwen3_5_moe_config() {
         let dir = temp_model_dir(
             r#"{
@@ -4854,6 +5392,17 @@ mod tests {
             Some(&[128, 128][..])
         );
         quantization_config.validate_supported().unwrap();
+
+        let cpu = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let error = super::load_qwen3_5_moe_model_quantized(
+            &dir,
+            crate::quantization::AffineQuantization::default(),
+            cpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Quantization(_)));
+        assert!(error.to_string().contains("requires a dense checkpoint"));
     }
 
     #[test]

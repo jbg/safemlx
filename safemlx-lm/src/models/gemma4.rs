@@ -45,11 +45,15 @@ use crate::{
         },
         input,
     },
+    quantization::AffineQuantization,
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
-    weights::{load_safetensors_strict, StrictLoadConfig, StrictLoadReport},
+    weights::{
+        load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -430,6 +434,14 @@ struct Gemma4Config {
 }
 
 impl ModelArgs {
+    fn affine_quantization(&self) -> Option<AffineQuantization> {
+        self.quantized.then_some(AffineQuantization {
+            group_size: self.quantization_group_size,
+            bits: self.quantization_bits,
+            mode: crate::quantization::AffineQuantizationMode::Affine,
+        })
+    }
+
     fn for_layer(&self, layer_type: LayerType) -> Self {
         let mut args = self.clone();
         if layer_type == LayerType::FullAttention {
@@ -2383,11 +2395,14 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = Gemma4ForConditionalGeneration::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_unloaded_maybe_quantized_lm_head(
-                args.hidden_size,
-                args.vocab_size,
-                stream,
-            )?)
+            Some(
+                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    args.affine_quantization(),
+                    stream,
+                )?,
+            )
         } else {
             None
         };
@@ -2417,11 +2432,14 @@ impl Model {
             stream,
         )?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::build_unloaded_maybe_quantized_lm_head(
-                args.hidden_size,
-                args.vocab_size,
-                stream,
-            )?)
+            Some(
+                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    args.affine_quantization(),
+                    stream,
+                )?,
+            )
         } else {
             None
         };
@@ -2712,8 +2730,81 @@ pub fn load_gemma4_model(
         audio_config,
         stream,
     )?;
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    let config = StrictLoadConfig::default()
+    let config = gemma4_strict_load_config();
+    let mut report = StrictLoadReport::default();
+    load_gemma4_weights(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        None,
+        &config,
+        &mut report,
+    )?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
+/// Loads a dense Gemma 4 checkpoint while affine-quantizing supported weights.
+///
+/// Transformer weights and modality bridge projections use affine storage.
+/// Vision and audio towers remain dense because their convolutional and
+/// specialized implementations do not expose MLX affine parameter layouts. A
+/// checkpoint already carrying matching affine metadata is loaded directly
+/// without requantization.
+pub fn load_gemma4_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+    let (
+        mut model_args,
+        vision_config,
+        image_token_id,
+        video_token_id,
+        audio_config,
+        audio_token_id,
+    ) = get_gemma4_model_config(model_dir)?;
+    if !crate::quantization::should_quantize_on_load(
+        "Gemma 4",
+        model_args.affine_quantization(),
+        quantization,
+    )? {
+        return load_gemma4_model(model_dir, stream, weights_stream);
+    }
+    model_args.quantized = true;
+    model_args.quantization_group_size = quantization.group_size;
+    model_args.quantization_bits = quantization.bits;
+    let mut model = Model::new_with_modalities(
+        model_args,
+        image_token_id,
+        vision_config,
+        video_token_id,
+        audio_token_id,
+        audio_config,
+        stream,
+    )?;
+    let config = gemma4_strict_load_config();
+    let mut report = StrictLoadReport::default();
+    load_gemma4_weights(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        Some(quantization),
+        &config,
+        &mut report,
+    )?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
+fn gemma4_strict_load_config() -> StrictLoadConfig {
+    StrictLoadConfig::default()
         .rewrite_prefix("language_model.model.", "model.language_model.")
         .rewrite_prefix("model.language_model.", "model.language_model.")
         .rewrite_prefix("vision_tower.", "model.vision_tower.")
@@ -2723,34 +2814,43 @@ pub fn load_gemma4_model(
         .allow_unused_prefix("multi_modal_projector.")
         .allow_unused_prefix("model.multi_modal_projector.")
         .allow_unused_prefix("model.vision_embedder.")
-        .allow_missing_suffix(".bias");
-    let mut report = StrictLoadReport::default();
+        .allow_missing_suffix(".bias")
+}
+
+fn load_gemma4_weights(
+    model: &mut Model,
+    model_dir: &Path,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: Option<AffineQuantization>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    let weights_index = model_dir.join("model.safetensors.index.json");
+    let mut load_file = |path: &Path| match quantization {
+        Some(quantization) => load_safetensors_quantized_strict(
+            model,
+            path,
+            weights_stream,
+            quantization_stream,
+            quantization,
+            config,
+            report,
+        ),
+        None => load_safetensors_strict(model, path, weights_stream, config, report),
+    };
     if weights_index.exists() {
         let json = std::fs::read_to_string(weights_index)?;
         let weight_map: WeightMap = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
         for weight_file in weight_files {
             let weights_filename = model_dir.join(weight_file);
-            load_safetensors_strict(
-                &mut model,
-                weights_filename,
-                weights_stream,
-                &config,
-                &mut report,
-            )?;
+            load_file(&weights_filename)?;
         }
     } else {
-        load_safetensors_strict(
-            &mut model,
-            model_dir.join("model.safetensors"),
-            weights_stream,
-            &config,
-            &mut report,
-        )?;
+        load_file(&model_dir.join("model.safetensors"))?;
     }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
+    Ok(())
 }
 
 impl Model {

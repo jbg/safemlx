@@ -7,8 +7,9 @@ use safemlx::{
 };
 use safemlx_lm::models::{
     input::{InputPart, ModelInput},
-    qwen3_5_moe, LoadedModel,
+    qwen3_5_moe, LoadedModel, ModelLoadOptions,
 };
+use safemlx_lm::quantization::AffineQuantization;
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[
@@ -20,11 +21,18 @@ const CASES: &[(&str, usize)] = &[
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let quantize_on_load = args.iter().any(|value| value == "--quantize-on-load");
+    let args = args
+        .into_iter()
+        .filter(|value| value != "--quantize-on-load")
+        .collect::<Vec<_>>();
     let model_dir = args
         .first()
         .map(PathBuf::from)
         .or_else(default_qwen35_moe_snapshot)
-        .expect("usage: qwen35_moe_bench [model-dir] [decode-tokens] [case-name]");
+        .expect(
+            "usage: qwen35_moe_bench [model-dir] [decode-tokens] [case-name] [--quantize-on-load]",
+        );
     let decode_tokens = args
         .get(1)
         .and_then(|value| value.parse::<usize>().ok())
@@ -38,15 +46,32 @@ fn main() -> anyhow::Result<()> {
     println!("model_dir={}", model_dir.display());
     println!("decode_tokens={decode_tokens}");
     println!("profile_components={profile_components}");
+    println!("quantize_on_load={quantize_on_load}");
 
     let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let stream = ctx.stream();
     let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let weights_stream = weights_ctx.stream();
+    safemlx::memory::reset_peak_memory()?;
     let load_start = Instant::now();
-    let mut model = LoadedModel::load(&model_dir, stream, weights_stream)?;
+    let options = if quantize_on_load {
+        ModelLoadOptions::with_quantization(AffineQuantization::default())
+    } else {
+        ModelLoadOptions::default()
+    };
+    let mut model = LoadedModel::load_with_options(&model_dir, options, stream, weights_stream)?;
+    stream.synchronize()?;
     let load_elapsed = load_start.elapsed();
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
+    println!(
+        "mlx_active_memory_bytes={}",
+        safemlx::memory::active_memory()?
+    );
+    println!("mlx_peak_memory_bytes={}", safemlx::memory::peak_memory()?);
+    println!(
+        "mlx_cache_memory_bytes={}",
+        safemlx::memory::cache_memory()?
+    );
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;

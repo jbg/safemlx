@@ -137,10 +137,34 @@ pub fn load_native_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    load_native_model_with_options(
+        model_dir,
+        crate::models::ModelLoadOptions::default(),
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads a native-layout PersonaPlex checkpoint using shared model-load options.
+pub fn load_native_model_with_options(
+    model_dir: impl AsRef<Path>,
+    options: crate::models::ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let metadata = get_model_metadata(&model_dir)?;
+    let quantize_on_load = if let Some(quantization) = options.quantization {
+        crate::quantization::should_quantize_on_load(
+            "PersonaPlex",
+            metadata.quantization,
+            quantization,
+        )?
+    } else {
+        false
+    };
     let mut args = model_args_7b_v1();
     args.moshi_name = Some(MODEL_SAFETENSORS.to_string());
-    args.quantization = metadata.quantization;
+    args.quantization = options.quantization.or(metadata.quantization);
     let mut model = moshi::Model::new(args, stream)?;
     let config = crate::weights::StrictLoadConfig::default();
     let mut report = crate::weights::StrictLoadReport::default();
@@ -149,21 +173,46 @@ pub fn load_native_model(
         .join("model.safetensors.index.json")
         .exists()
     {
-        crate::weights::load_safetensors_dir_strict(
-            &mut model,
-            &model_dir,
-            weights_stream,
-            &config,
-            &mut report,
-        )?;
+        if quantize_on_load {
+            crate::weights::load_safetensors_dir_quantized_strict(
+                &mut model,
+                &model_dir,
+                weights_stream,
+                stream,
+                options.quantization.expect("quantization requested"),
+                &config,
+                &mut report,
+            )?;
+        } else {
+            crate::weights::load_safetensors_dir_strict(
+                &mut model,
+                &model_dir,
+                weights_stream,
+                &config,
+                &mut report,
+            )?;
+        }
     } else {
-        crate::weights::load_safetensors_strict(
-            &mut model,
-            model_dir.as_ref().join(MODEL_SAFETENSORS),
-            weights_stream,
-            &config,
-            &mut report,
-        )?;
+        let path = model_dir.as_ref().join(MODEL_SAFETENSORS);
+        if quantize_on_load {
+            crate::weights::load_safetensors_quantized_strict(
+                &mut model,
+                path,
+                weights_stream,
+                stream,
+                options.quantization.expect("quantization requested"),
+                &config,
+                &mut report,
+            )?;
+        } else {
+            crate::weights::load_safetensors_strict(
+                &mut model,
+                path,
+                weights_stream,
+                &config,
+                &mut report,
+            )?;
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -208,12 +257,13 @@ pub fn load_model_quantized(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let metadata = get_model_metadata(&model_dir)?;
-    if metadata.quantization.is_some() {
-        return Err(Error::Quantization(
-            "on-the-fly quantization requires a dense source checkpoint".into(),
-        ));
+    if !crate::quantization::should_quantize_on_load(
+        "PersonaPlex",
+        metadata.quantization,
+        quantization,
+    )? {
+        return load_model(model_dir, stream, weights_stream);
     }
-    quantization.validate()?;
     let mut args = model_args_7b_v1();
     args.quantization = Some(quantization);
     let mut model = moshi::Model::new(args, stream)?;
@@ -475,13 +525,16 @@ mod tests {
             .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let model = super::load_model_quantized(
+        let model = crate::realtime::load_model_with_options(
             &model_dir,
-            crate::quantization::AffineQuantization::default(),
+            crate::models::ModelLoadOptions::with_quantization(
+                crate::quantization::AffineQuantization::default(),
+            ),
             gpu.stream(),
             cpu.stream(),
         )
-        .unwrap();
+        .unwrap()
+        .into_moshi_model();
         assert_eq!(model.args.quantization.unwrap().bits, 4);
         assert_eq!(model.args.dep_q, 16);
     }

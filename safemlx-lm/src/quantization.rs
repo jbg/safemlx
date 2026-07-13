@@ -75,6 +75,26 @@ impl AffineQuantization {
     }
 }
 
+/// Resolves an affine on-load request against checkpoint metadata.
+///
+/// Returns `true` for a dense checkpoint that must be quantized and `false`
+/// when a matching pre-quantized checkpoint should be loaded directly.
+pub(crate) fn should_quantize_on_load(
+    architecture: &str,
+    existing: Option<AffineQuantization>,
+    requested: AffineQuantization,
+) -> Result<bool, Error> {
+    requested.validate()?;
+    match existing {
+        None => Ok(true),
+        Some(existing) if existing == requested => Ok(false),
+        Some(existing) => Err(Error::Quantization(format!(
+            "{architecture} checkpoint is already affine-quantized as group_size={} bits={}, requested group_size={} bits={}",
+            existing.group_size, existing.bits, requested.group_size, requested.bits
+        ))),
+    }
+}
+
 fn default_affine_mode() -> AffineQuantizationMode {
     AffineQuantizationMode::Affine
 }
@@ -465,6 +485,18 @@ mod tests {
         assert_eq!(value["group_size"], 64);
         assert_eq!(value["bits"], 4);
         assert_eq!(value["mode"], "affine");
+    }
+
+    #[test]
+    fn on_load_resolution_reuses_matching_metadata_and_rejects_mismatch() {
+        let q4 = AffineQuantization::default();
+        assert!(should_quantize_on_load("test", None, q4).unwrap());
+        assert!(!should_quantize_on_load("test", Some(q4), q4).unwrap());
+
+        let q8 = AffineQuantization::new(64, 8).unwrap();
+        let error = should_quantize_on_load("test", Some(q4), q8).unwrap_err();
+        assert!(error.to_string().contains("already affine-quantized"));
+        assert!(error.to_string().contains("requested group_size=64 bits=8"));
     }
 
     #[test]
