@@ -1,6 +1,8 @@
-//! Implement conversion from safetensors TensorView to Array
-//! 
-//! `F8_*` dtypes are not supported and will return an error.
+//! Implement conversion from safetensors `TensorView` to `Array`.
+//!
+//! MLX represents FP8 E4M3 values as `uint8` arrays containing the encoded
+//! bit patterns. Accordingly, `F8_E4M3` tensor views are loaded losslessly as
+//! [`Dtype::Uint8`]. `F8_E5M2` is not supported.
 
 use std::ffi::c_void;
 
@@ -20,7 +22,13 @@ impl<'data> TryFrom<TensorView<'data>> for Array {
     type Error = ConversionError;
 
     fn try_from(value: TensorView<'data>) -> Result<Self, Self::Error> {
-        let dtype: Dtype = value.dtype().try_into()?;
+        let dtype = match value.dtype() {
+            // MLX's FP8 conversion and kernels use uint8 arrays as the storage
+            // type for E4M3. Keep the checkpoint bytes unchanged so callers can
+            // pass the array directly to those operations.
+            safetensors::Dtype::F8_E4M3 => Dtype::Uint8,
+            dtype => dtype.try_into()?,
+        };
         let shape = value.shape()
             .iter()
             .map(|x| *x as i32)
@@ -109,7 +117,8 @@ pub(crate) fn tensor_view_from_array<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{array, complex64, Array};
+    use crate::{array, complex64, Array, Dtype};
+    use safetensors::tensor::TensorView;
 
     // Helper macro to test conversion between Array and TensorView
     macro_rules! assert_conversion {
@@ -206,5 +215,32 @@ mod tests {
         let arr = arr.evaluated().unwrap();
         let tensor = super::tensor_view_from_array(&arr);
         assert!(tensor.is_err());
+    }
+
+    #[test]
+    fn test_conversion_float8_e4m3_preserves_encoded_bytes() {
+        let encoded = [0x00, 0x38, 0xb8, 0x7e, 0xff];
+        let tensor = TensorView::new(
+            safetensors::Dtype::F8_E4M3,
+            vec![1, encoded.len()],
+            &encoded,
+        )
+        .unwrap();
+
+        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let array = Array::try_from(tensor).unwrap().copy(&stream).unwrap();
+        let array = array.evaluated().unwrap();
+
+        assert_eq!(array.as_array().dtype(), Dtype::Uint8);
+        assert_eq!(array.as_array().shape(), &[1, encoded.len() as i32]);
+        assert_eq!(array.as_slice::<u8>(), &encoded);
+    }
+
+    #[test]
+    fn test_conversion_float8_e5m2_remains_unsupported() {
+        let encoded = [0x00];
+        let tensor = TensorView::new(safetensors::Dtype::F8_E5M2, vec![1], &encoded).unwrap();
+
+        assert!(Array::try_from(tensor).is_err());
     }
 }
