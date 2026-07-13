@@ -1,0 +1,21 @@
+[package]
+name = "safemlx-codec"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Neural audio codec components for safemlx"
+
+[dependencies]
+safemlx = { workspace = true, features = ["safetensors"] }
+thiserror.workspace = true
+serde.workspace = true
+memmap2 = "0.9"
+safetensors = "0.8"
+
+[dev-dependencies]
+safemlx-lm.workspace = true

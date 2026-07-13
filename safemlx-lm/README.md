@@ -95,7 +95,45 @@ features and valid-frame mask. The optional FFT dependency is only enabled by
 `audio-processing`; callers that provide `Audio/Tensor` and `audio_mask` directly
 do not pay that dependency cost.
 
-## Moshi encoded audio
+## Realtime encoded audio
+
+The `realtime` module defines a codec-free API for realtime speech-to-speech
+models. Models consume discrete codec-token frames and emit delay-aligned
+generated codec-token frames; callers keep audio encoding, decoding, transport,
+and device I/O outside `safemlx-lm`.
+
+Use `load_realtime_model` when the model directory contains a realtime
+codec-token model. It dispatches PersonaPlex, Moshi, and future realtime model
+families separately from the chat/text `LoadedModel` path:
+
+```rust,ignore
+use safemlx_lm::{
+    load_realtime_model,
+    realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
+    sampler::DefaultSampler,
+};
+
+let mut model = load_realtime_model(model_dir, stream, weights_stream)?;
+let config = model.realtime_config();
+let mut state = model.new_realtime_state();
+let mut text_sampler = DefaultSampler;
+let mut audio_samplers = (0..config.depth_audio_codebooks)
+    .map(|_| DefaultSampler)
+    .collect::<Vec<_>>();
+
+// Your codec supplies one user/input-side frame shaped
+// [batch, config.input_audio_codebooks].
+let output = model.step_realtime(
+    &mut state,
+    RealtimeStepInput::encoded_audio(&encoded_input_frame),
+    RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
+    stream,
+)?;
+
+if let Some(codec_tokens) = output.output_audio_tokens {
+    // Decode [batch, config.generated_audio_codebooks] with your codec.
+}
+```
 
 The `models::moshi` module implements Moshi's temporal and depth language
 models over pre-tokenized Mimi streams. `GenerationState` accepts one
@@ -103,10 +141,24 @@ input-side Mimi frame at a time and returns delay-aligned generated-side Mimi
 frames; `generate_encoded_greedy` is the offline sequence convenience API.
 Sequence tensors use Mimi's `[batch, codebooks, frames]` layout.
 
+`models::personaplex` exposes PersonaPlex's Moshi-family realtime token API,
+published 7B v1 defaults, dual-stream codebook layout, and hybrid system-prompt
+helpers. It can load the released Hugging Face PyTorch-layout
+`model.safetensors` directly via the shared Moshi-family PyTorch importer.
+
+PersonaPlex consumes 8 user-side codec codebooks per realtime frame and emits 8
+agent-side codec codebooks per output frame. Its depth transformer still samples
+or teacher-forces 16 codebooks, so realtime sampling requires 16 audio samplers.
+Prompt helpers remain token-only: use `wrap_system_prompt` before external text
+tokenization, pass text ids shaped `[batch, frames]` to
+`prefill_text_prompt_greedy`, and optionally pass agent voice codec tokens
+shaped `[batch, 8, frames]` to `prefill_system_prompt_greedy`.
+
 Mimi audio encoding/decoding and audio device I/O deliberately remain outside
-`safemlx-lm`. Kyutai publishes a Rust Mimi implementation as the public `mimi`
-module of its [`moshi` crate](https://crates.io/crates/moshi), which callers and
-applications can use at that boundary. It is not a dependency of this crate.
+`safemlx-lm`. The sibling `safemlx-codec` crate provides safemlx-native codec
+building blocks, including Mimi checkpoint loading, PCM encode/decode,
+residual-vector quantization, and stateful tokens-to-PCM decode. Audio device
+I/O remains optional codec surface rather than an `safemlx-lm` dependency.
 
 Moshi currently loads unquantized MLX checkpoints (`model.safetensors`). For
 the original released Moshika/Moshiko repositories, the loader uses Moshi's

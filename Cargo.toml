@@ -7,6 +7,7 @@ members = [
     "safemlx-tests",
     "safemlx-lm",
     "safemlx-lm-utils",
+    "safemlx-codec",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ safemlx-macros = { version = "0.1.1", path = "safemlx-macros" }
 safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" }
 safemlx-lm = { version = "0.4.1", path = "safemlx-lm" }
 safemlx-lm-utils = { version = "0.1.4", path = "safemlx-lm-utils", default-features = false }
+safemlx-codec = { version = "0.1.0", path = "safemlx-codec" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
