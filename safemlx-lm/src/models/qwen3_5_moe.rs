@@ -1,4 +1,4 @@
-//! Qwen3.5 MoE text model implementation and loader.
+//! Dense and MoE Qwen3.5 text model implementation and loader.
 
 use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 
@@ -217,7 +217,7 @@ fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exceptio
 }
 
 #[derive(Debug, Clone, Deserialize)]
-/// Deserialized Qwen3.5 MoE text configuration used by this loader.
+/// Deserialized dense or MoE Qwen3.5 text configuration used by this loader.
 pub struct ModelArgs {
     #[serde(default = "default_text_model_type")]
     /// Effective text model type.
@@ -2028,7 +2028,7 @@ impl LinearAttention {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-/// Dense SwiGLU MLP used by the shared expert.
+/// Dense SwiGLU MLP used by dense layers and shared experts.
 pub struct Mlp {
     #[param]
     /// Gate projection.
@@ -2857,8 +2857,129 @@ impl Module<&Array> for SparseMoeBlock {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Dense or sparse-MoE feed-forward layer stored under the checkpoint-native `mlp` namespace.
+pub enum FeedForward {
+    /// Dense SwiGLU MLP.
+    Dense(Mlp),
+    /// Sparse mixture-of-experts block.
+    Moe(SparseMoeBlock),
+}
+
+impl FeedForward {
+    fn new(
+        args: &ModelArgs,
+        layer_idx: usize,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if args.is_moe() {
+            Ok(Self::Moe(SparseMoeBlock::new_with_format(
+                args, layer_idx, format, stream,
+            )?))
+        } else {
+            Ok(Self::Dense(Mlp::new(
+                args.hidden_size,
+                args.intermediate_size,
+                false,
+                format,
+                stream,
+            )?))
+        }
+    }
+
+    fn is_moe(&self) -> bool {
+        matches!(self, Self::Moe(_))
+    }
+
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(input, stream),
+            Self::Moe(moe) => moe.forward(input, stream),
+        }
+    }
+
+    fn forward_with_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
+            Self::Moe(moe) => moe.forward_with_observer(input, stream, prefix, observer),
+        }
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.training_mode(mode),
+            Self::Moe(moe) => moe.training_mode(mode),
+        }
+    }
+}
+
+impl ModuleParameters for FeedForward {
+    fn num_parameters(&self) -> usize {
+        match self {
+            Self::Dense(mlp) => mlp.num_parameters(),
+            Self::Moe(moe) => moe.num_parameters(),
+        }
+    }
+
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters(),
+            Self::Moe(moe) => moe.parameters(),
+        }
+    }
+
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters_mut(),
+            Self::Moe(moe) => moe.parameters_mut(),
+        }
+    }
+
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.trainable_parameters(),
+            Self::Moe(moe) => moe.trainable_parameters(),
+        }
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.freeze_parameters(recursive),
+            Self::Moe(moe) => moe.freeze_parameters(recursive),
+        }
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.unfreeze_parameters(recursive),
+            Self::Moe(moe) => moe.unfreeze_parameters(recursive),
+        }
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.all_frozen(),
+            Self::Moe(moe) => moe.all_frozen(),
+        }
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.any_frozen(),
+            Self::Moe(moe) => moe.any_frozen(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
-/// Qwen3.5 MoE transformer block.
+/// Qwen3.5 transformer block.
 pub struct TransformerBlock {
     /// Layer kind.
     pub layer_type: LayerType,
@@ -2869,16 +2990,13 @@ pub struct TransformerBlock {
     /// Linear-attention layer when `layer_type` is [`LayerType::LinearAttention`].
     pub linear_attn: Option<LinearAttention>,
     #[param]
-    /// Sparse MoE feed-forward block, for `qwen35moe` checkpoints.
-    pub mlp: Option<SparseMoeBlock>,
-    #[param]
-    /// Dense SwiGLU block, for `qwen35` checkpoints.
-    pub dense_mlp: Option<Mlp>,
+    /// Dense or sparse-MoE feed-forward block.
+    pub mlp: FeedForward,
     #[param]
     /// Pre-attention normalization.
     pub input_layernorm: Qwen3NextRmsNorm,
     #[param]
-    /// Pre-MoE normalization.
+    /// Pre-feed-forward normalization.
     pub post_attention_layernorm: Qwen3NextRmsNorm,
 }
 
@@ -2912,21 +3030,7 @@ impl TransformerBlock {
             } else {
                 None
             },
-            mlp: args
-                .is_moe()
-                .then(|| SparseMoeBlock::new_with_format(args, layer_idx, format, stream))
-                .transpose()?,
-            dense_mlp: (!args.is_moe())
-                .then(|| {
-                    Mlp::new(
-                        args.hidden_size,
-                        args.intermediate_size,
-                        false,
-                        format,
-                        stream,
-                    )
-                })
-                .transpose()?,
+            mlp: FeedForward::new(args, layer_idx, format, stream)?,
             input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
             post_attention_layernorm: Qwen3NextRmsNorm::new(
                 args.hidden_size,
@@ -3008,14 +3112,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         let h = residual.add(h, stream)?;
         let residual = h.clone();
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        let h = if let Some(mlp) = &mut self.mlp {
-            mlp.forward(&post_normed, stream)?
-        } else {
-            self.dense_mlp
-                .as_mut()
-                .expect("dense Qwen3.5 MLP")
-                .forward(&post_normed, stream)?
-        };
+        let h = self.mlp.forward(&post_normed, stream)?;
         residual.add(h, stream)
     }
 
@@ -3026,12 +3123,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         if let Some(linear_attention) = &mut self.linear_attn {
             linear_attention.training_mode(mode);
         }
-        if let Some(mlp) = &mut self.mlp {
-            mlp.training_mode(mode);
-        }
-        if let Some(mlp) = &mut self.dense_mlp {
-            mlp.training_mode(mode);
-        }
+        self.mlp.training_mode(mode);
         self.input_layernorm.training_mode(mode);
         self.post_attention_layernorm.training_mode(mode);
     }
@@ -3115,19 +3207,17 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
         observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
 
-        let feed_forward_name = if self.mlp.is_some() { "moe" } else { "mlp" };
+        let feed_forward_name = if self.mlp.is_moe() { "moe" } else { "mlp" };
         observer.observe(&format!("{prefix}.residual_before_{feed_forward_name}"), &h)?;
         let residual = h.clone();
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
         observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
-        let h = if let Some(mlp) = &mut self.mlp {
-            mlp.forward_with_observer(&post_normed, stream, &format!("{prefix}.moe"), observer)?
-        } else {
-            self.dense_mlp
-                .as_mut()
-                .expect("dense Qwen3.5 MLP")
-                .forward_with_observer(&post_normed, stream, &format!("{prefix}.mlp"), observer)?
-        };
+        let h = self.mlp.forward_with_observer(
+            &post_normed,
+            stream,
+            &format!("{prefix}.{feed_forward_name}"),
+            observer,
+        )?;
         observer.observe(&format!("{prefix}.{feed_forward_name}_output"), &h)?;
         observer.observe(&format!("{prefix}.residual_delta_{feed_forward_name}"), &h)?;
         let output = residual.add(h, stream)?;
@@ -4027,9 +4117,9 @@ fn qwen35_translate_gguf_weight_name(name: &str) -> String {
         ("ffn_gate_exps", "mlp.experts.gate_proj"),
         ("ffn_up_exps", "mlp.experts.up_proj"),
         ("ffn_down_exps", "mlp.experts.down_proj"),
-        ("ffn_gate", "dense_mlp.gate_proj"),
-        ("ffn_up", "dense_mlp.up_proj"),
-        ("ffn_down", "dense_mlp.down_proj"),
+        ("ffn_gate", "mlp.gate_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("ffn_down", "mlp.down_proj"),
         ("rope_freqs", "rope_freqs"),
     ];
     for (source, target) in PARAMETERS {
@@ -4200,31 +4290,69 @@ fn qwen35_gguf_optional_f32(
     }
 }
 
-/// Loads `tokenizer.json` from a Qwen3.5 MoE model directory.
+/// Loads `tokenizer.json` from a Qwen3.5 model directory.
 pub fn load_qwen3_5_moe_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
-/// Reads and normalizes Qwen3.5 MoE model arguments from `config.json`.
-pub fn get_qwen3_5_moe_model_args(
-    model_dir: impl AsRef<Path>,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Qwen35Variant {
+    Dense,
+    Moe,
+}
+
+impl Qwen35Variant {
+    fn text_model_type(self) -> &'static str {
+        match self {
+            Self::Dense => "qwen3_5_text",
+            Self::Moe => "qwen3_5_moe_text",
+        }
+    }
+}
+
+fn parse_qwen3_5_config_value(
+    value: Value,
 ) -> Result<(ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>), Error> {
-    let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    let config: TopLevelConfig = serde_json::from_reader(file)?;
-    let mut args = match config.model_type.as_str() {
-        "qwen3_5_moe" => config.text_config.ok_or_else(|| {
-            Error::UnsupportedArchitecture("qwen3_5_moe config is missing text_config".to_string())
-        })?,
-        "qwen3_5_moe_text" => {
-            let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-            serde_json::from_reader(file)?
+    let mut config: TopLevelConfig = serde_json::from_value(value.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid Qwen3.5 config: {error}"))
+    })?;
+    let model_type = config.model_type.clone();
+    let (mut args, variant) = match model_type.as_str() {
+        "qwen3_5" | "qwen3_5_moe" => {
+            let variant = if model_type == "qwen3_5" {
+                Qwen35Variant::Dense
+            } else {
+                Qwen35Variant::Moe
+            };
+            let text_config = config.text_config.take().ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "{model_type} config is missing text_config"
+                ))
+            })?;
+            (text_config, variant)
         }
-        other => {
-            return Err(Error::UnsupportedModelType(other.to_string()));
+        "qwen3_5_text" | "qwen3_5_moe_text" => {
+            let variant = if model_type == "qwen3_5_text" {
+                Qwen35Variant::Dense
+            } else {
+                Qwen35Variant::Moe
+            };
+            let args = serde_json::from_value(value).map_err(|error| {
+                Error::UnsupportedArchitecture(format!("invalid {model_type} config: {error}"))
+            })?;
+            (args, variant)
         }
+        other => return Err(Error::UnsupportedModelType(other.to_string())),
     };
-    args.model_type = "qwen3_5_moe_text".to_string();
+
+    args.model_type = variant.text_model_type().to_string();
+    if variant == Qwen35Variant::Dense {
+        // Dense Qwen3.5 configs omit MoE-only fields. ModelArgs historically
+        // supplied MoE defaults for those fields, so normalize them explicitly.
+        args.num_experts = 0;
+        args.num_experts_per_tok = 0;
+    }
     args.quantization_config = config
         .quantization_config
         .or_else(|| args.quantization_config.clone());
@@ -4244,41 +4372,24 @@ pub fn get_qwen3_5_moe_model_args(
     ))
 }
 
+/// Reads and normalizes dense or MoE Qwen3.5 model arguments from `config.json`.
+pub fn get_qwen3_5_moe_model_args(
+    model_dir: impl AsRef<Path>,
+) -> Result<(ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>), Error> {
+    let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
+    let value = serde_json::from_reader(file)?;
+    parse_qwen3_5_config_value(value)
+}
+
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
-    let value = config.clone();
-    let config: TopLevelConfig = serde_json::from_value(value.clone()).map_err(|error| {
-        Error::UnsupportedArchitecture(format!("invalid qwen3_5_moe config: {error}"))
-    })?;
-    match config.model_type.as_str() {
-        "qwen3_5_moe" => {
-            let text_config = config.text_config.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "qwen3_5_moe config is missing text_config".to_string(),
-                )
-            })?;
-            if let Some(quantization_config) = &text_config.quantization_config {
-                quantization_config.validate_supported()?;
-            }
-        }
-        "qwen3_5_moe_text" => {
-            let args = serde_json::from_value::<ModelArgs>(value).map_err(|error| {
-                Error::UnsupportedArchitecture(format!("invalid qwen3_5_moe_text config: {error}"))
-            })?;
-            if let Some(quantization_config) = &args.quantization_config {
-                quantization_config.validate_supported()?;
-            }
-        }
-        other => {
-            return Err(Error::UnsupportedModelType(other.to_string()));
-        }
-    }
-    if let Some(quantization_config) = &config.quantization_config {
+    let (args, _, _, _) = parse_qwen3_5_config_value(config.clone())?;
+    if let Some(quantization_config) = &args.quantization_config {
         quantization_config.validate_supported()?;
     }
     Ok(())
 }
 
-/// Loads a Qwen3.5 MoE model and safetensors weights from a model directory.
+/// Loads a dense or MoE Qwen3.5 model and safetensors weights from a model directory.
 pub fn load_qwen3_5_moe_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -4311,8 +4422,8 @@ pub fn load_qwen3_5_moe_model(
     Ok(model)
 }
 
-/// Loads a dense Qwen3.5/3.6 MoE checkpoint while affine-quantizing eligible
-/// text weights, including the packed rank-3 routed expert banks.
+/// Loads a dense or MoE Qwen3.5/3.6 checkpoint while affine-quantizing eligible
+/// text weights, including packed rank-3 routed expert banks when present.
 pub fn load_qwen3_5_moe_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: AffineQuantization,
@@ -4325,7 +4436,7 @@ pub fn load_qwen3_5_moe_model_quantized(
         get_qwen3_5_moe_model_args(model_dir)?;
     if args.quantization_config.is_some() {
         return Err(Error::Quantization(
-            "Qwen3.5/3.6 MoE affine on-load quantization requires a dense checkpoint; native FP8 checkpoints cannot be requantized to affine Q4".into(),
+            "Qwen3.5/3.6 affine on-load quantization requires floating-point weights; native FP8 checkpoints cannot be requantized to affine Q4".into(),
         ));
     }
     let load_visual = vision_config.is_some();
@@ -4868,7 +4979,7 @@ mod tests {
         load_qwen3_5_moe_tokenizer, parse_fp8_expert_projection_key,
         qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
         qwen35_restore_v_head_order, qwen35_translate_gguf_weight_name,
-        qwen3_5_moe_strict_load_config, reverse_permutation, vision_window_index,
+        qwen3_5_moe_strict_load_config, reverse_permutation, vision_window_index, FeedForward,
         Fp8ExpertProjection, FullAttention, FullAttentionInput, LayerType, LinearAttention,
         LinearAttentionInput, Model, ModelArgs, SparseMoeBlock, VisionConfig,
     };
@@ -5132,7 +5243,7 @@ mod tests {
         );
         assert_eq!(
             qwen35_translate_gguf_weight_name("blk.3.ffn_gate.weight"),
-            "model.layers.3.dense_mlp.gate_proj.weight"
+            "model.layers.3.mlp.gate_proj.weight"
         );
         assert!(qwen35_is_offset_norm("blk.3.attn_q_norm.weight"));
         assert!(!qwen35_is_offset_norm("blk.3.ssm_norm.weight"));
@@ -5243,6 +5354,179 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_dense_qwen3_5_config() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_5",
+              "tie_word_embeddings": false,
+              "image_token_id": 248056,
+              "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 128,
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 128,
+                "intermediate_size": 32,
+                "layer_types": [
+                  "linear_attention",
+                  "linear_attention",
+                  "linear_attention",
+                  "full_attention"
+                ]
+              }
+            }"#,
+        );
+        let (args, image_token_id, video_token_id, vision_config) =
+            get_qwen3_5_moe_model_args(&dir).unwrap();
+        assert_eq!(args.model_type, "qwen3_5_text");
+        assert_eq!(args.num_experts, 0);
+        assert_eq!(args.num_experts_per_tok, 0);
+        assert_eq!(args.intermediate_size, 32);
+        assert_eq!(args.layer_types[3], LayerType::FullAttention);
+        assert_eq!(image_token_id, Some(248056));
+        assert_eq!(video_token_id, None);
+        assert!(vision_config.is_none());
+    }
+
+    #[test]
+    fn parses_text_only_dense_qwen3_5_config() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_5_text",
+              "vocab_size": 128,
+              "hidden_size": 16,
+              "num_hidden_layers": 1,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "max_position_embeddings": 128,
+              "intermediate_size": 32,
+              "layer_types": ["full_attention"]
+            }"#,
+        );
+        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        assert_eq!(args.model_type, "qwen3_5_text");
+        assert_eq!(args.num_experts, 0);
+        assert_eq!(args.num_experts_per_tok, 0);
+        assert_eq!(args.layer_types, vec![LayerType::FullAttention]);
+    }
+
+    #[test]
+    fn dense_safetensor_keys_map_directly_to_checkpoint_native_mlp_names() {
+        let config = qwen3_5_moe_strict_load_config(false);
+        assert!(config
+            .candidates("model.language_model.layers.0.mlp.gate_proj.weight")
+            .contains(&"model.layers.0.mlp.gate_proj.weight".to_string()));
+        assert!(config
+            .candidates("model.visual.blocks.0.mlp.fc1.weight")
+            .contains(&"visual.blocks.0.mlp.fc1.weight".to_string()));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn strict_loads_and_runs_dense_qwen3_5_safetensors() {
+        let _guard = mlx_runtime_test_guard();
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_5",
+              "tie_word_embeddings": false,
+              "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 32,
+                "hidden_size": 32,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "max_position_embeddings": 128,
+                "layer_types": ["full_attention"]
+              }
+            }"#,
+        );
+        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let mut source = Model::new(args, None, None, None, stream).unwrap();
+        zero_model_parameters(&mut source, stream);
+
+        let params = source.parameters().flatten();
+        let arrays = params
+            .iter()
+            .map(|(key, value)| {
+                let checkpoint_key = key
+                    .strip_prefix("model.")
+                    .map(|suffix| format!("model.language_model.{suffix}"))
+                    .unwrap_or_else(|| key.to_string());
+                (checkpoint_key, (*value).clone())
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(key, value)| (key.as_str(), value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let model = crate::models::load_model(&dir, stream, weights_ctx.stream()).unwrap();
+        let AnyModel::Qwen35Moe(mut model) = model else {
+            panic!("qwen3_5 must dispatch to the Qwen3.5 loader");
+        };
+        assert_eq!(model.model_type(), "qwen3_5_text");
+        assert_eq!(model.args.num_experts, 0);
+        assert!(matches!(model.model.layers[0].mlp, FeedForward::Dense(_)));
+
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [runtime_input::InputPart::text_token_ids(&tokens)];
+        let mut cache = model.new_cache();
+        let logits = CausalLm::prefill_input_logits(
+            &mut model,
+            runtime_input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, 32]);
+
+        let quantized = crate::models::load_model_with_options(
+            &dir,
+            crate::models::ModelLoadOptions::with_quantization(
+                AffineQuantization::new(32, 4).unwrap(),
+            ),
+            stream,
+            weights_ctx.stream(),
+        )
+        .unwrap();
+        let AnyModel::Qwen35Moe(mut quantized) = quantized else {
+            panic!("qwen3_5 must dispatch to the Qwen3.5 affine loader");
+        };
+        let params = quantized.parameters().flatten();
+        assert_eq!(
+            params
+                .get("model.layers.0.mlp.gate_proj.weight")
+                .unwrap()
+                .dtype(),
+            safemlx::Dtype::Uint32
+        );
+        assert!(params.contains_key("model.layers.0.mlp.gate_proj.scales"));
+        assert!(params.contains_key("model.layers.0.mlp.gate_proj.biases"));
+        assert!(!params.keys().any(|key| key.contains("dense_mlp")));
+        drop(params);
+        let mut cache = quantized.new_cache();
+        let logits = CausalLm::prefill_input_logits(
+            &mut quantized,
+            runtime_input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), &[1, 32]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn parses_top_level_vision_config() {
         let dir = temp_model_dir(
             r#"{
@@ -5322,7 +5606,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::Quantization(_)));
-        assert!(error.to_string().contains("requires a dense checkpoint"));
+        assert!(error
+            .to_string()
+            .contains("requires floating-point weights"));
     }
 
     #[test]

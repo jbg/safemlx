@@ -114,7 +114,7 @@ pub enum ModelKind {
     Qwen3,
     /// Qwen3-VL multimodal architecture.
     Qwen3Vl,
-    /// Qwen3.5 mixture-of-experts architecture.
+    /// Qwen3.5 dense or mixture-of-experts architecture.
     Qwen35Moe,
 }
 
@@ -147,7 +147,7 @@ impl ModelKind {
             "personaplex" => Ok(Self::PersonaPlex),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
-            "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
         }
     }
@@ -1322,7 +1322,7 @@ fn load_gguf_tokenizer_from_metadata(
 fn effective_model_type(metadata: &ModelMetadata) -> String {
     if matches!(
         metadata.model_type.as_str(),
-        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_5_moe"
+        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_5" | "qwen3_5_moe"
     ) {
         metadata
             .text_config
@@ -2131,6 +2131,57 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 kind: super::ModelKind::Qwen35Moe,
                 model_type: "qwen3_5_moe".to_string(),
                 effective_model_type: "qwen3_5_moe_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_dense_qwen3_5() {
+        let support = check_model_config(&json!({
+            "model_type": "qwen3_5",
+            "image_token_id": 248056,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 128,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 128
+            }
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Qwen35Moe,
+                model_type: "qwen3_5".to_string(),
+                effective_model_type: "qwen3_5_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_dense_qwen3_5_text() {
+        let support = check_model_config(&json!({
+            "model_type": "qwen3_5_text",
+            "vocab_size": 128,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 128,
+            "layer_types": ["full_attention"]
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Qwen35Moe,
+                model_type: "qwen3_5_text".to_string(),
+                effective_model_type: "qwen3_5_text".to_string(),
             })
         );
     }
