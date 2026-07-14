@@ -48,7 +48,11 @@ quantization types use MLX's bundled converter when
 supported, and unsupported tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `gemma4`,
 `llama`, `mistral`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense
-`qwen35`, and `qwen35moe` architectures.
+`qwen35`, and `qwen35moe` architectures, plus dense `qwen3vl` with its separate
+vision projector. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
+`mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
+the unique dense projector automatically; callers that need an explicit pair
+can use `models::qwen3_vl::load_qwen3_vl_gguf`.
 Nemotron-H routed expert banks retain Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 packed weights
 and execute through selected-expert quantized matrix multiplication. Qwen3 MoE
 uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6/Q8
@@ -58,8 +62,10 @@ Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 routed expert banks packed while loading
 quantization types. Gemma 4
 multimodal projectors, MoE, and assistant-drafter files are separate formats
 and are not handled by the initial Gemma 4 adapter. Nemotron-H latent-space MoE and
-Omni/multimodal checkpoints remain separate formats. Qwen3-VL and Qwen3.5-VL
-GGUF files are not handled by these text-only adapters.
+Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
+GGUFs retain their supported packed affine weights while the vision projector
+remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
+currently handled.
 
 ## Usage
 

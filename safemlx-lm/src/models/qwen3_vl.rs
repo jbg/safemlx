@@ -1,6 +1,9 @@
 //! Qwen3-VL conditional-generation model support.
 
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use safemlx::{
     error::Exception,
@@ -10,7 +13,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{masked_scatter, TryIndexOp},
-        zeros_dtype,
+        stack_axis, zeros_dtype, GgufMetadataArray, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Stream,
@@ -30,8 +33,8 @@ use crate::{
     quantization::AffineQuantization,
     utils::{create_attention_mask, AttentionMask},
     weights::{
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
-        StrictLoadReport,
+        load_arrays_strict, load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -577,6 +580,399 @@ pub fn load_qwen3_vl_model_quantized(
     Ok(model)
 }
 
+/// Loads a Qwen3-VL GGUF language model and its llama.cpp-style vision
+/// projector. The vision projector must use dense F16/BF16/F32 tensors; the
+/// language model may use any GGUF quantization supported by the Qwen3 loader.
+pub fn load_qwen3_vl_gguf(
+    gguf_file: impl AsRef<Path>,
+    mmproj_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    Ok(load_qwen3_vl_gguf_with_metadata(gguf_file, mmproj_file, stream, weights_stream)?.model)
+}
+
+pub(crate) struct LoadedQwen3VlGguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+pub(crate) fn load_qwen3_vl_gguf_with_metadata(
+    gguf_file: impl AsRef<Path>,
+    mmproj_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3VlGguf, Error> {
+    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    let (vision_arrays, vision_metadata) =
+        Array::load_gguf_with_metadata(mmproj_file, weights_stream)?;
+    load_qwen3_vl_gguf_data(
+        arrays,
+        metadata,
+        vision_arrays,
+        vision_metadata,
+        stream,
+        weights_stream,
+    )
+}
+
+pub(crate) fn load_qwen3_vl_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    mut vision_arrays: HashMap<String, Array>,
+    vision_metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3VlGguf, Error> {
+    let architecture = qwen3::gguf_string(&metadata, "general.architecture")?;
+    if architecture != "qwen3vl" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports dense qwen3vl"
+        )));
+    }
+    validate_qwen3_vl_mmproj(&vision_metadata)?;
+
+    let qwen3::PreparedQwen3Gguf {
+        mut args,
+        arrays,
+        eos_token_ids,
+    } = qwen3::prepare_qwen3_gguf_data(arrays, &metadata, &architecture, false, weights_stream)?;
+    args.model_type = "qwen3_vl_text".into();
+    if !args.tie_word_embeddings {
+        return Err(Error::UnsupportedArchitecture(
+            "qwen3vl GGUF with an untied output head is not supported".into(),
+        ));
+    }
+
+    let mrope_section = gguf_integer_array(&metadata, "qwen3vl.rope.dimension_sections", Some(3))?;
+    if mrope_section.iter().sum::<i32>() != args.head_dim / 2 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF RoPE sections {mrope_section:?} do not cover half of head_dim {}",
+            args.head_dim
+        )));
+    }
+
+    let deepstack_visual_indexes = gguf_deepstack_layers(&vision_metadata)?;
+    let hidden_size = qwen3::gguf_i32(
+        &vision_metadata,
+        "clip.vision.embedding_length",
+        weights_stream,
+    )?;
+    let num_position_embeddings = vision_num_position_embeddings(&vision_arrays, hidden_size)?;
+    let vision_config = VisionConfig {
+        depth: qwen3::gguf_i32(&vision_metadata, "clip.vision.block_count", weights_stream)?,
+        hidden_size,
+        hidden_act: "gelu_pytorch_tanh".into(),
+        intermediate_size: qwen3::gguf_i32(
+            &vision_metadata,
+            "clip.vision.feed_forward_length",
+            weights_stream,
+        )?,
+        num_heads: qwen3::gguf_i32(
+            &vision_metadata,
+            "clip.vision.attention.head_count",
+            weights_stream,
+        )?,
+        num_position_embeddings,
+        in_channels: 3,
+        patch_size: qwen3::gguf_i32(&vision_metadata, "clip.vision.patch_size", weights_stream)?,
+        spatial_merge_size: qwen3::gguf_i32(
+            &vision_metadata,
+            "clip.vision.spatial_merge_size",
+            weights_stream,
+        )?,
+        temporal_patch_size: 2,
+        window_size: 112,
+        out_hidden_size: qwen3::gguf_i32(
+            &vision_metadata,
+            "clip.vision.projection_dim",
+            weights_stream,
+        )?,
+        fullatt_block_indexes: Vec::new(),
+        deepstack_visual_indexes,
+    };
+    if vision_config
+        .deepstack_visual_indexes
+        .iter()
+        .any(|&layer| layer < 0 || layer >= vision_config.depth)
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF DeepStack layers {:?} exceed vision depth {}",
+            vision_config.deepstack_visual_indexes, vision_config.depth
+        )));
+    }
+    if let Some(value) = metadata.get("qwen3vl.n_deepstack_layers") {
+        let expected = value.as_i64().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "GGUF metadata key \"qwen3vl.n_deepstack_layers\" has the wrong type".into(),
+            )
+        })?;
+        if expected != vision_config.deepstack_visual_indexes.len() as i64 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "qwen3vl GGUF expects {expected} DeepStack layers, but its mmproj contains {}",
+                vision_config.deepstack_visual_indexes.len()
+            )));
+        }
+    }
+    if vision_config.out_hidden_size != args.hidden_size {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF projector output {} does not match language hidden size {}",
+            vision_config.out_hidden_size, args.hidden_size
+        )));
+    }
+
+    let image_token_id = gguf_token_id(&metadata, "<|image_pad|>")?;
+    let video_token_id = gguf_token_id(&metadata, "<|video_pad|>")?;
+    let mut translated = HashMap::with_capacity(arrays.len() + vision_arrays.len());
+    for (name, value) in arrays {
+        let name = name
+            .strip_prefix("model.")
+            .map(|name| format!("model.language_model.{name}"))
+            .unwrap_or(name);
+        insert_translated(&mut translated, name, value)?;
+    }
+
+    if vision_arrays
+        .keys()
+        .any(|name| name.ends_with(".scales") || name.ends_with(".biases"))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "quantized qwen3vl mmproj GGUF tensors are not supported; use the F16 projector".into(),
+        ));
+    }
+    reassemble_patch_embedding(&mut vision_arrays, weights_stream)?;
+    for (name, value) in vision_arrays {
+        let name = translate_qwen3_vl_mmproj_name(&name, &vision_config.deepstack_visual_indexes);
+        insert_translated(&mut translated, name, value)?;
+    }
+
+    let model_args = ModelArgs {
+        text_config: args,
+        vision_config,
+        image_token_id,
+        video_token_id,
+        mrope_section,
+    };
+    let mut model = Model::new(model_args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(LoadedQwen3VlGguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+fn validate_qwen3_vl_mmproj(metadata: &HashMap<String, GgufMetadataValue>) -> Result<(), Error> {
+    let architecture = qwen3::gguf_string(metadata, "general.architecture")?;
+    let projector = qwen3::gguf_string(metadata, "clip.projector_type")?;
+    if architecture != "clip" || projector != "qwen3vl_merger" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "expected a qwen3vl GGUF vision projector, got architecture {architecture:?} and projector {projector:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn gguf_integer_array(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    take: Option<usize>,
+) -> Result<Vec<i32>, Error> {
+    let values = metadata
+        .get(key)
+        .and_then(GgufMetadataValue::as_array)
+        .and_then(GgufMetadataArray::to_i64_vec)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata is missing integer array {key:?}"
+            ))
+        })?;
+    let values = take.map_or(values.as_slice(), |count| {
+        &values[..values.len().min(count)]
+    });
+    values
+        .iter()
+        .map(|&value| {
+            i32::try_from(value).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "GGUF metadata value in {key:?} exceeds i32"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn gguf_deepstack_layers(metadata: &HashMap<String, GgufMetadataValue>) -> Result<Vec<i32>, Error> {
+    let layers = match metadata.get("clip.vision.is_deepstack_layers") {
+        Some(GgufMetadataValue::Array(GgufMetadataArray::Bool(layers))) => layers,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key \"clip.vision.is_deepstack_layers\" has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "qwen3vl mmproj is missing DeepStack layer metadata".into(),
+            ));
+        }
+    };
+    layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &enabled)| enabled.then_some(i32::try_from(index)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Error::UnsupportedArchitecture("DeepStack layer index exceeds i32".into()))
+}
+
+fn vision_num_position_embeddings(
+    arrays: &HashMap<String, Array>,
+    hidden_size: i32,
+) -> Result<i32, Error> {
+    let shape = arrays
+        .get("v.position_embd.weight")
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "qwen3vl mmproj is missing v.position_embd.weight".into(),
+            )
+        })?
+        .shape();
+    if shape.len() != 2 || shape[1] != hidden_size {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "unexpected qwen3vl position embedding shape {shape:?}"
+        )));
+    }
+    Ok(shape[0])
+}
+
+fn gguf_token_id(metadata: &HashMap<String, GgufMetadataValue>, token: &str) -> Result<u32, Error> {
+    let tokens = metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture("qwen3vl GGUF is missing tokenizer.ggml.tokens".into())
+        })?;
+    let index = tokens
+        .iter()
+        .position(|candidate| candidate == token)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("qwen3vl GGUF tokenizer is missing {token:?}"))
+        })?;
+    u32::try_from(index)
+        .map_err(|_| Error::UnsupportedArchitecture("qwen3vl token id exceeds u32".into()))
+}
+
+fn reassemble_patch_embedding(
+    arrays: &mut HashMap<String, Array>,
+    stream: &Stream,
+) -> Result<(), Error> {
+    let first = arrays.remove("v.patch_embd.weight").ok_or_else(|| {
+        Error::UnsupportedArchitecture("qwen3vl mmproj is missing v.patch_embd.weight".into())
+    })?;
+    let second = arrays.remove("v.patch_embd.weight.1").ok_or_else(|| {
+        Error::UnsupportedArchitecture("qwen3vl mmproj is missing v.patch_embd.weight.1".into())
+    })?;
+    arrays.insert(
+        "v.patch_embd.weight".into(),
+        stack_axis(&[first, second], 2, stream)?,
+    );
+    Ok(())
+}
+
+fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32]) -> String {
+    const ROOTS: [(&str, &str); 6] = [
+        ("v.position_embd", "model.visual.pos_embed"),
+        ("v.patch_embd", "model.visual.patch_embed.proj"),
+        ("v.post_ln", "model.visual.merger.norm"),
+        ("mm.0", "model.visual.merger.linear_fc1"),
+        ("mm.2", "model.visual.merger.linear_fc2"),
+        ("v.blk", "model.visual.blocks"),
+    ];
+    if let Some(rest) = name.strip_prefix("v.deepstack.") {
+        if let Some((layer, suffix)) = rest.split_once('.') {
+            if let Ok(layer) = layer.parse::<i32>() {
+                if let Some(index) = deepstack_layers.iter().position(|&value| value == layer) {
+                    let suffix =
+                        suffix
+                            .replacen("fc1", "linear_fc1", 1)
+                            .replacen("fc2", "linear_fc2", 1);
+                    return format!("model.visual.deepstack_merger_list.{index}.{suffix}");
+                }
+            }
+        }
+    }
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            let mut translated = name.replacen(source, target, 1);
+            if source == "v.blk" {
+                translated = translated
+                    .replace(".attn_out.", ".attn.proj.")
+                    .replace(".attn_qkv.", ".attn.qkv.")
+                    .replace(".ffn_up.", ".mlp.linear_fc1.")
+                    .replace(".ffn_down.", ".mlp.linear_fc2.")
+                    .replace(".ln1.", ".norm1.")
+                    .replace(".ln2.", ".norm2.");
+            }
+            return translated;
+        }
+    }
+    name.to_string()
+}
+
+fn insert_translated(
+    arrays: &mut HashMap<String, Array>,
+    name: String,
+    value: Array,
+) -> Result<(), Error> {
+    if arrays.insert(name.clone(), value).is_some() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF tensors collide after translating {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Finds the dense sibling mmproj used by the single-path model loader.
+pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
+    let parent = gguf_file.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = std::fs::read_dir(parent)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            name.starts_with("mmproj") && name.ends_with(".gguf")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let dense = candidates
+        .iter()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            name.contains("f16") || name.contains("bf16") || name.contains("f32")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match (dense.as_slice(), candidates.as_slice()) {
+        ([path], _) => Ok(path.clone()),
+        ([], [path]) => Ok(path.clone()),
+        _ => Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF requires one dense sibling mmproj file; found {} candidates in {}",
+            candidates.len(),
+            parent.display()
+        ))),
+    }
+}
+
 impl CausalLm<Cache> for Model {
     fn prefill_input_logits(
         &mut self,
@@ -624,7 +1020,11 @@ pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a,
 mod tests {
     use std::collections::HashMap;
 
-    use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext};
+    use safemlx::{
+        module::ModuleParameters,
+        ops::{indexing::TryIndexOp, GgufMetadataArray, GgufMetadataValue},
+        Array, Device, DeviceType, ExecutionContext,
+    };
     use serde_json::json;
 
     use crate::models::{common::CausalLm, input as runtime_input};
@@ -728,6 +1128,239 @@ mod tests {
         let (values, _) = super::mrope_values(&positions, 14, 10_000.0, &[3, 2, 2]);
         let temporal_tail_angle = 1.0 / 10_000.0f32.powf(12.0 / 14.0);
         assert!((values[6] - temporal_tail_angle.cos()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn translates_llama_cpp_qwen3_vl_mmproj_names() {
+        let deepstack = [5, 11, 17];
+        assert_eq!(
+            super::translate_qwen3_vl_mmproj_name("v.blk.7.attn_qkv.weight", &deepstack),
+            "model.visual.blocks.7.attn.qkv.weight"
+        );
+        assert_eq!(
+            super::translate_qwen3_vl_mmproj_name("mm.2.bias", &deepstack),
+            "model.visual.merger.linear_fc2.bias"
+        );
+        assert_eq!(
+            super::translate_qwen3_vl_mmproj_name("v.deepstack.11.fc1.weight", &deepstack),
+            "model.visual.deepstack_merger_list.1.linear_fc1.weight"
+        );
+    }
+
+    #[test]
+    fn parses_qwen3_vl_gguf_deepstack_and_mrope_metadata() {
+        let metadata = HashMap::from([
+            (
+                "qwen3vl.rope.dimension_sections".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 2, 2, 0])),
+            ),
+            (
+                "clip.vision.is_deepstack_layers".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![false, true, false, true])),
+            ),
+        ]);
+        assert_eq!(
+            super::gguf_integer_array(&metadata, "qwen3vl.rope.dimension_sections", Some(3))
+                .unwrap(),
+            vec![2, 2, 2]
+        );
+        assert_eq!(super::gguf_deepstack_layers(&metadata).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn discovers_dense_qwen3_vl_mmproj_sibling() {
+        let dir = std::env::temp_dir().join(format!(
+            "safemlx-qwen3vl-mmproj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let model = dir.join("Qwen3VL-2B-Instruct-Q4_K_M.gguf");
+        let dense = dir.join("mmproj-Qwen3VL-2B-Instruct-F16.gguf");
+        let quantized = dir.join("mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf");
+        std::fs::File::create(&model).unwrap();
+        std::fs::File::create(&dense).unwrap();
+        std::fs::File::create(&quantized).unwrap();
+        assert_eq!(super::find_qwen3_vl_mmproj(&model).unwrap(), dense);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn strict_loads_dense_qwen3_vl_from_gguf_named_arrays() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let source = tiny_model(stream);
+        let mut arrays = HashMap::new();
+        let mut vision_arrays = HashMap::new();
+        for (name, value) in source.parameters().flatten() {
+            if let Some(name) = name.strip_prefix("model.language_model.") {
+                let name = name
+                    .replace("layers.", "blk.")
+                    .replace("self_attn.q_norm", "attn_q_norm")
+                    .replace("self_attn.k_norm", "attn_k_norm")
+                    .replace("self_attn.q_proj", "attn_q")
+                    .replace("self_attn.k_proj", "attn_k")
+                    .replace("self_attn.v_proj", "attn_v")
+                    .replace("self_attn.o_proj", "attn_output")
+                    .replace("input_layernorm", "attn_norm")
+                    .replace("post_attention_layernorm", "ffn_norm")
+                    .replace("mlp.gate_proj", "ffn_gate")
+                    .replace("mlp.down_proj", "ffn_down")
+                    .replace("mlp.up_proj", "ffn_up");
+                let name = match name.as_str() {
+                    "embed_tokens.weight" => "token_embd.weight".into(),
+                    "norm.weight" => "output_norm.weight".into(),
+                    _ => name,
+                };
+                arrays.insert(name, value.clone());
+                continue;
+            }
+            let name = name.strip_prefix("model.visual.").unwrap();
+            if name == "patch_embed.proj.weight" {
+                vision_arrays.insert(
+                    "v.patch_embd.weight".into(),
+                    value.try_index_device((.., .., 0, .., ..), stream).unwrap(),
+                );
+                vision_arrays.insert(
+                    "v.patch_embd.weight.1".into(),
+                    value.try_index_device((.., .., 1, .., ..), stream).unwrap(),
+                );
+                continue;
+            }
+            let name = name
+                .replace("pos_embed", "v.position_embd")
+                .replace("patch_embed.proj", "v.patch_embd")
+                .replace("blocks.", "v.blk.")
+                .replace(".attn.qkv.", ".attn_qkv.")
+                .replace(".attn.proj.", ".attn_out.")
+                .replace(".mlp.linear_fc1.", ".ffn_up.")
+                .replace(".mlp.linear_fc2.", ".ffn_down.")
+                .replace(".norm1.", ".ln1.")
+                .replace(".norm2.", ".ln2.")
+                .replace("merger.norm", "v.post_ln")
+                .replace("merger.linear_fc1", "mm.0")
+                .replace("merger.linear_fc2", "mm.2")
+                .replace("deepstack_merger_list.0.norm", "v.deepstack.0.norm")
+                .replace("deepstack_merger_list.0.linear_fc1", "v.deepstack.0.fc1")
+                .replace("deepstack_merger_list.0.linear_fc2", "v.deepstack.0.fc2");
+            vision_arrays.insert(name, value.clone());
+        }
+
+        let mut tokens = (0..30)
+            .map(|index| format!("token-{index}"))
+            .collect::<Vec<_>>();
+        tokens.extend(["<|image_pad|>".into(), "<|video_pad|>".into()]);
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen3vl".into()),
+            ),
+            (
+                "qwen3vl.embedding_length".into(),
+                GgufMetadataValue::Uint32(12),
+            ),
+            ("qwen3vl.block_count".into(), GgufMetadataValue::Uint32(1)),
+            (
+                "qwen3vl.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(24),
+            ),
+            (
+                "qwen3vl.attention.head_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "qwen3vl.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "qwen3vl.attention.key_length".into(),
+                GgufMetadataValue::Uint32(12),
+            ),
+            (
+                "qwen3vl.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "qwen3vl.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "qwen3vl.rope.freq_base".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+            (
+                "qwen3vl.rope.dimension_sections".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 2, 2, 0])),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+        ]);
+        let vision_metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("clip".into()),
+            ),
+            (
+                "clip.projector_type".into(),
+                GgufMetadataValue::String("qwen3vl_merger".into()),
+            ),
+            (
+                "clip.vision.embedding_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "clip.vision.block_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "clip.vision.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "clip.vision.attention.head_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.patch_size".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.spatial_merge_size".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.projection_dim".into(),
+                GgufMetadataValue::Uint32(12),
+            ),
+            (
+                "clip.vision.is_deepstack_layers".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true])),
+            ),
+        ]);
+
+        let loaded = super::load_qwen3_vl_gguf_data(
+            arrays,
+            metadata,
+            vision_arrays,
+            vision_metadata,
+            stream,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(loaded.model.args.image_token_id, 30);
+        assert_eq!(loaded.model.args.video_token_id, 31);
+        assert_eq!(loaded.model.args.mrope_section, vec![2, 2, 2]);
+        assert_eq!(loaded.eos_token_ids, vec![2]);
     }
 
     #[test]

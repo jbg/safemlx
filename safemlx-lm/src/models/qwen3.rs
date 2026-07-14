@@ -1260,6 +1260,12 @@ pub(crate) struct LoadedQwen3Gguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedQwen3Gguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) arrays: HashMap<String, Array>,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 /// Loads a Qwen3 GGUF checkpoint.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
@@ -1295,8 +1301,36 @@ pub(crate) fn load_qwen3_gguf_data(
         )));
     }
     let is_moe = architecture == "qwen3moe";
+    let PreparedQwen3Gguf {
+        args,
+        arrays: translated,
+        eos_token_ids,
+    } = prepare_qwen3_gguf_data(arrays, &metadata, &architecture, is_moe, weights_stream)?;
 
-    let mut args = qwen3_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+
+    Ok(LoadedQwen3Gguf {
+        model,
+        eos_token_ids,
+    })
+}
+
+/// Parses and translates a Qwen3-family GGUF text model without constructing
+/// the owning architecture. Multimodal architectures reuse this to embed the
+/// Qwen3 decoder under their own parameter-tree prefix.
+pub(crate) fn prepare_qwen3_gguf_data(
+    arrays: HashMap<String, Array>,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    is_moe: bool,
+    weights_stream: &Stream,
+) -> Result<PreparedQwen3Gguf, Error> {
+    let mut args = qwen3_args_from_gguf(&arrays, metadata, architecture, is_moe, weights_stream)?;
     let mut translated = HashMap::with_capacity(arrays.len());
     for (name, value) in arrays {
         let name = if is_moe {
@@ -1318,21 +1352,14 @@ pub(crate) fn load_qwen3_gguf_data(
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
 
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+        .and_then(|value| u32::try_from(value).ok())
+        .into_iter()
+        .collect();
 
-    let eos_token_ids =
-        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
-
-    Ok(LoadedQwen3Gguf {
-        model,
+    Ok(PreparedQwen3Gguf {
+        args,
+        arrays: translated,
         eos_token_ids,
     })
 }
@@ -1341,10 +1368,10 @@ fn qwen3_args_from_gguf(
     arrays: &HashMap<String, Array>,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
+    is_moe: bool,
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let is_moe = architecture == "qwen3moe";
     let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
     let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
     let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"), stream)?
@@ -1600,7 +1627,10 @@ fn qwen3_gguf_affine_quantization(
     crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
 }
 
-fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+pub(crate) fn gguf_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<String, Error> {
     gguf_optional_string(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
@@ -1619,7 +1649,7 @@ fn gguf_optional_string(
     }
 }
 
-fn gguf_i32(
+pub(crate) fn gguf_i32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -1984,8 +2014,8 @@ mod tests {
                 ])),
             ),
         ]);
-        let args =
-            super::qwen3_args_from_gguf(&HashMap::new(), &metadata, "qwen3", stream).unwrap();
+        let args = super::qwen3_args_from_gguf(&HashMap::new(), &metadata, "qwen3", false, stream)
+            .unwrap();
 
         assert_eq!(args.head_dim, 128);
         assert_eq!(args.num_key_value_heads, 8);

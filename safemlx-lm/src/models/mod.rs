@@ -1057,6 +1057,20 @@ fn load_gguf_model_data(
             let loaded = qwen3::load_qwen3_gguf_data(arrays, metadata, stream, weights_stream)?;
             (Model::Qwen3(loaded.model), loaded.eos_token_ids)
         }
+        "qwen3vl" => {
+            let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
+            let (vision_arrays, vision_metadata) =
+                Array::load_gguf_with_metadata(mmproj_file, weights_stream)?;
+            let loaded = qwen3_vl::load_qwen3_vl_gguf_data(
+                arrays,
+                metadata,
+                vision_arrays,
+                vision_metadata,
+                stream,
+                weights_stream,
+            )?;
+            (Model::Qwen3Vl(loaded.model), loaded.eos_token_ids)
+        }
         "qwen35" | "qwen35moe" => {
             let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_data(
                 arrays,
@@ -1067,7 +1081,7 @@ fn load_gguf_model_data(
             (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen35, and qwen35moe"
+            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
         ))),
     };
     Ok(LoadedGgufModel {
