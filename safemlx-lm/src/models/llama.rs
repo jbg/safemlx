@@ -988,7 +988,7 @@ pub(crate) struct LoadedLlamaGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
-/// Loads a Llama-family GGUF checkpoint.
+/// Loads a Llama-compatible GGUF checkpoint, including Mistral.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
 /// supported. Quantized formats are consumed in the packed affine
@@ -1018,13 +1018,13 @@ pub(crate) fn load_llama_gguf_data(
     weights_stream: &Stream,
 ) -> Result<LoadedLlamaGguf, Error> {
     let architecture = gguf_string(&metadata, "general.architecture")?;
-    if architecture != "llama" {
+    if !matches!(architecture.as_str(), "llama" | "mistral") {
         return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; the initial GGUF loader supports only llama"
+            "GGUF architecture {architecture:?}; this loader supports llama and mistral"
         )));
     }
 
-    let mut args = llama_args_from_gguf(&arrays, &metadata, weights_stream)?;
+    let mut args = llama_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
     let translated = arrays
         .into_iter()
         .map(|(name, value)| (translate_gguf_weight_name(&name), value))
@@ -1087,25 +1087,32 @@ fn llama_gguf_quantized_weight_configs(
 fn llama_args_from_gguf(
     arrays: &HashMap<String, Array>,
     metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
-    let hidden_size = gguf_i32(metadata, "llama.embedding_length", stream)?;
-    let num_attention_heads = gguf_i32(metadata, "llama.attention.head_count", stream)?;
-    let num_key_value_heads = gguf_optional_i64(metadata, "llama.attention.head_count_kv", stream)?
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"), stream)?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("GGUF KV-head count exceeds i32".into()))?
         .unwrap_or(num_attention_heads);
-    let head_dim = gguf_optional_i64(metadata, "llama.attention.key_length", stream)?
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| {
             Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
         })?
         .unwrap_or(hidden_size / num_attention_heads);
-    let rope_theta = gguf_optional_f32(metadata, "llama.rope.freq_base", stream)?
+    let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
         .unwrap_or_else(default_rope_theta);
-    let rope_scaling = gguf_rope_scaling(metadata, stream)?;
+    let rope_scaling = gguf_rope_scaling(metadata, architecture, stream)?;
+    let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::UnsupportedArchitecture("GGUF sliding-window size exceeds i32".into()))?
+        .filter(|window| *window != 0);
     let vocab_size = match metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -1118,19 +1125,19 @@ fn llama_args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => gguf_i32(metadata, "llama.vocab_size", stream)?,
+        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
     };
 
     Ok(ModelArgs {
-        model_type: "llama".to_string(),
+        model_type: architecture.to_string(),
         hidden_size,
-        num_hidden_layers: gguf_i32(metadata, "llama.block_count", stream)?,
-        intermediate_size: gguf_i32(metadata, "llama.feed_forward_length", stream)?,
+        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
+        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"), stream)?,
         num_attention_heads,
-        rms_norm_eps: gguf_f32(metadata, "llama.attention.layer_norm_rms_epsilon", stream)?,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
         vocab_size,
         num_key_value_heads,
-        max_position_embeddings: gguf_i32(metadata, "llama.context_length", stream)?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
         rope_theta,
         rope_traditional: true,
         head_dim,
@@ -1155,7 +1162,7 @@ fn llama_args_from_gguf(
                 )
         }),
         rope_scaling,
-        sliding_window: None,
+        sliding_window,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -1165,19 +1172,22 @@ fn llama_args_from_gguf(
 
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
     stream: &Stream,
 ) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
-    let Some(scaling_type) = gguf_optional_string(metadata, "llama.rope.scaling.type")? else {
+    let scaling_type_key = format!("{architecture}.rope.scaling.type");
+    let Some(scaling_type) = gguf_optional_string(metadata, &scaling_type_key)? else {
         return Ok(None);
     };
     match scaling_type.as_str() {
         "none" | "default" => Ok(None),
         "linear" => {
-            let factor = gguf_optional_f32(metadata, "llama.rope.scaling.factor", stream)?
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
-                        "linear GGUF RoPE scaling is missing llama.rope.scaling.factor".into(),
-                    )
+            let scaling_factor_key = format!("{architecture}.rope.scaling.factor");
+            let factor =
+                gguf_optional_f32(metadata, &scaling_factor_key, stream)?.ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "linear GGUF RoPE scaling is missing {scaling_factor_key}"
+                    ))
                 })?;
             Ok(Some(HashMap::from([
                 (
@@ -1390,11 +1400,16 @@ pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, env::home_dir, fs};
+    use std::{
+        collections::{HashMap, HashSet},
+        env::home_dir,
+        fs,
+    };
 
     use lazy_static::lazy_static;
     use safemlx::{
         ops::indexing::{NewAxis, TryIndexOp},
+        ops::{GgufMetadataArray, GgufMetadataValue},
         transforms::eval,
         Array,
     };
@@ -1473,6 +1488,119 @@ mod tests {
             super::translate_gguf_weight_name("output_norm.weight"),
             "model.norm.weight"
         );
+    }
+
+    #[test]
+    fn loads_dense_mistral_from_gguf_named_arrays() {
+        use safemlx::module::ModuleParameters;
+
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let source = super::Model::new(
+            super::ModelArgs {
+                model_type: "mistral".into(),
+                hidden_size: 32,
+                num_hidden_layers: 1,
+                intermediate_size: 64,
+                num_attention_heads: 1,
+                rms_norm_eps: 1e-5,
+                vocab_size: 32,
+                num_key_value_heads: 1,
+                max_position_embeddings: 128,
+                rope_theta: 10_000.0,
+                rope_traditional: true,
+                head_dim: 32,
+                tie_word_embeddings: true,
+                attention_bias: false,
+                mlp_bias: false,
+                rope_scaling: None,
+                sliding_window: Some(16),
+                quantization: None,
+                quantization_config: None,
+                quantized_weights: None,
+                quantized_weight_configs: None,
+            },
+            stream,
+        )
+        .unwrap();
+        let arrays = source
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let name = name
+                    .replace("model.layers.", "blk.")
+                    .replace("self_attn.q_proj", "attn_q")
+                    .replace("self_attn.k_proj", "attn_k")
+                    .replace("self_attn.v_proj", "attn_v")
+                    .replace("self_attn.o_proj", "attn_output")
+                    .replace("input_layernorm", "attn_norm")
+                    .replace("post_attention_layernorm", "ffn_norm")
+                    .replace("mlp.gate_proj", "ffn_gate")
+                    .replace("mlp.down_proj", "ffn_down")
+                    .replace("mlp.up_proj", "ffn_up")
+                    .replace("model.embed_tokens", "token_embd")
+                    .replace("model.norm", "output_norm");
+                (name, value.clone())
+            })
+            .collect();
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("mistral".into()),
+            ),
+            (
+                "mistral.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            ("mistral.block_count".into(), GgufMetadataValue::Uint32(1)),
+            (
+                "mistral.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            (
+                "mistral.attention.head_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "mistral.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "mistral.attention.key_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "mistral.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-5),
+            ),
+            (
+                "mistral.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "mistral.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "mistral.rope.freq_base".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec!["token".into(); 32])),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+        ]);
+
+        let loaded = super::load_llama_gguf_data(arrays, metadata, stream, stream).unwrap();
+
+        assert_eq!(loaded.model.model_type(), "mistral");
+        assert_eq!(loaded.model.sliding_window(), Some(16));
+        assert_eq!(loaded.eos_token_ids, vec![2]);
     }
 
     #[test]

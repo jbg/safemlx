@@ -1010,7 +1010,7 @@ fn load_gguf_model_data(
             let loaded = gemma4::load_gemma4_gguf_data(arrays, metadata, stream, weights_stream)?;
             (Model::Gemma4(loaded.model), loaded.eos_token_ids)
         }
-        "llama" => {
+        "llama" | "mistral" => {
             let loaded = llama::load_llama_gguf_data(arrays, metadata, stream, weights_stream)?;
             (Model::Llama(loaded.model), loaded.eos_token_ids)
         }
@@ -1037,7 +1037,7 @@ fn load_gguf_model_data(
             (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen35, and qwen35moe"
+            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen35, and qwen35moe"
         ))),
     };
     Ok(LoadedGgufModel {

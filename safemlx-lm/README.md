@@ -47,8 +47,8 @@ Q5_0 and Q5_1 tensors are converted to float16 while loading; other GGUF
 quantization types use MLX's bundled converter when
 supported, and unsupported tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `gemma4`,
-`llama`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`,
-and `qwen35moe` architectures.
+`llama`, `mistral`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense
+`qwen35`, and `qwen35moe` architectures.
 Nemotron-H routed expert banks retain Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 packed weights
 and execute through selected-expert quantized matrix multiplication. Qwen3 MoE
 uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6/Q8
