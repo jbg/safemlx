@@ -17,7 +17,7 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points
 accept Hugging Face-style model directories for Gemma 4, Llama, dense Mistral,
-dense and sparse-MoE Nemotron-H, Qwen3, and Qwen3.5 MoE. They also accept the
+dense and sparse-MoE Nemotron-H, Qwen3, Qwen3-VL, and Qwen3.5 MoE. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
 are supported by passing the first
 `-00001-of-NNNNN.gguf` shard; the remaining shards are discovered and
@@ -93,6 +93,7 @@ checkpoint metadata is an error.
 | Llama | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Mistral | yes | MLX affine | yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
 | Qwen3 | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Qwen3-VL | yes | no | capability error | `LoadedModel` (dense) | Reuses the Qwen3 decoder and shared Qwen vision tower; supports interleaved 3-D RoPE, DeepStack visual injection, images, and timestamped video chunks |
 | Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
 | Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |

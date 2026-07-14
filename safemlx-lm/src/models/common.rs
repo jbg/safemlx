@@ -764,6 +764,50 @@ where
     Ok((queries, keys, values))
 }
 
+/// Applies caller-provided rotary embeddings and updates a key/value cache.
+///
+/// This is shared by multimodal decoders whose positions are not representable
+/// by a single monotonically increasing RoPE offset.
+pub(crate) fn apply_rotary_embeddings_and_update_cache<C>(
+    queries: Array,
+    keys: Array,
+    mut values: Array,
+    cos: &Array,
+    sin: &Array,
+    cache: &mut Option<&mut C>,
+    stream: &Stream,
+) -> Result<(Array, Array, Array), Exception>
+where
+    C: KeyValueCache,
+{
+    let cos = cos
+        .as_dtype(queries.dtype(), stream)?
+        .try_index_device((.., NewAxis, .., ..), stream)?;
+    let sin = sin
+        .as_dtype(queries.dtype(), stream)?
+        .try_index_device((.., NewAxis, .., ..), stream)?;
+    let rotate_half = |x: &Array| -> Result<Array, Exception> {
+        let half = x.dim(-1) / 2;
+        let first = x.try_index_device((.., .., .., ..half), stream)?;
+        let second = x.try_index_device((.., .., .., half..), stream)?;
+        concatenate_axis(
+            &[second.multiply(Array::from_f32(-1.0), stream)?, first],
+            -1,
+            stream,
+        )
+    };
+    let queries = queries
+        .multiply(&cos, stream)?
+        .add(rotate_half(&queries)?.multiply(&sin, stream)?, stream)?;
+    let mut keys = keys
+        .multiply(&cos, stream)?
+        .add(rotate_half(&keys)?.multiply(&sin, stream)?, stream)?;
+    if let Some(cache) = cache.as_mut() {
+        (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+    }
+    Ok((queries, keys, values))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Runs scaled dot-product attention and reshapes the output back to hidden states.
 pub fn finish_attention<C>(

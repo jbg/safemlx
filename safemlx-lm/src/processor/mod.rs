@@ -321,7 +321,7 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
             ModelProcessor::load_gemma4(model_dir)
         }
-        "qwen3_5_moe" | "qwen3_5_moe_text" => {
+        "qwen3_vl" | "qwen3_vl_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
             #[cfg(feature = "image-processing")]
             {
                 ModelProcessor::load_qwen(model_dir)

@@ -29,9 +29,10 @@ use crate::{
     inspection::ActivationObserver,
     models::{
         common::{
-            self, apply_rope_and_update_cache, attention_probabilities, batch_seq,
-            finish_attention, project_logits_maybe_quantized, reshape_attention_projection, silu,
-            AttentionInput, CausalLm, SwiGluMlp, TopKRouterScoreFunction,
+            self, apply_rope_and_update_cache, apply_rotary_embeddings_and_update_cache,
+            attention_probabilities, batch_seq, finish_attention, project_logits_maybe_quantized,
+            reshape_attention_projection, silu, AttentionInput, CausalLm, SwiGluMlp,
+            TopKRouterScoreFunction,
         },
         input,
     },
@@ -314,6 +315,54 @@ impl Attention {
         let output = self.o_proj.forward(&output, stream)?;
         observer.observe(&format!("{prefix}.o_proj"), &output)?;
         Ok(output)
+    }
+
+    pub(crate) fn forward_with_rotary_embeddings<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, mut cache } = input;
+        let (batch, seq_len) = batch_seq(x);
+        let queries = self.q_norm.forward(
+            &reshape_attention_projection(
+                self.q_proj.forward(x, stream)?,
+                batch,
+                seq_len,
+                self.n_heads,
+                stream,
+            )?,
+            stream,
+        )?;
+        let keys = self.k_norm.forward(
+            &reshape_attention_projection(
+                self.k_proj.forward(x, stream)?,
+                batch,
+                seq_len,
+                self.n_kv_heads,
+                stream,
+            )?,
+            stream,
+        )?;
+        let values = reshape_attention_projection(
+            self.v_proj.forward(x, stream)?,
+            batch,
+            seq_len,
+            self.n_kv_heads,
+            stream,
+        )?;
+        let (queries, keys, values) = apply_rotary_embeddings_and_update_cache(
+            queries, keys, values, cos, sin, &mut cache, stream,
+        )?;
+        let output = finish_attention(
+            queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+        )?;
+        self.o_proj.forward(&output, stream)
     }
 }
 
@@ -829,6 +878,41 @@ impl TransformerBlock {
             &output,
         )?;
         Ok(output)
+    }
+
+    pub(crate) fn forward_with_rotary_embeddings<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, cache } = input;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let attention = self.self_attn.forward_with_rotary_embeddings(
+            AttentionInput {
+                x: &normed,
+                mask,
+                cache,
+            },
+            cos,
+            sin,
+            stream,
+        )?;
+        let hidden = x.add(attention, stream)?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = if let Some(moe) = &mut self.moe {
+            moe.forward(&normed, stream)?
+        } else {
+            self.mlp
+                .as_mut()
+                .expect("dense Qwen3 MLP")
+                .forward(&normed, stream)?
+        };
+        hidden.add(mlp, stream)
     }
 }
 
