@@ -2783,11 +2783,14 @@ fn gemma4_args_from_gguf(
                 )
             })?
             .unwrap_or(0);
-    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
-        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
             Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
         })?,
-        Some(_) => {
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
@@ -3041,31 +3044,12 @@ fn gguf_i64_values(
 fn gguf_optional_i64_values(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<Vec<i64>>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() > 0 => {
-            let value = value.as_dtype(Dtype::Int64, stream)?;
-            if value.size() == 1 {
-                return Ok(Some(vec![value.try_item::<i64>(stream)?]));
-            }
-            let value = value.flatten(None, None, stream)?;
-            let mut values = Vec::with_capacity(value.size());
-            for index in 0..value.size() {
-                values.push(
-                    value
-                        .try_index_device(index as i32, stream)?
-                        .try_item::<i64>(stream)?,
-                );
-            }
-            Ok(Some(values))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must not be empty"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.to_i64_vec().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }
@@ -3083,18 +3067,14 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<f32>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_f32().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {key:?} must be a numeric scalar"
+            ))
+        }),
         None => Ok(None),
     }
 }
@@ -3838,59 +3818,62 @@ mod tests {
         let metadata = HashMap::from([
             (
                 "gemma4.embedding_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1536u32], &[1])),
+                GgufMetadataValue::Uint32(1536),
             ),
-            (
-                "gemma4.block_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[2u32], &[1])),
-            ),
+            ("gemma4.block_count".into(), GgufMetadataValue::Uint32(2)),
             (
                 "gemma4.feed_forward_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[6144u32, 12288], &[2])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![
+                    6144, 12288,
+                ])),
             ),
             (
                 "gemma4.attention.head_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[8u32], &[1])),
+                GgufMetadataValue::Uint32(8),
             ),
             (
                 "gemma4.attention.head_count_kv".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32, 2], &[2])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 2])),
             ),
             (
                 "gemma4.attention.key_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[512u32], &[1])),
+                GgufMetadataValue::Uint32(512),
             ),
             (
                 "gemma4.attention.key_length_swa".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[256u32], &[1])),
+                GgufMetadataValue::Uint32(256),
             ),
             (
                 "gemma4.attention.sliding_window_pattern".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32, 0], &[2])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 0])),
             ),
             (
                 "gemma4.attention.shared_kv_layers".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+                GgufMetadataValue::Uint32(1),
             ),
             (
                 "gemma4.attention.layer_norm_rms_epsilon".into(),
-                GgufMetadataValue::Array(Array::from(1e-6f32)),
+                GgufMetadataValue::Float32(1e-6),
             ),
             (
                 "gemma4.context_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[131072u32], &[1])),
+                GgufMetadataValue::Uint32(131072),
             ),
             (
                 "gemma4.rope.freq_base".into(),
-                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+                GgufMetadataValue::Float32(1_000_000.0),
             ),
             (
                 "gemma4.rope.freq_base_swa".into(),
-                GgufMetadataValue::Array(Array::from(10_000f32)),
+                GgufMetadataValue::Float32(10_000.0),
             ),
             (
                 "tokenizer.ggml.tokens".into(),
-                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
             ),
         ]);
 

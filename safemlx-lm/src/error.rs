@@ -35,6 +35,10 @@ pub enum Error {
     #[error("media processor error: {0}")]
     Processor(String),
 
+    /// Embedded GGUF tokenizer metadata is invalid or cannot be reconstructed.
+    #[error("GGUF tokenizer error: {0}")]
+    GgufTokenizer(String),
+
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]
     StrictLoadValidation {

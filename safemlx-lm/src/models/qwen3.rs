@@ -1275,11 +1275,14 @@ fn qwen3_args_from_gguf(
             Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
         })?
         .unwrap_or(hidden_size / num_attention_heads);
-    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
-        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
             Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
         })?,
-        Some(_) => {
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
@@ -1556,18 +1559,12 @@ fn gguf_i64(
 fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<i64>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_i64().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }
@@ -1585,18 +1582,12 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<f32>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_f32().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }
@@ -1869,43 +1860,44 @@ mod tests {
         let metadata = HashMap::from([
             (
                 "qwen3.embedding_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1024u32], &[1])),
+                GgufMetadataValue::Uint32(1024),
             ),
-            (
-                "qwen3.block_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[28u32], &[1])),
-            ),
+            ("qwen3.block_count".into(), GgufMetadataValue::Uint32(28)),
             (
                 "qwen3.feed_forward_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[3072u32], &[1])),
+                GgufMetadataValue::Uint32(3072),
             ),
             (
                 "qwen3.attention.head_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[16u32], &[1])),
+                GgufMetadataValue::Uint32(16),
             ),
             (
                 "qwen3.attention.head_count_kv".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[8u32], &[1])),
+                GgufMetadataValue::Uint32(8),
             ),
             (
                 "qwen3.attention.key_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[128u32], &[1])),
+                GgufMetadataValue::Uint32(128),
             ),
             (
                 "qwen3.attention.layer_norm_rms_epsilon".into(),
-                GgufMetadataValue::Array(Array::from(1e-6f32)),
+                GgufMetadataValue::Float32(1e-6),
             ),
             (
                 "qwen3.context_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[40960u32], &[1])),
+                GgufMetadataValue::Uint32(40960),
             ),
             (
                 "qwen3.rope.freq_base".into(),
-                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+                GgufMetadataValue::Float32(1_000_000.0),
             ),
             (
                 "tokenizer.ggml.tokens".into(),
-                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
             ),
         ]);
         let args =
@@ -1952,47 +1944,48 @@ mod tests {
             ),
             (
                 "qwen3.embedding_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[32u32], &[1])),
+                GgufMetadataValue::Uint32(32),
             ),
-            (
-                "qwen3.block_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
-            ),
+            ("qwen3.block_count".into(), GgufMetadataValue::Uint32(1)),
             (
                 "qwen3.feed_forward_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[64u32], &[1])),
+                GgufMetadataValue::Uint32(64),
             ),
             (
                 "qwen3.attention.head_count".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+                GgufMetadataValue::Uint32(1),
             ),
             (
                 "qwen3.attention.head_count_kv".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+                GgufMetadataValue::Uint32(1),
             ),
             (
                 "qwen3.attention.key_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[32u32], &[1])),
+                GgufMetadataValue::Uint32(32),
             ),
             (
                 "qwen3.attention.layer_norm_rms_epsilon".into(),
-                GgufMetadataValue::Array(Array::from(1e-6f32)),
+                GgufMetadataValue::Float32(1e-6),
             ),
             (
                 "qwen3.context_length".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[128u32], &[1])),
+                GgufMetadataValue::Uint32(128),
             ),
             (
                 "qwen3.rope.freq_base".into(),
-                GgufMetadataValue::Array(Array::from(1_000_000f32)),
+                GgufMetadataValue::Float32(1_000_000.0),
             ),
             (
                 "tokenizer.ggml.tokens".into(),
-                GgufMetadataValue::Strings(vec!["token".into(); 32]),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
             ),
             (
                 "tokenizer.ggml.eos_token_id".into(),
-                GgufMetadataValue::Array(Array::from_slice(&[1u32], &[1])),
+                GgufMetadataValue::Uint32(1),
             ),
         ]);
 

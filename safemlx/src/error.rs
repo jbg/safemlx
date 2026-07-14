@@ -35,6 +35,10 @@ pub enum IoError {
     #[error("Unsupported file format")]
     UnsupportedFormat,
 
+    /// Invalid or unsupported GGUF data
+    #[error("invalid GGUF file: {0}")]
+    InvalidGguf(String),
+
     /// Unable to open file
     #[error("Unable to open file")]
     UnableToOpenFile,

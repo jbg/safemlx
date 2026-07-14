@@ -14,6 +14,7 @@ pub mod cache;
 pub mod error;
 /// Gemma 4 multi-token prediction generation helpers.
 pub mod gemma4_mtp;
+mod gguf_tokenizer;
 /// Lightweight activation inspection hooks.
 pub mod inspection;
 // pub mod generate;

@@ -10,7 +10,7 @@ use std::path::Path;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
-    ops::GgufMetadataValue,
+    ops::{GgufMetadata, GgufMetadataValue},
     Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
 use crate::models::common::CausalLm;
 #[cfg(feature = "media-processing")]
@@ -594,7 +595,11 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// Loads a supported model directory or GGUF file with its sidecar tokenizer.
+    /// Loads a supported model directory or GGUF file with its tokenizer.
+    ///
+    /// GGUF tokenizers are reconstructed from embedded metadata. A sibling
+    /// `tokenizer.json` is used only when the embedded tokenizer is absent or
+    /// uses an unsupported tokenizer model.
     pub fn load(
         model_dir: impl AsRef<Path>,
         stream: &Stream,
@@ -622,9 +627,14 @@ impl LoadedModel {
                 model,
                 eos_token_ids,
                 chat_template,
-            } = load_gguf_model_data(model_dir, stream, weights_stream)?;
-            let mut tokenizer = ChatTokenizer::from_tokenizer(load_gguf_tokenizer(sidecar_dir)?);
-            tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(sidecar_dir)?);
+                tokenizer,
+            } = load_gguf_model_data(model_dir, true, stream, weights_stream)?;
+            let GgufTokenizer {
+                tokenizer,
+                template_kwargs,
+            } = tokenizer.expect("GGUF tokenizer requested by the combined loader");
+            let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
+            tokenizer.set_template_kwargs(template_kwargs);
             let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
             return Ok(Self {
                 model,
@@ -959,16 +969,18 @@ struct LoadedGgufModel {
     model: Model,
     eos_token_ids: Vec<u32>,
     chat_template: Option<String>,
+    tokenizer: Option<GgufTokenizer>,
 }
 
 fn load_gguf_model_data(
     gguf_file: &Path,
+    load_tokenizer: bool,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGgufModel, Error> {
     let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
     let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(architecture)) => architecture.as_str(),
+        Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
         Some(_) => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF metadata key \"general.architecture\" has the wrong type".into(),
@@ -989,23 +1001,18 @@ fn load_gguf_model_data(
         }
         None => None,
     };
+    let tokenizer = load_tokenizer
+        .then(|| load_gguf_tokenizer_from_metadata(gguf_file, &metadata))
+        .transpose()?;
 
-    match architecture {
+    let (model, eos_token_ids) = match architecture.as_str() {
         "gemma4" => {
             let loaded = gemma4::load_gemma4_gguf_data(arrays, metadata, stream, weights_stream)?;
-            Ok(LoadedGgufModel {
-                model: Model::Gemma4(loaded.model),
-                eos_token_ids: loaded.eos_token_ids,
-                chat_template,
-            })
+            (Model::Gemma4(loaded.model), loaded.eos_token_ids)
         }
         "llama" => {
             let loaded = llama::load_llama_gguf_data(arrays, metadata, stream, weights_stream)?;
-            Ok(LoadedGgufModel {
-                model: Model::Llama(loaded.model),
-                eos_token_ids: loaded.eos_token_ids,
-                chat_template,
-            })
+            (Model::Llama(loaded.model), loaded.eos_token_ids)
         }
         "nemotron_h" | "nemotron_h_moe" => {
             let loaded = nemotron_h::load_nemotron_h_gguf_data(
@@ -1014,19 +1021,11 @@ fn load_gguf_model_data(
                 stream,
                 weights_stream,
             )?;
-            Ok(LoadedGgufModel {
-                model: Model::NemotronH(loaded.model),
-                eos_token_ids: loaded.eos_token_ids,
-                chat_template,
-            })
+            (Model::NemotronH(loaded.model), loaded.eos_token_ids)
         }
         "qwen3" | "qwen3moe" => {
             let loaded = qwen3::load_qwen3_gguf_data(arrays, metadata, stream, weights_stream)?;
-            Ok(LoadedGgufModel {
-                model: Model::Qwen3(loaded.model),
-                eos_token_ids: loaded.eos_token_ids,
-                chat_template,
-            })
+            (Model::Qwen3(loaded.model), loaded.eos_token_ids)
         }
         "qwen35" | "qwen35moe" => {
             let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_data(
@@ -1035,16 +1034,18 @@ fn load_gguf_model_data(
                 stream,
                 weights_stream,
             )?;
-            Ok(LoadedGgufModel {
-                model: Model::Qwen35Moe(loaded.model),
-                eos_token_ids: loaded.eos_token_ids,
-                chat_template,
-            })
+            (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
         }
-        other => Err(Error::UnsupportedArchitecture(format!(
+        other => return Err(Error::UnsupportedArchitecture(format!(
             "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen35, and qwen35moe"
         ))),
-    }
+    };
+    Ok(LoadedGgufModel {
+        model,
+        eos_token_ids,
+        chat_template,
+        tokenizer,
+    })
 }
 
 /// Loads only the model weights and architecture from a model directory.
@@ -1070,7 +1071,7 @@ pub fn load_model_with_options(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     if is_gguf_file(model_dir) {
-        return Ok(load_gguf_model_data(model_dir, stream, weights_stream)?.model);
+        return Ok(load_gguf_model_data(model_dir, false, stream, weights_stream)?.model);
     }
     let metadata = read_model_metadata(model_dir)?;
     let kind = ModelKind::from_model_type(&effective_model_type(&metadata))?;
@@ -1159,11 +1160,15 @@ fn load_model_for_kind(
     }
 }
 
-/// Loads only the tokenizer from a supported model directory.
+/// Loads only the tokenizer from a supported model directory or GGUF file.
+///
+/// Loading from GGUF parses embedded tokenizer metadata without creating an
+/// MLX stream. A sibling `tokenizer.json` remains a fallback for missing or
+/// unsupported embedded tokenizer formats.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let model_dir = model_dir.as_ref();
     if is_gguf_file(model_dir) {
-        return load_gguf_tokenizer(gguf_sidecar_dir(model_dir));
+        return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
     }
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
@@ -1183,16 +1188,35 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 /// This reads tokenizer/chat-template metadata only and does not load model weights.
 pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, Error> {
     let submitted_path = model_dir.as_ref();
-    let model_dir = if is_gguf_file(submitted_path) {
-        gguf_sidecar_dir(submitted_path)
+    let (template, model_id, tokenizer_template_kwargs) = if is_gguf_file(submitted_path) {
+        let metadata = GgufMetadata::from_file(submitted_path)?;
+        let sidecar_dir = gguf_sidecar_dir(submitted_path);
+        let template = match metadata.get("tokenizer.chat_template") {
+            Some(GgufMetadataValue::String(template)) => Some(template.clone()),
+            Some(_) => {
+                return Err(Error::GgufTokenizer(
+                    "tokenizer.chat_template must be a string".into(),
+                ));
+            }
+            None => load_chat_template(sidecar_dir)?,
+        };
+        let mut template_kwargs = gguf_tokenizer::template_kwargs(&metadata)?;
+        template_kwargs.extend(load_tokenizer_template_kwargs(sidecar_dir)?);
+        (
+            template,
+            submitted_path.display().to_string(),
+            template_kwargs,
+        )
     } else {
-        submitted_path
+        (
+            load_chat_template(submitted_path)?,
+            submitted_path.display().to_string(),
+            load_tokenizer_template_kwargs(submitted_path)?,
+        )
     };
-    let Some(template) = load_chat_template(model_dir)? else {
+    let Some(template) = template else {
         return Ok(Vec::new());
     };
-    let model_id = model_dir.display().to_string();
-    let tokenizer_template_kwargs = load_tokenizer_template_kwargs(model_dir)?;
     Ok(inspect_chat_template_kwargs(&template, &model_id)?
         .into_iter()
         .filter(|name| !tokenizer_template_kwargs.contains_key(name))
@@ -1215,8 +1239,26 @@ fn gguf_sidecar_dir(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
 
-fn load_gguf_tokenizer(sidecar_dir: &Path) -> Result<Tokenizer, Error> {
-    Tokenizer::from_file(sidecar_dir.join("tokenizer.json")).map_err(Into::into)
+fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, Error> {
+    let metadata = GgufMetadata::from_file(gguf_file)?;
+    load_gguf_tokenizer_from_metadata(gguf_file, &metadata)
+}
+
+fn load_gguf_tokenizer_from_metadata(
+    gguf_file: &Path,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+) -> Result<GgufTokenizer, Error> {
+    let sidecar_dir = gguf_sidecar_dir(gguf_file);
+    if let Some(mut embedded) = gguf_tokenizer::from_metadata(metadata)? {
+        embedded
+            .template_kwargs
+            .extend(load_tokenizer_template_kwargs(sidecar_dir)?);
+        return Ok(embedded);
+    }
+    Ok(GgufTokenizer {
+        tokenizer: Tokenizer::from_file(sidecar_dir.join("tokenizer.json"))?,
+        template_kwargs: load_tokenizer_template_kwargs(sidecar_dir)?,
+    })
 }
 
 fn effective_model_type(metadata: &ModelMetadata) -> String {
@@ -1384,6 +1426,62 @@ mod tests {
             .save(dir.join("tokenizer.json"), false)
             .unwrap();
         dir
+    }
+
+    fn append_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn append_gguf_string_value(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        append_gguf_string(bytes, key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        append_gguf_string(bytes, value);
+    }
+
+    fn append_gguf_strings(bytes: &mut Vec<u8>, key: &str, values: &[&str]) {
+        append_gguf_string(bytes, key);
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            append_gguf_string(bytes, value);
+        }
+    }
+
+    #[test]
+    fn loads_tokenizer_directly_from_gguf_metadata() {
+        let dir = temp_model_dir(r#"{"model_type":"qwen3"}"#);
+        fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        let file = dir.join("embedded-tokenizer.gguf");
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&6u64.to_le_bytes());
+        append_gguf_string_value(&mut bytes, "general.architecture", "qwen3");
+        append_gguf_string_value(&mut bytes, "tokenizer.ggml.model", "gpt2");
+        append_gguf_strings(
+            &mut bytes,
+            "tokenizer.ggml.tokens",
+            &["<eos>", "h", "e", "l", "o", "he", "ll", "hell", "hello"],
+        );
+        append_gguf_strings(
+            &mut bytes,
+            "tokenizer.ggml.merges",
+            &["h e", "l l", "he ll", "hell o"],
+        );
+        append_gguf_string(&mut bytes, "tokenizer.ggml.eos_token_id");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        append_gguf_string(&mut bytes, "tokenizer.ggml.add_eos_token");
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.push(1);
+        fs::write(&file, bytes).unwrap();
+
+        let tokenizer = load_tokenizer(&file).unwrap();
+        assert_eq!(tokenizer.encode("hello", true).unwrap().get_ids(), &[8, 0]);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn save_zero_checkpoint<M: ModuleParameters>(

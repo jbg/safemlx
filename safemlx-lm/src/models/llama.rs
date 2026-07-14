@@ -1106,11 +1106,14 @@ fn llama_args_from_gguf(
     let rope_theta = gguf_optional_f32(metadata, "llama.rope.freq_base", stream)?
         .unwrap_or_else(default_rope_theta);
     let rope_scaling = gguf_rope_scaling(metadata, stream)?;
-    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
-        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
             Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
         })?,
-        Some(_) => {
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
@@ -1249,18 +1252,12 @@ fn gguf_i64(
 fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<i64>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_i64().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }
@@ -1278,18 +1275,12 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<f32>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_f32().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }

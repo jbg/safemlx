@@ -1,4 +1,5 @@
 use crate::error::{Exception, IoError};
+use crate::ops::{GgufMetadata, GgufMetadataValue};
 use crate::utils::guard::Guarded;
 use crate::utils::io::{Gguf, SafeTensors};
 use crate::utils::SUCCESS;
@@ -10,17 +11,6 @@ use std::path::{Path, PathBuf};
 const GGUF_SPLIT_NO: &str = "split.no";
 const GGUF_SPLIT_COUNT: &str = "split.count";
 const GGUF_SPLIT_TENSORS_COUNT: &str = "split.tensors.count";
-
-/// A typed metadata value loaded from a GGUF file.
-#[derive(Debug, Clone)]
-pub enum GgufMetadataValue {
-    /// Numeric or boolean scalar/one-dimensional array metadata.
-    Array(Array),
-    /// UTF-8 string metadata.
-    String(String),
-    /// UTF-8 string-array metadata.
-    Strings(Vec<String>),
-}
 
 fn check_file_extension(path: &Path, expected: &str) -> Result<(), IoError> {
     match path.extension().and_then(|ext| ext.to_str()) {
@@ -107,6 +97,9 @@ impl Array {
     /// Canonically named sharded checkpoints are loaded automatically when
     /// `path` points to the first `-00001-of-NNNNN.gguf` shard. Metadata is
     /// returned from that first shard.
+    ///
+    /// Use [`GgufMetadata::from_file`] when only metadata is needed; that API
+    /// parses on the host and does not require an MLX stream.
     #[allow(clippy::type_complexity)]
     pub fn load_gguf_with_metadata(
         path: impl AsRef<Path>,
@@ -239,15 +232,16 @@ fn load_gguf_shards(
     stream: &Stream,
     with_metadata: bool,
 ) -> Result<GgufData, IoError> {
+    let first_metadata = GgufMetadata::from_file(path)?;
     let first = Gguf::load_device(path, stream)?;
-    let split_count = gguf_split_value(&first, GGUF_SPLIT_COUNT, stream)?.unwrap_or(0);
+    let split_count = gguf_split_value(&first_metadata, GGUF_SPLIT_COUNT)?.unwrap_or(0);
     if split_count <= 1 {
         let data = first.data()?;
-        let metadata = with_metadata.then(|| first.metadata()).transpose()?;
+        let metadata = with_metadata.then(|| first_metadata.into_inner());
         return Ok((data, metadata));
     }
 
-    let split_no = required_gguf_split_value(&first, GGUF_SPLIT_NO, path, stream)?;
+    let split_no = required_gguf_split_value(&first_metadata, GGUF_SPLIT_NO, path)?;
     if split_no != 0 {
         return Err(invalid_gguf_shards(format!(
             "sharded GGUF must be loaded from its first shard, but {:?} has {GGUF_SPLIT_NO}={split_no}",
@@ -255,11 +249,10 @@ fn load_gguf_shards(
         )));
     }
     let expected_tensors =
-        required_gguf_split_value(&first, GGUF_SPLIT_TENSORS_COUNT, path, stream)?;
+        required_gguf_split_value(&first_metadata, GGUF_SPLIT_TENSORS_COUNT, path)?;
     let shard_paths = gguf_shard_paths(path, split_count)?;
 
     let mut data = first.data()?;
-    let metadata = with_metadata.then(|| first.metadata()).transpose()?;
     for (split_no, shard_path) in shard_paths.into_iter().enumerate().skip(1) {
         if !shard_path.is_file() {
             return Err(invalid_gguf_shards(format!(
@@ -267,16 +260,17 @@ fn load_gguf_shards(
                 shard_path.display()
             )));
         }
+        let shard_metadata = GgufMetadata::from_file(&shard_path)?;
         let shard = Gguf::load_device(&shard_path, stream)?;
         let actual_split_no =
-            required_gguf_split_value(&shard, GGUF_SPLIT_NO, &shard_path, stream)?;
+            required_gguf_split_value(&shard_metadata, GGUF_SPLIT_NO, &shard_path)?;
         if actual_split_no != split_no {
             return Err(invalid_gguf_shards(format!(
                 "GGUF shard {:?} has {GGUF_SPLIT_NO}={actual_split_no}, expected {split_no}",
                 shard_path.display()
             )));
         }
-        if let Some(actual_count) = gguf_split_value(&shard, GGUF_SPLIT_COUNT, stream)? {
+        if let Some(actual_count) = gguf_split_value(&shard_metadata, GGUF_SPLIT_COUNT)? {
             if actual_count != split_count {
                 return Err(invalid_gguf_shards(format!(
                     "GGUF shard {:?} has {GGUF_SPLIT_COUNT}={actual_count}, expected {split_count}",
@@ -300,6 +294,7 @@ fn load_gguf_shards(
         )));
     }
 
+    let metadata = with_metadata.then(|| first_metadata.into_inner());
     Ok((data, metadata))
 }
 
@@ -325,33 +320,28 @@ fn gguf_tensor_count(data: &HashMap<String, Array>) -> usize {
         .count()
 }
 
-fn gguf_split_value(gguf: &Gguf, key: &str, stream: &Stream) -> Result<Option<usize>, IoError> {
-    match gguf.metadata_value(key)? {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            let value = value.try_item::<i64>(stream)?;
-            usize::try_from(value).map(Some).map_err(|_| {
-                invalid_gguf_shards(format!(
-                    "GGUF metadata key {key:?} must be a non-negative integer"
-                ))
-            })
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(invalid_gguf_shards(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(invalid_gguf_shards(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
-        None => Ok(None),
-    }
+fn gguf_split_value(metadata: &GgufMetadata, key: &str) -> Result<Option<usize>, IoError> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    invalid_gguf_shards(format!(
+                        "GGUF metadata key {key:?} must be a non-negative integer scalar"
+                    ))
+                })
+        })
+        .transpose()
 }
 
 fn required_gguf_split_value(
-    gguf: &Gguf,
+    metadata: &GgufMetadata,
     key: &str,
     path: &Path,
-    stream: &Stream,
 ) -> Result<usize, IoError> {
-    gguf_split_value(gguf, key, stream)?.ok_or_else(|| {
+    gguf_split_value(metadata, key)?.ok_or_else(|| {
         invalid_gguf_shards(format!(
             "GGUF shard {:?} is missing required metadata key {key:?}",
             path.display()
@@ -616,9 +606,7 @@ mod tests {
         assert_eq!(arrays["tensor"].shape(), &[2, 2]);
         assert!(arrays["tensor"].clone().try_item::<f32>(&stream).is_err());
         match &metadata["answer"] {
-            GgufMetadataValue::Array(value) => {
-                assert_eq!(value.clone().item::<i32>(&stream), 42)
-            }
+            GgufMetadataValue::Int32(value) => assert_eq!(*value, 42),
             value => panic!("unexpected answer metadata: {value:?}"),
         }
         match &metadata["general.name"] {
@@ -626,7 +614,9 @@ mod tests {
             value => panic!("unexpected name metadata: {value:?}"),
         }
         match &metadata["general.tags"] {
-            GgufMetadataValue::Strings(value) => assert_eq!(value, &["one", "two"]),
+            GgufMetadataValue::Array(value) => {
+                assert_eq!(value.as_strings().unwrap(), &["one", "two"])
+            }
             value => panic!("unexpected tags metadata: {value:?}"),
         }
     }

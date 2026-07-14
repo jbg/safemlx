@@ -2019,11 +2019,14 @@ fn nemotron_h_args_from_gguf(
         .map_err(|_| Error::UnsupportedArchitecture("Nemotron-H head size exceeds i32".into()))?
         .unwrap_or(hidden_size / num_attention_heads);
     let norm_eps = gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?;
-    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
-        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
             Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
         })?,
-        Some(_) => {
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
@@ -2405,31 +2408,12 @@ fn gguf_i64_values(
 fn gguf_optional_i64_values(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<Vec<i64>>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() > 0 => {
-            let value = value.as_dtype(Dtype::Int64, stream)?;
-            if value.size() == 1 {
-                return Ok(Some(vec![value.try_item::<i64>(stream)?]));
-            }
-            let value = value.flatten(None, None, stream)?;
-            let mut values = Vec::with_capacity(value.size());
-            for index in 0..value.size() {
-                values.push(
-                    value
-                        .try_index_device(index as i32, stream)?
-                        .try_item::<i64>(stream)?,
-                );
-            }
-            Ok(Some(values))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must not be empty"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.to_i64_vec().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
+        }),
         None => Ok(None),
     }
 }
@@ -2447,18 +2431,14 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<f32>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_f32().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {key:?} must be a numeric scalar"
+            ))
+        }),
         None => Ok(None),
     }
 }

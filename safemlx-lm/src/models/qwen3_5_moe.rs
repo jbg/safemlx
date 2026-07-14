@@ -4607,11 +4607,14 @@ fn qwen35_args_from_gguf(
             "Qwen3.5 full attention interval must be positive".into(),
         ));
     }
-    let vocab_size = match metadata.get("tokenizer.ggml.tokens") {
-        Some(GgufMetadataValue::Strings(tokens)) => i32::try_from(tokens.len()).map_err(|_| {
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
             Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
         })?,
-        Some(_) => {
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
@@ -5041,21 +5044,14 @@ fn qwen35_gguf_i64(
 fn qwen35_gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => Ok(Some(
-            value
-                .clone()
-                .as_dtype(Dtype::Int64, stream)?
-                .try_item::<i64>(stream)?,
-        )),
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_i64().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {key:?} must be an integer scalar"
+            ))
+        }),
         None => Ok(None),
     }
 }
@@ -5073,18 +5069,14 @@ fn qwen35_gguf_f32(
 fn qwen35_gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
-        Some(GgufMetadataValue::Array(value)) if value.size() == 1 => {
-            Ok(Some(value.clone().try_item::<f32>(stream)?))
-        }
-        Some(GgufMetadataValue::Array(_)) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} must be scalar"
-        ))),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
+        Some(value) => value.as_f32().map(Some).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {key:?} must be a numeric scalar"
+            ))
+        }),
         None => Ok(None),
     }
 }

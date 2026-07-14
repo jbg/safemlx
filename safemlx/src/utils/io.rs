@@ -1,5 +1,4 @@
 use crate::error::{Exception, IoError};
-use crate::ops::GgufMetadataValue;
 use crate::utils::SUCCESS;
 use crate::{Array, DeviceType, Stream};
 use std::collections::HashMap;
@@ -8,8 +7,6 @@ use std::path::Path;
 use std::ptr::null_mut;
 
 use super::Guarded;
-
-const GGUF_KEY_NOT_FOUND: i32 = 2;
 
 pub(crate) struct Gguf {
     pub(crate) inner: safemlx_sys::mlx_io_gguf,
@@ -54,7 +51,7 @@ impl Gguf {
     }
 
     pub(crate) fn data(&self) -> Result<HashMap<String, Array>, Exception> {
-        let keys = self.keys(false)?;
+        let keys = self.keys()?;
         let mut data = HashMap::with_capacity(keys.len());
         for key in keys {
             let c_key =
@@ -67,98 +64,10 @@ impl Gguf {
         Ok(data)
     }
 
-    pub(crate) fn metadata(&self) -> Result<HashMap<String, GgufMetadataValue>, Exception> {
-        let keys = self.keys(true)?;
-        let mut metadata = HashMap::with_capacity(keys.len());
-        for key in keys {
-            let value = self.metadata_value(&key)?.ok_or_else(|| {
-                Exception::custom(format!(
-                    "GGUF metadata key {key:?} has an unsupported value type"
-                ))
-            })?;
-            metadata.insert(key, value);
-        }
-        Ok(metadata)
-    }
-
-    pub(crate) fn metadata_value(&self, key: &str) -> Result<Option<GgufMetadataValue>, Exception> {
-        let c_key = CString::new(key).map_err(|error| Exception::custom(error.to_string()))?;
-        let mut is_array = false;
-        let status = unsafe {
-            safemlx_sys::mlx_io_gguf_has_metadata_array(&mut is_array, self.inner, c_key.as_ptr())
-        };
-        if status == GGUF_KEY_NOT_FOUND {
-            return Ok(None);
-        }
-        check_status(status)?;
-        if is_array {
-            let value = Array::try_from_op(|res| unsafe {
-                safemlx_sys::mlx_io_gguf_get_metadata_array(res, self.inner, c_key.as_ptr())
-            })?;
-            return Ok(Some(GgufMetadataValue::Array(value)));
-        }
-
-        let mut is_string = false;
-        check_status(unsafe {
-            safemlx_sys::mlx_io_gguf_has_metadata_string(&mut is_string, self.inner, c_key.as_ptr())
-        })?;
-        if is_string {
-            let value = unsafe {
-                let mut value = safemlx_sys::mlx_string_new();
-                let status = safemlx_sys::mlx_io_gguf_get_metadata_string(
-                    &mut value,
-                    self.inner,
-                    c_key.as_ptr(),
-                );
-                if let Err(error) = check_status(status) {
-                    safemlx_sys::mlx_string_free(value);
-                    return Err(error);
-                }
-                let value_str = CStr::from_ptr(safemlx_sys::mlx_string_data(value))
-                    .to_string_lossy()
-                    .into_owned();
-                safemlx_sys::mlx_string_free(value);
-                value_str
-            };
-            return Ok(Some(GgufMetadataValue::String(value)));
-        }
-
-        let mut is_vector_string = false;
-        check_status(unsafe {
-            safemlx_sys::mlx_io_gguf_has_metadata_vector_string(
-                &mut is_vector_string,
-                self.inner,
-                c_key.as_ptr(),
-            )
-        })?;
-        if is_vector_string {
-            let values = unsafe {
-                let mut values = safemlx_sys::mlx_vector_string_new();
-                let status = safemlx_sys::mlx_io_gguf_get_metadata_vector_string(
-                    &mut values,
-                    self.inner,
-                    c_key.as_ptr(),
-                );
-                if let Err(error) = check_status(status) {
-                    safemlx_sys::mlx_vector_string_free(values);
-                    return Err(error);
-                }
-                vector_strings(values)?
-            };
-            return Ok(Some(GgufMetadataValue::Strings(values)));
-        }
-
-        Ok(None)
-    }
-
-    fn keys(&self, metadata: bool) -> Result<Vec<String>, Exception> {
+    fn keys(&self) -> Result<Vec<String>, Exception> {
         unsafe {
             let mut keys = safemlx_sys::mlx_vector_string_new();
-            let status = if metadata {
-                safemlx_sys::mlx_io_gguf_get_metadata_keys(&mut keys, self.inner)
-            } else {
-                safemlx_sys::mlx_io_gguf_get_keys(&mut keys, self.inner)
-            };
+            let status = safemlx_sys::mlx_io_gguf_get_keys(&mut keys, self.inner);
             if let Err(error) = check_status(status) {
                 safemlx_sys::mlx_vector_string_free(keys);
                 return Err(error);
