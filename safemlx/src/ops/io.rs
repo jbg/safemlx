@@ -738,7 +738,10 @@ mod tests {
         save_gguf_shard(&second, "weight", 2.0, 1, 2, 2, "second", &stream);
 
         let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
-        assert!(error.contains("tensor \"weight\" is duplicated"), "{error}");
+        assert!(
+            error.contains("is duplicated across GGUF shards"),
+            "{error}"
+        );
     }
 
     #[test]
