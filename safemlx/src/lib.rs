@@ -261,8 +261,10 @@
 //! documentation](https://ml-explore.github.io/mlx/build/html/usage/saving_and_loading.html)
 //!
 //! `safemlx` supports loading from `.npy`, `.safetensors`, and `.gguf` files and
-//! saving to `.safetensors` files. Module parameters and optimizer states can
-//! also be saved and loaded from `.safetensors` files.
+//! saving to `.safetensors` files. Canonically named sharded GGUF checkpoints
+//! are loaded by passing their first `-00001-of-NNNNN.gguf` shard. Module
+//! parameters and optimizer states can also be saved and loaded from
+//! `.safetensors` files.
 //!
 //! | type | load function | save function |
 //! |------|---------------|----------------|

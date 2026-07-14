@@ -18,7 +18,11 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 The standard `models::load_model` and `models::LoadedModel::load` entry points
 accept Hugging Face-style model directories for Gemma 4, Llama, dense Mistral,
 dense and sparse-MoE Nemotron-H, Qwen3, and Qwen3.5 MoE. They also accept the
-GGUF architectures listed below. Put `tokenizer.json` next to a GGUF file when using `LoadedModel` or
+GGUF architectures listed below. Canonically named sharded GGUF checkpoints
+are supported by passing the first
+`-00001-of-NNNNN.gguf` shard; the remaining shards are discovered and
+validated automatically. Put `tokenizer.json` next to a GGUF file when using
+`LoadedModel` or
 `load_tokenizer`; adjacent
 `tokenizer_config.json` and `chat_template.jinja` files are used when present.
 
@@ -26,7 +30,7 @@ GGUF architectures listed below. Put `tokenizer.json` next to a GGUF file when u
 use safemlx_lm::models::LoadedModel;
 
 let model = LoadedModel::load(
-    "/path/to/model.gguf",
+    "/path/to/model-00001-of-00004.gguf",
     execution_stream,
     cpu_weights_stream,
 )?;

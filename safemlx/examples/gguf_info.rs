@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .map(PathBuf::from)
         .ok_or(
-            "usage: cargo run -p safemlx --example gguf_info -- <model.gguf> [max-tensors] [sample-tensor]",
+            "usage: cargo run -p safemlx --example gguf_info -- <model-or-first-shard.gguf> [max-tensors] [sample-tensor]",
         )?;
     let max_tensors = args
         .next()
