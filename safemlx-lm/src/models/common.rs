@@ -281,6 +281,20 @@ pub struct TopKRouterOutput {
     pub weights: Array,
 }
 
+/// Selects the largest router logits and normalizes only the selected values.
+/// This matches routers such as GPT-OSS where the softmax is applied after
+/// top-k selection rather than across every expert.
+pub fn top_k_softmax_routing(
+    logits: &Array,
+    top_k: i32,
+    stream: &Stream,
+) -> Result<(Array, Array), Exception> {
+    let indices =
+        argpartition_axis(logits, -top_k, -1, stream)?.try_index_device((.., -top_k..), stream)?;
+    let selected = take_along_axis(logits, &indices, -1, stream)?;
+    Ok((indices, softmax_axis(&selected, -1, true, stream)?))
+}
+
 impl TopKRouter {
     /// Creates an unloaded router.
     pub fn new(config: TopKRouterConfig, stream: &Stream) -> Result<Self, Exception> {

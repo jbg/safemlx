@@ -42,6 +42,8 @@ pub mod gemma4_assistant;
 mod gemma4_audio;
 mod gemma4_multimodal;
 mod gemma4_vision;
+/// OpenAI GPT-OSS sparse decoder architecture.
+pub mod gpt_oss;
 /// Typed runtime input support.
 pub mod input;
 /// Llama decoder-only model support.
@@ -104,6 +106,8 @@ impl TokenIdOrIds {
 pub enum ModelKind {
     /// Gemma 4 text architecture.
     Gemma4,
+    /// OpenAI GPT-OSS MXFP4 sparse decoder architecture.
+    GptOss,
     /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
     /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
@@ -142,6 +146,7 @@ impl ModelKind {
     fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
+            "gpt_oss" => Ok(Self::GptOss),
             "llama" | "mistral" => Ok(Self::Llama),
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
@@ -249,6 +254,7 @@ pub fn check_model_dir(model_dir: impl AsRef<Path>) -> ModelConfigSupport {
 fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     match kind {
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
+        ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Llama => llama::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
@@ -267,6 +273,8 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
 pub enum Model {
     /// Gemma 4 text model.
     Gemma4(gemma4::Model),
+    /// OpenAI GPT-OSS model.
+    GptOss(gpt_oss::Model),
     /// Llama-compatible dense model.
     Llama(llama::Model),
     /// Nemotron-H hybrid model.
@@ -284,6 +292,7 @@ impl Model {
     pub fn model_type(&self) -> &str {
         match self {
             Self::Gemma4(model) => model.model_type(),
+            Self::GptOss(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
             Self::NemotronH(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
@@ -361,6 +370,9 @@ impl Model {
             )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
+            )),
+            (Self::GptOss(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for gpt_oss yet",
             )),
             _ => Err(Exception::custom(
                 "model cache type does not match model kind",
@@ -444,6 +456,7 @@ impl Model {
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
+            Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
             Self::Llama(model) => match model.sliding_window() {
                 Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
                 None => ModelCache::KeyValue(Vec::new()),
@@ -464,6 +477,9 @@ impl Model {
     ) -> Result<Array, Exception> {
         match (self, cache) {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
@@ -521,6 +537,11 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
+                ModelGenerate::GptOss(gpt_oss::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
@@ -557,6 +578,8 @@ impl Model {
 pub enum ModelCache {
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
+    /// Alternating full/sliding GPT-OSS cache.
+    GptOss(gpt_oss::Cache),
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3-VL key/value cache and multimodal position state.
@@ -576,6 +599,8 @@ where
 {
     /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, S>),
+    /// GPT-OSS generation iterator.
+    GptOss(gpt_oss::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
@@ -599,6 +624,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Gemma4(generate) => generate.next(),
+            Self::GptOss(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::LlamaSliding(generate) => generate.next(),
             Self::NemotronH(generate) => generate.next(),
@@ -1143,6 +1169,9 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
+            ModelKind::GptOss => Err(Error::Quantization(
+                "GPT-OSS routed experts are already checkpoint-native MXFP4; additional affine on-load quantization is not supported".into(),
+            )),
             ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model_quantized(
                 model_dir,
                 quantization,
@@ -1182,6 +1211,11 @@ fn load_model_for_kind(
 
     match kind {
         ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
+        ModelKind::GptOss => Ok(Model::GptOss(gpt_oss::load_model(
             model_dir,
             stream,
             weights_stream,
@@ -1230,6 +1264,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
+        ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
@@ -2045,6 +2080,43 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 kind: super::ModelKind::Llama,
                 model_type: "mistral".to_string(),
                 effective_model_type: "mistral".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_gpt_oss() {
+        let support = check_model_config(&json!({
+            "model_type": "gpt_oss",
+            "hidden_size": 2880,
+            "intermediate_size": 2880,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "vocab_size": 201088,
+            "num_local_experts": 32,
+            "num_experts_per_tok": 4,
+            "rms_norm_eps": 1e-5,
+            "sliding_window": 128,
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 32.0,
+                "original_max_position_embeddings": 4096,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "truncate": false
+            },
+            "quantization_config": {"quant_method": "mxfp4"}
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::GptOss,
+                model_type: "gpt_oss".to_string(),
+                effective_model_type: "gpt_oss".to_string(),
             })
         );
     }

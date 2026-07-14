@@ -16,7 +16,7 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 ## GGUF models
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points
-accept Hugging Face-style model directories for Gemma 4, Llama, dense Mistral,
+accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Llama, dense Mistral,
 dense and sparse-MoE Nemotron-H, Qwen3, Qwen3-VL, and dense or MoE Qwen3.5. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
 are supported by passing the first
@@ -102,6 +102,7 @@ checkpoint metadata is an error.
 | Qwen3-VL | yes | MLX affine | yes | `LoadedModel` (dense/affine) | Reuses the Qwen3 decoder and shared Qwen vision tower; the language model uses affine storage while the vision tower remains dense; supports interleaved 3-D RoPE, DeepStack visual injection, images, and timestamped video chunks |
 | Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
 | Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
+| GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 | capability error | `LoadedModel` | Loads native combined expert block/scale/bias tensors without key rewrites; routed experts use MXFP4 `gather_qmm`, alternating bounded/full KV caches, attention sinks, and YaRN RoPE |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
 | Qwen3.5/3.6-MoE | yes | block FP8 | yes, from dense checkpoints | `LoadedModel` (dense/FP8/affine) | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints cannot be requantized to affine on load |
 | Moshi | yes | MLX affine | yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |

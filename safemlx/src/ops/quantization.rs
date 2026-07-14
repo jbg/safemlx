@@ -12,6 +12,24 @@ const DEFAULT_MODE: &CStr = c"affine";
 const DEFAULT_GROUP_SIZE: i32 = 64;
 const DEFAULT_BITS: i32 = 4;
 
+/// Quantized matrix-multiplication weight encoding.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum QuantizationMode {
+    /// Per-group scale and bias used by MLX's general-purpose quantizer.
+    Affine,
+    /// Microscaling FP4 with one E8M0 scale for every 32 values.
+    MxFp4,
+}
+
+impl QuantizationMode {
+    fn as_c_str(self) -> &'static CStr {
+        match self {
+            Self::Affine => c"affine",
+            Self::MxFp4 => c"mxfp4",
+        }
+    }
+}
+
 /// Returns the number of `u32` values used to store one packed quantized row.
 ///
 /// MLX packs power-of-two widths directly and packs 3-, 5-, and 6-bit values
@@ -201,17 +219,48 @@ pub fn gather_qmm<'b, 'lhs, 'rhs>(
     let bits = optional_int(bits.into(), DEFAULT_BITS);
     let sorted = sorted_indices.into().unwrap_or(false);
 
+    gather_qmm_with_mode(
+        x,
+        w,
+        scales,
+        biases.into(),
+        lhs_indices.into(),
+        rhs_indices.into(),
+        transpose,
+        group_size.value,
+        bits.value,
+        sorted,
+        QuantizationMode::Affine,
+        stream.as_ref(),
+    )
+}
+
+/// Performs a gathered quantized matrix multiplication using an explicit
+/// weight encoding. This is the common primitive for affine routed experts and
+/// checkpoint-native MXFP4 routed experts.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm_with_mode(
+    x: impl AsRef<Array>,
+    w: impl AsRef<Array>,
+    scales: impl AsRef<Array>,
+    biases: Option<&Array>,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+    sorted_indices: bool,
+    mode: QuantizationMode,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
     unsafe {
         let biases_ptr = biases
-            .into()
             .map(|a| a.as_ptr())
             .unwrap_or(safemlx_sys::mlx_array_new());
         let lhs_ptr = lhs_indices
-            .into()
             .map(|i| i.as_ptr())
             .unwrap_or(safemlx_sys::mlx_array_new());
         let rhs_ptr = rhs_indices
-            .into()
             .map(|i| i.as_ptr())
             .unwrap_or(safemlx_sys::mlx_array_new());
 
@@ -225,10 +274,10 @@ pub fn gather_qmm<'b, 'lhs, 'rhs>(
                 lhs_ptr,
                 rhs_ptr,
                 transpose,
-                group_size,
-                bits,
-                DEFAULT_MODE.as_ptr(),
-                sorted,
+                optional_int(Some(group_size), DEFAULT_GROUP_SIZE),
+                optional_int(Some(bits), DEFAULT_BITS),
+                mode.as_c_str().as_ptr(),
+                sorted_indices,
                 stream.as_ref().as_ptr(),
             )
         })
@@ -468,5 +517,35 @@ mod tests {
                 .item::<bool>(&stream),
             "gather_qmm test case 2 failed"
         );
+    }
+
+    #[test]
+    fn test_gather_qmm_mxfp4_mode() {
+        use crate::ops::{gather_qmm_with_mode, QuantizationMode};
+
+        let stream = crate::test_stream();
+        let x = Array::ones::<f32>(&[1, 1, 32], stream).unwrap();
+        // Four u32 values pack 32 FP4 nibbles. Code zero represents 0.0;
+        // E8M0 scale 127 represents 2^0.
+        let weights = Array::zeros::<u32>(&[1, 1, 4], stream).unwrap();
+        let scales = Array::from_slice(&[127u8], &[1, 1, 1]);
+        let indices = Array::from_slice(&[0u32], &[1]);
+        let output = gather_qmm_with_mode(
+            &x,
+            &weights,
+            &scales,
+            None,
+            Some(&indices),
+            Some(&indices),
+            true,
+            32,
+            4,
+            true,
+            QuantizationMode::MxFp4,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(output.shape(), &[1, 1, 1]);
+        assert_eq!(output.item::<f32>(&stream), 0.0);
     }
 }

@@ -44,6 +44,7 @@ impl Gemma4VisionConfig {
             .and_then(|value| match value {
                 FloatOrString::Float(value) => Some(*value),
                 FloatOrString::String(value) => value.parse().ok(),
+                FloatOrString::Bool(_) => None,
             })
             .unwrap_or(100.0)
     }

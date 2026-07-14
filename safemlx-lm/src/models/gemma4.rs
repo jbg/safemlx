@@ -475,6 +475,7 @@ impl ModelArgs {
             .and_then(|value| match value {
                 FloatOrString::Float(v) => Some(*v),
                 FloatOrString::String(s) => s.parse().ok(),
+                FloatOrString::Bool(_) => None,
             })
             .unwrap_or(self.rope_theta)
     }
@@ -509,6 +510,7 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
         .and_then(|value| match value {
             FloatOrString::Float(v) => Some(*v),
             FloatOrString::String(s) => s.parse().ok(),
+            FloatOrString::Bool(_) => None,
         })
         .unwrap_or(1.0);
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)

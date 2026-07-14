@@ -24,6 +24,8 @@ pub enum FloatOrStr<'a> {
     Float(f32),
     /// Borrowed string value.
     Str(&'a str),
+    /// Boolean option used by scaling schemes such as YaRN `truncate`.
+    Bool(bool),
 }
 
 // TODO: check if additional serde attributes are needed
@@ -35,6 +37,8 @@ pub enum FloatOrString {
     Float(f32),
     /// String value, used by config fields such as `rope_type`.
     String(String),
+    /// Boolean scaling option.
+    Bool(bool),
 }
 
 impl FloatOrString {
@@ -43,6 +47,7 @@ impl FloatOrString {
         match self {
             FloatOrString::Float(f) => FloatOrStr::Float(*f),
             FloatOrString::String(s) => FloatOrStr::Str(s),
+            FloatOrString::Bool(value) => FloatOrStr::Bool(*value),
         }
     }
 }
@@ -66,6 +71,7 @@ fn get_numeric_from_config(
         FloatOrStr::Str(s) => s
             .parse::<f32>()
             .map_err(|_| Exception::custom(format!(r#"key "{key}" is not a valid number"#))),
+        FloatOrStr::Bool(_) => Err(Exception::custom(format!(r#"key "{key}" is not numeric"#))),
     }
 }
 
@@ -230,6 +236,124 @@ pub struct ProportionalRope {
     pub freqs: Array,
 }
 
+/// YaRN rotary embeddings with frequency interpolation and attention scaling.
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct YarnRope {
+    /// Number of rotary dimensions.
+    pub dimensions: i32,
+    /// Whether adjacent pairs, rather than split halves, are rotated.
+    pub traditional: bool,
+    /// Multiplicative attention scale applied to the rotated inputs.
+    pub concentration: f32,
+    /// Pre-computed YaRN frequency denominators.
+    pub freqs: Array,
+}
+
+fn yarn_frequency_values(
+    dims: i32,
+    base: f32,
+    factor: f32,
+    original_context: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    truncate: bool,
+) -> Vec<f32> {
+    let correction = |rotations: f32| {
+        dims as f32 * (original_context / (rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * base.ln())
+    };
+    let low = if truncate {
+        correction(beta_fast).floor()
+    } else {
+        correction(beta_fast)
+    }
+    .max(0.0);
+    let high = if truncate {
+        correction(beta_slow).ceil()
+    } else {
+        correction(beta_slow)
+    }
+    .min((dims - 1) as f32);
+    let width = if low == high { 0.001 } else { high - low };
+    (0..dims / 2)
+        .map(|index| {
+            let base_frequency = base.powf(2.0 * index as f32 / dims as f32);
+            let ramp = ((index as f32 - low) / width).clamp(0.0, 1.0);
+            let extrapolation_mask = 1.0 - ramp;
+            factor * base_frequency / (factor * extrapolation_mask + (1.0 - extrapolation_mask))
+        })
+        .collect()
+}
+
+impl YarnRope {
+    /// Constructs a YaRN RoPE module.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        factor: f32,
+        original_context: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        mscale: f32,
+        mscale_all_dim: f32,
+        truncate: bool,
+    ) -> Self {
+        let scale = |coefficient: f32| {
+            if factor <= 1.0 {
+                1.0
+            } else {
+                0.1 * coefficient * factor.ln() + 1.0
+            }
+        };
+        let values = yarn_frequency_values(
+            dims,
+            base,
+            factor,
+            original_context,
+            beta_fast,
+            beta_slow,
+            truncate,
+        );
+        Self {
+            dimensions: dims,
+            traditional,
+            concentration: scale(mscale) / scale(mscale_all_dim),
+            freqs: Array::from_slice(&values, &[dims / 2]),
+        }
+    }
+}
+
+impl<'a, Input> Module<Input> for YarnRope
+where
+    Input: Into<nn::RopeInput<'a>>,
+{
+    type Error = Exception;
+    type Output = Array;
+
+    fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        let nn::RopeInput { x, offset } = input.into();
+        let shape = x.shape();
+        let x = x
+            .multiply(Array::from_f32(self.concentration), stream)?
+            .reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
+        let x = safemlx::fast::rope(
+            x,
+            self.dimensions,
+            self.traditional,
+            None::<f32>,
+            1.0,
+            offset,
+            &self.freqs,
+            stream,
+        )?;
+        x.reshape(shape, stream)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
 fn proportional_rotary_dims(dims: i32, proportion: f32) -> (i32, i32) {
     let half_dims = dims / 2;
     let rotary_dims = ((proportion * dims as f32).round() as i32).clamp(2, dims);
@@ -309,6 +433,8 @@ pub enum RopeVariant {
     Llama3(Llama3Rope),
     /// Proportional RoPE used by Gemma 4.
     Proportional(ProportionalRope),
+    /// YaRN scaled RoPE.
+    Yarn(YarnRope),
 }
 
 // TODO: support derive ModuleParameters for enum
@@ -318,6 +444,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.num_parameters(),
             RopeVariant::Llama3(rope) => rope.num_parameters(),
             RopeVariant::Proportional(rope) => rope.num_parameters(),
+            RopeVariant::Yarn(rope) => rope.num_parameters(),
         }
     }
 
@@ -326,6 +453,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Proportional(rope) => rope.freeze_parameters(_recursive),
+            RopeVariant::Yarn(rope) => rope.freeze_parameters(_recursive),
         }
     }
 
@@ -334,6 +462,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Llama3(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Proportional(rope) => rope.unfreeze_parameters(_recursive),
+            RopeVariant::Yarn(rope) => rope.unfreeze_parameters(_recursive),
         }
     }
 
@@ -342,6 +471,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.parameters(),
             RopeVariant::Llama3(rope) => rope.parameters(),
             RopeVariant::Proportional(rope) => rope.parameters(),
+            RopeVariant::Yarn(rope) => rope.parameters(),
         }
     }
 
@@ -350,6 +480,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.parameters_mut(),
             RopeVariant::Llama3(rope) => rope.parameters_mut(),
             RopeVariant::Proportional(rope) => rope.parameters_mut(),
+            RopeVariant::Yarn(rope) => rope.parameters_mut(),
         }
     }
 
@@ -358,6 +489,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.trainable_parameters(),
             RopeVariant::Llama3(rope) => rope.trainable_parameters(),
             RopeVariant::Proportional(rope) => rope.trainable_parameters(),
+            RopeVariant::Yarn(rope) => rope.trainable_parameters(),
         }
     }
 
@@ -366,6 +498,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.all_frozen(),
             RopeVariant::Llama3(rope) => rope.all_frozen(),
             RopeVariant::Proportional(rope) => rope.all_frozen(),
+            RopeVariant::Yarn(rope) => rope.all_frozen(),
         }
     }
 
@@ -374,6 +507,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
             RopeVariant::Default(rope) => rope.any_frozen(),
             RopeVariant::Llama3(rope) => rope.any_frozen(),
             RopeVariant::Proportional(rope) => rope.any_frozen(),
+            RopeVariant::Yarn(rope) => rope.any_frozen(),
         }
     }
 }
@@ -390,6 +524,7 @@ where
             RopeVariant::Default(rope) => rope.forward(input, stream),
             RopeVariant::Llama3(rope) => rope.forward(input, stream),
             RopeVariant::Proportional(rope) => rope.forward(input, stream),
+            RopeVariant::Yarn(rope) => rope.forward(input, stream),
         }
     }
 
@@ -403,6 +538,9 @@ where
             }
             RopeVariant::Proportional(rope) => {
                 <ProportionalRope as Module<nn::RopeInput>>::training_mode(rope, mode)
+            }
+            RopeVariant::Yarn(rope) => {
+                <YarnRope as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
         }
     }
@@ -487,7 +625,37 @@ pub fn initialize_rope(
             stream,
         )?));
     } else if rope_type == FloatOrStr::Str("yarn") {
-        todo!()
+        let config = scaling_config
+            .as_ref()
+            .ok_or_else(|| Exception::custom("scaling_config is required for YaRN RoPE"))?;
+        let value_or = |key: &str, default: f32| {
+            config
+                .get(key)
+                .map(|_| get_numeric_from_config(config, key))
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        };
+        let truncate = match config.get("truncate") {
+            Some(FloatOrString::Bool(value)) => *value,
+            Some(_) => {
+                return Err(Exception::custom(
+                    "YaRN truncate must be a boolean when provided",
+                ))
+            }
+            None => true,
+        };
+        return Ok(RopeVariant::Yarn(YarnRope::new(
+            dims,
+            traditional,
+            base,
+            get_numeric_from_config(config, "factor")?,
+            get_numeric_from_config(config, "original_max_position_embeddings")?,
+            value_or("beta_fast", 32.0)?,
+            value_or("beta_slow", 1.0)?,
+            value_or("mscale", 1.0)?,
+            value_or("mscale_all_dim", 0.0)?,
+            truncate,
+        )));
     } else if rope_type == FloatOrStr::Str("longrope") {
         todo!()
     }
@@ -499,7 +667,7 @@ pub fn initialize_rope(
 
 #[cfg(test)]
 mod tests {
-    use super::{proportional_frequency_values, proportional_rotary_dims};
+    use super::{proportional_frequency_values, proportional_rotary_dims, yarn_frequency_values};
 
     #[test]
     fn proportional_rope_uses_full_half_head_frequency_layout() {
@@ -514,5 +682,16 @@ mod tests {
         assert!(freqs[63] > 0.0);
         assert_eq!(freqs[64], f32::MAX);
         assert_eq!(freqs[255], f32::MAX);
+    }
+
+    #[test]
+    fn yarn_interpolates_between_original_and_extended_frequencies() {
+        let factor = 32.0;
+        let base = 150_000.0;
+        let freqs = yarn_frequency_values(64, base, factor, 4096.0, 32.0, 1.0, false);
+        assert_eq!(freqs.len(), 32);
+        assert!((freqs[0] - 1.0).abs() < 1e-6);
+        let last_base = base.powf(62.0 / 64.0);
+        assert!((freqs[31] / last_base - factor).abs() < 1e-3);
     }
 }
