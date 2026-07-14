@@ -27,7 +27,10 @@ use crate::models::common::CausalLm;
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::AffineQuantization;
 use crate::sampler::{DefaultSampler, Sampler};
-use crate::{cache::ConcatKeyValueCache, error::Error};
+use crate::{
+    cache::{ConcatKeyValueCache, SlidingKeyValueCache},
+    error::Error,
+};
 
 /// Shared building blocks used by multiple decoder-only model families.
 pub mod common;
@@ -97,7 +100,7 @@ impl TokenIdOrIds {
 pub enum ModelKind {
     /// Gemma 4 text architecture.
     Gemma4,
-    /// Llama decoder architecture.
+    /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
     /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
     NemotronH,
@@ -133,7 +136,7 @@ impl ModelKind {
     fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
-            "llama" => Ok(Self::Llama),
+            "llama" | "mistral" => Ok(Self::Llama),
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
             "qwen3" => Ok(Self::Qwen3),
@@ -239,12 +242,7 @@ pub fn check_model_dir(model_dir: impl AsRef<Path>) -> ModelConfigSupport {
 fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     match kind {
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
-        ModelKind::Llama => {
-            serde_json::from_value::<llama::ModelArgs>(config.clone()).map_err(|error| {
-                Error::UnsupportedArchitecture(format!("invalid llama config: {error}"))
-            })?;
-            Ok(())
-        }
+        ModelKind::Llama => llama::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
         ModelKind::Qwen3 => {
@@ -261,7 +259,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
 pub enum Model {
     /// Gemma 4 text model.
     Gemma4(gemma4::Model),
-    /// Llama model.
+    /// Llama-compatible dense model.
     Llama(llama::Model),
     /// Nemotron-H hybrid model.
     NemotronH(nemotron_h::Model),
@@ -306,6 +304,16 @@ impl Model {
                 stream,
                 observer,
             ),
+            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => model
+                .forward_with_observer(
+                    llama::ModelInput {
+                        inputs: input_tokens,
+                        mask,
+                        cache,
+                    },
+                    stream,
+                    observer,
+                ),
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
                 qwen3::ModelInput {
                     inputs: input_tokens,
@@ -377,6 +385,19 @@ impl Model {
                 )?;
                 final_token_logits(&logits, stream)
             }
+            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
+                let logits = model.forward_with_observer(
+                    llama::ModelInput {
+                        inputs: &prompt_tokens,
+                        mask: None,
+                        cache,
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
                 let prompt_tokens = input::text_token_ids(input, stream)?;
                 let logits = model.forward_with_observer(
@@ -406,7 +427,11 @@ impl Model {
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
-            Self::Llama(_) | Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
+            Self::Llama(model) => match model.sliding_window() {
+                Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
+                None => ModelCache::KeyValue(Vec::new()),
+            },
+            Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
             Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
         }
@@ -424,6 +449,9 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
@@ -475,6 +503,11 @@ impl Model {
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
+            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
+                ModelGenerate::LlamaSliding(llama::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
                 qwen3::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
@@ -500,6 +533,8 @@ pub enum ModelCache {
     Gemma4(gemma4::Cache),
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
+    /// Homogeneous bounded cache for sliding-window attention.
+    SlidingKeyValue(Vec<Option<SlidingKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
     NemotronH(nemotron_h::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
@@ -515,6 +550,8 @@ where
     Gemma4(gemma4::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
+    /// Llama-compatible generation with bounded sliding-window caches.
+    LlamaSliding(llama::Generate<'a, SlidingKeyValueCache, S>),
     /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
     /// Nemotron-H generation iterator.
@@ -533,6 +570,7 @@ where
         match self {
             Self::Gemma4(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
+            Self::LlamaSliding(generate) => generate.next(),
             Self::NemotronH(generate) => generate.next(),
             Self::Qwen3(generate) => generate.next(),
             Self::Qwen35Moe(generate) => generate.next(),
@@ -1722,6 +1760,56 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
             "num_key_value_heads": 2,
             "max_position_embeddings": 128,
             "head_dim": 4
+        }));
+
+        assert!(support.is_supported(), "{support:?}");
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_dense_mistral() {
+        let support = check_model_config(&json!({
+            "architectures": ["MistralForCausalLM"],
+            "model_type": "mistral",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "intermediate_size": 14336,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32032,
+            "max_position_embeddings": 32768,
+            "rope_theta": 10000.0,
+            "sliding_window": 4096,
+            "tie_word_embeddings": false
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Llama,
+                model_type: "mistral".to_string(),
+                effective_model_type: "mistral".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_full_attention_mistral_small() {
+        let support = check_model_config(&json!({
+            "architectures": ["MistralForCausalLM"],
+            "model_type": "mistral",
+            "hidden_size": 5120,
+            "num_hidden_layers": 40,
+            "intermediate_size": 32768,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 131072,
+            "max_position_embeddings": 32768,
+            "rope_theta": 100000000.0,
+            "sliding_window": null,
+            "tie_word_embeddings": false
         }));
 
         assert!(support.is_supported(), "{support:?}");

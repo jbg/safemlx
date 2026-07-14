@@ -87,6 +87,91 @@ pub struct ConcatKeyValueCache {
     max_size: Option<i32>,
 }
 
+/// A bounded key/value cache for causal sliding-window attention.
+///
+/// The cache keeps only the newest `max_size` states between calls while
+/// preserving an absolute token offset for positional encodings. During an
+/// update it returns the retained prefix together with every newly submitted
+/// state so multi-token attention can still compute all queries correctly;
+/// callers must apply the matching sliding-window mask.
+#[derive(Debug, Clone)]
+pub struct SlidingKeyValueCache {
+    keys: Option<Array>,
+    values: Option<Array>,
+    offset: i32,
+    max_size: i32,
+}
+
+impl Default for SlidingKeyValueCache {
+    fn default() -> Self {
+        // Model-aware high-level callers construct this cache with the actual
+        // window. The effectively unbounded default keeps generic direct
+        // callers correct until they provide a configured cache explicitly.
+        Self::new(i32::MAX)
+    }
+}
+
+impl SlidingKeyValueCache {
+    /// Creates an empty cache retaining at most `max_size` states.
+    pub fn new(max_size: i32) -> Self {
+        assert!(max_size > 0, "sliding KV cache size must be positive");
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
+            max_size,
+        }
+    }
+
+    /// Returns the arrays retained for the next attention call.
+    pub fn arrays(&self) -> impl Iterator<Item = &Array> {
+        self.keys.iter().chain(self.values.iter())
+    }
+
+    /// Clears cached arrays while preserving the configured window size.
+    pub fn clear(&mut self) {
+        self.keys = None;
+        self.values = None;
+        self.offset = 0;
+    }
+}
+
+impl KeyValueCache for SlidingKeyValueCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        Some(self.max_size)
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let new_tokens = keys.dim(-2);
+        let combined_keys = match self.keys.take() {
+            Some(previous) => concatenate_axis(&[previous, keys], -2, stream)?,
+            None => keys,
+        };
+        let combined_values = match self.values.take() {
+            Some(previous) => concatenate_axis(&[previous, values], -2, stream)?,
+            None => values,
+        };
+        self.offset += new_tokens;
+
+        let combined_len = combined_keys.dim(-2);
+        let retained_start = (combined_len - self.max_size).max(0);
+        self.keys = Some(combined_keys.try_index_device((.., .., retained_start.., ..), stream)?);
+        self.values =
+            Some(combined_values.try_index_device((.., .., retained_start.., ..), stream)?);
+
+        Ok((combined_keys, combined_values))
+    }
+}
+
 impl ConcatKeyValueCache {
     /// Creates an empty concatenating key/value cache.
     pub fn new() -> Self {
@@ -303,7 +388,7 @@ pub struct DefaultKeyValueCache {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ConcatKeyValueCache, KeyValueCache};
+    use super::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache};
     use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};
 
     #[test]
@@ -343,5 +428,46 @@ mod tests {
                 .item::<f32>(stream),
             9.0
         );
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn sliding_cache_returns_transient_context_and_retains_only_its_window() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = SlidingKeyValueCache::new(3);
+
+        let keys = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 4, 1]);
+        let fetched = cache
+            .update_and_fetch(keys.clone(), keys, stream)
+            .unwrap()
+            .0;
+        assert_eq!(fetched.shape(), &[1, 1, 4, 1]);
+        assert_eq!(cache.offset(), 4);
+        assert_eq!(cache.arrays().next().unwrap().shape(), &[1, 1, 3, 1]);
+
+        let next = Array::from_slice(&[4.0f32], &[1, 1, 1, 1]);
+        let fetched = cache
+            .update_and_fetch(next.clone(), next, stream)
+            .unwrap()
+            .0;
+        assert_eq!(fetched.shape(), &[1, 1, 4, 1]);
+        assert_eq!(
+            fetched
+                .try_index_device((0, 0, 0, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            1.0
+        );
+        let retained = cache.arrays().next().unwrap();
+        assert_eq!(retained.shape(), &[1, 1, 3, 1]);
+        assert_eq!(
+            retained
+                .try_index_device((0, 0, 0, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            2.0
+        );
+        assert_eq!(cache.offset(), 5);
     }
 }

@@ -16,9 +16,9 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 ## GGUF models
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points
-accept Gemma 4, Llama, dense and sparse-MoE Nemotron-H, Qwen3, and Qwen3.5 MoE
-`.gguf` files as well as Hugging Face-style model directories. Put
-`tokenizer.json` next to the GGUF file when using `LoadedModel` or
+accept Hugging Face-style model directories for Gemma 4, Llama, dense Mistral,
+dense and sparse-MoE Nemotron-H, Qwen3, and Qwen3.5 MoE. They also accept the
+GGUF architectures listed below. Put `tokenizer.json` next to a GGUF file when using `LoadedModel` or
 `load_tokenizer`; adjacent
 `tokenizer_config.json` and `chat_template.jinja` files are used when present.
 
@@ -87,6 +87,7 @@ checkpoint metadata is an error.
 | Architecture | Dense | Existing quantized | Affine on load | High-level dispatch | Special policy |
 |---|---:|---:|---:|---:|---|
 | Llama | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Mistral | yes | MLX affine | yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
 | Qwen3 | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
 | Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |

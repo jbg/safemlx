@@ -355,3 +355,106 @@ where
         Ok(None)
     }
 }
+
+/// Builds an explicit causal mask for a fixed-size attention window.
+///
+/// `window_size` is the total number of key positions visible to a query,
+/// including the query position itself. This matches Hugging Face Mistral's
+/// sliding-window convention. Unlike the generic mask helper, this may return
+/// a mask for a single decode token once a bounded cache is full, because the
+/// cache temporarily exposes one extra old state during the update.
+pub(crate) fn create_sliding_attention_mask<C>(
+    h: &Array,
+    cache: &[Option<C>],
+    window_size: i32,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception>
+where
+    C: KeyValueCache,
+{
+    if window_size <= 0 {
+        return Err(Exception::custom(
+            "sliding attention window must be positive",
+        ));
+    }
+
+    let sequence = h.shape()[1];
+    let retained_prefix = cache
+        .first()
+        .and_then(|cache| cache.as_ref())
+        .map(|cache| {
+            cache
+                .max_size()
+                .map_or_else(|| cache.offset(), |max_size| cache.offset().min(max_size))
+        })
+        .unwrap_or(0);
+    let key_length = retained_prefix + sequence;
+
+    if sequence == 1 && key_length <= window_size {
+        return Ok(None);
+    }
+
+    create_causal_mask(
+        sequence,
+        Some(retained_prefix),
+        Some(window_size - 1),
+        None,
+        stream,
+    )
+    .map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};
+
+    use crate::cache::{KeyValueCache, SlidingKeyValueCache};
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mistral_window_counts_the_current_token() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let hidden = Array::from_slice(&[0.0f32; 4], &[1, 4, 1]);
+        let cache: Vec<Option<SlidingKeyValueCache>> = Vec::new();
+        let mask = super::create_sliding_attention_mask(&hidden, &cache, 2, stream)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(mask.shape(), &[4, 4]);
+        assert!(mask
+            .try_index_device((3, 2), stream)
+            .unwrap()
+            .item::<bool>(stream));
+        assert!(!mask
+            .try_index_device((3, 1), stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn full_sliding_cache_masks_the_extra_decode_state() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = SlidingKeyValueCache::new(3);
+        let states = Array::from_slice(&[0.0f32; 3], &[1, 1, 3, 1]);
+        cache
+            .update_and_fetch(states.clone(), states, stream)
+            .unwrap();
+        let hidden = Array::from_slice(&[0.0f32], &[1, 1, 1]);
+        let mask = super::create_sliding_attention_mask(&hidden, &[Some(cache)], 3, stream)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(mask.shape(), &[1, 4]);
+        assert!(!mask
+            .try_index_device((0, 0), stream)
+            .unwrap()
+            .item::<bool>(stream));
+        assert!(mask
+            .try_index_device((0, 3), stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+}

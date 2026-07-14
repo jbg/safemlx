@@ -22,19 +22,23 @@ use tokenizers::Tokenizer;
 pub use super::common::sample;
 
 use crate::{
-    cache::KeyValueCache,
+    cache::{KeyValueCache, SlidingKeyValueCache},
     error::Error,
     inspection::ActivationObserver,
     models::{
         common::{
             self, apply_rope_and_update_cache, attention_probabilities, batch_seq,
             finish_attention, project_logits_maybe_quantized, reshape_attention_projection,
-            AttentionInput, CausalLm, SwiGluMlp,
+            CausalLm, SwiGluMlp,
         },
         input,
     },
     quantization::AffineQuantization,
-    utils::rope::{initialize_rope, FloatOrString, RopeVariant},
+    utils::{
+        create_attention_mask, create_sliding_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
+    },
     weights::{
         load_arrays_strict, load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict,
         StrictLoadConfig, StrictLoadReport,
@@ -84,6 +88,9 @@ pub struct ModelArgs {
     pub mlp_bias: bool,
     /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    /// Optional total causal attention window, including the current token.
+    #[serde(default)]
+    pub sliding_window: Option<i32>,
     /// Preferred MLX-LM affine quantization metadata.
     #[serde(default)]
     pub quantization: Option<AffineQuantization>,
@@ -129,6 +136,18 @@ fn default_true() -> bool {
 
 fn default_rope_theta() -> f32 {
     10_000.0
+}
+
+/// Internal input shared by Llama-compatible attention and decoder blocks.
+pub struct AttentionInput<'a, C> {
+    /// Hidden states with shape `[batch, sequence, hidden]`.
+    pub x: &'a Array,
+    /// Optional attention mask.
+    pub mask: Option<&'a Array>,
+    /// Optional mutable key/value cache.
+    pub cache: Option<&'a mut C>,
+    /// Generated total sliding-window size eligible for chunked prefill.
+    pub generated_sliding_window: Option<i32>,
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -285,7 +304,9 @@ impl Attention {
     where
         C: KeyValueCache,
     {
-        let AttentionInput { x, mask, mut cache } = input;
+        let AttentionInput {
+            x, mask, mut cache, ..
+        } = input;
 
         let (batch, seq_len) = batch_seq(x);
 
@@ -336,7 +357,12 @@ where
         input: AttentionInput<'_, C>,
         stream: &Stream,
     ) -> Result<Self::Output, Self::Error> {
-        let AttentionInput { x, mask, mut cache } = input;
+        let AttentionInput {
+            x,
+            mask,
+            mut cache,
+            generated_sliding_window,
+        } = input;
 
         let (B, L) = batch_seq(x);
 
@@ -347,10 +373,24 @@ where
         let queries = reshape_attention_projection(queries, B, L, self.n_heads, stream)?;
         let keys = reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?;
         let values = reshape_attention_projection(values, B, L, self.n_kv_heads, stream)?;
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
-        let output =
-            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?;
+        let output = if let Some(window_size) = generated_sliding_window.filter(|_| L > 1) {
+            common::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window_size,
+                position_offset,
+                B,
+                L,
+                stream,
+            )?
+        } else {
+            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?
+        };
 
         self.o_proj.forward(&output, stream)
     }
@@ -459,7 +499,12 @@ impl TransformerBlock {
     where
         C: KeyValueCache,
     {
-        let AttentionInput { x, mask, cache } = input;
+        let AttentionInput {
+            x,
+            mask,
+            cache,
+            generated_sliding_window,
+        } = input;
 
         observer.observe(&format!("{prefix}.input"), x)?;
         observer.observe(&format!("{prefix}.residual_before_attention"), x)?;
@@ -470,6 +515,7 @@ impl TransformerBlock {
             x: &normed,
             mask,
             cache,
+            generated_sliding_window,
         };
         let r = self.self_attn.forward_with_observer(
             self_attn_input,
@@ -517,13 +563,19 @@ where
         input: AttentionInput<'_, C>,
         stream: &Stream,
     ) -> Result<Self::Output, Self::Error> {
-        let AttentionInput { x, mask, cache } = input;
+        let AttentionInput {
+            x,
+            mask,
+            cache,
+            generated_sliding_window,
+        } = input;
 
         let normed = self.input_layernorm.forward(x, stream)?;
         let self_attn_input = AttentionInput {
             x: &normed,
             mask,
             cache,
+            generated_sliding_window,
         };
         let r = self.self_attn.forward(self_attn_input, stream)?;
         let h = x.add(r, stream)?;
@@ -548,6 +600,8 @@ pub struct LlamaModel {
     pub vocab_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    /// Optional total causal attention window.
+    pub sliding_window: Option<i32>,
 
     #[quantizable]
     #[param]
@@ -587,10 +641,33 @@ impl LlamaModel {
         Ok(Self {
             vocab_size,
             num_hidden_layers,
+            sliding_window: args.sliding_window,
             embed_tokens,
             layers,
             norm,
         })
+    }
+
+    fn attention_mask<C>(
+        &self,
+        h: &Array,
+        cache: &[Option<C>],
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception>
+    where
+        C: KeyValueCache,
+    {
+        if let Some(window_size) = self.sliding_window {
+            return create_sliding_attention_mask(h, cache, window_size, stream);
+        }
+
+        match create_attention_mask(h, cache, Some(true), stream)? {
+            Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
+            Some(AttentionMask::Causal) => Err(Exception::custom(
+                "Llama-compatible decoders require an explicit attention mask",
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Forward pass that reports transformer-body activations to an observer.
@@ -614,17 +691,7 @@ impl LlamaModel {
 
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
-            None => {
-                if h.shape()[1] > 1 {
-                    let m = nn::MultiHeadAttention::create_additive_causal_mask::<f32>(
-                        h.shape()[1],
-                        stream,
-                    )?;
-                    Some(m.as_dtype(h.dtype(), stream)?)
-                } else {
-                    None
-                }
-            }
+            None => self.attention_mask(&h, cache, stream)?,
         };
         if let Some(mask) = mask.as_ref() {
             observer.observe("model.attention_mask", mask)?;
@@ -639,6 +706,7 @@ impl LlamaModel {
                 x: &h,
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
+                generated_sliding_window: None,
             };
             h = layer.forward_with_observer(
                 layer_input,
@@ -685,19 +753,12 @@ where
 
         let mut h = self.embed_tokens.forward(inputs, stream)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => {
-                if h.shape()[1] > 1 {
-                    let m = nn::MultiHeadAttention::create_additive_causal_mask::<f32>(
-                        h.shape()[1],
-                        stream,
-                    )?;
-                    Some(m.as_dtype(h.dtype(), stream)?)
-                } else {
-                    None
-                }
+        let (mask, generated_sliding_window) = match mask {
+            Some(mask) => (Some(mask.clone()), None),
+            None if self.sliding_window.is_some() && h.shape()[1] > 1 => {
+                (None, self.sliding_window)
             }
+            None => (self.attention_mask(&h, cache, stream)?, None),
         };
 
         if cache.is_empty() {
@@ -709,6 +770,7 @@ where
                 x: &h,
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
+                generated_sliding_window,
             };
             h = layer.forward(layer_input, stream)?;
         }
@@ -769,6 +831,22 @@ impl Model {
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    /// Returns the configured total sliding-window size, if any.
+    pub fn sliding_window(&self) -> Option<i32> {
+        self.args.sliding_window
+    }
+
+    /// Creates bounded per-layer caches for a sliding-window configuration.
+    pub fn new_sliding_cache(&self) -> Vec<Option<SlidingKeyValueCache>> {
+        let window_size = self
+            .args
+            .sliding_window
+            .expect("new_sliding_cache requires a sliding-window model");
+        (0..self.args.num_hidden_layers)
+            .map(|_| Some(SlidingKeyValueCache::new(window_size)))
+            .collect()
     }
 
     /// Forward pass that reports activations to an observer.
@@ -834,18 +912,75 @@ pub fn load_llama_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Er
 pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let model_args_filename = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(model_args_filename)?;
-    let mut model_args: ModelArgs = serde_json::from_reader(file)?;
+    let model_args: ModelArgs = serde_json::from_reader(file)?;
+    normalize_model_args(model_args)
+}
+
+fn normalize_model_args(mut model_args: ModelArgs) -> Result<ModelArgs, Error> {
     if model_args.num_key_value_heads == 0 {
         model_args.num_key_value_heads = model_args.num_attention_heads;
     }
     if model_args.head_dim == 0 {
+        if model_args.num_attention_heads <= 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "num_attention_heads must be positive, got {}",
+                model_args.num_attention_heads
+            )));
+        }
         model_args.head_dim = model_args.hidden_size / model_args.num_attention_heads;
     }
     if model_args.max_position_embeddings == 0 {
         model_args.max_position_embeddings = 2048;
     }
 
+    validate_model_args(&model_args)?;
     Ok(model_args)
+}
+
+fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
+    if !matches!(model_args.model_type.as_str(), "llama" | "mistral") {
+        return Err(Error::UnsupportedModelType(model_args.model_type.clone()));
+    }
+    for (name, value) in [
+        ("hidden_size", model_args.hidden_size),
+        ("num_hidden_layers", model_args.num_hidden_layers),
+        ("intermediate_size", model_args.intermediate_size),
+        ("num_attention_heads", model_args.num_attention_heads),
+        ("num_key_value_heads", model_args.num_key_value_heads),
+        ("vocab_size", model_args.vocab_size),
+        (
+            "max_position_embeddings",
+            model_args.max_position_embeddings,
+        ),
+        ("head_dim", model_args.head_dim),
+    ] {
+        if value <= 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "{name} must be positive, got {value}"
+            )));
+        }
+    }
+    if model_args.num_attention_heads % model_args.num_key_value_heads != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            model_args.num_attention_heads, model_args.num_key_value_heads
+        )));
+    }
+    if let Some(window_size) = model_args.sliding_window {
+        if window_size <= 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "sliding_window must be positive, got {window_size}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    let args = serde_json::from_value::<ModelArgs>(config.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid Llama-compatible config: {error}"))
+    })?;
+    normalize_model_args(args).map(|_| ())
 }
 
 pub(crate) struct LoadedLlamaGguf {
@@ -1017,6 +1152,7 @@ fn llama_args_from_gguf(
                 )
         }),
         rope_scaling,
+        sliding_window: None,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -1279,6 +1415,56 @@ mod tests {
     };
 
     #[test]
+    fn normalizes_hermes_mistral_config() {
+        let args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "mistral",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "intermediate_size": 14336,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32032,
+            "max_position_embeddings": 32768,
+            "rope_theta": 10000.0,
+            "sliding_window": 4096,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let args = super::normalize_model_args(args).unwrap();
+
+        assert_eq!(args.model_type, "mistral");
+        assert_eq!(args.head_dim, 128);
+        assert_eq!(args.num_key_value_heads, 8);
+        assert_eq!(args.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn preserves_mistral_small_explicit_head_dimension() {
+        let args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "mistral",
+            "hidden_size": 5120,
+            "num_hidden_layers": 40,
+            "intermediate_size": 32768,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 131072,
+            "max_position_embeddings": 32768,
+            "rope_theta": 100000000.0,
+            "sliding_window": null,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let args = super::normalize_model_args(args).unwrap();
+
+        assert_eq!(args.head_dim, 128);
+        assert_eq!(args.hidden_size, 5120);
+        assert_eq!(args.sliding_window, None);
+    }
+
+    #[test]
     fn translates_gguf_llama_weight_names() {
         assert_eq!(
             super::translate_gguf_weight_name("blk.3.attn_q.weight"),
@@ -1321,6 +1507,7 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
+            sliding_window: None,
             quantization: Some(AffineQuantization::new(32, 4).unwrap()),
             quantization_config: None,
             quantized_weights: Some(selected),
