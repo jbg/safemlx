@@ -27,8 +27,12 @@ use crate::{
         input as runtime_input, qwen3,
         qwen_vl::grid_thw_from_array,
     },
+    quantization::AffineQuantization,
     utils::{create_attention_mask, AttentionMask},
-    weights::{load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport},
+    weights::{
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -77,12 +81,20 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
         serde_json::from_value(object.get("vision_config").cloned().ok_or_else(|| {
             Error::UnsupportedArchitecture("qwen3_vl config is missing vision_config".into())
         })?)?;
+    let top_level_quantization = object.get("quantization").cloned();
+    let top_level_quantization_config = object.get("quantization_config").cloned();
     let mut text_value = object.get("text_config").cloned().ok_or_else(|| {
         Error::UnsupportedArchitecture("qwen3_vl config is missing text_config".into())
     })?;
     let text_object = text_value.as_object_mut().ok_or_else(|| {
         Error::UnsupportedArchitecture("qwen3_vl text_config must be a JSON object".into())
     })?;
+    if let Some(quantization) = top_level_quantization {
+        text_object.insert("quantization".into(), quantization);
+    }
+    if let Some(quantization) = top_level_quantization_config {
+        text_object.insert("quantization_config".into(), quantization);
+    }
     let rope = text_object
         .get_mut("rope_scaling")
         .and_then(Value::as_object_mut);
@@ -527,6 +539,44 @@ pub fn load_qwen3_vl_model(
     Ok(model)
 }
 
+/// Loads a dense Qwen3-VL checkpoint while affine-quantizing its language model.
+///
+/// The shared Qwen vision tower remains dense so its parameter and checkpoint
+/// layout stays identical for Qwen3-VL and Qwen3.5 multimodal models.
+pub fn load_qwen3_vl_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: AffineQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+    let mut args = get_qwen3_vl_model_args(model_dir)?;
+    let existing = args
+        .text_config
+        .quantization
+        .or(args.text_config.quantization_config);
+    if !crate::quantization::should_quantize_on_load("Qwen3-VL", existing, quantization)? {
+        return load_qwen3_vl_model(model_dir, stream, weights_stream);
+    }
+    args.text_config.quantization = Some(quantization);
+    args.text_config.quantization_config = None;
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    load_safetensors_dir_quantized_strict(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        quantization,
+        &config,
+        &mut report,
+    )?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
 impl CausalLm<Cache> for Model {
     fn prefill_input_logits(
         &mut self,
@@ -634,7 +684,7 @@ mod tests {
 
     #[test]
     fn parses_qwen3_vl_2b_config_shape() {
-        let args = super::parse_model_args_value(json!({
+        let mut config = json!({
             "model_type":"qwen3_vl","image_token_id":151655,"video_token_id":151656,
             "text_config":{
                 "model_type":"qwen3_vl_text","hidden_size":2048,"num_hidden_layers":28,
@@ -650,10 +700,19 @@ mod tests {
                 "temporal_patch_size":2,"out_hidden_size":2048,
                 "deepstack_visual_indexes":[5,11,17]
             }
-        })).unwrap();
+        });
+        let args = super::parse_model_args_value(config.clone()).unwrap();
         assert_eq!(args.text_config.hidden_size, 2048);
         assert_eq!(args.vision_config.deepstack_visual_indexes, vec![5, 11, 17]);
         assert_eq!(args.mrope_section, vec![24, 20, 20]);
+        assert!(args.text_config.quantization.is_none());
+
+        config["quantization"] = json!({"group_size": 64, "bits": 4, "mode": "affine"});
+        let args = super::parse_model_args_value(config).unwrap();
+        assert_eq!(
+            args.text_config.quantization,
+            Some(crate::quantization::AffineQuantization::default())
+        );
     }
 
     #[test]

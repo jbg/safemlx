@@ -93,7 +93,7 @@ checkpoint metadata is an error.
 | Llama | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Mistral | yes | MLX affine | yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
 | Qwen3 | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
-| Qwen3-VL | yes | no | capability error | `LoadedModel` (dense) | Reuses the Qwen3 decoder and shared Qwen vision tower; supports interleaved 3-D RoPE, DeepStack visual injection, images, and timestamped video chunks |
+| Qwen3-VL | yes | MLX affine | yes | `LoadedModel` (dense/affine) | Reuses the Qwen3 decoder and shared Qwen vision tower; the language model uses affine storage while the vision tower remains dense; supports interleaved 3-D RoPE, DeepStack visual injection, images, and timestamped video chunks |
 | Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
 | Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |

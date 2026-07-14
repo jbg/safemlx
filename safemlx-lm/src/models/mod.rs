@@ -1141,8 +1141,13 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
-            ModelKind::Qwen3Vl => Err(Error::Quantization(
-                "Qwen3-VL affine on-load quantization is not implemented; load the dense checkpoint".into(),
+            ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
+                qwen3_vl::load_qwen3_vl_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
             )),
             ModelKind::NemotronH => Err(Error::Quantization(
                 "Nemotron-H affine on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without an affine grouped-matmul implementation".into(),
@@ -1678,6 +1683,106 @@ mod tests {
             fs::remove_dir_all(dir).unwrap();
             fs::remove_dir_all(saved_dir).unwrap();
         }
+    }
+
+    #[test]
+    fn tiny_qwen3_vl_affine_on_load_quantizes_only_language_model() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let dir = temp_model_dir(
+            r#"{
+              "model_type":"qwen3_vl","image_token_id":30,"video_token_id":31,
+              "text_config":{
+                "model_type":"qwen3_vl_text","hidden_size":32,"num_hidden_layers":1,
+                "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":8,"rms_norm_eps":0.000001,"vocab_size":32,
+                "max_position_embeddings":128,"rope_theta":10000.0,
+                "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1],"mrope_interleaved":true}
+              },
+              "vision_config":{
+                "depth":1,"hidden_size":8,"hidden_act":"gelu_pytorch_tanh",
+                "intermediate_size":16,"num_heads":2,"num_position_embeddings":16,
+                "in_channels":3,"patch_size":2,"spatial_merge_size":2,
+                "temporal_patch_size":2,"window_size":8,"out_hidden_size":32,
+                "fullatt_block_indexes":[],"deepstack_visual_indexes":[0]
+              }
+            }"#,
+        );
+        let args = super::qwen3_vl::get_qwen3_vl_model_args(&dir).unwrap();
+        save_zero_checkpoint(
+            &super::qwen3_vl::Model::new(args, stream).unwrap(),
+            &dir,
+            stream,
+        );
+
+        let quantization = AffineQuantization::new(32, 4).unwrap();
+        let mut quantized = load_model_with_options(
+            &dir,
+            ModelLoadOptions::with_quantization(quantization),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let super::Model::Qwen3Vl(model) = &quantized else {
+            panic!("expected Qwen3-VL model");
+        };
+        let params = model.parameters().flatten();
+        assert!(params.contains_key("model.language_model.layers.0.self_attn.q_proj.inner.weight"));
+        assert!(params.contains_key("model.language_model.layers.0.self_attn.q_proj.scales"));
+        assert!(params.contains_key("model.language_model.layers.0.self_attn.q_proj.biases"));
+        assert!(params.contains_key("model.language_model.embed_tokens.inner.weight"));
+        assert!(params.contains_key("model.visual.blocks.0.attn.qkv.weight"));
+        assert!(!params.contains_key("model.visual.blocks.0.attn.qkv.scales"));
+        drop(params);
+
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let pixels = Array::zeros::<f32>(&[4, 24], stream).unwrap();
+        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let parts = [
+            super::input::InputPart::text_token_ids(&tokens),
+            super::input::InputPart::image_tensor(
+                &pixels,
+                super::input::InputMetadata::qwen_grid_thw(&grid),
+            ),
+        ];
+        let mut cache = quantized.new_cache();
+        let logits = quantized
+            .prefill_input_with_cache(super::input::ModelInput::new(&parts), &mut cache, stream)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 32]);
+
+        let saved_dir = dir.with_extension("q4");
+        crate::quantization::quantize_checkpoint(
+            &dir,
+            &saved_dir,
+            &CheckpointQuantizationOptions {
+                quantization,
+                exclude: vec!["model.visual.".into()],
+                ..Default::default()
+            },
+            stream,
+        )
+        .unwrap();
+        let saved_quantized = load_model_with_options(
+            &saved_dir,
+            ModelLoadOptions::with_quantization(quantization),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let super::Model::Qwen3Vl(saved_model) = &saved_quantized else {
+            panic!("expected saved Qwen3-VL model");
+        };
+        assert!(saved_model
+            .parameters()
+            .flatten()
+            .contains_key("model.language_model.layers.0.self_attn.q_proj.scales"));
+
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(saved_dir).unwrap();
     }
 
     #[test]
