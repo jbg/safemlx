@@ -23,14 +23,30 @@ cargo run --release -p safemlx-lm-cli -- \
   "Tell me a short story."
 ```
 
+Dense checkpoints can be quantized while loading. For example, 4-bit affine
+weights substantially reduce decode-time weight traffic and memory use:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model LiquidAI/LFM2.5-1.2B-Instruct \
+  --quantize 4 \
+  "Explain MLX in one paragraph."
+```
+
+The default quantization group size is 64 weights; change it with
+`--quantization-group-size`. Load-time quantization is performed on every run,
+so use a checkpoint already carrying matching quantization metadata when
+startup time is important.
+
 When the positional prompt is omitted, the binary reads it from stdin. Only
 the generated text is written to stdout, making it convenient to pipe or
 capture; `--verbose` writes model details, separate load and generation times,
-time to first token, overall generated-token rate, total execution time, and
-MLX peak/current/cache unified-memory statistics to stderr. Generation time
-includes prompt prefill, and token rate is generated tokens divided by that
-generation time. The memory values cover allocations managed by MLX, not total
-process resident memory or memory-mapped files.
+time to first token, decode-only and overall generated-token rates, total
+execution time, and MLX peak/current/cache unified-memory statistics to stderr.
+Generation time includes prompt prefill, and `token_rate` is generated tokens
+divided by that generation time. `decode_token_rate` excludes time to first
+token and the first generated token. The memory values cover allocations
+managed by MLX, not total process resident memory or memory-mapped files.
 
 ```sh
 printf 'Summarize the purpose of MLX.' | \

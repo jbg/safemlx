@@ -186,6 +186,14 @@ impl ConcatKeyValueCache {
         }
     }
 
+    /// Creates an unbounded cache whose backing arrays grow in `step`-token chunks.
+    pub(crate) fn new_with_step(step: i32) -> Self {
+        Self {
+            step: step.max(1),
+            ..Self::default()
+        }
+    }
+
     /// Creates a bounded cache whose backing arrays grow in `step`-token chunks.
     ///
     /// Chunked growth avoids rebuilding the full retained cache on every decode

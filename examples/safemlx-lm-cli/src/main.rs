@@ -7,14 +7,38 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
-use safemlx::{Device, DeviceType, ExecutionContext};
+use safemlx::{
+    error::Exception, random::RandomState, transforms::async_eval, Array, Device, DeviceType,
+    ExecutionContext, Stream,
+};
 use safemlx_lm::{
     models::{
         input::{InputPart, ModelInput},
-        LoadedModel,
+        LoadedModel, ModelLoadOptions,
     },
-    sampler::GenerationSampler,
+    quantization::AffineQuantization,
+    sampler::{DefaultSampler, GenerationSampler, Sampler},
 };
+
+enum CliSampler {
+    Greedy(DefaultSampler),
+    Configured(GenerationSampler),
+}
+
+impl Sampler for CliSampler {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Greedy(sampler) => sampler.sample(logits, temp, prng_state, stream),
+            Self::Configured(sampler) => sampler.sample(logits, temp, prng_state, stream),
+        }
+    }
+}
 
 /// Generate text with a model supported by safemlx-lm.
 #[derive(Debug, Parser)]
@@ -72,6 +96,14 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
+    /// Quantize eligible dense weights to this bit width while loading.
+    #[arg(long, value_name = "BITS")]
+    quantize: Option<i32>,
+
+    /// Number of adjacent weights sharing quantization parameters.
+    #[arg(long, default_value_t = 64, value_name = "WEIGHTS")]
+    quantization_group_size: i32,
+
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
     raw: bool,
@@ -100,8 +132,16 @@ fn main() -> Result<()> {
         safemlx::memory::reset_peak_memory()?;
     }
     let load_started = Instant::now();
-    let mut model = LoadedModel::load(&model_path, stream, weights.stream())
-        .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let load_options = match args.quantize {
+        Some(bits) => ModelLoadOptions::with_quantization(AffineQuantization::new(
+            args.quantization_group_size,
+            bits,
+        )?),
+        None => ModelLoadOptions::default(),
+    };
+    let mut model =
+        LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
+            .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     stream.synchronize()?;
     let load_elapsed = load_started.elapsed();
 
@@ -128,7 +168,7 @@ fn main() -> Result<()> {
 
     let eos_token_ids = model.eos_token_ids().to_vec();
     let mut cache = model.new_cache();
-    let sampler = GenerationSampler::new()
+    let configured_sampler = GenerationSampler::new()
         .top_k(args.top_k)
         .top_p(args.top_p)
         .min_p(args.min_p)
@@ -138,6 +178,16 @@ fn main() -> Result<()> {
             args.frequency_penalty,
             args.presence_penalty,
         );
+    // Probability filters cannot change a greedy argmax. Avoid their full-vocabulary
+    // sorting and softmax work, as well as GenerationSampler's token-history readback,
+    // when no repetition/frequency/presence penalty is active.
+    let penalties_active =
+        args.repeat_penalty != 1.0 || args.frequency_penalty != 0.0 || args.presence_penalty != 0.0;
+    let sampler = if args.temperature == 0.0 && !penalties_active {
+        CliSampler::Greedy(DefaultSampler)
+    } else {
+        CliSampler::Configured(configured_sampler)
+    };
     let prng_key = (args.temperature != 0.0)
         .then(|| safemlx::random::key(args.seed))
         .transpose()?;
@@ -157,11 +207,23 @@ fn main() -> Result<()> {
             sampler,
         );
 
-        for _ in 0..args.max_tokens {
-            let Some(token) = generator.next() else {
+        let mut current = generator.next().transpose()?;
+        for index in 0..args.max_tokens {
+            let Some(token) = current.take() else {
                 break;
             };
-            let token_id = token?.item::<u32>(stream);
+            // Start the following decode before reading the current token back to
+            // the CPU. This mirrors mlx-lm's one-token async evaluation pipeline.
+            let next = if index + 1 < args.max_tokens {
+                let next = generator.next();
+                if let Some(Ok(next_token)) = next.as_ref() {
+                    async_eval([next_token])?;
+                }
+                next
+            } else {
+                None
+            };
+            let token_id = token.item::<u32>(stream);
             if time_to_first_token.is_none() {
                 time_to_first_token = Some(generation_started.elapsed());
             }
@@ -169,6 +231,7 @@ fn main() -> Result<()> {
             if eos_token_ids.contains(&token_id) {
                 break;
             }
+            current = next.transpose()?;
         }
     }
     let generation_elapsed = generation_started.elapsed();
@@ -202,7 +265,15 @@ fn main() -> Result<()> {
         eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
         match time_to_first_token {
             Some(elapsed) => {
-                eprintln!("time_to_first_token: {:.3} s", elapsed.as_secs_f64())
+                eprintln!("time_to_first_token: {:.3} s", elapsed.as_secs_f64());
+                let decode_tokens = output_ids.len().saturating_sub(1);
+                let decode_elapsed = generation_elapsed.saturating_sub(elapsed);
+                let decode_token_rate = if decode_elapsed.is_zero() {
+                    0.0
+                } else {
+                    decode_tokens as f64 / decode_elapsed.as_secs_f64()
+                };
+                eprintln!("decode_token_rate: {decode_token_rate:.2} tokens/s");
             }
             None => eprintln!("time_to_first_token: n/a"),
         }
@@ -266,6 +337,9 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if !args.frequency_penalty.is_finite() || !args.presence_penalty.is_finite() {
         bail!("frequency and presence penalties must be finite numbers");
+    }
+    if let Some(bits) = args.quantize {
+        AffineQuantization::new(args.quantization_group_size, bits)?;
     }
     if args.revision.is_some() && Path::new(&args.model).exists() {
         bail!("--revision can only be used with a Hugging Face model identifier");
@@ -349,10 +423,10 @@ fn select_revision<'a>(
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use hf_hub::cache::CachedRevisionInfo;
 
-    use super::{format_bytes, select_revision, Cli};
+    use super::{format_bytes, select_revision, validate_args, Cli};
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
         CachedRevisionInfo {
@@ -368,6 +442,34 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn validates_load_time_quantization_arguments() {
+        let valid = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--quantize",
+            "4",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&valid).unwrap();
+
+        let invalid = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--quantize",
+            "7",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("bits must be one of"));
     }
 
     #[test]

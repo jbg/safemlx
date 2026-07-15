@@ -676,7 +676,9 @@ impl LayerCache {
     fn new(layer_type: LayerType) -> Self {
         match layer_type {
             LayerType::Conv => Self::Conv(CausalConv1dCache::default()),
-            LayerType::FullAttention => Self::Attention(ConcatKeyValueCache::new()),
+            // Match mlx-lm's KVCache growth policy. Chunked backing arrays
+            // avoid concatenating the complete cache for every decode token.
+            LayerType::FullAttention => Self::Attention(ConcatKeyValueCache::new_with_step(256)),
         }
     }
 
