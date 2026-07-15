@@ -598,6 +598,39 @@ pub fn load_safetensors_dir_strict_with_split_swiglu_experts<M>(
 where
     M: ModuleParameters,
 {
+    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
+        model,
+        model_dir,
+        weights_stream,
+        transform_stream,
+        quantization,
+        config,
+        report,
+        num_experts,
+        |key, value| Ok(vec![(key, value)]),
+    )
+}
+
+/// Strict-loads and packs split SwiGLU experts after applying a streaming key/value transform.
+///
+/// The transform can split or rewrite architecture-specific tensors before
+/// expert detection and strict parameter matching without buffering a shard.
+#[allow(clippy::too_many_arguments)]
+pub fn load_safetensors_dir_strict_with_split_swiglu_experts_and_transform<M, F>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    weights_stream: &Stream,
+    transform_stream: &Stream,
+    quantization: Option<WeightQuantization>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+    num_experts: i32,
+    transform: F,
+) -> Result<(), Error>
+where
+    M: ModuleParameters,
+    F: Fn(String, Array) -> Result<Vec<(String, Array)>, Error>,
+{
     if let Some(quantization) = quantization {
         quantization.validate()?;
     }
@@ -606,54 +639,55 @@ where
 
     for file in safetensors_files(model_dir)? {
         for_each_safetensor_array(file, weights_stream, |key, value| {
-            if let Some((prefix, expert, projection)) =
-                parse_split_swiglu_expert_projection_key(&key)
-            {
+            for (key, value) in transform(key, value)? {
+                if let Some((prefix, expert, projection)) =
+                    parse_split_swiglu_expert_projection_key(&key)
                 {
-                    let parts = expert_parts.entry((prefix.clone(), expert)).or_default();
-                    match projection {
-                        SwiGluExpertProjection::Gate => parts.gate = Some(value),
-                        SwiGluExpertProjection::Down => parts.down = Some(value),
-                        SwiGluExpertProjection::Up => parts.up = Some(value),
-                    }
-                }
-                if split_swiglu_expert_prefix_complete(&expert_parts, &prefix, num_experts) {
-                    for (key, value) in pack_split_swiglu_expert_prefix(
-                        &mut expert_parts,
-                        &prefix,
-                        num_experts,
-                        transform_stream,
-                    )? {
-                        if let Some(quantization) = quantization {
-                            load_array_quantized_strict(
-                                &mut params,
-                                key,
-                                value,
-                                transform_stream,
-                                quantization,
-                                config,
-                                report,
-                            )?;
-                        } else {
-                            load_array_strict(&mut params, key, value, config, report);
+                    {
+                        let parts = expert_parts.entry((prefix.clone(), expert)).or_default();
+                        match projection {
+                            SwiGluExpertProjection::Gate => parts.gate = Some(value),
+                            SwiGluExpertProjection::Down => parts.down = Some(value),
+                            SwiGluExpertProjection::Up => parts.up = Some(value),
                         }
                     }
+                    if split_swiglu_expert_prefix_complete(&expert_parts, &prefix, num_experts) {
+                        for (key, value) in pack_split_swiglu_expert_prefix(
+                            &mut expert_parts,
+                            &prefix,
+                            num_experts,
+                            transform_stream,
+                        )? {
+                            if let Some(quantization) = quantization {
+                                load_array_quantized_strict(
+                                    &mut params,
+                                    key,
+                                    value,
+                                    transform_stream,
+                                    quantization,
+                                    config,
+                                    report,
+                                )?;
+                            } else {
+                                load_array_strict(&mut params, key, value, config, report);
+                            }
+                        }
+                    }
+                } else if let Some(quantization) = quantization {
+                    load_array_quantized_strict(
+                        &mut params,
+                        key,
+                        value,
+                        transform_stream,
+                        quantization,
+                        config,
+                        report,
+                    )?;
+                } else {
+                    load_array_strict(&mut params, key, value, config, report);
                 }
-                Ok(())
-            } else if let Some(quantization) = quantization {
-                load_array_quantized_strict(
-                    &mut params,
-                    key,
-                    value,
-                    transform_stream,
-                    quantization,
-                    config,
-                    report,
-                )
-            } else {
-                load_array_strict(&mut params, key, value, config, report);
-                Ok(())
             }
+            Ok(())
         })?;
     }
 
@@ -689,9 +723,9 @@ pub fn parse_split_swiglu_expert_projection_key(
     let mut parts = rest.split('.');
     let expert = parts.next()?.parse().ok()?;
     let projection = match parts.next()? {
-        "w1" => SwiGluExpertProjection::Gate,
-        "w2" => SwiGluExpertProjection::Down,
-        "w3" => SwiGluExpertProjection::Up,
+        "w1" | "gate_proj" => SwiGluExpertProjection::Gate,
+        "w2" | "down_proj" => SwiGluExpertProjection::Down,
+        "w3" | "up_proj" => SwiGluExpertProjection::Up,
         _ => return None,
     };
     if parts.next()? != "weight" || parts.next().is_some() {
@@ -907,6 +941,11 @@ mod tests {
         assert_eq!(prefix, "model.layers.3.feed_forward.experts");
         assert_eq!(expert, 17);
         assert_eq!(projection, super::SwiGluExpertProjection::Up);
+        let (_, _, projection) = parse_split_swiglu_expert_projection_key(
+            "model.layers.3.mlp.experts.17.gate_proj.weight",
+        )
+        .unwrap();
+        assert_eq!(projection, super::SwiGluExpertProjection::Gate);
         assert!(parse_split_swiglu_expert_projection_key(
             "model.layers.3.feed_forward.experts.17.bias"
         )

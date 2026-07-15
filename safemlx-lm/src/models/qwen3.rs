@@ -8,7 +8,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
+    module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt},
     nn,
     ops::{concatenate_axis, indexing::TryIndexOp, GgufMetadataValue},
     quantization::MaybeQuantized,
@@ -459,10 +459,10 @@ impl SparseMoeBlock {
                 args.hidden_size,
                 args.moe_intermediate_size,
                 args.weight_quantization_for(&format!(
-                    "model.layers.{layer_index}.moe.experts.gate_up_proj"
+                    "model.layers.{layer_index}.mlp.experts.gate_up_proj"
                 )),
                 args.weight_quantization_for(&format!(
-                    "model.layers.{layer_index}.moe.experts.down_proj"
+                    "model.layers.{layer_index}.mlp.experts.down_proj"
                 )),
                 stream,
             )?,
@@ -508,6 +508,163 @@ impl Module<&Array> for SparseMoeBlock {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Dense or sparse Qwen3 feed-forward layer stored under the checkpoint-native `mlp` namespace.
+pub enum FeedForward {
+    /// Dense SwiGLU MLP.
+    Dense(Mlp),
+    /// Sparse mixture-of-experts block.
+    Moe(SparseMoeBlock),
+}
+
+impl FeedForward {
+    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
+        if args.is_moe() {
+            Ok(Self::Moe(SparseMoeBlock::new(args, layer_index, stream)?))
+        } else {
+            let prefix = format!("model.layers.{layer_index}.mlp");
+            Ok(Self::Dense(SwiGluMlp {
+                gate_proj: common::linear::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.intermediate_size,
+                    false,
+                    args.weight_quantization_for(&format!("{prefix}.gate_proj.weight")),
+                    stream,
+                )?,
+                down_proj: common::linear::unloaded_maybe_quantized_linear(
+                    args.intermediate_size,
+                    args.hidden_size,
+                    false,
+                    args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
+                    stream,
+                )?,
+                up_proj: common::linear::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.intermediate_size,
+                    false,
+                    args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
+                    stream,
+                )?,
+            }))
+        }
+    }
+
+    fn is_moe(&self) -> bool {
+        matches!(self, Self::Moe(_))
+    }
+
+    fn forward_with_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
+            Self::Moe(moe) => moe.forward_with_observer(input, stream, prefix, observer),
+        }
+    }
+}
+
+impl Module<&Array> for FeedForward {
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Self::Output, Self::Error> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(input, stream),
+            Self::Moe(moe) => moe.forward(input, stream),
+        }
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.training_mode(mode),
+            Self::Moe(moe) => moe.training_mode(mode),
+        }
+    }
+}
+
+impl ModuleParametersTrait for FeedForward {
+    fn num_parameters(&self) -> usize {
+        match self {
+            Self::Dense(mlp) => mlp.num_parameters(),
+            Self::Moe(moe) => moe.num_parameters(),
+        }
+    }
+
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters(),
+            Self::Moe(moe) => moe.parameters(),
+        }
+    }
+
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters_mut(),
+            Self::Moe(moe) => moe.parameters_mut(),
+        }
+    }
+
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.trainable_parameters(),
+            Self::Moe(moe) => moe.trainable_parameters(),
+        }
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.freeze_parameters(recursive),
+            Self::Moe(moe) => moe.freeze_parameters(recursive),
+        }
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.unfreeze_parameters(recursive),
+            Self::Moe(moe) => moe.unfreeze_parameters(recursive),
+        }
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.all_frozen(),
+            Self::Moe(moe) => moe.all_frozen(),
+        }
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.any_frozen(),
+            Self::Moe(moe) => moe.any_frozen(),
+        }
+    }
+}
+
+impl safemlx::quantization::Quantizable for FeedForward {
+    type Quantized = Self;
+    type QuantizationError = Exception;
+
+    fn try_into_quantized(
+        self,
+        group_size: i32,
+        bits: i32,
+        stream: &Stream,
+    ) -> Result<Self::Quantized, Self::QuantizationError> {
+        match self {
+            Self::Dense(mlp) => Ok(Self::Dense(
+                safemlx::quantization::Quantizable::try_into_quantized(
+                    mlp, group_size, bits, stream,
+                )?,
+            )),
+            Self::Moe(moe) => Ok(Self::Moe(moe)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Qwen3 decoder block.
 pub struct TransformerBlock {
@@ -523,12 +680,8 @@ pub struct TransformerBlock {
 
     #[quantizable]
     #[param]
-    /// Feed-forward layer.
-    pub mlp: Option<Mlp>,
-
-    #[param]
-    /// Sparse routed-expert layer for Qwen3 MoE.
-    pub moe: Option<SparseMoeBlock>,
+    /// Dense or sparse feed-forward layer.
+    pub mlp: FeedForward,
 
     #[param]
     /// Pre-attention RMSNorm.
@@ -554,38 +707,7 @@ impl TransformerBlock {
         let hidden_size = args.hidden_size;
 
         let self_attn = Attention::new_for_layer(args, layer_index, stream)?;
-        let mlp = if args.is_moe() {
-            None
-        } else {
-            let mlp_prefix = format!("model.layers.{layer_index}.mlp");
-            Some(SwiGluMlp {
-                gate_proj: common::linear::unloaded_maybe_quantized_linear(
-                    args.hidden_size,
-                    args.intermediate_size,
-                    false,
-                    args.weight_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
-                    stream,
-                )?,
-                down_proj: common::linear::unloaded_maybe_quantized_linear(
-                    args.intermediate_size,
-                    args.hidden_size,
-                    false,
-                    args.weight_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
-                    stream,
-                )?,
-                up_proj: common::linear::unloaded_maybe_quantized_linear(
-                    args.hidden_size,
-                    args.intermediate_size,
-                    false,
-                    args.weight_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
-                    stream,
-                )?,
-            })
-        };
-        let moe = args
-            .is_moe()
-            .then(|| SparseMoeBlock::new(args, layer_index, stream))
-            .transpose()?;
+        let mlp = FeedForward::new(args, layer_index, stream)?;
         let input_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let post_attention_layernorm =
@@ -596,7 +718,6 @@ impl TransformerBlock {
             hidden_size,
             self_attn,
             mlp,
-            moe,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -637,18 +758,16 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
         observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
 
-        let feed_forward_name = if self.moe.is_some() { "moe" } else { "mlp" };
+        let feed_forward_name = if self.mlp.is_moe() { "moe" } else { "mlp" };
         observer.observe(&format!("{prefix}.residual_before_{feed_forward_name}"), &h)?;
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
         observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
-        let r = if let Some(moe) = &mut self.moe {
-            moe.forward_with_observer(&post_normed, stream, &format!("{prefix}.moe"), observer)?
-        } else {
-            self.mlp
-                .as_mut()
-                .expect("dense Qwen3 MLP")
-                .forward_with_observer(&post_normed, stream, &format!("{prefix}.mlp"), observer)?
-        };
+        let r = self.mlp.forward_with_observer(
+            &post_normed,
+            stream,
+            &format!("{prefix}.mlp"),
+            observer,
+        )?;
         observer.observe(&format!("{prefix}.{feed_forward_name}_output"), &r)?;
         observer.observe(&format!("{prefix}.residual_delta_{feed_forward_name}"), &r)?;
         let output = h.add(r, stream)?;
@@ -687,14 +806,7 @@ impl TransformerBlock {
         )?;
         let hidden = x.add(attention, stream)?;
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
-        let mlp = if let Some(moe) = &mut self.moe {
-            moe.forward(&normed, stream)?
-        } else {
-            self.mlp
-                .as_mut()
-                .expect("dense Qwen3 MLP")
-                .forward(&normed, stream)?
-        };
+        let mlp = self.mlp.forward(&normed, stream)?;
         hidden.add(mlp, stream)
     }
 }
@@ -724,25 +836,13 @@ where
         let h = x.add(r, stream)?;
 
         let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        let r = if let Some(moe) = &mut self.moe {
-            moe.forward(&post_normed, stream)?
-        } else {
-            self.mlp
-                .as_mut()
-                .expect("dense Qwen3 MLP")
-                .forward(&post_normed, stream)?
-        };
+        let r = self.mlp.forward(&post_normed, stream)?;
         h.add(r, stream)
     }
 
     fn training_mode(&mut self, mode: bool) {
         <Attention as Module<AttentionInput<'_, C>>>::training_mode(&mut self.self_attn, mode);
-        if let Some(mlp) = &mut self.mlp {
-            mlp.training_mode(mode);
-        }
-        if let Some(moe) = &mut self.moe {
-            moe.training_mode(mode);
-        }
+        self.mlp.training_mode(mode);
         self.input_layernorm.training_mode(mode);
         self.post_attention_layernorm.training_mode(mode);
     }
@@ -1316,15 +1416,15 @@ fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
     };
     if is_moe {
         const MOE_PARAMETERS: [(&str, &str); 4] = [
-            ("ffn_gate_inp", "moe.gate"),
-            ("ffn_gate_exps", "moe.experts.gate_proj"),
-            ("ffn_up_exps", "moe.experts.up_proj"),
-            ("ffn_down_exps", "moe.experts.down_proj"),
+            ("ffn_gate_inp", "mlp.gate"),
+            ("ffn_gate_exps", "mlp.experts.gate_proj"),
+            ("ffn_up_exps", "mlp.experts.up_proj"),
+            ("ffn_down_exps", "mlp.experts.down_proj"),
         ];
         for (source, target) in MOE_PARAMETERS {
             if parameter == source || parameter.starts_with(&format!("{source}.")) {
                 let mut suffix = parameter.strip_prefix(source).unwrap_or_default();
-                if target.starts_with("moe.experts.") {
+                if target.starts_with("mlp.experts.") {
                     suffix = match suffix {
                         ".weight" => "",
                         ".scales" => "_scales",
@@ -1368,7 +1468,7 @@ fn pack_qwen3_moe_expert_banks(
     stream: &Stream,
 ) -> Result<(), Error> {
     for layer in 0..args.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.moe.experts");
+        let prefix = format!("model.layers.{layer}.mlp.experts");
         let affine = arrays.contains_key(&format!("{prefix}.gate_proj_scales"))
             || arrays.contains_key(&format!("{prefix}.up_proj_scales"));
         let suffixes: &[&str] = if affine {
@@ -1691,15 +1791,15 @@ mod tests {
     fn translates_qwen3_moe_experts_and_mixed_affine_shapes() {
         assert_eq!(
             super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_inp.weight", true),
-            "model.layers.3.moe.gate.weight"
+            "model.layers.3.mlp.gate.weight"
         );
         assert_eq!(
             super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_exps.scales", true),
-            "model.layers.3.moe.experts.gate_proj_scales"
+            "model.layers.3.mlp.experts.gate_proj_scales"
         );
         assert_eq!(
             super::translate_qwen3_gguf_weight_name("blk.3.ffn_down_exps.weight", true),
-            "model.layers.3.moe.experts.down_proj"
+            "model.layers.3.mlp.experts.down_proj"
         );
         assert_eq!(
             super::qwen3_gguf_affine_quantization(&[4096, 256], &[4096, 64], "q_proj").unwrap(),
@@ -1739,23 +1839,23 @@ mod tests {
         args.norm_topk_prob = true;
         args.quantized_weight_configs = Some(HashMap::from([
             (
-                "model.layers.0.moe.experts.gate_up_proj".into(),
+                "model.layers.0.mlp.experts.gate_up_proj".into(),
                 AffineQuantization::new(32, 4).unwrap(),
             ),
             (
-                "model.layers.0.moe.experts.down_proj".into(),
+                "model.layers.0.mlp.experts.down_proj".into(),
                 AffineQuantization::new(32, 4).unwrap(),
             ),
         ]));
         let model = super::Model::new(args, ctx.stream()).unwrap();
         let params = model.parameters().flatten();
-        assert!(params.contains_key("model.layers.0.moe.gate.weight"));
+        assert!(params.contains_key("model.layers.0.mlp.gate.weight"));
         assert_eq!(
-            params["model.layers.0.moe.experts.gate_up_proj"].shape(),
+            params["model.layers.0.mlp.experts.gate_up_proj"].shape(),
             &[4, 16, 4]
         );
         assert_eq!(
-            params["model.layers.0.moe.experts.down_proj"].shape(),
+            params["model.layers.0.mlp.experts.down_proj"].shape(),
             &[4, 32, 1]
         );
         assert!(!params.contains_key("model.layers.0.mlp.gate_proj.weight"));

@@ -4361,6 +4361,7 @@ pub fn load_qwen3_5_moe_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokeniz
 enum Qwen35Variant {
     Dense,
     Moe,
+    Qwen3Next,
 }
 
 impl Qwen35Variant {
@@ -4368,6 +4369,7 @@ impl Qwen35Variant {
         match self {
             Self::Dense => "qwen3_5_text",
             Self::Moe => "qwen3_5_moe_text",
+            Self::Qwen3Next => "qwen3_next",
         }
     }
 }
@@ -4399,10 +4401,16 @@ fn parse_qwen3_5_config_value(
             } else {
                 Qwen35Variant::Moe
             };
-            let args = serde_json::from_value(value).map_err(|error| {
+            let args = serde_json::from_value(value.clone()).map_err(|error| {
                 Error::UnsupportedArchitecture(format!("invalid {model_type} config: {error}"))
             })?;
             (args, variant)
+        }
+        "qwen3_next" => {
+            let args = serde_json::from_value(value.clone()).map_err(|error| {
+                Error::UnsupportedArchitecture(format!("invalid qwen3_next config: {error}"))
+            })?;
+            (args, Qwen35Variant::Qwen3Next)
         }
         other => return Err(Error::UnsupportedModelType(other.to_string())),
     };
@@ -4421,9 +4429,43 @@ fn parse_qwen3_5_config_value(
     if let Some(tie_word_embeddings) = config.tie_word_embeddings {
         args.tie_word_embeddings = tie_word_embeddings;
     }
+    if variant == Qwen35Variant::Qwen3Next && args.rope_parameters.is_none() {
+        let mut rope_parameters = HashMap::new();
+        if let Some(rope_theta) = value.get("rope_theta").cloned() {
+            rope_parameters.insert("rope_theta".into(), rope_theta);
+        }
+        if let Some(partial_rotary_factor) = value.get("partial_rotary_factor").cloned() {
+            rope_parameters.insert("partial_rotary_factor".into(), partial_rotary_factor);
+        }
+        if !rope_parameters.is_empty() {
+            args.rope_parameters = Some(rope_parameters);
+        }
+    }
     if args.layer_types.is_empty() {
+        let interval = value
+            .get("full_attention_interval")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture(
+                    "qwen3_next full_attention_interval exceeds usize".into(),
+                )
+            })?
+            .unwrap_or(4);
+        if interval == 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "qwen3_next full_attention_interval must be positive".into(),
+            ));
+        }
         args.layer_types = (0..args.num_hidden_layers)
-            .map(|idx| default_layer_type(idx as usize))
+            .map(|idx| {
+                if (idx as usize + 1) % interval == 0 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
             .collect();
     }
     Ok((
@@ -4824,7 +4866,7 @@ fn parse_fp8_expert_scale_key(key: &str) -> Option<(String, i32, Fp8ExpertProjec
     parse_fp8_expert_projection_key(&weight_key)
 }
 
-fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadConfig {
+pub(crate) fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadConfig {
     let config = StrictLoadConfig::default()
         .rewrite_prefix("model.language_model.", "model.")
         .rewrite_prefix("language_model.", "model.")
@@ -5410,6 +5452,44 @@ mod tests {
         assert_eq!(args.layer_types[3], LayerType::FullAttention);
         assert_eq!(image_token_id, Some(248056));
         assert_eq!(video_token_id, Some(248057));
+        assert!(vision_config.is_none());
+    }
+
+    #[test]
+    fn parses_qwen3_next_config() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_next",
+              "vocab_size": 151936,
+              "hidden_size": 2048,
+              "num_hidden_layers": 8,
+              "num_attention_heads": 16,
+              "num_key_value_heads": 2,
+              "head_dim": 256,
+              "max_position_embeddings": 262144,
+              "intermediate_size": 5120,
+              "moe_intermediate_size": 512,
+              "shared_expert_intermediate_size": 512,
+              "num_experts_per_tok": 10,
+              "num_experts": 512,
+              "norm_topk_prob": true,
+              "tie_word_embeddings": false,
+              "full_attention_interval": 4,
+              "rope_theta": 10000000,
+              "partial_rotary_factor": 0.25
+            }"#,
+        );
+        let (args, image_token_id, video_token_id, vision_config) =
+            get_qwen3_5_moe_model_args(&dir).unwrap();
+        assert_eq!(args.model_type, "qwen3_next");
+        assert_eq!(args.layer_types.len(), 8);
+        assert_eq!(args.layer_types[2], LayerType::LinearAttention);
+        assert_eq!(args.layer_types[3], LayerType::FullAttention);
+        assert_eq!(args.rope_theta(), 10_000_000.0);
+        assert_eq!(args.partial_rotary_factor(), 0.25);
+        assert_eq!(args.num_experts, 512);
+        assert_eq!(image_token_id, None);
+        assert_eq!(video_token_id, None);
         assert!(vision_config.is_none());
     }
 

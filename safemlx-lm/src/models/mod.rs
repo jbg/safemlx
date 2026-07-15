@@ -67,8 +67,12 @@ pub mod personaplex;
 pub mod qwen3;
 /// Qwen3.5 MoE text model support.
 pub mod qwen3_5_moe;
+/// Qwen3-Next hybrid attention/MoE text model support.
+pub mod qwen3_next;
 /// Qwen3-VL multimodal conditional-generation support.
 pub mod qwen3_vl;
+/// Qwen3-VL-MoE multimodal conditional-generation support.
+pub mod qwen3_vl_moe;
 mod qwen_vl;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,8 +124,12 @@ pub enum ModelKind {
     PersonaPlex,
     /// Qwen3 decoder architecture.
     Qwen3,
+    /// Qwen3-Next hybrid attention/MoE architecture.
+    Qwen3Next,
     /// Qwen3-VL multimodal architecture.
     Qwen3Vl,
+    /// Qwen3-VL multimodal architecture with a sparse MoE text decoder.
+    Qwen3VlMoe,
     /// Qwen3.5 dense or mixture-of-experts architecture.
     Qwen35Moe,
 }
@@ -156,7 +164,9 @@ impl ModelKind {
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
             "qwen3" => Ok(Self::Qwen3),
+            "qwen3_next" => Ok(Self::Qwen3Next),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
+            "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             other => Err(Error::UnsupportedModelType(other.to_string())),
         }
@@ -270,7 +280,9 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
             })?;
             Ok(())
         }
+        ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
+        ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),
         ModelKind::Qwen35Moe => qwen3_5_moe::validate_model_config_value(config),
     }
 }
@@ -289,8 +301,12 @@ pub enum Model {
     NemotronH(nemotron_h::Model),
     /// Qwen3 model.
     Qwen3(qwen3::Model),
+    /// Qwen3-Next model.
+    Qwen3Next(qwen3_next::Model),
     /// Qwen3-VL multimodal model.
     Qwen3Vl(qwen3_vl::Model),
+    /// Qwen3-VL-MoE multimodal model.
+    Qwen3VlMoe(qwen3_vl_moe::Model),
     /// Qwen3.5 MoE text model.
     Qwen35Moe(qwen3_5_moe::Model),
 }
@@ -305,7 +321,9 @@ impl Model {
             Self::Lfm2(model) => model.model_type(),
             Self::NemotronH(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
+            Self::Qwen3Next(model) => model.model_type(),
             Self::Qwen3Vl(model) => model.model_type(),
+            Self::Qwen3VlMoe(model) => model.model_type(),
             Self::Qwen35Moe(model) => model.model_type(),
         }
     }
@@ -362,6 +380,16 @@ impl Model {
                 stream,
                 observer,
             ),
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => model.forward_with_observer(
+                qwen3_next::ModelInput {
+                    inputs: input_tokens,
+                    inputs_embeds: None,
+                    mask,
+                    cache: Some(cache),
+                },
+                stream,
+                observer,
+            ),
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => model.forward_with_observer(
                 gemma4::ModelInput {
                     inputs: input_tokens,
@@ -382,6 +410,9 @@ impl Model {
             )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
+            )),
+            (Self::Qwen3VlMoe(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for qwen3_vl_moe yet",
             )),
             (Self::GptOss(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for gpt_oss yet",
@@ -452,6 +483,9 @@ impl Model {
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
+                model.prefill_typed_with_observer(input, cache, stream, observer)
+            }
             (Self::NemotronH(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
             )),
@@ -460,6 +494,9 @@ impl Model {
             )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
+            )),
+            (Self::Qwen3VlMoe(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for qwen3_vl_moe yet",
             )),
             _ => Err(Exception::custom(
                 "model cache type does not match model kind",
@@ -478,7 +515,9 @@ impl Model {
             },
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
             Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
+            Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
+            Self::Qwen3VlMoe(model) => ModelCache::Qwen3VlMoe(model.new_cache()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
             Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
         }
@@ -514,6 +553,12 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
@@ -580,6 +625,11 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+                ModelGenerate::Qwen3VlMoe(qwen3_vl_moe::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
                 ModelGenerate::NemotronH(nemotron_h::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
@@ -587,6 +637,11 @@ impl Model {
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 ModelGenerate::Qwen35Moe(qwen3_5_moe::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
+                ModelGenerate::Qwen3Next(qwen3_next::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
@@ -606,6 +661,8 @@ pub enum ModelCache {
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
+    /// Qwen3-VL-MoE key/value cache and multimodal position state.
+    Qwen3VlMoe(qwen3_vl_moe::Cache),
     /// Homogeneous bounded cache for sliding-window attention.
     SlidingKeyValue(Vec<Option<SlidingKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
@@ -614,6 +671,8 @@ pub enum ModelCache {
     Lfm2(lfm2::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35Moe(qwen3_5_moe::Cache),
+    /// Heterogeneous Qwen3-Next cache.
+    Qwen3Next(qwen3_next::Cache),
 }
 
 /// Token iterator for any supported model variant.
@@ -633,12 +692,16 @@ where
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
     /// Qwen3-VL generation iterator.
     Qwen3Vl(qwen3_vl::Generate<'a, S>),
+    /// Qwen3-VL-MoE generation iterator.
+    Qwen3VlMoe(qwen3_vl_moe::Generate<'a, S>),
     /// Nemotron-H generation iterator.
     NemotronH(nemotron_h::Generate<'a, S>),
     /// LFM2 generation iterator.
     Lfm2(lfm2::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
+    /// Qwen3-Next generation iterator.
+    Qwen3Next(qwen3_next::Generate<'a, S>),
 }
 
 impl<S> Iterator for ModelGenerate<'_, S>
@@ -657,7 +720,9 @@ where
             Self::NemotronH(generate) => generate.next(),
             Self::Qwen3(generate) => generate.next(),
             Self::Qwen3Vl(generate) => generate.next(),
+            Self::Qwen3VlMoe(generate) => generate.next(),
             Self::Qwen35Moe(generate) => generate.next(),
+            Self::Qwen3Next(generate) => generate.next(),
         }
     }
 }
@@ -1302,8 +1367,24 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
+            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
+                qwen3_next::load_qwen3_next_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
                 qwen3_vl::load_qwen3_vl_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
+                qwen3_vl_moe::load_qwen3_vl_moe_model_quantized(
                     model_dir,
                     quantization,
                     stream,
@@ -1358,7 +1439,17 @@ fn load_model_for_kind(
             stream,
             weights_stream,
         )?)),
+        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(qwen3_next::load_qwen3_next_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(qwen3_vl::load_qwen3_vl_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
+        ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(qwen3_vl_moe::load_qwen3_vl_moe_model(
             model_dir,
             stream,
             weights_stream,
@@ -1395,7 +1486,9 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
             "PersonaPlex uses the released SentencePiece tokenizer; load it outside the chat tokenizer API".into(),
         )),
         ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
+        ModelKind::Qwen3Next => qwen3_next::load_qwen3_next_tokenizer(model_dir),
         ModelKind::Qwen3Vl => qwen3::load_qwen3_tokenizer(model_dir),
+        ModelKind::Qwen3VlMoe => qwen3::load_qwen3_tokenizer(model_dir),
         ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
     }
 }
@@ -1481,7 +1574,7 @@ fn load_gguf_tokenizer_from_metadata(
 fn effective_model_type(metadata: &ModelMetadata) -> String {
     if matches!(
         metadata.model_type.as_str(),
-        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_5" | "qwen3_5_moe"
+        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
     ) {
         metadata
             .text_config
@@ -2505,6 +2598,59 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 kind: super::ModelKind::Qwen35Moe,
                 model_type: "qwen3_5_moe".to_string(),
                 effective_model_type: "qwen3_5_moe_text".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_qwen3_next() {
+        let support = check_model_config(&json!({
+            "model_type":"qwen3_next","vocab_size":128,"hidden_size":16,
+            "num_hidden_layers":4,"num_attention_heads":2,"num_key_value_heads":1,
+            "head_dim":8,"max_position_embeddings":128,"intermediate_size":32,
+            "moe_intermediate_size":8,"shared_expert_intermediate_size":8,
+            "num_experts_per_tok":2,"num_experts":4,"tie_word_embeddings":false,
+            "rope_theta":10000000,"partial_rotary_factor":0.25
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Qwen3Next,
+                model_type: "qwen3_next".to_string(),
+                effective_model_type: "qwen3_next".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_qwen3_vl_moe() {
+        let support = check_model_config(&json!({
+            "model_type":"qwen3_vl_moe","image_token_id":30,"video_token_id":31,
+            "tie_word_embeddings":false,
+            "text_config":{
+                "model_type":"qwen3_vl_moe_text","hidden_size":16,"num_hidden_layers":2,
+                "intermediate_size":32,"num_attention_heads":2,"rms_norm_eps":0.000001,
+                "vocab_size":32,"num_key_value_heads":1,"max_position_embeddings":128,
+                "rope_theta":10000.0,"head_dim":8,"moe_intermediate_size":8,
+                "num_experts":4,"num_experts_per_tok":2,"norm_topk_prob":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}
+            },
+            "vision_config":{
+                "depth":1,"hidden_size":8,"hidden_act":"gelu_pytorch_tanh",
+                "intermediate_size":16,"num_heads":2,"num_position_embeddings":16,
+                "in_channels":3,"patch_size":2,"spatial_merge_size":2,
+                "temporal_patch_size":2,"out_hidden_size":16,
+                "deepstack_visual_indexes":[0]
+            }
+        }));
+
+        assert_eq!(
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Qwen3VlMoe,
+                model_type: "qwen3_vl_moe".to_string(),
+                effective_model_type: "qwen3_vl_moe_text".to_string(),
             })
         );
     }

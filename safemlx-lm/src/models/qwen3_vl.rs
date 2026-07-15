@@ -57,14 +57,13 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
     let object = value.as_object_mut().ok_or_else(|| {
         Error::UnsupportedArchitecture("qwen3_vl config must be a JSON object".into())
     })?;
-    if object.get("model_type").and_then(Value::as_str) != Some("qwen3_vl") {
-        return Err(Error::UnsupportedModelType(
-            object
-                .get("model_type")
-                .and_then(Value::as_str)
-                .unwrap_or("<missing>")
-                .to_string(),
-        ));
+    let model_type = object
+        .get("model_type")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string();
+    if !matches!(model_type.as_str(), "qwen3_vl" | "qwen3_vl_moe") {
+        return Err(Error::UnsupportedModelType(model_type));
     }
     let image_token_id = object
         .get("image_token_id")
@@ -90,8 +89,13 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
         Error::UnsupportedArchitecture("qwen3_vl config is missing text_config".into())
     })?;
     let text_object = text_value.as_object_mut().ok_or_else(|| {
-        Error::UnsupportedArchitecture("qwen3_vl text_config must be a JSON object".into())
+        Error::UnsupportedArchitecture(format!("{model_type} text_config must be a JSON object"))
     })?;
+    if !text_object.contains_key("tie_word_embeddings") {
+        if let Some(tie_word_embeddings) = object.get("tie_word_embeddings").cloned() {
+            text_object.insert("tie_word_embeddings".into(), tie_word_embeddings);
+        }
+    }
     if let Some(quantization) = top_level_quantization {
         text_object.insert("quantization".into(), quantization);
     }
@@ -118,12 +122,17 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
     }
     let mut text_config: qwen3::ModelArgs =
         serde_json::from_value(text_value).map_err(|error| {
-            Error::UnsupportedArchitecture(format!("invalid qwen3_vl text_config: {error}"))
+            Error::UnsupportedArchitecture(format!("invalid {model_type} text_config: {error}"))
         })?;
-    text_config.model_type = "qwen3_vl_text".into();
-    if !text_config.tie_word_embeddings {
+    text_config.model_type = if model_type == "qwen3_vl_moe" {
+        "qwen3_vl_moe_text"
+    } else {
+        "qwen3_vl_text"
+    }
+    .into();
+    if model_type == "qwen3_vl_moe" && text_config.num_experts <= 0 {
         return Err(Error::UnsupportedArchitecture(
-            "qwen3_vl untied language-model heads are not supported".into(),
+            "qwen3_vl_moe text_config must define routed experts".into(),
         ));
     }
     if mrope_section.len() != 3 || mrope_section.iter().any(|&section| section < 0) {
@@ -176,6 +185,9 @@ pub struct Model {
     #[param]
     /// Model body matching the public checkpoint parameter tree.
     pub model: Qwen3VLModel,
+    #[param]
+    /// Optional untied language-model head.
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 /// Generation state for Qwen3-VL, including multimodal RoPE offset state.
@@ -199,18 +211,37 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
         let language_model = qwen3::Qwen3Model::new(&args.text_config, stream)?;
+        let lm_head = if args.text_config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.text_config.hidden_size,
+                    args.text_config.vocab_size,
+                    args.text_config
+                        .quantization
+                        .or(args.text_config.quantization_config),
+                    stream,
+                )?,
+            )
+        };
         Ok(Self {
             args,
             model: Qwen3VLModel {
                 visual,
                 language_model,
             },
+            lm_head,
         })
     }
 
     /// Returns the effective model type.
     pub fn model_type(&self) -> &str {
-        "qwen3_vl"
+        if self.args.text_config.model_type == "qwen3_vl_moe_text" {
+            "qwen3_vl_moe"
+        } else {
+            "qwen3_vl"
+        }
     }
 
     /// Creates an empty cache.
@@ -404,9 +435,8 @@ impl Model {
             }
         }
         let hidden = self.model.language_model.norm.forward(&hidden, stream)?;
-        let mut lm_head: Option<MaybeQuantized<nn::Linear>> = None;
         common::linear::project_logits_maybe_quantized(
-            &mut lm_head,
+            &mut self.lm_head,
             &mut self.model.language_model.embed_tokens,
             &hidden,
             stream,
@@ -1151,6 +1181,36 @@ mod tests {
             args.text_config.quantization,
             Some(crate::quantization::AffineQuantization::default().into())
         );
+    }
+
+    #[test]
+    fn parses_qwen3_vl_moe_config_shape() {
+        let config = json!({
+            "model_type":"qwen3_vl_moe","image_token_id":151655,"video_token_id":151656,
+            "tie_word_embeddings":false,
+            "text_config":{
+                "model_type":"qwen3_vl_moe_text","hidden_size":2048,"num_hidden_layers":48,
+                "intermediate_size":6144,"num_attention_heads":32,"rms_norm_eps":0.000001,
+                "vocab_size":151936,"num_key_value_heads":4,"max_position_embeddings":262144,
+                "rope_theta":5000000.0,"head_dim":128,
+                "moe_intermediate_size":768,"num_experts":128,"num_experts_per_tok":8,
+                "norm_topk_prob":true,
+                "rope_scaling":{"rope_type":"default","mrope_interleaved":true,"mrope_section":[24,20,20]}
+            },
+            "vision_config":{
+                "depth":27,"hidden_size":1152,"hidden_act":"gelu_pytorch_tanh",
+                "intermediate_size":4304,"num_heads":16,"num_position_embeddings":2304,
+                "in_channels":3,"patch_size":16,"spatial_merge_size":2,
+                "temporal_patch_size":2,"out_hidden_size":2048,
+                "deepstack_visual_indexes":[8,16,24]
+            }
+        });
+        let args = super::parse_model_args_value(config).unwrap();
+        assert_eq!(args.text_config.model_type, "qwen3_vl_moe_text");
+        assert_eq!(args.text_config.num_experts, 128);
+        assert_eq!(args.text_config.num_experts_per_tok, 8);
+        assert!(!args.text_config.tie_word_embeddings);
+        assert_eq!(args.vision_config.deepstack_visual_indexes, vec![8, 16, 24]);
     }
 
     #[test]
