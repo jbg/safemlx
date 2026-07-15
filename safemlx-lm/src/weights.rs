@@ -889,7 +889,7 @@ mod tests {
     };
 
     use crate::{
-        models::common::unloaded_maybe_quantized_linear,
+        models::common::linear::unloaded_maybe_quantized_linear,
         quantization::{quantize_tensor, AffineQuantization, WeightQuantization},
     };
 

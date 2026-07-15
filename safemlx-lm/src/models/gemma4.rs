@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::sample;
+pub use super::common::generation::sample;
 use super::{
     gemma4_audio::{Gemma4AudioConfig, Gemma4AudioTower},
     gemma4_multimodal::Gemma4ModalityEmbedder,
@@ -41,8 +41,11 @@ use crate::{
     inspection::ActivationObserver,
     models::{
         common::{
-            self, attention_probabilities, batch_seq, finish_attention,
-            reshape_attention_projection, CausalLm,
+            self,
+            attention::{
+                attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
+            },
+            generation::CausalLm,
         },
         input,
     },
@@ -3622,7 +3625,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Gemma 4 token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
 mod tests {
@@ -3638,7 +3642,7 @@ mod tests {
         ModelArgs,
     };
     use crate::models::{
-        common::CausalLm,
+        common::generation::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
     };
 

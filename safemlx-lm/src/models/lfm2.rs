@@ -23,10 +23,15 @@ use crate::{
     error::Error,
     models::{
         common::{
-            self, apply_rope_and_update_cache, batch_seq, causal_depthwise_conv1d,
-            finish_attention, project_logits_maybe_quantized, reshape_attention_projection,
-            CausalConv1dCache, CausalLm, DepthwiseConv1d, PackedSwiGluExperts,
-            TopKRouterScoreFunction,
+            self,
+            attention::{
+                apply_rope_and_update_cache, batch_seq, finish_attention,
+                reshape_attention_projection,
+            },
+            convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
+            generation::CausalLm,
+            linear::project_logits_maybe_quantized,
+            moe::{PackedSwiGluExperts, TopKRouterScoreFunction},
         },
         input,
         qwen3::{gguf_i32, gguf_string},
@@ -365,28 +370,28 @@ impl Attention {
             n_kv_heads: args.num_key_value_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            q_proj: common::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
-            k_proj: common::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
-            v_proj: common::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
-            out_proj: common::unloaded_maybe_quantized_linear(
+            out_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * head_dim,
                 args.hidden_size,
                 false,
@@ -489,14 +494,14 @@ impl ShortConv {
                 args.conv_bias,
                 stream,
             )?,
-            in_proj: common::unloaded_maybe_quantized_linear(
+            in_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 3 * args.hidden_size,
                 args.conv_bias,
                 args.weight_quantization_for(&format!("{prefix}.in_proj.weight")),
                 stream,
             )?,
-            out_proj: common::unloaded_maybe_quantized_linear(
+            out_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.hidden_size,
                 args.conv_bias,
@@ -543,7 +548,7 @@ pub struct FeedForward {
     pub w3: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     /// Sparse router.
-    pub gate: Option<common::TopKRouter>,
+    pub gate: Option<common::moe::TopKRouter>,
     #[param]
     /// Packed routed experts.
     pub experts: Option<PackedSwiGluExperts>,
@@ -562,21 +567,21 @@ impl FeedForward {
         let prefix = format!("model.layers.{layer}.feed_forward");
         Ok(Self {
             is_moe: false,
-            w1: Some(common::unloaded_maybe_quantized_linear(
+            w1: Some(common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 intermediate_size,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.w1.weight")),
                 stream,
             )?),
-            w2: Some(common::unloaded_maybe_quantized_linear(
+            w2: Some(common::linear::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 args.hidden_size,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.w2.weight")),
                 stream,
             )?),
-            w3: Some(common::unloaded_maybe_quantized_linear(
+            w3: Some(common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 intermediate_size,
                 false,
@@ -596,8 +601,8 @@ impl FeedForward {
             w1: None,
             w2: None,
             w3: None,
-            gate: Some(common::TopKRouter::new(
-                common::TopKRouterConfig {
+            gate: Some(common::moe::TopKRouter::new(
+                common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.num_experts,
                     hidden_size: args.hidden_size,
@@ -636,7 +641,7 @@ impl Module<&Array> for FeedForward {
         if !self.is_moe {
             let gate = self.w1.as_mut().expect("dense w1").forward(x, stream)?;
             let up = self.w3.as_mut().expect("dense w3").forward(x, stream)?;
-            let hidden = common::silu(gate, stream)?.multiply(up, stream)?;
+            let hidden = common::layers::silu(gate, stream)?.multiply(up, stream)?;
             return self.w2.as_mut().expect("dense w2").forward(&hidden, stream);
         }
         let shape = x.shape();
@@ -849,7 +854,7 @@ pub struct Lfm2Model {
 impl Lfm2Model {
     fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Error> {
         Ok(Self {
-            embed_tokens: common::unloaded_maybe_quantized_embedding(
+            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
                 args.weight_quantization_for("model.embed_tokens.weight"),
@@ -948,7 +953,7 @@ impl Model {
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(common::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.vocab_size,
                 false,
@@ -1017,7 +1022,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// LFM2 token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 /// Reads and validates LFM2 model arguments.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
@@ -1717,7 +1723,7 @@ mod tests {
             let mut cache = model.new_cache();
             let prompt = safemlx::Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
             let parts = [crate::models::input::InputPart::text_token_ids(&prompt)];
-            let logits = crate::models::common::CausalLm::prefill_input_logits(
+            let logits = crate::models::common::generation::CausalLm::prefill_input_logits(
                 &mut model,
                 crate::models::input::ModelInput::new(&parts),
                 &mut cache,
@@ -1729,7 +1735,7 @@ mod tests {
             assert_eq!(logits.max(None, stream).unwrap().item::<f32>(stream), 0.0);
 
             let next = safemlx::Array::from_slice(&[4_u32], &[1, 1]);
-            let logits = crate::models::common::CausalLm::decode_logits(
+            let logits = crate::models::common::generation::CausalLm::decode_logits(
                 &mut model, &next, &mut cache, stream,
             )
             .unwrap();

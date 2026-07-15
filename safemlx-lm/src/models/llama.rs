@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::sample;
+pub use super::common::generation::sample;
 
 use crate::{
     cache::{KeyValueCache, SlidingKeyValueCache},
@@ -27,9 +27,14 @@ use crate::{
     inspection::ActivationObserver,
     models::{
         common::{
-            self, apply_rope_and_update_cache, attention_probabilities, batch_seq,
-            finish_attention, project_logits_maybe_quantized, reshape_attention_projection,
-            CausalLm, SwiGluMlp,
+            self,
+            attention::{
+                apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
+                reshape_attention_projection,
+            },
+            generation::CausalLm,
+            layers::SwiGluMlp,
+            linear::project_logits_maybe_quantized,
         },
         input,
     },
@@ -211,7 +216,7 @@ impl Attention {
         let head_dim = args.head_dim;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let q_proj = common::unloaded_maybe_quantized_linear(
+        let q_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_heads * head_dim,
             args.attention_bias,
@@ -226,7 +231,7 @@ impl Attention {
                 }),
             stream,
         )?;
-        let k_proj = common::unloaded_maybe_quantized_linear(
+        let k_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
@@ -241,7 +246,7 @@ impl Attention {
                 }),
             stream,
         )?;
-        let v_proj = common::unloaded_maybe_quantized_linear(
+        let v_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.attention_bias,
@@ -256,7 +261,7 @@ impl Attention {
                 }),
             stream,
         )?;
-        let o_proj = common::unloaded_maybe_quantized_linear(
+        let o_proj = common::linear::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             args.attention_bias,
@@ -377,7 +382,7 @@ where
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
         let output = if let Some(window_size) = generated_sliding_window.filter(|_| L > 1) {
-            common::sliding_window_prefill_attention(
+            common::attention::sliding_window_prefill_attention(
                 queries,
                 keys,
                 values,
@@ -451,21 +456,21 @@ impl TransformerBlock {
         let self_attn = Attention::new_for_layer(args, layer_index, stream)?;
         let mlp_prefix = format!("model.layers.{layer_index}.mlp");
         let mlp = SwiGluMlp {
-            gate_proj: common::unloaded_maybe_quantized_linear(
+            gate_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.intermediate_size,
                 args.mlp_bias,
                 args.affine_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
                 stream,
             )?,
-            down_proj: common::unloaded_maybe_quantized_linear(
+            down_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.intermediate_size,
                 args.hidden_size,
                 args.mlp_bias,
                 args.affine_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
                 stream,
             )?,
-            up_proj: common::unloaded_maybe_quantized_linear(
+            up_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.intermediate_size,
                 args.mlp_bias,
@@ -626,7 +631,7 @@ impl LlamaModel {
         let vocab_size = args.vocab_size;
         let num_hidden_layers = args.num_hidden_layers;
 
-        let embed_tokens = common::unloaded_maybe_quantized_embedding(
+        let embed_tokens = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
             args.affine_quantization_for("model.embed_tokens.weight"),
@@ -810,7 +815,7 @@ impl Model {
         let model = LlamaModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(
-                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
                     args.affine_quantization_for("lm_head.weight"),
@@ -1423,7 +1428,7 @@ where
 
 /// Llama token generation iterator.
 pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
-    common::Generate<'a, Model, Vec<Option<C>>, S>;
+    common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
 
 #[cfg(test)]
 mod tests {

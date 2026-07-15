@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::sample;
+pub use super::common::generation::sample;
 
 use crate::{
     cache::KeyValueCache,
@@ -26,10 +26,16 @@ use crate::{
     inspection::ActivationObserver,
     models::{
         common::{
-            self, apply_rope_and_update_cache, apply_rotary_embeddings_and_update_cache,
-            attention_probabilities, batch_seq, finish_attention, project_logits_maybe_quantized,
-            reshape_attention_projection, AttentionInput, CausalLm, SwiGluMlp,
-            TopKRouterScoreFunction,
+            self,
+            attention::{
+                apply_rope_and_update_cache, apply_rotary_embeddings_and_update_cache,
+                attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
+                AttentionInput,
+            },
+            generation::CausalLm,
+            layers::SwiGluMlp,
+            linear::project_logits_maybe_quantized,
+            moe::TopKRouterScoreFunction,
         },
         input,
     },
@@ -206,28 +212,28 @@ impl Attention {
         let head_dim = args.head_dim;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let q_proj = common::unloaded_maybe_quantized_linear(
+        let q_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_heads * head_dim,
             false,
             quantization_for(args, prefix.as_deref(), "q_proj"),
             stream,
         )?;
-        let k_proj = common::unloaded_maybe_quantized_linear(
+        let k_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             false,
             quantization_for(args, prefix.as_deref(), "k_proj"),
             stream,
         )?;
-        let v_proj = common::unloaded_maybe_quantized_linear(
+        let v_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             false,
             quantization_for(args, prefix.as_deref(), "v_proj"),
             stream,
         )?;
-        let o_proj = common::unloaded_maybe_quantized_linear(
+        let o_proj = common::linear::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             false,
@@ -417,14 +423,14 @@ where
 pub type Mlp = SwiGluMlp;
 
 /// Packed routed-expert bank shared with other SwiGLU MoE architectures.
-pub type Experts = common::PackedSwiGluExperts;
+pub type Experts = common::moe::PackedSwiGluExperts;
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Qwen3 sparse MoE feed-forward block.
 pub struct SparseMoeBlock {
     #[param]
     /// Top-k router.
-    pub gate: common::TopKRouter,
+    pub gate: common::moe::TopKRouter,
     #[param]
     /// Routed expert bank.
     pub experts: Experts,
@@ -433,8 +439,8 @@ pub struct SparseMoeBlock {
 impl SparseMoeBlock {
     fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            gate: common::TopKRouter::new(
-                common::TopKRouterConfig {
+            gate: common::moe::TopKRouter::new(
+                common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.num_experts,
                     hidden_size: args.hidden_size,
@@ -553,21 +559,21 @@ impl TransformerBlock {
         } else {
             let mlp_prefix = format!("model.layers.{layer_index}.mlp");
             Some(SwiGluMlp {
-                gate_proj: common::unloaded_maybe_quantized_linear(
+                gate_proj: common::linear::unloaded_maybe_quantized_linear(
                     args.hidden_size,
                     args.intermediate_size,
                     false,
                     args.weight_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
                     stream,
                 )?,
-                down_proj: common::unloaded_maybe_quantized_linear(
+                down_proj: common::linear::unloaded_maybe_quantized_linear(
                     args.intermediate_size,
                     args.hidden_size,
                     false,
                     args.weight_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
                     stream,
                 )?,
-                up_proj: common::unloaded_maybe_quantized_linear(
+                up_proj: common::linear::unloaded_maybe_quantized_linear(
                     args.hidden_size,
                     args.intermediate_size,
                     false,
@@ -773,7 +779,7 @@ impl Qwen3Model {
         let vocab_size = args.vocab_size;
         let num_hidden_layers = args.num_hidden_layers;
 
-        let embed_tokens = common::unloaded_maybe_quantized_embedding(
+        let embed_tokens = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
             args.weight_quantization_for("model.embed_tokens.weight"),
@@ -941,7 +947,7 @@ impl Model {
         let model = Qwen3Model::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(
-                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
                     args.weight_quantization_for("lm_head.weight"),
@@ -1612,7 +1618,7 @@ where
 
 /// Qwen3 token generation iterator.
 pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
-    common::Generate<'a, Model, Vec<Option<C>>, S>;
+    common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
 
 #[cfg(test)]
 mod tests {
@@ -1628,7 +1634,7 @@ mod tests {
 
     use crate::{
         cache::{ConcatKeyValueCache, KeyValueCache},
-        models::common::CausalLm,
+        models::common::generation::CausalLm,
         models::qwen3::{load_qwen3_model, load_qwen3_tokenizer},
         quantization::AffineQuantization,
     };

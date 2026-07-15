@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
     error::Error,
-    models::{common, common::CausalLm, input},
+    models::{common, common::generation::CausalLm, input},
     quantization::WeightQuantization,
     utils::{
         create_causal_mask,
@@ -216,28 +216,28 @@ impl Attention {
             head_dim: args.head_dim,
             scale: 1.0 / (args.head_dim as f32).sqrt(),
             sinks: Param::<Array>::unloaded(&[args.num_attention_heads], Dtype::Float32, stream)?,
-            q_proj: common::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 true,
                 args.quantization,
                 stream,
             )?,
-            k_proj: common::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
                 args.quantization,
                 stream,
             )?,
-            v_proj: common::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
                 args.quantization,
                 stream,
             )?,
-            o_proj: common::unloaded_maybe_quantized_linear(
+            o_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 true,
@@ -451,7 +451,7 @@ impl Experts {
             stream,
         )?;
         debug_assert_eq!(output.dim(-1), self.hidden_size);
-        common::weighted_route_sum(output, top_k_weights, &plan, tokens, stream)
+        common::moe::weighted_route_sum(output, top_k_weights, &plan, tokens, stream)
     }
 }
 
@@ -486,7 +486,7 @@ impl Mlp {
         let shape = x.shape();
         let flat = x.reshape(&[-1, shape[2]], stream)?;
         let logits = self.router.forward(&flat, stream)?;
-        let (indices, weights) = common::top_k_softmax_routing(&logits, self.top_k, stream)?;
+        let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
         self.experts
             .forward(&flat, &indices, &weights, stream)?
             .reshape(shape, stream)
@@ -612,7 +612,7 @@ impl GptOssModel {
         Ok(Self {
             layer_types: args.effective_layer_types(),
             sliding_window: args.sliding_window,
-            embed_tokens: common::unloaded_maybe_quantized_embedding(
+            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
                 args.quantization,
@@ -697,7 +697,7 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             model: GptOssModel::new(&args, stream)?,
-            lm_head: common::unloaded_maybe_quantized_linear(
+            lm_head: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.vocab_size,
                 false,
@@ -753,7 +753,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// GPT-OSS token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 /// Reads GPT-OSS model arguments from `config.json`.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {

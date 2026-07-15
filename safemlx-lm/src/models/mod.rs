@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 
 use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
-use crate::models::common::CausalLm;
+use crate::models::common::generation::CausalLm;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::WeightQuantization;

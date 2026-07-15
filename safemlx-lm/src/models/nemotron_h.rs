@@ -28,9 +28,13 @@ use crate::{
     error::Error,
     models::{
         common::{
-            self, batch_seq, finish_attention, project_logits_maybe_quantized, relu2,
-            reshape_attention_projection, weighted_route_sum, CausalLm, DepthwiseConv1d,
-            TopKRouterScoreFunction,
+            self,
+            attention::{batch_seq, finish_attention, reshape_attention_projection},
+            convolution::DepthwiseConv1d,
+            generation::CausalLm,
+            layers::relu2,
+            linear::project_logits_maybe_quantized,
+            moe::{weighted_route_sum, TopKRouterScoreFunction},
         },
         input,
     },
@@ -472,14 +476,14 @@ impl Mlp {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            up_proj: common::unloaded_maybe_quantized_linear(
+            up_proj: common::linear::unloaded_maybe_quantized_linear(
                 hidden_size,
                 intermediate_size,
                 bias,
                 quantization[0].map(Into::into),
                 stream,
             )?,
-            down_proj: common::unloaded_maybe_quantized_linear(
+            down_proj: common::linear::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 hidden_size,
                 bias,
@@ -506,7 +510,7 @@ impl Module<&Array> for Mlp {
 }
 
 /// Sigmoid top-k router used by Nemotron-H MoE layers.
-pub type TopKRouter = common::TopKRouter;
+pub type TopKRouter = common::moe::TopKRouter;
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Packed routed ReLU2 expert bank for Nemotron-H MoE layers.
@@ -732,7 +736,7 @@ impl SparseMoeBlock {
         let prefix = format!("model.layers.{layer_idx}.moe");
         Ok(Self {
             gate: TopKRouter::new(
-                common::TopKRouterConfig {
+                common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.n_routed_experts,
                     hidden_size: args.hidden_size,
@@ -838,7 +842,7 @@ impl Attention {
             n_heads: args.num_attention_heads,
             n_kv_heads: args.num_key_value_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
-            q_proj: common::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 args.attention_bias,
@@ -846,7 +850,7 @@ impl Attention {
                     .map(Into::into),
                 stream,
             )?,
-            k_proj: common::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
@@ -854,7 +858,7 @@ impl Attention {
                     .map(Into::into),
                 stream,
             )?,
-            v_proj: common::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
@@ -862,7 +866,7 @@ impl Attention {
                     .map(Into::into),
                 stream,
             )?,
-            o_proj: common::unloaded_maybe_quantized_linear(
+            o_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
@@ -1020,7 +1024,7 @@ impl Mamba2Mixer {
             conv_kernel_size: args.conv_kernel,
             d_mlp,
             chunk_size: args.chunk_size,
-            in_proj: common::unloaded_maybe_quantized_linear(
+            in_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 projection_size,
                 args.use_bias,
@@ -1040,7 +1044,7 @@ impl Mamba2Mixer {
                 args.layer_norm_epsilon,
                 stream,
             )?,
-            out_proj: common::unloaded_maybe_quantized_linear(
+            out_proj: common::linear::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 args.hidden_size,
                 args.use_bias,
@@ -1585,7 +1589,7 @@ pub struct NemotronHModel {
 impl NemotronHModel {
     /// Creates an unloaded Nemotron-H transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embeddings = common::unloaded_maybe_quantized_embedding(
+        let embeddings = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
             args.affine_quantization_for("model.embeddings.weight")
@@ -1733,7 +1737,7 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let model = NemotronHModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.vocab_size,
                 false,
@@ -1848,7 +1852,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Nemotron-H token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) struct LoadedNemotronHGguf {
     pub(crate) model: Model,
@@ -2591,7 +2596,7 @@ mod tests {
     };
     use crate::weights::{StrictLoadConfig, StrictLoadReport};
     use crate::{
-        models::common::{CausalLm, TopKRouterScoreFunction},
+        models::common::{generation::CausalLm, moe::TopKRouterScoreFunction},
         quantization::AffineQuantization,
     };
     use safemlx::{module::ModuleParameters, ops::indexing::TryIndexOp, Array, ExecutionContext};

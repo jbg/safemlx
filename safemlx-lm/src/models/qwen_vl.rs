@@ -14,7 +14,7 @@ use safemlx::{
 };
 use serde::Deserialize;
 
-use crate::{cache::ConcatKeyValueCache, models::common::silu};
+use crate::{cache::ConcatKeyValueCache, models::common::layers::silu};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 /// Qwen VL vision encoder configuration.

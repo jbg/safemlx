@@ -26,7 +26,7 @@ use crate::{
     cache::ConcatKeyValueCache,
     error::Error,
     models::{
-        common::{self, AttentionInput, CausalLm},
+        common::{self, attention::AttentionInput, generation::CausalLm},
         input as runtime_input, qwen3,
         qwen_vl::grid_thw_from_array,
     },
@@ -405,7 +405,7 @@ impl Model {
         }
         let hidden = self.model.language_model.norm.forward(&hidden, stream)?;
         let mut lm_head: Option<MaybeQuantized<nn::Linear>> = None;
-        common::project_logits_maybe_quantized(
+        common::linear::project_logits_maybe_quantized(
             &mut lm_head,
             &mut self.model.language_model.embed_tokens,
             &hidden,
@@ -1051,7 +1051,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3-VL generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
 mod tests {
@@ -1064,7 +1065,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::models::{common::CausalLm, input as runtime_input};
+    use crate::models::{common::generation::CausalLm, input as runtime_input};
 
     fn tiny_model(stream: &safemlx::Stream) -> super::Model {
         let text_config = super::qwen3::ModelArgs {

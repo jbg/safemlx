@@ -1,7 +1,7 @@
 //! Moshi temporal/depth language model for pre-tokenized Mimi streams.
 //!
 //! Moshi is not a single-stream causal LM, so it deliberately does not
-//! implement [`super::common::CausalLm`]. The input to one temporal step is a
+//! implement [`super::common::generation::CausalLm`]. The input to one temporal step is a
 //! text token plus one token from every delayed audio codebook. The temporal
 //! output predicts text; the depth transformer then predicts generated audio
 //! codebooks autoregressively within the same frame.

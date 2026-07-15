@@ -263,14 +263,14 @@ impl Gemma4AssistantDraftModel {
 
         let text_config = &config.text_config;
         let model = DraftInner::new(text_config, stream)?;
-        let pre_projection = common::unloaded_maybe_quantized_linear(
+        let pre_projection = common::linear::unloaded_maybe_quantized_linear(
             2 * config.backbone_hidden_size,
             text_config.hidden_size,
             false,
             config.quantization,
             stream,
         )?;
-        let post_projection = common::unloaded_maybe_quantized_linear(
+        let post_projection = common::linear::unloaded_maybe_quantized_linear(
             text_config.hidden_size,
             config.backbone_hidden_size,
             false,
@@ -280,7 +280,7 @@ impl Gemma4AssistantDraftModel {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(common::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear(
                 text_config.hidden_size,
                 text_config.vocab_size,
                 false,

@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::sample;
+pub use super::common::generation::sample;
 use super::qwen_vl::grid_thw_from_array;
 #[cfg(test)]
 pub(crate) use super::qwen_vl::{reverse_permutation, vision_window_index};
@@ -40,8 +40,8 @@ use crate::{
     inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
         common::{
-            self, attention_probabilities, project_logits_maybe_quantized, silu, CausalLm,
-            TopKRouterScoreFunction,
+            self, attention::attention_probabilities, generation::CausalLm, layers::silu,
+            linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
         },
         input as runtime_input,
     },
@@ -2596,7 +2596,7 @@ impl Experts {
                 stream,
             )?
         };
-        common::weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+        common::moe::weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
 
     fn forward_expert_major_chunk_with_observer(
@@ -2698,8 +2698,13 @@ impl Experts {
             &format!("{prefix}.expert_major_route_output"),
             &route_output,
         )?;
-        let output =
-            common::weighted_route_sum(route_output, top_k_weights, &plan, num_tokens, stream)?;
+        let output = common::moe::weighted_route_sum(
+            route_output,
+            top_k_weights,
+            &plan,
+            num_tokens,
+            stream,
+        )?;
         observer.observe(&format!("{prefix}.output"), &output)?;
         Ok(output)
     }
@@ -2709,7 +2714,7 @@ impl Experts {
 }
 
 /// Top-k router for Qwen3.5 MoE experts.
-pub type TopKRouter = common::TopKRouter;
+pub type TopKRouter = common::moe::TopKRouter;
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Sparse MoE block with routed experts plus a shared expert.
@@ -2747,7 +2752,7 @@ impl SparseMoeBlock {
     ) -> Result<Self, Exception> {
         Ok(Self {
             gate: TopKRouter::new(
-                common::TopKRouterConfig {
+                common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.num_experts,
                     hidden_size: args.hidden_size,
@@ -3291,7 +3296,7 @@ impl Qwen35MoeTextModel {
         format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let embed_tokens = common::unloaded_maybe_quantized_embedding(
+        let embed_tokens = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
             format.affine(),
@@ -3559,7 +3564,7 @@ impl Model {
             .transpose()?;
         let lm_head = if !args.tie_word_embeddings {
             Some(
-                common::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
                     format.affine(),
@@ -5039,7 +5044,8 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3.5 MoE token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> = common::Generate<'a, Model, Cache, S>;
+pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+    common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
 mod tests {
@@ -5057,7 +5063,9 @@ mod tests {
     use crate::{
         error::Error,
         inspection::ActivationRecorder,
-        models::{common::CausalLm, input as runtime_input, Model as AnyModel, ModelCache},
+        models::{
+            common::generation::CausalLm, input as runtime_input, Model as AnyModel, ModelCache,
+        },
         quantization::AffineQuantization,
         weights::{load_safetensors_strict, StrictLoadReport},
     };
