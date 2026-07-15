@@ -1131,6 +1131,23 @@ mod tests {
     }
 
     #[test]
+    fn half_precision_scalar_and_data_access_preserve_bits() {
+        let stream = crate::test_stream();
+
+        let f16_value = half::f16::from_bits(0x3555);
+        let f16_array = Array::from_slice(&[f16_value], &[]);
+        assert_eq!(f16_array.clone().item::<half::f16>(&stream), f16_value);
+        let f16_clone = f16_array.deep_clone().unwrap().into_evaluated().unwrap();
+        assert_eq!(f16_clone.as_slice::<half::f16>(), &[f16_value]);
+
+        let bf16_value = half::bf16::from_bits(0x3eab);
+        let bf16_array = Array::from_slice(&[bf16_value], &[]);
+        assert_eq!(bf16_array.clone().item::<half::bf16>(&stream), bf16_value);
+        let bf16_clone = bf16_array.deep_clone().unwrap().into_evaluated().unwrap();
+        assert_eq!(bf16_clone.as_slice::<half::bf16>(), &[bf16_value]);
+    }
+
+    #[test]
     fn new_array_from_multi_element_slice() {
         let data = [1i32, 2, 3, 4, 5];
         let array = Array::from_slice(&data, &[5]);

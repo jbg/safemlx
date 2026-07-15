@@ -469,7 +469,9 @@ extern "C" int mlx_array_item_complex64(
 #ifdef HAS_FLOAT16
 extern "C" int mlx_array_item_float16(float16_t* res, const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<float16_t>();
+    auto value = mlx_array_get_(arr).item<mlx::core::float16_t>();
+    static_assert(sizeof(value) == sizeof(*res));
+    std::memcpy(res, &value, sizeof(value));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -481,7 +483,9 @@ extern "C" int mlx_array_item_float16(float16_t* res, const mlx_array arr) {
 #ifdef HAS_BFLOAT16
 extern "C" int mlx_array_item_bfloat16(bfloat16_t* res, const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<bfloat16_t>();
+    auto value = mlx_array_get_(arr).item<mlx::core::bfloat16_t>();
+    static_assert(sizeof(value) == sizeof(*res));
+    std::memcpy(res, &value, sizeof(value));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -593,7 +597,9 @@ extern "C" const mlx_complex64_t* mlx_array_data_complex64(
 #ifdef HAS_FLOAT16
 extern "C" const float16_t* mlx_array_data_float16(const mlx_array arr) {
   try {
-    return mlx_array_get_(arr).data<float16_t>();
+    static_assert(sizeof(float16_t) == sizeof(mlx::core::float16_t));
+    return reinterpret_cast<const float16_t*>(
+        mlx_array_get_(arr).data<mlx::core::float16_t>());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return nullptr;
@@ -604,7 +610,9 @@ extern "C" const float16_t* mlx_array_data_float16(const mlx_array arr) {
 #ifdef HAS_BFLOAT16
 extern "C" const bfloat16_t* mlx_array_data_bfloat16(const mlx_array arr) {
   try {
-    return mlx_array_get_(arr).data<bfloat16_t>();
+    static_assert(sizeof(bfloat16_t) == sizeof(mlx::core::bfloat16_t));
+    return reinterpret_cast<const bfloat16_t*>(
+        mlx_array_get_(arr).data<mlx::core::bfloat16_t>());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return nullptr;
