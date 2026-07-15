@@ -1,0 +1,22 @@
+[package]
+name = "safemlx-lm-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Example command-line text generator for safemlx-lm"
+
+[[bin]]
+name = "safemlx-lm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hf-hub = { version = "=1.0.0", features = ["blocking"] }
+safemlx.workspace = true
+safemlx-lm.workspace = true
+serde_json.workspace = true

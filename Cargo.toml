@@ -8,6 +8,7 @@ members = [
     "safemlx-lm",
     "safemlx-lm-utils",
     "safemlx-codec",
+    "examples/safemlx-lm-cli",
 ]
 resolver = "2"
 
