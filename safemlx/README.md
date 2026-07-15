@@ -1,6 +1,6 @@
 # safemlx
 
-Rust bindings for Apple's MLX machine learning framework.
+Rust bindings for the MLX machine learning framework.
 
 `safemlx` provides a safe, idiomatic Rust interface over the low-level
 `safemlx-sys` bindings. It includes array operations, neural-network building
@@ -8,14 +8,18 @@ blocks, transforms, optimizers, quantization helpers, optional SafeTensors
 support, and typed GGUF tensor/metadata loading.
 
 This crate targets macOS 14+, iOS/iPadOS 17+, tvOS 17+, and visionOS 1+ on
-Apple silicon. The default feature set enables both Accelerate and Metal
-support. Cross-compilation and Xcode Metal-resource integration are documented
-in the [`safemlx-sys` README](../safemlx-sys/README.md#apple-platform-targets).
+Apple silicon, as well as CPU-only and NVIDIA CUDA Linux systems. The default
+feature set enables Accelerate and Metal on Apple targets; those features are
+ignored on Linux, where `cuda` can be selected explicitly. Cross-compilation, Xcode
+Metal-resource integration, and Linux prerequisites are documented in the
+[`safemlx-sys` README](../safemlx-sys/README.md).
 
 ## Features
 
 - `accelerate`: enables Accelerate-backed MLX operations.
+- `cuda`: builds MLX's CUDA backend on Linux.
 - `metal`: enables Metal-backed MLX operations.
+- `nccl`: enables CUDA plus MLX's optional NCCL distributed backend.
 - `safetensors`: enables conversion between `Array` and
   `safetensors::TensorView`.
 

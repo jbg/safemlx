@@ -10,6 +10,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Neural audio codec components for safemlx"
 
+[features]
+cuda = ["safemlx/cuda"]
+nccl = ["cuda", "safemlx/nccl"]
+
 [dependencies]
 safemlx = { workspace = true, features = ["safetensors"] }
 thiserror.workspace = true

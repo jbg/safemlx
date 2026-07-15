@@ -9,6 +9,10 @@ rust-version.workspace = true
 publish = false
 description = "Example command-line text generator for safemlx-lm"
 
+[features]
+cuda = ["safemlx/cuda", "safemlx-lm/cuda"]
+nccl = ["cuda", "safemlx/nccl", "safemlx-lm/nccl"]
+
 [[bin]]
 name = "safemlx-lm"
 path = "src/main.rs"

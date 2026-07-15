@@ -13,6 +13,19 @@ contributors.
 This fork adds model/runtime support including Gemma 4 loading, Gemma 4
 assistant drafting, expanded model dispatch, and related generation utilities.
 
+## Linux and CUDA
+
+Enable the `cuda` feature to propagate MLX CUDA support through this crate:
+
+```toml
+safemlx-lm = { version = "0.4", features = ["cuda"] }
+```
+
+Most model code uses backend-neutral MLX operations. Qwen3.5 MoE's custom
+Metal FP8 and recurrent kernels use portable MLX operation fallbacks on CUDA;
+these prioritize correctness and can be slower or use more temporary memory
+than the Metal-specialized paths.
+
 ## GGUF models
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points

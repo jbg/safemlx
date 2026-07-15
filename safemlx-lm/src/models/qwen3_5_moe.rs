@@ -2,10 +2,11 @@
 
 use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 
+#[cfg(not(feature = "cuda"))]
+use safemlx::fast::{MetalKernel, MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
 use safemlx::{
     builder::Builder,
     error::Exception,
-    fast::{MetalKernel, MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel},
     macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
@@ -82,6 +83,7 @@ impl<'de> Deserialize<'de> for LayerType {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
 thread_local! {
     static RECURRENT_DELTA_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
     static FP8_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
@@ -90,12 +92,17 @@ thread_local! {
     static FP8_GROUPED_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
+#[cfg(not(feature = "cuda"))]
 const FP8_LINEAR_OUT_TILE: i32 = 16;
+#[cfg(not(feature = "cuda"))]
 const FP8_TILED_ROW_THRESHOLD: i32 = 8;
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
+#[cfg(not(feature = "cuda"))]
 const RECURRENT_PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
+#[cfg(not(feature = "cuda"))]
 const RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
+#[cfg(not(feature = "cuda"))]
 const RECURRENT_PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[derive(Debug, Clone, Default)]
@@ -692,31 +699,58 @@ fn fp8_linear(
     scale: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let input_shape = input.shape();
-    let in_dim = input.dim(-1);
-    let out_dim = weight.dim(0);
-    let rows = (input.size() as i32) / in_dim;
-    let input = input.reshape(&[rows, in_dim], stream)?;
-    let scale_cols = scale.dim(-1);
-
-    let out = if rows <= FP8_TILED_ROW_THRESHOLD {
-        fp8_linear_tiled(
-            &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
-        )?
-    } else {
-        fp8_linear_scalar(
-            &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
-        )?
-    };
-
-    let mut output_shape = input_shape.to_vec();
-    if let Some(last) = output_shape.last_mut() {
-        *last = out_dim;
+    #[cfg(feature = "cuda")]
+    {
+        return fp8_linear_portable(input, weight, scale, stream);
     }
-    out.reshape(&output_shape, stream)
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let input_shape = input.shape();
+        let in_dim = input.dim(-1);
+        let out_dim = weight.dim(0);
+        let rows = (input.size() as i32) / in_dim;
+        let input = input.reshape(&[rows, in_dim], stream)?;
+        let scale_cols = scale.dim(-1);
+
+        let out = if rows <= FP8_TILED_ROW_THRESHOLD {
+            fp8_linear_tiled(
+                &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+            )?
+        } else {
+            fp8_linear_scalar(
+                &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+            )?
+        };
+
+        let mut output_shape = input_shape.to_vec();
+        if let Some(last) = output_shape.last_mut() {
+            *last = out_dim;
+        }
+        out.reshape(&output_shape, stream)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn fp8_linear_portable(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let out_dim = weight.dim(0);
+    let in_dim = weight.dim(1);
+    let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 0, stream)?;
+    let scale = Array::repeat_axis::<f32>(scale, 128, 1, stream)?;
+    let scale = scale.try_index_device((..out_dim, ..in_dim), stream)?;
+    let weight = weight
+        .from_fp8(Dtype::Float32, stream)?
+        .multiply(scale, stream)?;
+    matmul(input, weight.transpose(stream)?, stream)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
 fn fp8_linear_tiled(
     input: &Array,
     weight: &Array,
@@ -748,6 +782,7 @@ fn fp8_linear_tiled(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
 fn fp8_linear_scalar(
     input: &Array,
     weight: &Array,
@@ -776,6 +811,7 @@ fn fp8_linear_scalar(
     })
 }
 
+#[cfg(not(feature = "cuda"))]
 fn fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "qwen35_moe_fp8_linear_k16",
@@ -814,6 +850,7 @@ fn fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
+#[cfg(not(feature = "cuda"))]
 fn fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "qwen35_moe_fp8_linear_scalar",
@@ -848,22 +885,45 @@ fn grouped_fp8_linear(
     group_ids: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let routes = input.dim(0);
-    let in_dim = input.dim(-1);
-    let out_dim = weight.dim(1);
-    let scale_cols = scale.dim(-1);
-    if routes <= FP8_TILED_ROW_THRESHOLD {
-        return grouped_fp8_linear_tiled(
-            input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
+    #[cfg(feature = "cuda")]
+    {
+        let out_dim = weight.dim(1);
+        let in_dim = weight.dim(2);
+        let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 1, stream)?;
+        let scale = Array::repeat_axis::<f32>(scale, 128, 2, stream)?;
+        let scale = scale.try_index_device((.., ..out_dim, ..in_dim), stream)?;
+        let weight = weight
+            .from_fp8(Dtype::Float32, stream)?
+            .multiply(scale, stream)?;
+        return grouped_matmul(
+            input,
+            weight.swap_axes(-1, -2, stream)?,
+            group_ids,
+            true,
+            stream,
         );
     }
 
-    grouped_fp8_linear_scalar(
-        input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
-    )
+    #[cfg(not(feature = "cuda"))]
+    {
+        let routes = input.dim(0);
+        let in_dim = input.dim(-1);
+        let out_dim = weight.dim(1);
+        let scale_cols = scale.dim(-1);
+        if routes <= FP8_TILED_ROW_THRESHOLD {
+            return grouped_fp8_linear_tiled(
+                input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
+            );
+        }
+
+        grouped_fp8_linear_scalar(
+            input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
 fn grouped_fp8_linear_tiled(
     input: &Array,
     weight: &Array,
@@ -896,6 +956,7 @@ fn grouped_fp8_linear_tiled(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
 fn grouped_fp8_linear_scalar(
     input: &Array,
     weight: &Array,
@@ -926,6 +987,7 @@ fn grouped_fp8_linear_scalar(
     })
 }
 
+#[cfg(not(feature = "cuda"))]
 fn grouped_fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "qwen35_moe_grouped_fp8_linear_k16",
@@ -964,6 +1026,7 @@ fn grouped_fp8_linear_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
+#[cfg(not(feature = "cuda"))]
 fn grouped_fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "qwen35_moe_grouped_fp8_linear_scalar",
@@ -992,6 +1055,7 @@ fn grouped_fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
+#[cfg(not(feature = "cuda"))]
 const FP8_METAL_HEADER: &str = concat!(
     "float fp8_e4m3_to_float(uint8_t bits) {",
     "  uint16_t v = uint16_t(bits & 127) << 7;",
@@ -1622,6 +1686,7 @@ impl LinearAttention {
         x.multiply(safemlx::ops::rsqrt(denom, stream)?, stream)
     }
 
+    #[cfg(not(feature = "cuda"))]
     fn recurrent_delta_kernels() -> Result<RecurrentScanKernel, Exception> {
         Ok(RecurrentScanKernel::new(
             StatefulMetalKernel::new(
@@ -1696,6 +1761,7 @@ impl LinearAttention {
         ))
     }
 
+    #[cfg(not(feature = "cuda"))]
     fn recurrent_delta_decode_kernel(
         state: &Array,
         query: &Array,
@@ -1738,6 +1804,7 @@ impl LinearAttention {
         Ok((state, out))
     }
 
+    #[cfg(not(feature = "cuda"))]
     fn recurrent_delta_prefill_kernel(
         state: &Array,
         query: &Array,
@@ -1783,6 +1850,7 @@ impl LinearAttention {
         Ok((state, out))
     }
 
+    #[cfg(not(feature = "cuda"))]
     fn recurrent_delta_prefill_scan_chunked(
         mut state: Array,
         query: &Array,
@@ -1826,6 +1894,61 @@ impl LinearAttention {
         Ok((state, concatenate_axis(&outs, 1, stream)?))
     }
 
+    #[cfg(feature = "cuda")]
+    fn recurrent_delta_step_portable(
+        state: &Array,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        g: &Array,
+        beta: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let gate = exp(g, stream)?.try_index_device((.., .., NewAxis, NewAxis), stream)?;
+        let gated_state = state.multiply(gate, stream)?;
+        let key_column = key.try_index_device((.., .., .., NewAxis), stream)?;
+        let kv_memory = sum_axis(
+            gated_state.multiply(&key_column, stream)?,
+            -2,
+            false,
+            stream,
+        )?;
+        let beta = beta.try_index_device((.., .., NewAxis), stream)?;
+        let delta = value.subtract(kv_memory, stream)?.multiply(beta, stream)?;
+        let delta = delta.try_index_device((.., .., NewAxis, ..), stream)?;
+        let new_state = gated_state.add(key_column.multiply(delta, stream)?, stream)?;
+        let query = query.try_index_device((.., .., .., NewAxis), stream)?;
+        let output = sum_axis(new_state.multiply(query, stream)?, -2, false, stream)?;
+        Ok((new_state, output))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn recurrent_delta_portable(
+        mut state: Array,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        g: &Array,
+        beta: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let length = query.shape()[1];
+        let mut outputs = Vec::with_capacity(length as usize);
+        for index in 0..length {
+            let query = query.try_index_device((.., index, .., ..), stream)?;
+            let key = key.try_index_device((.., index, .., ..), stream)?;
+            let value = value.try_index_device((.., index, .., ..), stream)?;
+            let gate = g.try_index_device((.., index, ..), stream)?;
+            let beta = beta.try_index_device((.., index, ..), stream)?;
+            let (new_state, output) = Self::recurrent_delta_step_portable(
+                &state, &query, &key, &value, &gate, &beta, stream,
+            )?;
+            state = new_state;
+            outputs.push(output.try_index_device((.., NewAxis, .., ..), stream)?);
+        }
+        Ok((state, concatenate_axis(&outputs, 1, stream)?))
+    }
+
     #[allow(non_snake_case, clippy::too_many_arguments)]
     fn recurrent_delta_rule(
         &self,
@@ -1839,6 +1962,7 @@ impl LinearAttention {
     ) -> Result<Array, Exception> {
         let shape = query.shape();
         let B = shape[0];
+        #[cfg(not(feature = "cuda"))]
         let L = shape[1];
         let H = shape[2];
         let KD = shape[3];
@@ -1850,6 +1974,17 @@ impl LinearAttention {
             .and_then(|cache| cache.recurrent_state.clone())
             .unwrap_or(zeros::<f32>(&[B, H, KD, VD], stream)?);
 
+        #[cfg(feature = "cuda")]
+        {
+            let (new_state, output) =
+                Self::recurrent_delta_portable(state, &query, &key, &value, &g, &beta, stream)?;
+            if let Some(cache) = cache {
+                cache.recurrent_state = Some(new_state);
+            }
+            return Ok(output);
+        }
+
+        #[cfg(not(feature = "cuda"))]
         if L == 1 {
             let q_t = query.try_index_device((.., 0, .., ..), stream)?;
             let k_t = key.try_index_device((.., 0, .., ..), stream)?;
@@ -1865,12 +2000,15 @@ impl LinearAttention {
             return Ok(out_t);
         }
 
+        #[cfg(not(feature = "cuda"))]
         let (new_state, out) = Self::recurrent_delta_prefill_scan_chunked(
             state, &query, &key, &value, &g, &beta, stream,
         )?;
+        #[cfg(not(feature = "cuda"))]
         if let Some(cache) = cache {
             cache.recurrent_state = Some(new_state);
         }
+        #[cfg(not(feature = "cuda"))]
         Ok(out)
     }
 }

@@ -432,6 +432,8 @@ pub fn qqmm<'a>(
             group_size,
             bits,
             mode_cstr.as_ptr(),
+            safemlx_sys::mlx_array_new(),
+            safemlx_sys::mlx_array_new(),
             stream.as_ref().as_ptr(),
         )
     })

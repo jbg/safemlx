@@ -1,0 +1,74 @@
+name: Linux builds
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "safemlx/**"
+      - "safemlx-sys/**"
+      - "safemlx-lm/**"
+      - "safemlx-codec/**"
+      - "safemlx-tests/**"
+      - "examples/safemlx-lm-cli/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install MLX CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
+          python3 -m pip install --user "cmake>=3.25"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build and link safemlx tests
+        run: cargo test -p safemlx --lib --no-run
+      - name: Check the Linux workspace
+        run: cargo check --workspace
+
+  cuda-build:
+    runs-on: ubuntu-22.04
+    env:
+      SAFEMLX_CUDA_ARCHITECTURES: "80"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install NVIDIA repository
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+      - name: Install MLX CUDA build dependencies
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libblas-dev \
+            liblapack-dev \
+            liblapacke-dev \
+            libcudnn9-dev-cuda-12 \
+            cuda-compiler-12-9 \
+            cuda-libraries-dev-12-9
+          python3 -m pip install --user "cmake>=3.25"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
+      - name: Build and link safemlx with CUDA
+        # Some generated CUDA translation units are memory-intensive. Keep the
+        # native build serialized so standard hosted runners do not OOM.
+        run: cargo test -j 1 -p safemlx --features cuda --lib --no-run
+      - name: Check the CUDA language-model CLI
+        run: cargo check -j 1 -p safemlx-lm-cli --features cuda
+
+  cuda-gpu-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64, cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run CUDA device smoke test
+        run: cargo run --release -p safemlx --features cuda --example cuda_smoke

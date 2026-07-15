@@ -4,9 +4,9 @@ use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
 use crate::{error::Exception, error::Result, Array, ArrayElement, Stream};
-use mach_sys::mach_time;
 use safemlx_internal_macros::generate_macro;
 use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Random state for reproducible random number generation.
 ///
@@ -48,7 +48,10 @@ pub struct RandomState {
 impl RandomState {
     /// Create a new random state with a time-based seed.
     pub fn new() -> Result<Self> {
-        let now = unsafe { mach_time::mach_approximate_time() };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         Ok(Self { state: key(now)? })
     }
 

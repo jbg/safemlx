@@ -8,6 +8,10 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+cuda = ["safemlx/cuda"]
+nccl = ["cuda", "safemlx/nccl"]
+
 [dependencies]
 
 [dev-dependencies]

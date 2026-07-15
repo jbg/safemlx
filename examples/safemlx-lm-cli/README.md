@@ -10,6 +10,14 @@ cargo run --release -p safemlx-lm-cli -- \
   "Write a Rust function that adds two integers."
 ```
 
+On a Linux system with the CUDA prerequisites installed, add the workspace
+feature to build and run the same CLI on MLX's CUDA backend:
+
+```sh
+cargo run --release -p safemlx-lm-cli --features cuda -- \
+  --model /path/to/model "Write a Rust function that adds two integers."
+```
+
 The Hugging Face form never downloads files. It scans the cache selected by
 `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, or `HF_HOME` and uses the cached
 `main` revision. Use `--revision` to select another cached ref or commit.

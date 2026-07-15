@@ -1,0 +1,19 @@
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+index aed6d69..993ef21 100644
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -583,8 +583,12 @@ std::unordered_map<int, CommandEncoder>& get_command_encoders() {
+ }
+ 
+ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+-  static std::unordered_map<int, CommandEncoder> encoders;
+-  return encoders;
++  // Keep process-global encoders alive until the OS reclaims them. With a
++  // statically linked CUDA backend their destructor can otherwise run after
++  // the CUDA runtime has started unloading. This follows the intentionally
++  // leaked lifetime used by the CUDA Device and Scheduler singletons.
++  static auto* encoders = new std::unordered_map<int, CommandEncoder>;
++  return *encoders;
+ }
+ 
+ } // namespace mlx::core::cu

@@ -297,6 +297,8 @@ pub mod macros; // Must be first to ensure the other modules can use the macros
 
 mod array;
 pub mod builder;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 mod device;
 mod dtype;
 pub mod error;

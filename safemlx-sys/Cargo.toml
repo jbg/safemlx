@@ -26,8 +26,10 @@ targets = [
 default = ["accelerate", "metal"]
 
 accelerate = []
+cuda = []
 generate-bindings = ["dep:bindgen"]
 metal = []
+nccl = ["cuda"]
 
 [dependencies]
 

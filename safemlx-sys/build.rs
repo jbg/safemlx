@@ -6,6 +6,99 @@ use build_support::apple_mobile_target;
 use cmake::Config;
 use std::{env, path::Path, path::PathBuf};
 
+#[cfg(feature = "cuda")]
+fn define_from_env(config: &mut Config, name: &str) {
+    println!("cargo:rerun-if-env-changed={name}");
+    if let Some(value) = env::var_os(name) {
+        config.define(name, value);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_toolkit_root() -> Option<PathBuf> {
+    for name in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|path| path.join("nvcc"))
+        .find(|path| path.is_file())
+        .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
+}
+
+#[cfg(feature = "cuda")]
+fn add_cuda_link_search_paths(target_arch: &str) {
+    let mut roots = Vec::new();
+    if let Some(root) = cuda_toolkit_root() {
+        let cuda_target = match target_arch {
+            "aarch64" => "sbsa-linux",
+            "x86_64" => "x86_64-linux",
+            other => other,
+        };
+        roots.push(root.join("lib64"));
+        roots.push(root.join("lib64").join("stubs"));
+        roots.push(root.join("lib"));
+        roots.push(root.join("lib").join("stubs"));
+        roots.push(root.join("targets").join(cuda_target).join("lib"));
+        roots.push(
+            root.join("targets")
+                .join(cuda_target)
+                .join("lib")
+                .join("stubs"),
+        );
+    }
+    if let Some(path) = env::var_os("CUDNN_LIBRARY_PATH") {
+        roots.extend(env::split_paths(&path));
+    }
+    if let Some(path) = env::var_os("NCCL_LIB_DIR") {
+        roots.extend(env::split_paths(&path));
+    }
+    if let Some(root) = env::var_os("NCCL_ROOT_DIR").map(PathBuf::from) {
+        roots.push(root.join("lib"));
+        roots.push(root.join("lib64"));
+    }
+
+    roots.sort();
+    roots.dedup();
+    for path in roots.into_iter().filter(|path| path.is_dir()) {
+        println!("cargo:rustc-link-search=native={}", path.display());
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn link_cuda_dependencies(target_arch: &str) {
+    add_cuda_link_search_paths(target_arch);
+
+    // Keep this list aligned with MLX's CUDA CMake target. CUDA's runtime is
+    // selected as shared below so Rust consumers do not need to reproduce
+    // nvcc's static-runtime link group.
+    for library in [
+        "cublasLt",
+        "cufft",
+        "nvrtc",
+        "cuda",
+        "cudart",
+        "cudnn",
+        "cudnn_graph",
+        "cudnn_engines_runtime_compiled",
+        "cudnn_ops",
+        "cudnn_cnn",
+        "cudnn_adv",
+        "cudnn_engines_precompiled",
+        "cudnn_heuristic",
+    ] {
+        println!("cargo:rustc-link-lib=dylib={library}");
+    }
+
+    #[cfg(feature = "nccl")]
+    println!("cargo:rustc-link-lib=dylib=nccl");
+}
+
 #[cfg(feature = "metal")]
 fn find_metal_compiler() -> PathBuf {
     for arguments in [
@@ -94,6 +187,20 @@ fn build_and_link_mlx_c(out_path: &Path) {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("target OS was not set by Cargo");
     let target_arch =
         env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture was not set by Cargo");
+    let target_vendor =
+        env::var("CARGO_CFG_TARGET_VENDOR").expect("target vendor was not set by Cargo");
+    let is_apple = target_vendor == "apple";
+
+    #[cfg(feature = "cuda")]
+    if target_os != "linux" {
+        panic!("the safemlx `cuda` feature is currently supported only on Linux targets");
+    }
+
+    #[cfg(feature = "nccl")]
+    if target_os != "linux" {
+        panic!("the safemlx `nccl` feature is currently supported only on Linux targets");
+    }
+
     let mobile_target = apple_mobile_target(&target, &target_os, &target_arch)
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -108,11 +215,11 @@ fn build_and_link_mlx_c(out_path: &Path) {
             "Debug"
         },
     );
-    config.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
     config.define("BUILD_SHARED_LIBS", "OFF");
     config.define("MLX_C_BUILD_EXAMPLES", "OFF");
 
     if let Some(platform) = mobile_target {
+        config.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
         println!(
             "cargo:rerun-if-env-changed={}",
             platform.deployment_target_env
@@ -136,16 +243,43 @@ fn build_and_link_mlx_c(out_path: &Path) {
 
     config.define("MLX_BUILD_METAL", "OFF");
     config.define("MLX_BUILD_ACCELERATE", "OFF");
+    config.define("MLX_BUILD_CUDA", "OFF");
 
     #[cfg(feature = "metal")]
-    {
+    if is_apple {
         config.define("MLX_METAL_COMPILER", find_metal_compiler());
         config.define("MLX_BUILD_METAL", "ON");
     }
 
     #[cfg(feature = "accelerate")]
-    {
+    if is_apple {
         config.define("MLX_BUILD_ACCELERATE", "ON");
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        config.define("MLX_BUILD_CUDA", "ON");
+        config.define("CMAKE_CUDA_RUNTIME_LIBRARY", "Shared");
+        config.define(
+            "CMAKE_DISABLE_FIND_PACKAGE_NCCL",
+            if cfg!(feature = "nccl") { "OFF" } else { "ON" },
+        );
+        for name in [
+            "CMAKE_CUDA_COMPILER",
+            "CUDAToolkit_ROOT",
+            "CUDNN_INCLUDE_PATH",
+            "CUDNN_LIBRARY_PATH",
+            "MLX_CUDA_ARCHITECTURES",
+            "NCCL_INCLUDE_DIR",
+            "NCCL_LIB_DIR",
+            "NCCL_ROOT_DIR",
+        ] {
+            define_from_env(&mut config, name);
+        }
+        println!("cargo:rerun-if-env-changed=SAFEMLX_CUDA_ARCHITECTURES");
+        if let Some(architectures) = env::var_os("SAFEMLX_CUDA_ARCHITECTURES") {
+            config.define("MLX_CUDA_ARCHITECTURES", architectures);
+        }
     }
 
     // build the mlx-c project
@@ -156,30 +290,42 @@ fn build_and_link_mlx_c(out_path: &Path) {
         "cargo:rustc-link-search=native={}/build/_deps/mlx-build/mlx/io",
         dst.display()
     );
-    println!("cargo:rustc-link-lib=static=mlx");
     println!("cargo:rustc-link-lib=static=mlxc");
+    println!("cargo:rustc-link-lib=static=mlx");
     // MLX links its GGUF parser privately. Static Rust consumers must name the
     // parser archive as well because CMake's transitive link interface is not
     // preserved when Cargo links the installed archives directly.
     println!("cargo:rustc-link-lib=static=gguflib");
 
-    println!("cargo:rustc-link-lib=c++");
-    println!("cargo:rustc-link-lib=dylib=objc");
-    println!("cargo:rustc-link-lib=framework=Foundation");
+    if is_apple {
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-link-lib=dylib=objc");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    } else if target_os == "linux" {
+        println!("cargo:rustc-link-lib=dylib=lapack");
+        println!("cargo:rustc-link-lib=dylib=blas");
+        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=m");
+    }
 
     #[cfg(feature = "metal")]
-    {
+    if is_apple {
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
 
     #[cfg(feature = "accelerate")]
-    {
+    if is_apple {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
+    #[cfg(feature = "cuda")]
+    link_cuda_dependencies(&target_arch);
+
     #[cfg(feature = "metal")]
-    {
+    if is_apple {
         let metallib = export_metallib(&dst, out_path);
         println!("cargo:metadata=metallib_path={}", metallib.display());
         println!(

@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 documentation = "https://github.com/jbg/safemlx"
-description = "Unofficial rust wrapper for Apple's mlx machine learning library."
+description = "Unofficial Rust wrapper for the MLX machine learning library."
 readme = "README.md"
 
 [package.metadata.docs.rs]
@@ -26,7 +26,6 @@ safemlx-internal-macros.workspace = true
 safemlx-macros.workspace = true
 dyn-clone = "1"
 half = "2"
-mach-sys = "0.5"
 num-complex = "0.4"
 num_enum = "0.7"
 num-traits = "0.2"
@@ -51,7 +50,9 @@ tempfile = "3"
 default = ["accelerate", "metal"]
 
 accelerate = ["safemlx-sys/accelerate"]
+cuda = ["safemlx-sys/cuda"]
 metal = ["safemlx-sys/metal"]
+nccl = ["cuda", "safemlx-sys/nccl"]
 
 # Enables conversion between `Array` and `safetensors::TensorView`
 safetensors = ["dep:safetensors", "dep:bytemuck"]

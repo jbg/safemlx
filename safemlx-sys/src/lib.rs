@@ -10,5 +10,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 /// Add this file to the application's Copy Bundle Resources phase. Set
 /// `SAFEMLX_METALLIB_OUTPUT_DIR` while building to export it directly to a
 /// different resource-staging directory.
-#[cfg(feature = "metal")]
-pub const MLX_METALLIB_PATH: &str = env!("SAFEMLX_METALLIB_PATH");
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+pub const MLX_METALLIB_PATH: &str = match option_env!("SAFEMLX_METALLIB_PATH") {
+    Some(path) => path,
+    None => "",
+};

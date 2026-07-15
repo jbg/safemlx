@@ -1,7 +1,7 @@
 # SafeMLX LM
 
-This repository contains Rust crates for running language models with Apple's
-MLX framework:
+This repository contains Rust crates for running language models with the MLX
+framework on Apple silicon and Linux systems with NVIDIA GPUs:
 
 - `safemlx`
 - `safemlx-sys`
@@ -44,6 +44,19 @@ and `mlx-lm-utils` crates in
 [`oxideai/mlx-rs#281`](https://github.com/oxideai/mlx-rs/pull/281) and merged
 as commit `7c667cb7`. The original implementation and authorship belong to the
 `oxideai/mlx-rs` contributors.
+
+## Linux and CUDA
+
+The core `safemlx` crates support CPU-only Linux builds and opt-in CUDA builds.
+CUDA support requires the CUDA toolkit, cuDNN, BLAS, and LAPACK development
+packages. Build the core crate with:
+
+```sh
+cargo build --release -p safemlx --features cuda
+```
+
+See the [safemlx-sys Linux and CUDA instructions](safemlx-sys/README.md#linux-and-cuda)
+for prerequisites, architecture selection, and NCCL support.
 
 ## Apple mobile and spatial platforms
 
