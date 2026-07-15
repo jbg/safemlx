@@ -45,6 +45,13 @@ and `mlx-lm-utils` crates in
 as commit `7c667cb7`. The original implementation and authorship belong to the
 `oxideai/mlx-rs` contributors.
 
+## Apple mobile and spatial platforms
+
+`safemlx` and `safemlx-sys` can be cross-compiled on macOS for iOS/iPadOS,
+tvOS, and visionOS device and Apple Silicon simulator targets. The build also
+exports the target-specific `mlx.metallib` needed by the application bundle.
+See the [Apple target and Xcode integration instructions](safemlx-sys/README.md#apple-platform-targets).
+
 ## License
 
 Licensed under either of:

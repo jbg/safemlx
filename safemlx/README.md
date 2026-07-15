@@ -7,8 +7,10 @@ Rust bindings for Apple's MLX machine learning framework.
 blocks, transforms, optimizers, quantization helpers, optional SafeTensors
 support, and typed GGUF tensor/metadata loading.
 
-This crate targets Apple platforms supported by MLX. The default feature set
-enables both Accelerate and Metal support.
+This crate targets macOS 14+, iOS/iPadOS 17+, tvOS 17+, and visionOS 1+ on
+Apple silicon. The default feature set enables both Accelerate and Metal
+support. Cross-compilation and Xcode Metal-resource integration are documented
+in the [`safemlx-sys` README](../safemlx-sys/README.md#apple-platform-targets).
 
 ## Features
 

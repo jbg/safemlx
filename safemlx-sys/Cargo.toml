@@ -12,9 +12,15 @@ categories.workspace = true
 license = "MIT"
 documentation = "https://github.com/jbg/safemlx"
 readme = "README.md"
+links = "mlx"
 
 [package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin"]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-tvos",
+    "aarch64-apple-visionos",
+]
 
 [features]
 default = ["accelerate", "metal"]

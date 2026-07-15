@@ -2465,6 +2465,9 @@ extern "C" {
     pub fn mlx_metal_is_available(res: *mut bool) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn mlx_metal_set_metallib_path(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn mlx_metal_start_capture(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 }
 extern "C" {

@@ -1,7 +1,39 @@
 extern crate cmake;
 
+mod build_support;
+
+use build_support::apple_mobile_target;
 use cmake::Config;
-use std::{env, path::PathBuf, process::Command};
+use std::{env, path::Path, path::PathBuf};
+
+#[cfg(feature = "metal")]
+fn find_metal_compiler() -> PathBuf {
+    for arguments in [
+        &["--toolchain", "Metal", "-find", "metal"][..],
+        &["-find", "metal"][..],
+    ] {
+        let output = std::process::Command::new("xcrun")
+            .args(arguments)
+            // An SDKROOT for a mobile SDK can make xcrun select the placeholder
+            // compiler in XcodeDefault.xctoolchain instead of the separately
+            // installed Metal toolchain.
+            .env_remove("SDKROOT")
+            .output()
+            .expect("Couldn't run xcrun to locate the Metal compiler");
+        if output.status.success() {
+            let path = String::from_utf8(output.stdout)
+                .expect("xcrun returned a non-UTF-8 Metal compiler path");
+            let path = PathBuf::from(path.trim());
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+
+    panic!(
+        "Couldn't locate the Metal compiler. Install it with `xcodebuild -downloadComponent MetalToolchain`."
+    );
+}
 
 fn is_docs_rs() -> bool {
     env::var_os("DOCS_RS").is_some()
@@ -17,64 +49,89 @@ fn copy_pregenerated_bindings(out_path: PathBuf) {
         .expect("Couldn't copy pregenerated bindings!");
 }
 
-/// Find the clang runtime library path dynamically using xcrun
-fn find_clang_rt_path() -> Option<String> {
-    // Use xcrun to find the active toolchain path
-    let output = Command::new("xcrun")
-        .args(["--show-sdk-platform-path"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    // Get the developer directory which contains the toolchain
-    let output = Command::new("xcode-select")
-        .args(["--print-path"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let developer_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let toolchain_base = format!(
-        "{}/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang",
-        developer_dir
-    );
-
-    // Find the clang version directory (it varies by Xcode version)
-    let clang_dir = std::fs::read_dir(&toolchain_base).ok()?;
-    for entry in clang_dir.flatten() {
-        let darwin_path = entry.path().join("lib/darwin");
-        let clang_rt_lib = darwin_path.join("libclang_rt.osx.a");
-        if clang_rt_lib.exists() {
-            return Some(darwin_path.to_string_lossy().to_string());
-        }
-    }
-
-    None
+#[cfg(feature = "metal")]
+fn profile_output_dir(out_path: &Path) -> PathBuf {
+    out_path
+        .ancestors()
+        .nth(3)
+        .expect("Cargo OUT_DIR did not have the expected layout")
+        .join("safemlx-resources")
 }
 
-fn build_and_link_mlx_c() {
+#[cfg(feature = "metal")]
+fn export_metallib(dst: &Path, out_path: &Path) -> PathBuf {
+    let source_candidates = [
+        dst.join("lib/mlx.metallib"),
+        dst.join("build/lib/mlx.metallib"),
+        dst.join("build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib"),
+    ];
+    let source = source_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "MLX built with Metal but did not produce mlx.metallib; checked: {}",
+                source_candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+    let output_dir = env::var_os("SAFEMLX_METALLIB_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| profile_output_dir(out_path));
+    std::fs::create_dir_all(&output_dir).expect("Couldn't create Metal resource output dir");
+    let output = output_dir.join("mlx.metallib");
+    std::fs::copy(source, &output).expect("Couldn't export mlx.metallib");
+    output
+}
+
+fn build_and_link_mlx_c(out_path: &Path) {
+    #[cfg(not(feature = "metal"))]
+    let _ = out_path;
+    let target = env::var("TARGET").expect("TARGET was not set by Cargo");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("target OS was not set by Cargo");
+    let target_arch =
+        env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture was not set by Cargo");
+    let mobile_target = apple_mobile_target(&target, &target_os, &target_arch)
+        .unwrap_or_else(|error| panic!("{error}"));
+
     let mut config = Config::new("src/mlx-c");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
+    config.define(
+        "CMAKE_BUILD_TYPE",
+        if env::var("PROFILE").as_deref() == Ok("release") {
+            "Release"
+        } else {
+            "Debug"
+        },
+    );
+    config.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
+    config.define("BUILD_SHARED_LIBS", "OFF");
+    config.define("MLX_C_BUILD_EXAMPLES", "OFF");
 
-    // Use Xcode's clang to ensure compatibility with the macOS SDK
-    config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
-    config.define("CMAKE_CXX_COMPILER", "/usr/bin/c++");
-
-    #[cfg(debug_assertions)]
-    {
-        config.define("CMAKE_BUILD_TYPE", "Debug");
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        config.define("CMAKE_BUILD_TYPE", "Release");
+    if let Some(platform) = mobile_target {
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            platform.deployment_target_env
+        );
+        let deployment_target = env::var(platform.deployment_target_env)
+            .unwrap_or_else(|_| platform.default_deployment_target.into());
+        if env::var_os(platform.deployment_target_env).is_none() {
+            // The cmake crate asks cc-rs for the target compiler and flags.
+            // Make its deployment target agree with the CMake and Metal builds.
+            env::set_var(platform.deployment_target_env, &deployment_target);
+        }
+        config.define("CMAKE_OSX_SYSROOT", platform.sdk);
+        config.define("CMAKE_OSX_ARCHITECTURES", platform.cmake_architecture);
+        config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+        config.define("MLX_METAL_SDK", platform.sdk);
+        config.define(
+            "MLX_METAL_MIN_VERSION_FLAG",
+            platform.metal_minimum_version_arg(&deployment_target),
+        );
     }
 
     config.define("MLX_BUILD_METAL", "OFF");
@@ -82,6 +139,7 @@ fn build_and_link_mlx_c() {
 
     #[cfg(feature = "metal")]
     {
+        config.define("MLX_METAL_COMPILER", find_metal_compiler());
         config.define("MLX_BUILD_METAL", "ON");
     }
 
@@ -112,6 +170,7 @@ fn build_and_link_mlx_c() {
     #[cfg(feature = "metal")]
     {
         println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
 
     #[cfg(feature = "accelerate")]
@@ -119,12 +178,14 @@ fn build_and_link_mlx_c() {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
-    // Link against Xcode's clang runtime for ___isPlatformVersionAtLeast symbol
-    // This is needed on macOS 26+ where the bundled LLVM runtime may be outdated
-    // See: https://github.com/conda-forge/llvmdev-feedstock/issues/244
-    if let Some(clang_rt_path) = find_clang_rt_path() {
-        println!("cargo:rustc-link-search={}", clang_rt_path);
-        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    #[cfg(feature = "metal")]
+    {
+        let metallib = export_metallib(&dst, out_path);
+        println!("cargo:metadata=metallib_path={}", metallib.display());
+        println!(
+            "cargo:rustc-env=SAFEMLX_METALLIB_PATH={}",
+            metallib.display()
+        );
     }
 }
 
@@ -165,6 +226,8 @@ fn generate_bindings(out_path: PathBuf) {
 fn main() {
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=SAFEMLX_SYS_GENERATE_BINDINGS");
+    println!("cargo:rerun-if-env-changed=SAFEMLX_METALLIB_OUTPUT_DIR");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-changed=src/mlx-c");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -174,7 +237,7 @@ fn main() {
         return;
     }
 
-    build_and_link_mlx_c();
+    build_and_link_mlx_c(&out_path);
 
     if should_generate_bindings() {
         #[cfg(feature = "generate-bindings")]

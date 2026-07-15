@@ -17,6 +17,18 @@ extern "C" int mlx_metal_is_available(bool* res) {
   }
   return 0;
 }
+extern "C" int mlx_metal_set_metallib_path(const char* path) {
+  try {
+    if (path == nullptr) {
+      throw std::invalid_argument("[mlx_metal_set_metallib_path] path is null");
+    }
+    mlx::core::metal::set_metallib_path(std::string(path));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_metal_start_capture(const char* path) {
   try {
     mlx::core::metal::start_capture(std::string(path));

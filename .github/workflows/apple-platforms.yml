@@ -1,0 +1,51 @@
+name: Apple platform builds
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/apple-platforms.yml"
+      - "Cargo.toml"
+      - "safemlx/**"
+      - "safemlx-sys/**"
+  push:
+    branches: [main]
+
+jobs:
+  target-mapping:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Apple target mapping
+        run: |
+          rustc --edition 2021 --test safemlx-sys/build_support.rs -o /tmp/safemlx-build-support-tests
+          /tmp/safemlx-build-support-tests
+
+  cross-build:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - aarch64-apple-tvos
+          - aarch64-apple-tvos-sim
+          - aarch64-apple-visionos
+          - aarch64-apple-visionos-sim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Install Metal toolchain when required
+        run: |
+          if xcrun --toolchain Metal metal --version; then
+            exit 0
+          fi
+          if xcrun metal --version; then
+            exit 0
+          fi
+          xcodebuild -downloadComponent MetalToolchain
+      - name: Cross-build safemlx
+        run: cargo build --release -p safemlx --target "${{ matrix.target }}"
+      - name: Verify Metal resource
+        run: test -s "target/${{ matrix.target }}/release/safemlx-resources/mlx.metallib"

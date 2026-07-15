@@ -395,7 +395,7 @@ pub fn gather_qmm_with_mode(
 /// - `group_size`: The quantization group size (default depends on mode: 16 for nvfp4, 32 for mxfp8)
 /// - `bits`: The number of bits per element (default depends on mode: 4 for nvfp4, 8 for mxfp8)
 /// - `mode`: Quantization mode - either "nvfp4" or "mxfp8" (default: "nvfp4")
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
 pub fn qqmm<'a>(

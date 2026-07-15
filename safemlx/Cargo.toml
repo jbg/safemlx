@@ -13,7 +13,12 @@ description = "Unofficial rust wrapper for Apple's mlx machine learning library.
 readme = "README.md"
 
 [package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin"]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-tvos",
+    "aarch64-apple-visionos",
+]
 
 [dependencies]
 safemlx-sys = { workspace = true, default-features = false }

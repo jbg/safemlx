@@ -4,3 +4,11 @@
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+/// Path to the `mlx.metallib` produced for this Cargo target and profile.
+///
+/// Add this file to the application's Copy Bundle Resources phase. Set
+/// `SAFEMLX_METALLIB_OUTPUT_DIR` while building to export it directly to a
+/// different resource-staging directory.
+#[cfg(feature = "metal")]
+pub const MLX_METALLIB_PATH: &str = env!("SAFEMLX_METALLIB_PATH");

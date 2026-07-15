@@ -1,0 +1,187 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -71,7 +71,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+     endif()
+   endif()
+-elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+-  # Enable the Metal backend by default on iOS; the caller selects the SDK.
++elseif(CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|visionOS)$")
++  # Enable the Metal backend on supported embedded Apple platforms; the caller
++  # selects the device or simulator SDK.
+ else()
+   set(MLX_BUILD_METAL OFF)
+ endif()
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
++if(CMAKE_SYSTEM_NAME MATCHES "^(Darwin|iOS|tvOS|visionOS)$")
+   set(COMPILER ${CMAKE_C_COMPILER})
+   set(CLANG TRUE)
+ else()
+@@ -82,7 +82,7 @@ if(MLX_BUILD_ACCELERATE)
+                              ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_bf16.cpp)
+ endif()
+ 
+-if(IOS)
++if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|visionOS)$")
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../no_cpu/compiled.cpp)
+ else()
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
+diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
+--- a/mlx/backend/metal/CMakeLists.txt
++++ b/mlx/backend/metal/CMakeLists.txt
+@@ -1,3 +1,35 @@
++if(NOT MLX_METAL_SDK)
++  set(MLX_METAL_SDK macosx)
++endif()
++
++if(NOT MLX_METAL_COMPILER)
++  execute_process(
++    COMMAND xcrun --toolchain Metal -find metal
++    OUTPUT_VARIABLE MLX_METAL_COMPILER
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    RESULT_VARIABLE MLX_METAL_COMPILER_RESULT)
++  if(NOT MLX_METAL_COMPILER_RESULT EQUAL 0)
++    execute_process(
++      COMMAND xcrun -find metal
++      OUTPUT_VARIABLE MLX_METAL_COMPILER
++      OUTPUT_STRIP_TRAILING_WHITESPACE
++      COMMAND_ERROR_IS_FATAL ANY)
++  endif()
++endif()
++
++if(NOT MLX_METAL_SYSROOT)
++  execute_process(
++    COMMAND xcrun -sdk ${MLX_METAL_SDK} --show-sdk-path
++    OUTPUT_VARIABLE MLX_METAL_SYSROOT
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    COMMAND_ERROR_IS_FATAL ANY)
++endif()
++
++if(NOT MLX_METAL_MODULE_CACHE)
++  set(MLX_METAL_MODULE_CACHE ${CMAKE_CURRENT_BINARY_DIR}/module-cache)
++endif()
++file(MAKE_DIRECTORY ${MLX_METAL_MODULE_CACHE})
++
+ function(make_jit_source SRC_FILE)
+   # This function takes a metal header file, runs the C preprocessesor on it,
+   # and makes the processed contents available as a string in a C++ function
+@@ -13,8 +45,9 @@ function(make_jit_source SRC_FILE)
+     OUTPUT jit/${SRC_NAME}.cpp
+     COMMAND
+       bash ${CMAKE_CURRENT_SOURCE_DIR}/make_compiled_preamble.sh
+-      ${CMAKE_CURRENT_BINARY_DIR}/jit ${CMAKE_C_COMPILER} ${PROJECT_SOURCE_DIR}
+-      ${SRC_FILE}
++      ${CMAKE_CURRENT_BINARY_DIR}/jit ${MLX_METAL_COMPILER}
++      ${PROJECT_SOURCE_DIR} ${SRC_FILE}
++      "-isysroot ${MLX_METAL_SYSROOT} -fmodules-cache-path=${MLX_METAL_MODULE_CACHE} ${MLX_METAL_MIN_VERSION_FLAG}"
+     DEPENDS make_compiled_preamble.sh kernels/${SRC_FILE}.h ${ARGN})
+   add_custom_target(${SRC_NAME} DEPENDS jit/${SRC_NAME}.cpp)
+   add_dependencies(mlx ${SRC_NAME})
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -10,6 +10,38 @@ set(BASE_HEADERS
+     logging.h
+     utils.h)
+ 
++if(NOT MLX_METAL_SDK)
++  set(MLX_METAL_SDK macosx)
++endif()
++
++if(NOT MLX_METAL_COMPILER)
++  execute_process(
++    COMMAND xcrun --toolchain Metal -find metal
++    OUTPUT_VARIABLE MLX_METAL_COMPILER
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    RESULT_VARIABLE MLX_METAL_COMPILER_RESULT)
++  if(NOT MLX_METAL_COMPILER_RESULT EQUAL 0)
++    execute_process(
++      COMMAND xcrun -find metal
++      OUTPUT_VARIABLE MLX_METAL_COMPILER
++      OUTPUT_STRIP_TRAILING_WHITESPACE
++      COMMAND_ERROR_IS_FATAL ANY)
++  endif()
++endif()
++
++if(NOT MLX_METAL_SYSROOT)
++  execute_process(
++    COMMAND xcrun -sdk ${MLX_METAL_SDK} --show-sdk-path
++    OUTPUT_VARIABLE MLX_METAL_SYSROOT
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    COMMAND_ERROR_IS_FATAL ANY)
++endif()
++
++if(NOT MLX_METAL_MODULE_CACHE)
++  set(MLX_METAL_MODULE_CACHE ${CMAKE_CURRENT_BINARY_DIR}/module-cache)
++endif()
++file(MAKE_DIRECTORY ${MLX_METAL_MODULE_CACHE})
++
+ function(build_kernel_base TARGET SRCFILE DEPS)
+   set(METAL_FLAGS
+       -x
+@@ -24,14 +56,17 @@ function(build_kernel_base TARGET SRCFILE DEPS)
+   if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MLX_METAL_VERSION GREATER_EQUAL 320)
+     set(METAL_FLAGS ${METAL_FLAGS} -fmetal-enable-logging)
+   endif()
+-  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++  if(MLX_METAL_MIN_VERSION_FLAG)
++    set(METAL_FLAGS ${METAL_FLAGS} "${MLX_METAL_MIN_VERSION_FLAG}")
++  elseif(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+     set(METAL_FLAGS ${METAL_FLAGS}
+                     "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+   endif()
++  set(METAL_FLAGS ${METAL_FLAGS} "-fmodules-cache-path=${MLX_METAL_MODULE_CACHE}")
+   add_custom_command(
+-    COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
+-            -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
++    COMMAND ${MLX_METAL_COMPILER} -isysroot ${MLX_METAL_SYSROOT} ${METAL_FLAGS}
++            -c ${SRCFILE} -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
+     OUTPUT ${TARGET}.air
+     COMMENT "Building ${TARGET}.air"
+     VERBATIM)
+@@ -179,14 +208,16 @@ if(NOT MLX_METAL_JIT)
+ endif()
+ 
+ set(METAL_LINK_FLAGS)
+-if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++if(MLX_METAL_MIN_VERSION_FLAG)
++  set(METAL_LINK_FLAGS "${MLX_METAL_MIN_VERSION_FLAG}")
++elseif(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+   set(METAL_LINK_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+ endif()
+ 
+ add_custom_command(
+   OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+-  COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
+-          ${MLX_METAL_PATH}/mlx.metallib
++  COMMAND ${MLX_METAL_COMPILER} -isysroot ${MLX_METAL_SYSROOT}
++          ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o ${MLX_METAL_PATH}/mlx.metallib
+   DEPENDS ${KERNEL_AIR}
+   COMMENT "Building mlx.metallib"
+   VERBATIM)
+diff --git a/mlx/backend/metal/make_compiled_preamble.sh b/mlx/backend/metal/make_compiled_preamble.sh
+--- a/mlx/backend/metal/make_compiled_preamble.sh
++++ b/mlx/backend/metal/make_compiled_preamble.sh
+@@ -31,7 +31,7 @@ OUTPUT_FILE=${OUTPUT_DIR}/${SRC_NAME}.cpp
+ mkdir -p "$OUTPUT_DIR"
+ 
+ # Use the metal compiler to get a list of headers (with depth)
+-CCC="xcrun -sdk macosx metal -x metal"
++CCC="${CC} -x metal"
+ HDRS=$( $CCC -I"$SRC_DIR" -I"$JIT_INCLUDES" -DMLX_METAL_JIT -E -P -CC -C -H "$INPUT_FILE" $CFLAGS -w 2>&1 1>/dev/null )
+ 
+ # Fail early if the Metal compiler returned errors instead of header paths.
+@@ -45,7 +45,7 @@ if [ -n "$HDRS" ]; then
+     echo "$invalid_lines" >&2
+     echo "" >&2
+     echo "This usually means xcrun or the Metal toolchain is not configured correctly." >&2
+-    echo "Try running: xcrun -sdk macosx metal --version" >&2
++    echo "Try running: ${CC} --version" >&2
+     exit 1
+   fi
+ fi
