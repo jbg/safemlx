@@ -4,7 +4,10 @@ use crate::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     ops::indexing::TryIndexOp,
-    ops::{self, dequantize, quantized_matmul, quantized_packed_dimension},
+    ops::{
+        self, dequantize_with_mode, quantized_matmul_with_mode, quantized_packed_dimension,
+        QuantizationMode,
+    },
     quantization::Quantizable,
     Array, Dtype, Stream,
 };
@@ -47,6 +50,9 @@ pub struct QuantizedEmbeddingBuilder {
 
     /// Bits per parameter. Default to [`QuantizedEmbedding::DEFAULT_BITS`]
     pub bits: i32,
+
+    /// Quantized weight encoding.
+    pub mode: QuantizationMode,
 }
 
 /// The same as ``Embedding`` but with a quantized weight matrix.
@@ -59,13 +65,16 @@ pub struct QuantizedEmbedding {
     /// Bits per parameter. Default to [`QuantizedEmbedding::DEFAULT_BITS`]
     pub bits: i32,
 
+    /// Quantized weight encoding.
+    pub mode: QuantizationMode,
+
     /// Scales
     #[param]
     pub scales: Param<Array>,
 
     /// Biases
     #[param]
-    pub biases: Param<Array>,
+    pub biases: Param<Option<Array>>,
 
     /// Inner embedding
     #[param]
@@ -80,6 +89,7 @@ impl QuantizedEmbeddingBuilder {
             dimensions: dimensions.into(),
             group_size: QuantizedEmbedding::DEFAULT_GROUP_SIZE,
             bits: QuantizedEmbedding::DEFAULT_BITS,
+            mode: QuantizationMode::Affine,
         }
     }
 
@@ -92,6 +102,12 @@ impl QuantizedEmbeddingBuilder {
     /// Set the quantization bit width.
     pub fn bits(mut self, bits: impl Into<i32>) -> Self {
         self.bits = bits.into();
+        self
+    }
+
+    /// Set the quantized weight encoding.
+    pub fn mode(mut self, mode: QuantizationMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -118,7 +134,7 @@ impl QuantizedEmbeddingBuilder {
     ) -> Result<QuantizedEmbedding, Exception> {
         let group_size = self.group_size;
         let bits = self.bits;
-        build_quantized_embedding_inner(weight, group_size, bits, stream)
+        build_quantized_embedding_inner(weight, group_size, bits, self.mode, stream)
     }
 }
 
@@ -126,19 +142,21 @@ fn build_quantized_embedding_inner(
     weight: Array,
     group_size: i32,
     bits: i32,
+    mode: QuantizationMode,
     stream: &crate::Stream,
 ) -> Result<QuantizedEmbedding, Exception> {
-    let (quantized_weight, scales, biases) = ops::quantize(&weight, group_size, bits, stream)?;
+    let arrays = ops::quantize_with_mode(&weight, group_size, bits, mode, stream)?;
 
     let inner = Embedding {
-        weight: Param::new(quantized_weight),
+        weight: Param::new(arrays.weight),
     };
 
     let mut qe = QuantizedEmbedding {
         group_size,
         bits,
-        scales: Param::new(scales),
-        biases: Param::new(biases),
+        mode,
+        scales: Param::new(arrays.scales),
+        biases: Param::new(arrays.biases),
         inner,
     };
 
@@ -180,7 +198,32 @@ impl QuantizedEmbedding {
         bits: i32,
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
+        Self::unloaded_with_mode(
+            embedding_count,
+            dimensions,
+            group_size,
+            bits,
+            QuantizationMode::Affine,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded quantized embedding with an explicit encoding.
+    pub fn unloaded_with_mode(
+        embedding_count: i32,
+        dimensions: i32,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizationMode,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        mode.validate(group_size, bits)?;
         let stream = stream.as_ref();
+        let scale_dtype = if mode == QuantizationMode::MxFp4 {
+            Dtype::Uint8
+        } else {
+            Dtype::Float32
+        };
         let inner = Embedding {
             weight: Param::<Array>::unloaded(
                 &[
@@ -194,16 +237,21 @@ impl QuantizedEmbedding {
         let mut qe = Self {
             group_size,
             bits,
+            mode,
             scales: Param::<Array>::unloaded(
                 &[embedding_count, dimensions / group_size],
-                Dtype::Float32,
+                scale_dtype,
                 stream,
             )?,
-            biases: Param::<Array>::unloaded(
-                &[embedding_count, dimensions / group_size],
-                Dtype::Float32,
-                stream,
-            )?,
+            biases: if mode.has_biases() {
+                Param::<Option<Array>>::unloaded_some(
+                    &[embedding_count, dimensions / group_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             inner,
         };
         qe.freeze_parameters(true);
@@ -234,7 +282,13 @@ impl QuantizedEmbedding {
     ) -> Result<Self, Exception> {
         let group_size = group_size.into().unwrap_or(Self::DEFAULT_GROUP_SIZE);
         let bits = bits.into().unwrap_or(Self::DEFAULT_BITS);
-        build_quantized_embedding_inner(embedding.weight.value, group_size, bits, stream)
+        build_quantized_embedding_inner(
+            embedding.weight.value,
+            group_size,
+            bits,
+            QuantizationMode::Affine,
+            stream,
+        )
     }
 
     /// Call the embedding layer as a linear layer.
@@ -246,14 +300,15 @@ impl QuantizedEmbedding {
         x: impl AsRef<Array>,
         stream: &crate::Stream,
     ) -> Result<Array, Exception> {
-        quantized_matmul(
+        quantized_matmul_with_mode(
             x.as_ref(),
             &self.inner.weight,
             &self.scales,
-            self.biases.as_ref(),
+            self.biases.value.as_ref(),
             true,
             self.group_size,
             self.bits,
+            self.mode,
             stream,
         )
     }
@@ -268,9 +323,22 @@ impl Module<&Array> for QuantizedEmbedding {
         let x = x.flatten(None, None, stream)?;
         let w = self.inner.weight.try_index_device(&x, stream)?;
         let scales = self.scales.try_index_device(&x, stream)?;
-        let biases = self.biases.try_index_device(&x, stream)?;
+        let biases = self
+            .biases
+            .value
+            .as_ref()
+            .map(|biases| biases.try_index_device(&x, stream))
+            .transpose()?;
 
-        let out = dequantize(&w, &scales, &biases, self.group_size, self.bits, stream)?;
+        let out = dequantize_with_mode(
+            &w,
+            &scales,
+            biases.as_ref(),
+            self.group_size,
+            self.bits,
+            self.mode,
+            stream,
+        )?;
 
         let ret_shape = s.iter().copied().chain(once(-1)).collect::<Vec<_>>();
         out.reshape(&ret_shape, stream)
@@ -296,6 +364,9 @@ pub struct QuantizedLinearBuilder {
     /// Bits per parameter. Default to [`QuantizedLinear::DEFAULT_BITS`]
     pub bits: i32,
 
+    /// Quantized weight encoding.
+    pub mode: QuantizationMode,
+
     /// Whether the linear layer has a bias. Default to [`Linear::DEFAULT_BIAS`]
     pub bias: bool,
 }
@@ -308,6 +379,7 @@ impl QuantizedLinearBuilder {
             output_dims: output_dims.into(),
             group_size: QuantizedLinear::DEFAULT_GROUP_SIZE,
             bits: QuantizedLinear::DEFAULT_BITS,
+            mode: QuantizationMode::Affine,
             bias: Linear::DEFAULT_BIAS,
         }
     }
@@ -321,6 +393,12 @@ impl QuantizedLinearBuilder {
     /// Set the quantization bit width.
     pub fn bits(mut self, bits: impl Into<i32>) -> Self {
         self.bits = bits.into();
+        self
+    }
+
+    /// Set the quantized weight encoding.
+    pub fn mode(mut self, mode: QuantizationMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -350,7 +428,7 @@ impl QuantizedLinearBuilder {
         bias: Option<Array>,
         stream: &crate::Stream,
     ) -> Result<QuantizedLinear, Exception> {
-        build_quantized_linear_inner(weight, bias, self.group_size, self.bits, stream)
+        build_quantized_linear_inner(weight, bias, self.group_size, self.bits, self.mode, stream)
     }
 }
 
@@ -359,20 +437,22 @@ fn build_quantized_linear_inner(
     bias: Option<Array>,
     group_size: i32,
     bits: i32,
+    mode: QuantizationMode,
     stream: &crate::Stream,
 ) -> Result<QuantizedLinear, Exception> {
-    let (quantized_weight, scales, biases) = ops::quantize(&weight, group_size, bits, stream)?;
+    let arrays = ops::quantize_with_mode(&weight, group_size, bits, mode, stream)?;
 
     let inner = Linear {
-        weight: Param::new(quantized_weight),
+        weight: Param::new(arrays.weight),
         bias: Param::new(bias),
     };
 
     let mut ql = QuantizedLinear {
         group_size,
         bits,
-        scales: Param::new(scales),
-        biases: Param::new(biases),
+        mode,
+        scales: Param::new(arrays.scales),
+        biases: Param::new(arrays.biases),
         inner,
     };
 
@@ -418,13 +498,16 @@ pub struct QuantizedLinear {
     /// Bits per parameter. Default to [`QuantizedLinear::DEFAULT_BITS`]
     pub bits: i32,
 
+    /// Quantized weight encoding.
+    pub mode: QuantizationMode,
+
     /// Scales
     #[param]
     pub scales: Param<Array>,
 
     /// Biases
     #[param]
-    pub biases: Param<Array>,
+    pub biases: Param<Option<Array>>,
 
     /// Inner linear layer
     #[param]
@@ -451,7 +534,35 @@ impl QuantizedLinear {
         bias: bool,
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
+        Self::unloaded_with_mode(
+            input_dims,
+            output_dims,
+            group_size,
+            bits,
+            QuantizationMode::Affine,
+            bias,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded quantized linear layer with an explicit encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unloaded_with_mode(
+        input_dims: i32,
+        output_dims: i32,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizationMode,
+        bias: bool,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        mode.validate(group_size, bits)?;
         let stream = stream.as_ref();
+        let scale_dtype = if mode == QuantizationMode::MxFp4 {
+            Dtype::Uint8
+        } else {
+            Dtype::Float32
+        };
         let inner = Linear {
             weight: Param::<Array>::unloaded(
                 &[output_dims, quantized_packed_dimension(input_dims, bits)],
@@ -467,16 +578,21 @@ impl QuantizedLinear {
         let mut ql = Self {
             group_size,
             bits,
+            mode,
             scales: Param::<Array>::unloaded(
                 &[output_dims, input_dims / group_size],
-                Dtype::Float32,
+                scale_dtype,
                 stream,
             )?,
-            biases: Param::<Array>::unloaded(
-                &[output_dims, input_dims / group_size],
-                Dtype::Float32,
-                stream,
-            )?,
+            biases: if mode.has_biases() {
+                Param::<Option<Array>>::unloaded_some(
+                    &[output_dims, input_dims / group_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             inner,
         };
         ql.freeze_parameters(true);
@@ -512,6 +628,7 @@ impl QuantizedLinear {
             linear.bias.value,
             group_size,
             bits,
+            QuantizationMode::Affine,
             stream,
         )
     }
@@ -522,14 +639,15 @@ impl Module<&Array> for QuantizedLinear {
     type Output = Array;
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
-        let mut x = quantized_matmul(
+        let mut x = quantized_matmul_with_mode(
             x,
             &self.inner.weight,
             &self.scales,
-            self.biases.as_ref(),
+            self.biases.value.as_ref(),
             true,
             self.group_size,
             self.bits,
+            self.mode,
             stream,
         )?;
         if let Some(bias) = &self.inner.bias.value {
@@ -547,12 +665,15 @@ impl Module<&Array> for QuantizedLinear {
 mod tests {
     use crate::{
         array,
-        module::Module,
+        module::{Module, ModuleParameters},
+        ops::QuantizationMode,
         random::{randint, uniform},
         Dtype,
     };
 
-    use super::{QuantizedEmbedding, QuantizedEmbeddingBuilder, QuantizedLinear};
+    use super::{
+        QuantizedEmbedding, QuantizedEmbeddingBuilder, QuantizedLinear, QuantizedLinearBuilder,
+    };
 
     #[test]
     fn unloaded_parameters_use_mlx_bit_packing() {
@@ -610,5 +731,38 @@ mod tests {
 
         assert_eq!(output.shape(), &[2, 3, 64]);
         assert_eq!(output.dtype(), Dtype::Float32);
+    }
+
+    #[test]
+    fn mxfp4_modules_execute_without_quantization_bias_parameters() {
+        let stream = crate::test_stream();
+        let mut linear = QuantizedLinearBuilder::new(64, 8)
+            .group_size(32)
+            .bits(4)
+            .mode(QuantizationMode::MxFp4)
+            .bias(true)
+            .build(stream)
+            .unwrap();
+        let input = crate::Array::ones::<f32>(&[2, 64], stream).unwrap();
+        assert_eq!(linear.forward(&input, stream).unwrap().shape(), &[2, 8]);
+        let linear_keys = linear.parameters().flatten();
+        assert!(linear_keys.contains_key("inner.weight"));
+        assert!(linear_keys.contains_key("scales"));
+        assert!(!linear_keys.contains_key("biases"));
+        assert!(linear_keys.contains_key("inner.bias"));
+
+        let mut embedding = QuantizedEmbeddingBuilder::new(16, 64)
+            .group_size(32)
+            .bits(4)
+            .mode(QuantizationMode::MxFp4)
+            .build(stream)
+            .unwrap();
+        let tokens = crate::Array::from_slice(&[0i32, 3, 7, 15], &[2, 2]);
+        assert_eq!(
+            embedding.forward(&tokens, stream).unwrap().shape(),
+            &[2, 2, 64]
+        );
+        let embedding_keys = embedding.parameters().flatten();
+        assert!(!embedding_keys.contains_key("biases"));
     }
 }

@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::{
     error::Error,
     models::moshi,
-    quantization::AffineQuantization,
+    quantization::WeightQuantization,
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -49,7 +49,7 @@ pub struct ModelMetadata {
     pub version: Option<String>,
     /// Optional MLX affine checkpoint quantization settings.
     #[serde(default)]
-    pub quantization: Option<AffineQuantization>,
+    pub quantization: Option<WeightQuantization>,
 }
 
 /// PersonaPlex uses the Moshi-family token model implementation.
@@ -252,7 +252,7 @@ pub fn load_model(
 /// Loads the dense released PersonaPlex checkpoint with on-the-fly affine quantization.
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -535,7 +535,7 @@ mod tests {
         )
         .unwrap()
         .into_moshi_model();
-        assert_eq!(model.args.quantization.unwrap().bits, 4);
+        assert_eq!(model.args.quantization.unwrap().bits(), 4);
         assert_eq!(model.args.dep_q, 16);
     }
 

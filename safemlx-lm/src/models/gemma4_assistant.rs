@@ -26,7 +26,7 @@ use crate::{
         gemma4::{sample, Gemma4Embedding, LayerType, Model, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
-    quantization::AffineQuantization,
+    quantization::WeightQuantization,
     weights::{
         load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
         StrictLoadReport,
@@ -60,7 +60,7 @@ pub struct Gemma4AssistantConfig {
     pub text_config: ModelArgs,
     #[serde(default)]
     /// Optional MLX affine checkpoint metadata.
-    pub quantization: Option<AffineQuantization>,
+    pub quantization: Option<WeightQuantization>,
 }
 
 fn default_model_type() -> String {
@@ -250,12 +250,13 @@ impl Gemma4AssistantDraftModel {
         }
         config.text_config.model_type = "gemma4".to_string();
         config.text_config.quantized = config.quantization.is_some();
+        config.text_config.weight_quantization = config.quantization;
         config.text_config.quantization_group_size = config
             .quantization
-            .map_or(64, |quantization| quantization.group_size);
+            .map_or(64, |quantization| quantization.group_size());
         config.text_config.quantization_bits = config
             .quantization
-            .map_or(4, |quantization| quantization.bits);
+            .map_or(4, |quantization| quantization.bits());
         if config.text_config.num_kv_shared_layers == 0 {
             config.text_config.num_kv_shared_layers = config.text_config.num_hidden_layers;
         }
@@ -566,7 +567,10 @@ mod tests {
 
     use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext};
 
-    use crate::{models::ModelLoadOptions, quantization::AffineQuantization};
+    use crate::{
+        models::ModelLoadOptions,
+        quantization::{AffineQuantization, WeightQuantization},
+    };
 
     const CONFIG: &str = r#"{
       "model_type":"gemma4_assistant",
@@ -617,7 +621,7 @@ mod tests {
         )
         .unwrap();
 
-        let quantization = AffineQuantization::new(32, 4).unwrap();
+        let quantization = WeightQuantization::MxFp4;
         let model = super::load_gemma4_assistant_model_with_options(
             &dir,
             ModelLoadOptions::with_quantization(quantization),
@@ -629,6 +633,10 @@ mod tests {
         assert!(model.post_projection.is_quantized());
         assert!(model.lm_head.as_ref().unwrap().is_quantized());
         assert!(model.model.embed_tokens.quantized);
+        assert!(!model
+            .parameters()
+            .flatten()
+            .contains_key("pre_projection.biases"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

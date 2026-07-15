@@ -1,4 +1,4 @@
-//! Model-agnostic affine quantization for safetensors checkpoints.
+//! Model-agnostic load-time quantization for safetensors checkpoints.
 //!
 //! The serialized representation follows the MLX-LM convention: a dense
 //! `name.weight` tensor becomes a packed `name.weight` tensor plus
@@ -13,7 +13,7 @@ use std::{
 };
 
 use safemlx::{ops, Array, Stream};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::{error::Error, weights};
@@ -75,22 +75,21 @@ impl AffineQuantization {
     }
 }
 
-/// Resolves an affine on-load request against checkpoint metadata.
+/// Resolves an on-load request against checkpoint quantization metadata.
 ///
 /// Returns `true` for a dense checkpoint that must be quantized and `false`
 /// when a matching pre-quantized checkpoint should be loaded directly.
 pub(crate) fn should_quantize_on_load(
     architecture: &str,
-    existing: Option<AffineQuantization>,
-    requested: AffineQuantization,
+    existing: Option<WeightQuantization>,
+    requested: WeightQuantization,
 ) -> Result<bool, Error> {
     requested.validate()?;
     match existing {
         None => Ok(true),
         Some(existing) if existing == requested => Ok(false),
         Some(existing) => Err(Error::Quantization(format!(
-            "{architecture} checkpoint is already affine-quantized as group_size={} bits={}, requested group_size={} bits={}",
-            existing.group_size, existing.bits, requested.group_size, requested.bits
+            "{architecture} checkpoint is already quantized as {existing:?}, requested {requested:?}; implicit dequantization and requantization is unsupported"
         ))),
     }
 }
@@ -138,11 +137,122 @@ pub enum AffineQuantizationMode {
     Affine,
 }
 
+/// Weight encoding requested for load-time quantization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightQuantization {
+    /// MLX affine integer quantization.
+    Affine(AffineQuantization),
+    /// Microscaling FP4 with E2M1 values and E8M0 scales.
+    MxFp4,
+}
+
+impl WeightQuantization {
+    /// MXFP4 group size fixed by the format.
+    pub const MXFP4_GROUP_SIZE: i32 = 32;
+    /// MXFP4 packed value width fixed by the format.
+    pub const MXFP4_BITS: i32 = 4;
+
+    /// Returns the group size passed to MLX.
+    pub const fn group_size(self) -> i32 {
+        match self {
+            Self::Affine(config) => config.group_size,
+            Self::MxFp4 => Self::MXFP4_GROUP_SIZE,
+        }
+    }
+
+    /// Returns the packed value width passed to MLX.
+    pub const fn bits(self) -> i32 {
+        match self {
+            Self::Affine(config) => config.bits,
+            Self::MxFp4 => Self::MXFP4_BITS,
+        }
+    }
+
+    /// Returns the corresponding typed MLX execution mode.
+    pub const fn mode(self) -> ops::QuantizationMode {
+        match self {
+            Self::Affine(_) => ops::QuantizationMode::Affine,
+            Self::MxFp4 => ops::QuantizationMode::MxFp4,
+        }
+    }
+
+    /// Returns whether the encoding stores affine quantization biases.
+    pub const fn has_biases(self) -> bool {
+        matches!(self, Self::Affine(_))
+    }
+
+    /// Validates the selected encoding.
+    pub fn validate(self) -> Result<(), Error> {
+        match self {
+            Self::Affine(config) => config.validate(),
+            Self::MxFp4 => Ok(()),
+        }
+    }
+}
+
+impl From<AffineQuantization> for WeightQuantization {
+    fn from(value: AffineQuantization) -> Self {
+        Self::Affine(value)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WeightQuantizationMetadata {
+    group_size: i32,
+    bits: i32,
+    mode: String,
+}
+
+impl Serialize for WeightQuantization {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        WeightQuantizationMetadata {
+            group_size: self.group_size(),
+            bits: self.bits(),
+            mode: match self {
+                Self::Affine(_) => "affine",
+                Self::MxFp4 => "mxfp4",
+            }
+            .into(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WeightQuantization {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let metadata = WeightQuantizationMetadata::deserialize(deserializer)?;
+        match metadata.mode.as_str() {
+            "affine" => AffineQuantization::new(metadata.group_size, metadata.bits)
+                .map(Self::Affine)
+                .map_err(de::Error::custom),
+            "mxfp4"
+                if metadata.group_size == Self::MXFP4_GROUP_SIZE
+                    && metadata.bits == Self::MXFP4_BITS =>
+            {
+                Ok(Self::MxFp4)
+            }
+            "mxfp4" => Err(de::Error::custom(format!(
+                "MXFP4 requires group_size=32 and bits=4, got group_size={} bits={}",
+                metadata.group_size, metadata.bits
+            ))),
+            mode => Err(de::Error::custom(format!(
+                "unsupported quantization mode {mode:?}"
+            ))),
+        }
+    }
+}
+
 /// Tensor selection and output-sharding options for checkpoint conversion.
 #[derive(Debug, Clone)]
 pub struct CheckpointQuantizationOptions {
-    /// Affine format settings.
-    pub quantization: AffineQuantization,
+    /// Output weight encoding.
+    pub quantization: WeightQuantization,
     /// Maximum uncompressed tensor bytes accumulated before writing a shard.
     pub shard_size_bytes: usize,
     /// Only quantize tensor names containing at least one of these strings.
@@ -157,7 +267,7 @@ pub struct CheckpointQuantizationOptions {
 impl Default for CheckpointQuantizationOptions {
     fn default() -> Self {
         Self {
-            quantization: AffineQuantization::default(),
+            quantization: AffineQuantization::default().into(),
             shard_size_bytes: 512 * 1024 * 1024,
             include: Vec::new(),
             exclude: Vec::new(),
@@ -172,7 +282,7 @@ impl CheckpointQuantizationOptions {
         canonical_weight_name(name).is_some()
             && tensor.ndim() == 2
             && tensor.dtype().is_float()
-            && tensor.dim(1) % self.quantization.group_size == 0
+            && tensor.dim(1) % self.quantization.group_size() == 0
             && tensor.dim(1) % 32 == 0
             && tensor.size() >= self.minimum_elements
             && (self.include.is_empty() || self.include.iter().any(|needle| name.contains(needle)))
@@ -199,7 +309,7 @@ fn canonical_weight_name(name: &str) -> Option<String> {
     }
 }
 
-/// The three tensors produced from one dense affine-quantized matrix.
+/// Tensors produced from one dense quantized matrix.
 #[derive(Debug, Clone)]
 pub struct QuantizedTensor {
     /// Packed unsigned-integer weights.
@@ -207,53 +317,87 @@ pub struct QuantizedTensor {
     /// Per-group scales.
     pub scales: Array,
     /// Per-group affine biases.
-    pub biases: Array,
+    pub biases: Option<Array>,
 }
 
 impl QuantizedTensor {
     /// Returns the standard MLX-LM checkpoint keys and arrays for `weight_name`.
-    pub fn into_named_arrays(self, weight_name: &str) -> Result<[(String, Array); 3], Error> {
+    pub fn into_named_arrays(self, weight_name: &str) -> Result<Vec<(String, Array)>, Error> {
         let prefix = weight_name.strip_suffix(".weight").ok_or_else(|| {
             Error::Quantization(format!(
                 "quantized tensor name must end in .weight: {weight_name}"
             ))
         })?;
-        Ok([
+        let mut arrays = vec![
             (weight_name.to_string(), self.weight),
             (format!("{prefix}.scales"), self.scales),
-            (format!("{prefix}.biases"), self.biases),
-        ])
+        ];
+        if let Some(biases) = self.biases {
+            arrays.push((format!("{prefix}.biases"), biases));
+        }
+        Ok(arrays)
     }
 }
 
-/// Quantizes one two-dimensional weight using an explicit execution stream.
+/// Quantizes one floating-point weight using an explicit execution stream.
 ///
-/// Both on-the-fly model loading and checkpoint conversion call this function.
+/// The last dimension is grouped and packed. Leading dimensions, including an
+/// expert-bank dimension, are retained. Both on-the-fly model loading and
+/// checkpoint conversion call this function.
 pub fn quantize_tensor(
     weight: &Array,
-    config: AffineQuantization,
+    config: impl Into<WeightQuantization>,
     stream: &Stream,
 ) -> Result<QuantizedTensor, Error> {
+    let config = config.into();
     config.validate()?;
-    if weight.ndim() != 2 || !weight.dtype().is_float() {
+    if weight.ndim() < 2 || !weight.dtype().is_float() {
         return Err(Error::Quantization(format!(
-            "expected a floating-point matrix, got shape {:?} and dtype {:?}",
+            "expected a floating-point weight with at least two dimensions, got shape {:?} and dtype {:?}",
             weight.shape(),
             weight.dtype()
         )));
     }
-    if weight.dim(1) % config.group_size != 0 || weight.dim(1) % 32 != 0 {
+    let input_dims = weight.dim(-1);
+    if input_dims % config.group_size() != 0 || input_dims % 32 != 0 {
         return Err(Error::Quantization(format!(
             "input dimension {} must be divisible by group_size {} and 32",
-            weight.dim(1),
-            config.group_size
+            input_dims,
+            config.group_size()
         )));
     }
-    let (weight, scales, biases) = ops::quantize(weight, config.group_size, config.bits, stream)?;
+    let original_shape = weight.shape();
+    let leading_size = weight.size() as i32 / input_dims;
+    let matrix = if weight.ndim() == 2 {
+        weight.clone()
+    } else {
+        weight.reshape(&[leading_size, input_dims], stream)?
+    };
+    let arrays = ops::quantize_with_mode(
+        &matrix,
+        config.group_size(),
+        config.bits(),
+        config.mode(),
+        stream,
+    )?;
+    let restore_shape = |array: Array, last_dim: i32| -> Result<Array, Error> {
+        if weight.ndim() == 2 {
+            Ok(array)
+        } else {
+            let mut shape = original_shape[..original_shape.len() - 1].to_vec();
+            shape.push(last_dim);
+            Ok(array.reshape(&shape, stream)?)
+        }
+    };
+    let packed_dims = input_dims / (32 / config.bits());
+    let group_dims = input_dims / config.group_size();
     Ok(QuantizedTensor {
-        weight,
-        scales,
-        biases,
+        weight: restore_shape(arrays.weight, packed_dims)?,
+        scales: restore_shape(arrays.scales, group_dims)?,
+        biases: arrays
+            .biases
+            .map(|biases| restore_shape(biases, group_dims))
+            .transpose()?,
     })
 }
 
@@ -309,6 +453,18 @@ pub fn quantize_checkpoint(
             source_dir.display()
         )));
     }
+    if let Some(existing) = checkpoint_quantization_metadata(source_dir)? {
+        return if existing == options.quantization {
+            Err(Error::Quantization(format!(
+                "checkpoint already uses {existing:?}; reuse it instead of quantizing it again"
+            )))
+        } else {
+            Err(Error::Quantization(format!(
+                "checkpoint is already quantized as {existing:?}, requested {:?}; implicit transcoding is unsupported",
+                options.quantization
+            )))
+        };
+    }
     fs::create_dir(output_dir).map_err(|error| {
         Error::Quantization(format!(
             "could not create empty output directory {}: {error}",
@@ -322,6 +478,35 @@ pub fn quantize_checkpoint(
         let _ = fs::remove_dir_all(output_dir);
     }
     result
+}
+
+fn checkpoint_quantization_metadata(
+    source_dir: &Path,
+) -> Result<Option<WeightQuantization>, Error> {
+    let path = source_dir.join("config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let config: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let Some(object) = config.as_object() else {
+        return Err(Error::Quantization(
+            "config.json must contain a JSON object".into(),
+        ));
+    };
+    for key in ["quantization", "quantization_config"] {
+        let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if value.get("mode").is_some() {
+            return serde_json::from_value(value.clone())
+                .map(Some)
+                .map_err(|error| Error::Quantization(format!("invalid {key} metadata: {error}")));
+        }
+        return Err(Error::Quantization(format!(
+            "checkpoint contains prequantized {key} metadata that is not MLX affine/MXFP4; implicit transcoding is unsupported"
+        )));
+    }
+    Ok(None)
 }
 
 fn quantize_checkpoint_inner(
@@ -348,8 +533,6 @@ fn quantize_checkpoint_inner(
                 let weight_name = canonical_weight_name(&name).expect("selected weight name");
                 quantize_tensor(&tensor, options.quantization, stream)?
                     .into_named_arrays(&weight_name)?
-                    .into_iter()
-                    .collect::<Vec<_>>()
             } else {
                 copied_tensors += 1;
                 vec![(name, tensor)]
@@ -475,7 +658,7 @@ fn copy_checkpoint_assets(
 fn write_quantized_config(
     source_dir: &Path,
     output_dir: &Path,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
 ) -> Result<(), Error> {
     let path = source_dir.join("config.json");
     let mut config = if path.exists() {
@@ -519,15 +702,70 @@ mod tests {
     }
 
     #[test]
+    fn mxfp4_metadata_is_fixed_and_round_trips() {
+        let value = serde_json::to_value(WeightQuantization::MxFp4).unwrap();
+        assert_eq!(value, json!({"group_size": 32, "bits": 4, "mode": "mxfp4"}));
+        assert_eq!(
+            serde_json::from_value::<WeightQuantization>(value).unwrap(),
+            WeightQuantization::MxFp4
+        );
+        assert!(serde_json::from_value::<WeightQuantization>(
+            json!({"group_size": 64, "bits": 4, "mode": "mxfp4"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<WeightQuantization>(
+            json!({"group_size": 32, "bits": 8, "mode": "mxfp4"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn checkpoint_conversion_rejects_prequantized_inputs() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "safemlx-prequantized-rejection-{}-{suffix}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("config.json"),
+            serde_json::to_vec(&json!({
+                "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let options = CheckpointQuantizationOptions {
+            quantization: WeightQuantization::MxFp4,
+            ..Default::default()
+        };
+        let error = quantize_checkpoint(&source, root.join("output"), &options, context.stream())
+            .unwrap_err();
+        assert!(error.to_string().contains("implicit transcoding"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn on_load_resolution_reuses_matching_metadata_and_rejects_mismatch() {
         let q4 = AffineQuantization::default();
-        assert!(should_quantize_on_load("test", None, q4).unwrap());
-        assert!(!should_quantize_on_load("test", Some(q4), q4).unwrap());
+        assert!(should_quantize_on_load("test", None, q4.into()).unwrap());
+        assert!(!should_quantize_on_load("test", Some(q4.into()), q4.into()).unwrap());
 
         let q8 = AffineQuantization::new(64, 8).unwrap();
-        let error = should_quantize_on_load("test", Some(q4), q8).unwrap_err();
-        assert!(error.to_string().contains("already affine-quantized"));
-        assert!(error.to_string().contains("requested group_size=64 bits=8"));
+        let error = should_quantize_on_load("test", Some(q4.into()), q8.into()).unwrap_err();
+        assert!(error.to_string().contains("already quantized"));
+        assert!(error.to_string().contains("implicit dequantization"));
+        assert!(!should_quantize_on_load(
+            "test",
+            Some(WeightQuantization::MxFp4),
+            WeightQuantization::MxFp4
+        )
+        .unwrap());
     }
 
     #[test]
@@ -547,6 +785,60 @@ mod tests {
         assert!(!options.selects("anything.norm.weight", &vector));
         options.exclude.push("proj".into());
         assert!(!options.selects("anything.proj.weight", &tensor));
+    }
+
+    #[test]
+    fn mxfp4_quantizes_rank_three_expert_banks() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let experts = Array::from_slice(&vec![0.25f32; 3 * 8 * 64], &[3, 8, 64]);
+        let quantized =
+            quantize_tensor(&experts, WeightQuantization::MxFp4, context.stream()).unwrap();
+        assert_eq!(quantized.weight.shape(), &[3, 8, 8]);
+        assert_eq!(quantized.scales.shape(), &[3, 8, 2]);
+        assert!(quantized.biases.is_none());
+    }
+
+    #[test]
+    fn saved_mxfp4_checkpoint_has_no_affine_bias_tensors() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "safemlx-mxfp4-save-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), br#"{"model_type":"test"}"#).unwrap();
+        let weight = Array::from_slice(&vec![0.25f32; 2 * 64], &[2, 64]);
+        Array::save_safetensors(
+            [("model.proj.weight", &weight)],
+            None,
+            source.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let options = CheckpointQuantizationOptions {
+            quantization: WeightQuantization::MxFp4,
+            ..Default::default()
+        };
+        quantize_checkpoint(&source, &output, &options, stream).unwrap();
+        let arrays =
+            Array::load_safetensors(output.join("model.safetensors"), weights_context.stream())
+                .unwrap();
+        assert!(arrays.contains_key("model.proj.weight"));
+        assert!(arrays.contains_key("model.proj.scales"));
+        assert!(!arrays.contains_key("model.proj.biases"));
+        let config: Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["quantization"], config["quantization_config"]);
+        assert_eq!(config["quantization"]["mode"], "mxfp4");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -618,7 +910,13 @@ mod tests {
                 .evaluated()
                 .unwrap()
                 .as_slice::<f32>(),
-            expected.biases.evaluated().unwrap().as_slice::<f32>()
+            expected
+                .biases
+                .as_ref()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
         );
         assert_eq!(
             saved["model.norm.weight"]

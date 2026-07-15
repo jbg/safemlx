@@ -16,8 +16,8 @@ use safemlx::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        addmm, dequantize, indexing::TryIndexOp, matmul, maximum, quantized_matmul,
-        quantized_packed_dimension, r#where, split, zeros_like,
+        addmm, dequantize_with_mode, indexing::TryIndexOp, matmul, maximum,
+        quantized_matmul_with_mode, quantized_packed_dimension, r#where, split, zeros_like,
     },
     random::RandomState,
     transforms::compile::{
@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    quantization::AffineQuantization,
+    quantization::WeightQuantization,
     realtime::{
         self, RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
     },
@@ -145,7 +145,7 @@ pub struct ModelArgs {
     pub extra_heads_num_heads: i32,
     /// Optional MLX affine checkpoint quantization settings.
     #[serde(default)]
-    pub quantization: Option<AffineQuantization>,
+    pub quantization: Option<WeightQuantization>,
 }
 
 impl ModelArgs {
@@ -300,18 +300,18 @@ struct ScaledEmbedding {
     scales: Param<Option<Array>>,
     #[param]
     biases: Param<Option<Array>>,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
 }
 
 impl ScaledEmbedding {
     fn unloaded(
         vocab: i32,
         dim: i32,
-        quantization: Option<AffineQuantization>,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let packed_dim =
-            quantization.map_or(dim, |config| quantized_packed_dimension(dim, config.bits));
+            quantization.map_or(dim, |config| quantized_packed_dimension(dim, config.bits()));
         Ok(Self {
             weight: Param::<Array>::unloaded(
                 &[vocab, packed_dim],
@@ -326,8 +326,12 @@ impl ScaledEmbedding {
                 quantization
                     .map(|config| {
                         Param::<Array>::unloaded(
-                            &[vocab, dim / config.group_size],
-                            Dtype::Float32,
+                            &[vocab, dim / config.group_size()],
+                            if config == WeightQuantization::MxFp4 {
+                                Dtype::Uint8
+                            } else {
+                                Dtype::Float32
+                            },
                             stream,
                         )
                         .map(|param| param.value)
@@ -336,9 +340,10 @@ impl ScaledEmbedding {
             ),
             biases: Param::new(
                 quantization
+                    .filter(|config| config.has_biases())
                     .map(|config| {
                         Param::<Array>::unloaded(
-                            &[vocab, dim / config.group_size],
+                            &[vocab, dim / config.group_size()],
                             Dtype::Float32,
                             stream,
                         )
@@ -363,14 +368,15 @@ impl ScaledEmbedding {
                 .biases
                 .value
                 .as_ref()
-                .expect("quantized embedding biases")
-                .try_index_device(tokens, stream)?;
-            dequantize(
+                .map(|biases| biases.try_index_device(tokens, stream))
+                .transpose()?;
+            dequantize_with_mode(
                 &weight,
                 &scales,
-                &biases,
-                config.group_size,
-                config.bits,
+                biases.as_ref(),
+                config.group_size(),
+                config.bits(),
+                config.mode(),
                 stream,
             )
         } else {
@@ -405,7 +411,7 @@ struct MoshiLinear {
     scales: Param<Option<Array>>,
     #[param]
     biases: Param<Option<Array>>,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     weight_t: Option<Array>,
 }
 
@@ -415,11 +421,11 @@ impl MoshiLinear {
         output_dims: i32,
         bias: bool,
         dtype: Dtype,
-        quantization: Option<AffineQuantization>,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let packed_input_dims = quantization.map_or(input_dims, |config| {
-            quantized_packed_dimension(input_dims, config.bits)
+            quantized_packed_dimension(input_dims, config.bits())
         });
         Ok(Self {
             weight: Param::<Array>::unloaded(
@@ -440,8 +446,12 @@ impl MoshiLinear {
                 quantization
                     .map(|config| {
                         Param::<Array>::unloaded(
-                            &[output_dims, input_dims / config.group_size],
-                            Dtype::Float32,
+                            &[output_dims, input_dims / config.group_size()],
+                            if config == WeightQuantization::MxFp4 {
+                                Dtype::Uint8
+                            } else {
+                                Dtype::Float32
+                            },
                             stream,
                         )
                         .map(|param| param.value)
@@ -450,9 +460,10 @@ impl MoshiLinear {
             ),
             biases: Param::new(
                 quantization
+                    .filter(|config| config.has_biases())
                     .map(|config| {
                         Param::<Array>::unloaded(
-                            &[output_dims, input_dims / config.group_size],
+                            &[output_dims, input_dims / config.group_size()],
                             Dtype::Float32,
                             stream,
                         )
@@ -467,14 +478,15 @@ impl MoshiLinear {
 
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         if let Some(config) = self.quantization {
-            let output = quantized_matmul(
+            let output = quantized_matmul_with_mode(
                 x,
                 &self.weight,
                 self.scales.value.as_ref().expect("quantized linear scales"),
                 self.biases.value.as_ref(),
                 true,
-                config.group_size,
-                config.bits,
+                config.group_size(),
+                config.bits(),
+                config.mode(),
                 stream,
             )?;
             return match &self.bias.value {
@@ -679,7 +691,7 @@ struct TransformerConfig {
     context: i32,
     max_period: f32,
     rope: bool,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -2251,7 +2263,7 @@ pub fn load_model(
 /// affine tensor transform and produce the same in-memory parameter layout.
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -2357,7 +2369,7 @@ pub fn load_pytorch_safetensors_files_quantized_strict<P, I>(
     paths: I,
     weights_stream: &Stream,
     quantization_stream: &Stream,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
 ) -> Result<(), Error>
 where
     P: AsRef<Path>,
@@ -2561,6 +2573,7 @@ mod tests {
     use super::{
         parse_depformer_attention_weight, parse_depformer_gating_weight, Model, ModelArgs,
     };
+    use crate::quantization::WeightQuantization;
     use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
 
     fn minimal_config() -> &'static str {
@@ -2610,6 +2623,25 @@ mod tests {
         args.validate().unwrap();
         assert_eq!(args.delays.len(), 17);
         assert_eq!(args.depformer_dim_feedforward, Some(4096));
+    }
+
+    #[test]
+    fn mxfp4_realtime_model_tree_omits_affine_biases() {
+        let mut value: serde_json::Value = serde_json::from_str(minimal_config()).unwrap();
+        value["dim"] = 32.into();
+        value["dim_feedforward"] = 64.into();
+        value["depformer_dim"] = 32.into();
+        value["depformer_dim_feedforward"] = 64.into();
+        let mut args: ModelArgs = serde_json::from_value(value).unwrap();
+        args.quantization = Some(WeightQuantization::MxFp4);
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let model = Model::new(args, context.stream()).unwrap();
+        let params = model.parameters().flatten();
+        assert!(params.contains_key("text_emb.scales"));
+        assert!(!params.contains_key("text_emb.biases"));
+        assert!(params.contains_key("transformer.layers.0.self_attn.in_proj.scales"));
+        assert!(!params.contains_key("transformer.layers.0.self_attn.in_proj.biases"));
+        assert_eq!(params["text_emb.scales"].dtype(), safemlx::Dtype::Uint8);
     }
 
     #[test]

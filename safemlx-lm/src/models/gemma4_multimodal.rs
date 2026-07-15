@@ -9,6 +9,7 @@ use safemlx::{
 };
 
 use super::gemma4::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
+use crate::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4ClippedLinear {
@@ -61,18 +62,15 @@ impl Gemma4ModalityEmbedder {
         output_size: i32,
         eps: f32,
         bias: bool,
-        quantization: (bool, i32, i32),
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let (quantized, group_size, bits) = quantization;
         Ok(Self {
             eps,
             embedding_projection: maybe_quantized_linear_with_bias(
-                quantized,
+                quantization,
                 input_size,
                 output_size,
-                group_size,
-                bits,
                 bias,
                 stream,
             )?,

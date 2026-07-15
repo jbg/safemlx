@@ -15,7 +15,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::quantization::{quantize_tensor, AffineQuantization};
+use crate::quantization::{quantize_tensor, WeightQuantization};
 
 /// Options for strict checkpoint loading.
 ///
@@ -215,6 +215,33 @@ pub(crate) fn load_arrays_strict<M: ModuleParameters>(
     Ok(())
 }
 
+/// Strict-loads and quantizes eligible tensors from an in-memory named-array
+/// source such as an unquantized GGUF. The map is consumed so each dense source
+/// array can be released after its packed replacement is materialized.
+pub(crate) fn load_arrays_quantized_strict<M: ModuleParameters>(
+    model: &mut M,
+    loaded: HashMap<String, Array>,
+    quantization_stream: &Stream,
+    quantization: WeightQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    quantization.validate()?;
+    let mut params = model.parameters_mut().flatten();
+    for (key, value) in loaded {
+        load_array_quantized_strict(
+            &mut params,
+            key,
+            value,
+            quantization_stream,
+            quantization,
+            config,
+            report,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn for_each_safetensor_array<F>(
     path: impl AsRef<Path>,
     stream: &Stream,
@@ -302,7 +329,7 @@ pub fn load_safetensors_quantized_strict<M: ModuleParameters>(
     path: impl AsRef<Path>,
     weights_stream: &Stream,
     quantization_stream: &Stream,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
@@ -326,30 +353,38 @@ pub(crate) fn load_array_quantized_strict(
     key: String,
     value: Array,
     quantization_stream: &Stream,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    if key.ends_with(".weight") {
+    {
         let target = config.candidates(&key).into_iter().find_map(|candidate| {
-            let (prefix, weight_key) = if let Some(prefix) = candidate.strip_suffix(".inner.weight")
-            {
-                (prefix.to_string(), candidate)
-            } else if let Some(prefix) = candidate.strip_suffix(".weight") {
-                (prefix.to_string(), candidate)
+            let (prefix, weight_key, underscore_companions) =
+                if let Some(prefix) = candidate.strip_suffix(".inner.weight") {
+                    (prefix.to_string(), candidate, false)
+                } else if let Some(prefix) = candidate.strip_suffix(".weight") {
+                    (prefix.to_string(), candidate, false)
+                } else {
+                    (candidate.clone(), candidate, true)
+                };
+            let scales_key = if underscore_companions {
+                format!("{prefix}_scales")
             } else {
-                return None;
+                format!("{prefix}.scales")
             };
-            let scales_key = format!("{prefix}.scales");
-            let biases_key = format!("{prefix}.biases");
-            let has_affine_parameters = params.contains_key(weight_key.as_str())
+            let biases_key = if underscore_companions {
+                format!("{prefix}_biases")
+            } else {
+                format!("{prefix}.biases")
+            };
+            let has_quantized_parameters = params.contains_key(weight_key.as_str())
                 && params.contains_key(scales_key.as_str())
-                && params.contains_key(biases_key.as_str());
+                && (!quantization.has_biases() || params.contains_key(biases_key.as_str()));
             let packed_direct_weight = !weight_key.ends_with(".inner.weight")
                 && params
                     .get(weight_key.as_str())
                     .is_some_and(|target| target.shape() != value.shape());
-            (has_affine_parameters
+            (has_quantized_parameters
                 && (weight_key.ends_with(".inner.weight") || packed_direct_weight))
                 .then_some((weight_key, scales_key, biases_key))
         });
@@ -359,11 +394,17 @@ pub(crate) fn load_array_quantized_strict(
             // MLX quantization is lazy. Materialize this tensor before the
             // source value leaves the streaming callback so subsequent
             // weights do not accumulate a checkpoint-sized dense graph.
-            eval([&quantized.weight, &quantized.scales, &quantized.biases])?;
+            let mut arrays = vec![&quantized.weight, &quantized.scales];
+            if let Some(biases) = &quantized.biases {
+                arrays.push(biases);
+            }
+            eval(arrays)?;
             quantization_stream.synchronize()?;
             load_array_strict(params, weight_key, quantized.weight, config, report);
             load_array_strict(params, scales_key, quantized.scales, config, report);
-            load_array_strict(params, biases_key, quantized.biases, config, report);
+            if let Some(biases) = quantized.biases {
+                load_array_strict(params, biases_key, biases, config, report);
+            }
             return Ok(());
         }
     }
@@ -377,7 +418,7 @@ pub fn load_safetensors_dir_quantized_strict<M: ModuleParameters>(
     model_dir: impl AsRef<Path>,
     weights_stream: &Stream,
     quantization_stream: &Stream,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
@@ -662,24 +703,71 @@ fn pack_split_relu2_expert_prefix(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use safemlx::{
-        macros::ModuleParameters, quantization::MaybeQuantized, Array, Device, DeviceType,
-        ExecutionContext,
+        macros::ModuleParameters, module::Param, quantization::MaybeQuantized, Array, Device,
+        DeviceType, Dtype, ExecutionContext,
     };
 
     use crate::{
         models::common::unloaded_maybe_quantized_linear,
-        quantization::{quantize_tensor, AffineQuantization},
+        quantization::{quantize_tensor, AffineQuantization, WeightQuantization},
     };
 
-    use super::{load_safetensors_quantized_strict, StrictLoadConfig, StrictLoadReport};
+    use super::{
+        load_arrays_quantized_strict, load_safetensors_quantized_strict, StrictLoadConfig,
+        StrictLoadReport,
+    };
 
     #[derive(Debug, Clone, ModuleParameters)]
     struct RewrittenLinear {
         #[param]
         projection: MaybeQuantized<safemlx::nn::Linear>,
+    }
+
+    #[derive(Debug, Clone, ModuleParameters)]
+    struct PackedExperts {
+        #[param]
+        experts: Param<Array>,
+        #[param]
+        experts_scales: Param<Option<Array>>,
+        #[param]
+        experts_biases: Param<Option<Array>>,
+    }
+
+    #[test]
+    fn named_array_quantization_packs_rank_three_experts() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut model = PackedExperts {
+            experts: Param::<Array>::unloaded(&[3, 8, 8], Dtype::Uint32, stream).unwrap(),
+            experts_scales: Param::<Option<Array>>::unloaded_some(&[3, 8, 2], Dtype::Uint8, stream)
+                .unwrap(),
+            experts_biases: Param::new(None),
+        };
+        let dense = Array::from_slice(&vec![0.25f32; 3 * 8 * 64], &[3, 8, 64]);
+        let config = StrictLoadConfig::default();
+        let mut report = StrictLoadReport::default();
+        load_arrays_quantized_strict(
+            &mut model,
+            HashMap::from([("experts".into(), dense)]),
+            stream,
+            WeightQuantization::MxFp4,
+            &config,
+            &mut report,
+        )
+        .unwrap();
+        report.finish(&model, &config).unwrap();
+        assert_eq!(model.experts.shape(), &[3, 8, 8]);
+        assert_eq!(
+            model.experts_scales.value.as_ref().unwrap().shape(),
+            &[3, 8, 2]
+        );
+        assert!(model.experts_biases.value.is_none());
     }
 
     #[test]
@@ -690,8 +778,14 @@ mod tests {
         let weights_stream = weights_context.stream();
         let quantization = AffineQuantization::default();
         let mut model = RewrittenLinear {
-            projection: unloaded_maybe_quantized_linear(64, 8, false, Some(quantization), stream)
-                .unwrap(),
+            projection: unloaded_maybe_quantized_linear(
+                64,
+                8,
+                false,
+                Some(quantization.into()),
+                stream,
+            )
+            .unwrap(),
         };
         let values = (0..(8 * 64))
             .map(|index| (index as f32 - 255.5) / 64.0)
@@ -715,7 +809,7 @@ mod tests {
             &path,
             weights_stream,
             stream,
-            quantization,
+            quantization.into(),
             &config,
             &mut report,
         )
@@ -739,9 +833,69 @@ mod tests {
             expected.scales.evaluated().unwrap().as_slice::<f32>()
         );
         assert_eq!(
-            projection.biases.evaluated().unwrap().as_slice::<f32>(),
-            expected.biases.evaluated().unwrap().as_slice::<f32>()
+            projection
+                .biases
+                .value
+                .as_ref()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            expected
+                .biases
+                .as_ref()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mxfp4_strict_load_streams_weight_and_scales_without_biases() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights_stream = weights_context.stream();
+        let mut model = RewrittenLinear {
+            projection: unloaded_maybe_quantized_linear(
+                64,
+                8,
+                false,
+                Some(WeightQuantization::MxFp4),
+                stream,
+            )
+            .unwrap(),
+        };
+        let dense = Array::from_slice(&vec![0.5f32; 8 * 64], &[8, 64]);
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "safemlx-mxfp4-strict-load-{}-{suffix}.safetensors",
+            std::process::id()
+        ));
+        Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
+        let config = StrictLoadConfig::default();
+        let mut report = StrictLoadReport::default();
+        load_safetensors_quantized_strict(
+            &mut model,
+            &path,
+            weights_stream,
+            stream,
+            WeightQuantization::MxFp4,
+            &config,
+            &mut report,
+        )
+        .unwrap();
+        report.finish(&model, &config).unwrap();
+        let MaybeQuantized::Quantized(projection) = model.projection else {
+            panic!("target projection should use MXFP4 storage")
+        };
+        assert_eq!(projection.mode, safemlx::ops::QuantizationMode::MxFp4);
+        assert!(projection.biases.value.is_none());
         std::fs::remove_file(path).unwrap();
     }
 }

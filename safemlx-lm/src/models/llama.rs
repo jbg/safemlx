@@ -33,15 +33,15 @@ use crate::{
         },
         input,
     },
-    quantization::AffineQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
     utils::{
         create_attention_mask, create_sliding_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        load_arrays_strict, load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict,
-        StrictLoadConfig, StrictLoadReport,
+        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -93,10 +93,10 @@ pub struct ModelArgs {
     pub sliding_window: Option<i32>,
     /// Preferred MLX-LM affine quantization metadata.
     #[serde(default)]
-    pub quantization: Option<AffineQuantization>,
+    pub quantization: Option<WeightQuantization>,
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
     #[serde(default)]
-    pub quantization_config: Option<AffineQuantization>,
+    pub quantization_config: Option<WeightQuantization>,
     /// Optional exact weight names that use affine quantization.
     ///
     /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
@@ -110,19 +110,19 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn affine_quantization(&self) -> Option<AffineQuantization> {
+    fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
 
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some(*config);
+            return Some((*config).into());
         }
-        let quantization = self.affine_quantization()?;
+        let quantization = self.weight_quantization()?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(quantization),
@@ -221,7 +221,7 @@ impl Attention {
                 .or_else(|| {
                     prefix
                         .is_none()
-                        .then(|| args.affine_quantization())
+                        .then(|| args.weight_quantization())
                         .flatten()
                 }),
             stream,
@@ -236,7 +236,7 @@ impl Attention {
                 .or_else(|| {
                     prefix
                         .is_none()
-                        .then(|| args.affine_quantization())
+                        .then(|| args.weight_quantization())
                         .flatten()
                 }),
             stream,
@@ -251,7 +251,7 @@ impl Attention {
                 .or_else(|| {
                     prefix
                         .is_none()
-                        .then(|| args.affine_quantization())
+                        .then(|| args.weight_quantization())
                         .flatten()
                 }),
             stream,
@@ -266,7 +266,7 @@ impl Attention {
                 .or_else(|| {
                     prefix
                         .is_none()
-                        .then(|| args.affine_quantization())
+                        .then(|| args.weight_quantization())
                         .flatten()
                 }),
             stream,
@@ -1017,6 +1017,16 @@ pub(crate) fn load_llama_gguf_data(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedLlamaGguf, Error> {
+    load_llama_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
+}
+
+pub(crate) fn load_llama_gguf_data_with_quantization(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedLlamaGguf, Error> {
     let architecture = gguf_string(&metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "llama" | "mistral") {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -1031,22 +1041,39 @@ pub(crate) fn load_llama_gguf_data(
         .collect::<HashMap<_, _>>();
 
     let quantized_weight_configs = llama_gguf_quantized_weight_configs(&translated)?;
-    args.quantized_weights = Some(
-        translated
-            .keys()
-            .filter_map(|name| {
-                name.strip_suffix(".scales")
-                    .map(|prefix| format!("{prefix}.weight"))
-            })
-            .collect(),
-    );
-    args.quantization = None;
-    args.quantized_weight_configs = Some(quantized_weight_configs);
+    if let Some(quantization) = quantization {
+        args.quantized_weights = None;
+        args.quantization = Some(quantization);
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(
+            translated
+                .keys()
+                .filter_map(|name| {
+                    name.strip_suffix(".scales")
+                        .map(|prefix| format!("{prefix}.weight"))
+                })
+                .collect(),
+        );
+        args.quantization = None;
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+    }
 
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    if let Some(quantization) = quantization {
+        load_arrays_quantized_strict(
+            &mut model,
+            translated,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    } else {
+        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -1323,7 +1350,7 @@ pub fn load_llama_model(
 /// Loads a dense Llama checkpoint while quantizing matrices tensor-by-tensor.
 pub fn load_llama_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -1331,7 +1358,7 @@ pub fn load_llama_model_quantized(
     let mut model_args = get_llama_model_args(model_dir)?;
     if !crate::quantization::should_quantize_on_load(
         "Llama",
-        model_args.affine_quantization(),
+        model_args.weight_quantization(),
         quantization,
     )? {
         return load_llama_model(model_dir, stream, weights_stream);
@@ -1523,7 +1550,7 @@ mod tests {
             stream,
         )
         .unwrap();
-        let arrays = source
+        let arrays: HashMap<String, Array> = source
             .parameters()
             .flatten()
             .into_iter()
@@ -1596,11 +1623,28 @@ mod tests {
             ),
         ]);
 
+        let quantized_arrays = arrays.clone();
+        let quantized_metadata = metadata.clone();
         let loaded = super::load_llama_gguf_data(arrays, metadata, stream, stream).unwrap();
 
         assert_eq!(loaded.model.model_type(), "mistral");
         assert_eq!(loaded.model.sliding_window(), Some(16));
         assert_eq!(loaded.eos_token_ids, vec![2]);
+
+        let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let quantized = super::load_llama_gguf_data_with_quantization(
+            quantized_arrays,
+            quantized_metadata,
+            Some(crate::quantization::WeightQuantization::MxFp4),
+            gpu.stream(),
+            stream,
+        )
+        .unwrap();
+        let params = quantized.model.parameters().flatten();
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
+        assert!(!params.contains_key("model.layers.0.self_attn.q_proj.biases"));
+        assert!(params.contains_key("model.embed_tokens.scales"));
+        assert!(!params.contains_key("model.embed_tokens.biases"));
     }
 
     #[test]
@@ -1627,7 +1671,7 @@ mod tests {
             mlp_bias: false,
             rope_scaling: None,
             sliding_window: None,
-            quantization: Some(AffineQuantization::new(32, 4).unwrap()),
+            quantization: Some(AffineQuantization::new(32, 4).unwrap().into()),
             quantization_config: None,
             quantized_weights: Some(selected),
             quantized_weight_configs: None,

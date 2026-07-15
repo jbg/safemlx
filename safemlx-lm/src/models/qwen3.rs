@@ -11,7 +11,7 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        arange, concatenate_axis, gather_grouped_rows, gather_qmm, grouped_matmul,
+        arange, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode, grouped_matmul,
         indexing::TryIndexOp, quantized_packed_dimension, topk_route_plan, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
@@ -36,15 +36,15 @@ use crate::{
         },
         input,
     },
-    quantization::AffineQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        load_arrays_strict, load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict,
-        StrictLoadConfig, StrictLoadReport,
+        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -79,10 +79,10 @@ pub struct ModelArgs {
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     /// Preferred MLX-LM affine quantization metadata.
     #[serde(default)]
-    pub quantization: Option<AffineQuantization>,
+    pub quantization: Option<WeightQuantization>,
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
     #[serde(default)]
-    pub quantization_config: Option<AffineQuantization>,
+    pub quantization_config: Option<WeightQuantization>,
     /// Optional exact weight names that use affine quantization.
     ///
     /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
@@ -107,19 +107,19 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn affine_quantization(&self) -> Option<AffineQuantization> {
+    fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
 
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some(*config);
+            return Some((*config).into());
         }
-        let quantization = self.affine_quantization()?;
+        let quantization = self.weight_quantization()?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(quantization),
@@ -135,10 +135,10 @@ fn quantization_for(
     args: &ModelArgs,
     prefix: Option<&str>,
     parameter: &str,
-) -> Option<AffineQuantization> {
+) -> Option<WeightQuantization> {
     match prefix {
-        Some(prefix) => args.affine_quantization_for(&format!("{prefix}.{parameter}.weight")),
-        None => args.affine_quantization(),
+        Some(prefix) => args.weight_quantization_for(&format!("{prefix}.{parameter}.weight")),
+        None => args.weight_quantization(),
     }
 }
 
@@ -432,9 +432,9 @@ pub struct Experts {
     /// Per-expert intermediate dimension.
     pub intermediate_dim: i32,
     /// Optional affine quantization for packed gate/up weights.
-    pub gate_up_affine: Option<AffineQuantization>,
+    pub gate_up_affine: Option<WeightQuantization>,
     /// Optional affine quantization for packed down weights.
-    pub down_affine: Option<AffineQuantization>,
+    pub down_affine: Option<WeightQuantization>,
     #[param]
     /// Concatenated gate and up weights for all experts.
     pub gate_up_proj: Param<Array>,
@@ -460,11 +460,11 @@ type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<
 impl Experts {
     fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer_index}.moe.experts");
-        let gate_up_affine = args.affine_quantization_for(&format!("{prefix}.gate_up_proj"));
-        let down_affine = args.affine_quantization_for(&format!("{prefix}.down_proj"));
+        let gate_up_affine = args.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
+        let down_affine = args.weight_quantization_for(&format!("{prefix}.down_proj"));
         let projection = |out_features: i32,
                           in_features: i32,
-                          affine: Option<AffineQuantization>|
+                          affine: Option<WeightQuantization>|
          -> Result<ExpertProjectionParams, Exception> {
             if let Some(affine) = affine {
                 Ok((
@@ -472,7 +472,7 @@ impl Experts {
                         &[
                             args.num_experts,
                             out_features,
-                            quantized_packed_dimension(in_features, affine.bits),
+                            quantized_packed_dimension(in_features, affine.bits()),
                         ],
                         Dtype::Uint32,
                         stream,
@@ -481,20 +481,28 @@ impl Experts {
                         &[
                             args.num_experts,
                             out_features,
-                            in_features / affine.group_size,
+                            in_features / affine.group_size(),
                         ],
-                        Dtype::Float16,
+                        if affine == WeightQuantization::MxFp4 {
+                            Dtype::Uint8
+                        } else {
+                            Dtype::Float16
+                        },
                         stream,
                     )?,
-                    Param::<Option<Array>>::unloaded_some(
-                        &[
-                            args.num_experts,
-                            out_features,
-                            in_features / affine.group_size,
-                        ],
-                        Dtype::Float16,
-                        stream,
-                    )?,
+                    if affine.has_biases() {
+                        Param::<Option<Array>>::unloaded_some(
+                            &[
+                                args.num_experts,
+                                out_features,
+                                in_features / affine.group_size(),
+                            ],
+                            Dtype::Float16,
+                            stream,
+                        )?
+                    } else {
+                        Param::new(None)
+                    },
                 ))
             } else {
                 Ok((
@@ -534,25 +542,26 @@ impl Experts {
         input: &Array,
         weight: &Array,
         scales: &Array,
-        biases: &Array,
+        biases: Option<&Array>,
         group_ids: &Array,
-        affine: AffineQuantization,
+        affine: WeightQuantization,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let routes = input.dim(0);
         let out_features = weight.dim(-2);
         let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
-        gather_qmm(
+        gather_qmm_with_mode(
             input.reshape(&[routes, 1, input.dim(-1)], stream)?,
             weight,
             scales,
             biases,
-            &lhs_indices,
-            group_ids,
+            Some(&lhs_indices),
+            Some(group_ids),
             true,
-            affine.group_size,
-            affine.bits,
+            affine.group_size(),
+            affine.bits(),
             true,
+            affine.mode(),
             stream,
         )?
         .reshape(&[routes, out_features], stream)
@@ -576,10 +585,7 @@ impl Experts {
                     .as_ref()
                     .as_ref()
                     .expect("affine gate/up scales"),
-                self.gate_up_proj_biases
-                    .as_ref()
-                    .as_ref()
-                    .expect("affine gate/up biases"),
+                self.gate_up_proj_biases.as_ref().as_ref(),
                 &plan.sorted_group_ids,
                 affine,
                 stream,
@@ -604,10 +610,7 @@ impl Experts {
                     .as_ref()
                     .as_ref()
                     .expect("affine down scales"),
-                self.down_proj_biases
-                    .as_ref()
-                    .as_ref()
-                    .expect("affine down biases"),
+                self.down_proj_biases.as_ref().as_ref(),
                 &plan.sorted_group_ids,
                 affine,
                 stream,
@@ -780,21 +783,21 @@ impl TransformerBlock {
                     args.hidden_size,
                     args.intermediate_size,
                     false,
-                    args.affine_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
+                    args.weight_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
                     stream,
                 )?,
                 down_proj: common::unloaded_maybe_quantized_linear(
                     args.intermediate_size,
                     args.hidden_size,
                     false,
-                    args.affine_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
+                    args.weight_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
                     stream,
                 )?,
                 up_proj: common::unloaded_maybe_quantized_linear(
                     args.hidden_size,
                     args.intermediate_size,
                     false,
-                    args.affine_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
+                    args.weight_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
                     stream,
                 )?,
             })
@@ -999,7 +1002,7 @@ impl Qwen3Model {
         let embed_tokens = common::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization_for("model.embed_tokens.weight"),
+            args.weight_quantization_for("model.embed_tokens.weight"),
             stream,
         )?;
         let layers = (0..num_hidden_layers)
@@ -1167,7 +1170,7 @@ impl Model {
                 common::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.affine_quantization_for("lm_head.weight"),
+                    args.weight_quantization_for("lm_head.weight"),
                     stream,
                 )?,
             )
@@ -1294,6 +1297,16 @@ pub(crate) fn load_qwen3_gguf_data(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen3Gguf, Error> {
+    load_qwen3_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
+}
+
+pub(crate) fn load_qwen3_gguf_data_with_quantization(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3Gguf, Error> {
     let architecture = gguf_string(&metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "qwen3" | "qwen3moe") {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -1302,15 +1315,33 @@ pub(crate) fn load_qwen3_gguf_data(
     }
     let is_moe = architecture == "qwen3moe";
     let PreparedQwen3Gguf {
-        args,
+        mut args,
         arrays: translated,
         eos_token_ids,
     } = prepare_qwen3_gguf_data(arrays, &metadata, &architecture, is_moe, weights_stream)?;
 
+    if let Some(quantization) = quantization {
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+    }
+
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    if let Some(quantization) = quantization {
+        load_arrays_quantized_strict(
+            &mut model,
+            translated,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    } else {
+        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -1734,7 +1765,7 @@ pub fn load_qwen3_model(
 /// Loads a dense Qwen3 checkpoint while quantizing matrices tensor-by-tensor.
 pub fn load_qwen3_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -1742,7 +1773,7 @@ pub fn load_qwen3_model_quantized(
     let mut model_args = get_qwen3_model_args(model_dir)?;
     if !crate::quantization::should_quantize_on_load(
         "Qwen3",
-        model_args.affine_quantization(),
+        model_args.weight_quantization(),
         quantization,
     )? {
         return load_qwen3_model(model_dir, stream, weights_stream);
@@ -1954,7 +1985,7 @@ mod tests {
     fn mixed_quantization_builds_only_selected_qwen3_parameters() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let mut args = tiny_args();
-        args.quantization = Some(AffineQuantization::new(32, 4).unwrap());
+        args.quantization = Some(AffineQuantization::new(32, 4).unwrap().into());
         args.quantized_weights = Some(HashSet::from([
             "model.layers.0.self_attn.q_proj.weight".to_string()
         ]));

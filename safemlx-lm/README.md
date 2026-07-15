@@ -74,17 +74,21 @@ currently handled.
 safemlx-lm = { version = "0.4", features = ["image-processing"] }
 ```
 
-Dense checkpoints can be affine-quantized while loading through the same
-architecture-dispatched API used for ordinary loading:
+Dense safetensors checkpoints and unquantized F32/F16/BF16 GGUF checkpoints can be affine- or
+MXFP4-quantized while loading through the same architecture-dispatched API used for ordinary
+loading:
 
 ```rust,ignore
 use safemlx_lm::{
     models::{LoadedModel, ModelLoadOptions},
-    quantization::AffineQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
 };
 
-let options = ModelLoadOptions::with_quantization(AffineQuantization::new(64, 4)?);
-let model = LoadedModel::load_with_options(model_dir, options, stream, weights_stream)?;
+let affine = ModelLoadOptions::with_quantization(WeightQuantization::Affine(
+    AffineQuantization::new(64, 4)?,
+));
+let mxfp4 = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4);
+let model = LoadedModel::load_with_options(model_dir, mxfp4, stream, weights_stream)?;
 ```
 
 The realtime counterpart is `load_realtime_model_with_options`. Both APIs
@@ -94,19 +98,19 @@ checkpoint metadata is an error.
 
 ### Quantized loading coverage
 
-| Architecture | Dense | Existing quantized | Affine on load | High-level dispatch | Special policy |
+| Architecture | Dense | Existing quantized | Affine / MXFP4 on load | High-level dispatch | Special policy |
 |---|---:|---:|---:|---:|---|
-| Llama | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
-| Mistral | yes | MLX affine | yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
-| Qwen3 | yes | MLX affine | yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
-| Qwen3-VL | yes | MLX affine | yes | `LoadedModel` (dense/affine) | Reuses the Qwen3 decoder and shared Qwen vision tower; the language model uses affine storage while the vision tower remains dense; supports interleaved 3-D RoPE, DeepStack visual injection, images, and timestamped video chunks |
-| Gemma 4 | yes | MLX affine | yes | `LoadedModel` | Transformer and modality-bridge projections use affine storage; vision/audio towers remain deliberately dense |
-| Gemma 4 assistant | yes | MLX affine | yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
-| GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 | capability error | `LoadedModel` | Loads native combined expert block/scale/bias tensors without key rewrites; routed experts use MXFP4 `gather_qmm`, alternating bounded/full KV caches, attention sinks, and YaRN RoPE |
+| Llama | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Mistral | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
+| Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
+| Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
+| Gemma 4 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Currently eligible language and modality-bridge projections are quantized; specialized vision/audio components remain dense |
+| Gemma 4 assistant | yes | MLX affine/MXFP4 | yes / yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
+| GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts | no / yes | `LoadedModel` | Native experts stay unchanged; attention projections, embeddings, and LM head can be MXFP4, while the router stays dense |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
-| Qwen3.5/3.6-MoE | yes | block FP8 | yes, from dense checkpoints | `LoadedModel` (dense/FP8/affine) | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints cannot be requantized to affine on load |
-| Moshi | yes | MLX affine | yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |
-| PersonaPlex | yes, transformed PyTorch layout | MLX affine | yes | realtime loader | Preserves per-depth checkpoint transformation; no codec dependency |
+| Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
+| Moshi | yes | MLX affine/MXFP4 | yes / yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |
+| PersonaPlex | yes, transformed PyTorch layout | MLX affine/MXFP4 | yes / yes | realtime loader | Preserves per-depth checkpoint transformation; no codec dependency |
 
 On-load selection is driven by the target module parameter tree, not by
 blindly quantizing every rank-2 checkpoint tensor. Therefore specialized
@@ -254,7 +258,7 @@ building blocks, including Mimi checkpoint loading, PCM encode/decode,
 residual-vector quantization, and stateful tokens-to-PCM decode. Audio device
 I/O remains optional codec surface rather than an `safemlx-lm` dependency.
 
-Moshi loads dense and MLX affine-quantized checkpoints. For the original
+Moshi loads dense and MLX affine- or MXFP4-quantized checkpoints. For the original
 released Moshika/Moshiko repositories, the loader uses Moshi's built-in v0.1
 config when the model directory has no `config.json`.
 
@@ -262,8 +266,8 @@ config when the model directory has no `config.json`.
 
 The generic checkpoint converter quantizes eligible two-dimensional
 `*.weight` tensors one at a time, writes bounded-size safetensors shards, and
-copies tokenizer and other model assets. Its output follows the MLX-LM affine
-convention: packed `weight` tensors have sibling `scales` and `biases`, while
+copies tokenizer and other model assets. Affine output has packed `weight`, `scales`, and
+`biases`; MXFP4 output has only packed E2M1 `weight` and E8M0 `scales`. In both cases,
 `config.json` contains identical `quantization` and `quantization_config`
 objects.
 
@@ -271,12 +275,20 @@ objects.
 cargo run --release -p safemlx-lm --example quantize_checkpoint -- \
   /path/to/dense-model /path/to/model-4bit \
   --group-size 64 --bits 4
+
+cargo run --release -p safemlx-lm --example quantize_checkpoint -- \
+  /path/to/dense-model /path/to/model-mxfp4 --mode mxfp4
 ```
 
 Use repeatable `--include` and `--exclude` substring filters to experiment on
 part of any safetensors checkpoint, `--minimum-elements` to leave small
 matrices dense, and `--shard-size-mib` to control peak buffered output and
 shard size. The output directory must not already exist.
+
+The checkpoint converter accepts dense safetensors inputs. Load-time conversion also accepts
+unquantized F32, F16, and BF16 GGUF inputs through `ModelLoadOptions`. GGUF files containing
+packed quantized tensors are rejected rather than being implicitly dequantized and transcoded to
+affine or MXFP4 storage.
 
 Library callers can use `quantization::quantize_checkpoint` for conversion,
 the shared `ModelLoadOptions` APIs for architecture dispatch, or

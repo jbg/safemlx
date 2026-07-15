@@ -8,7 +8,6 @@ use crate::{
     Array, Stream,
 };
 
-const DEFAULT_MODE: &CStr = c"affine";
 const DEFAULT_GROUP_SIZE: i32 = 64;
 const DEFAULT_BITS: i32 = 4;
 
@@ -28,6 +27,32 @@ impl QuantizationMode {
             Self::MxFp4 => c"mxfp4",
         }
     }
+
+    /// Returns whether this encoding stores a per-group quantization bias.
+    pub const fn has_biases(self) -> bool {
+        matches!(self, Self::Affine)
+    }
+
+    /// Validates the group size and bit width required by this encoding.
+    pub fn validate(self, group_size: i32, bits: i32) -> Result<()> {
+        if self == Self::MxFp4 && (group_size != 32 || bits != 4) {
+            return Err(crate::error::Exception::custom(format!(
+                "MXFP4 requires group_size=32 and bits=4, got group_size={group_size} bits={bits}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Arrays returned by quantization. MXFP4 has no quantization bias tensor.
+#[derive(Debug, Clone)]
+pub struct QuantizedArrays {
+    /// Packed quantized values.
+    pub weight: Array,
+    /// Per-group scales.
+    pub scales: Array,
+    /// Per-group affine biases, absent for MXFP4.
+    pub biases: Option<Array>,
 }
 
 /// Returns the number of `u32` values used to store one packed quantized row.
@@ -78,8 +103,31 @@ pub fn quantize(
     #[optional] bits: impl Into<Option<i32>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<(Array, Array, Array)> {
-    let group_size = optional_int(group_size.into(), DEFAULT_GROUP_SIZE);
-    let bits = optional_int(bits.into(), DEFAULT_BITS);
+    let arrays = quantize_with_mode(
+        w,
+        group_size.into().unwrap_or(DEFAULT_GROUP_SIZE),
+        bits.into().unwrap_or(DEFAULT_BITS),
+        QuantizationMode::Affine,
+        stream,
+    )?;
+    Ok((
+        arrays.weight,
+        arrays.scales,
+        arrays.biases.expect("affine quantization returns biases"),
+    ))
+}
+
+/// Quantizes `w` using an explicit weight encoding.
+pub fn quantize_with_mode(
+    w: impl AsRef<Array>,
+    group_size: i32,
+    bits: i32,
+    mode: QuantizationMode,
+    stream: impl AsRef<Stream>,
+) -> Result<QuantizedArrays> {
+    mode.validate(group_size, bits)?;
+    let group_size = optional_int(Some(group_size), DEFAULT_GROUP_SIZE);
+    let bits = optional_int(Some(bits), DEFAULT_BITS);
 
     let result = VectorArray::try_from_op(|res| unsafe {
         safemlx_sys::mlx_quantize(
@@ -87,25 +135,26 @@ pub fn quantize(
             w.as_ref().as_ptr(),
             group_size,
             bits,
-            DEFAULT_MODE.as_ptr(),
+            mode.as_c_str().as_ptr(),
             safemlx_sys::mlx_array_new(),
             stream.as_ref().as_ptr(),
         )
     })?;
 
     let arrays: Vec<Array> = result.try_into_values()?;
-    if arrays.len() != 3 {
+    let expected = if mode.has_biases() { 3 } else { 2 };
+    if arrays.len() != expected {
         return Err(crate::error::Exception::custom(format!(
-            "Expected 3 arrays from quantize, got {}",
+            "Expected {expected} arrays from {mode:?} quantize, got {}",
             arrays.len()
         )));
     }
     let mut iter = arrays.into_iter();
-    Ok((
-        iter.next().unwrap(),
-        iter.next().unwrap(),
-        iter.next().unwrap(),
-    ))
+    Ok(QuantizedArrays {
+        weight: iter.next().unwrap(),
+        scales: iter.next().unwrap(),
+        biases: iter.next(),
+    })
 }
 
 /// Perform the matrix multiplication with the quantized matrix `w`. The quantization uses one
@@ -123,9 +172,34 @@ pub fn quantized_matmul<'a>(
     #[optional] bits: impl Into<Option<i32>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    let transpose = transpose.into().unwrap_or(false);
-    let group_size = optional_int(group_size.into(), DEFAULT_GROUP_SIZE);
-    let bits = optional_int(bits.into(), DEFAULT_BITS);
+    quantized_matmul_with_mode(
+        x,
+        w,
+        scales,
+        biases.into(),
+        transpose.into().unwrap_or(false),
+        group_size.into().unwrap_or(DEFAULT_GROUP_SIZE),
+        bits.into().unwrap_or(DEFAULT_BITS),
+        QuantizationMode::Affine,
+        stream,
+    )
+}
+
+/// Performs quantized matrix multiplication using an explicit weight encoding.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_with_mode(
+    x: impl AsRef<Array>,
+    w: impl AsRef<Array>,
+    scales: impl AsRef<Array>,
+    biases: Option<&Array>,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+    mode: QuantizationMode,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let group_size = optional_int(Some(group_size), DEFAULT_GROUP_SIZE);
+    let bits = optional_int(Some(bits), DEFAULT_BITS);
 
     <Array as Guarded>::try_from_op(|res| unsafe {
         safemlx_sys::mlx_quantized_matmul(
@@ -134,13 +208,12 @@ pub fn quantized_matmul<'a>(
             w.as_ref().as_ptr(),
             scales.as_ref().as_ptr(),
             biases
-                .into()
                 .map(|a| a.as_ptr())
                 .unwrap_or(safemlx_sys::mlx_array_new()),
             transpose,
             group_size,
             bits,
-            DEFAULT_MODE.as_ptr(),
+            mode.as_c_str().as_ptr(),
             stream.as_ref().as_ptr(),
         )
     })
@@ -160,8 +233,30 @@ pub fn dequantize<'a>(
     #[optional] bits: impl Into<Option<i32>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    let group_size = optional_int(group_size.into(), DEFAULT_GROUP_SIZE);
-    let bits = optional_int(bits.into(), DEFAULT_BITS);
+    dequantize_with_mode(
+        w,
+        scales,
+        biases.into(),
+        group_size.into().unwrap_or(DEFAULT_GROUP_SIZE),
+        bits.into().unwrap_or(DEFAULT_BITS),
+        QuantizationMode::Affine,
+        stream,
+    )
+}
+
+/// Dequantizes `w` using an explicit weight encoding.
+pub fn dequantize_with_mode(
+    w: impl AsRef<Array>,
+    scales: impl AsRef<Array>,
+    biases: Option<&Array>,
+    group_size: i32,
+    bits: i32,
+    mode: QuantizationMode,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    mode.validate(group_size, bits)?;
+    let group_size = optional_int(Some(group_size), DEFAULT_GROUP_SIZE);
+    let bits = optional_int(Some(bits), DEFAULT_BITS);
 
     <Array as Guarded>::try_from_op(|res| unsafe {
         safemlx_sys::mlx_dequantize(
@@ -169,12 +264,11 @@ pub fn dequantize<'a>(
             w.as_ref().as_ptr(),
             scales.as_ref().as_ptr(),
             biases
-                .into()
                 .map(|a| a.as_ptr())
                 .unwrap_or(safemlx_sys::mlx_array_new()),
             group_size,
             bits,
-            DEFAULT_MODE.as_ptr(),
+            mode.as_c_str().as_ptr(),
             safemlx_sys::mlx_array_new(),
             optional_dtype_none(),
             stream.as_ref().as_ptr(),
@@ -253,6 +347,7 @@ pub fn gather_qmm_with_mode(
     mode: QuantizationMode,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    mode.validate(group_size, bits)?;
     unsafe {
         let biases_ptr = biases
             .map(|a| a.as_ptr())
@@ -346,7 +441,10 @@ pub fn qqmm<'a>(
 mod tests {
     use crate::{
         array,
-        ops::{dequantize, expand_dims, quantize, quantized_matmul},
+        ops::{
+            dequantize, dequantize_with_mode, expand_dims, quantize, quantize_with_mode,
+            quantized_matmul, quantized_matmul_with_mode, QuantizationMode,
+        },
         random, Array, Stream,
     };
 
@@ -380,6 +478,78 @@ mod tests {
                 .item::<f32>(&stream);
             assert!(max_diff <= 127.0 / (1 << i) as f32);
         }
+    }
+
+    #[test]
+    fn test_mxfp4_quantize_dequantize_and_matmul() {
+        let stream = crate::test_stream();
+        let weight = Array::arange::<_, f32>(-64, 64, None, stream)
+            .unwrap()
+            .reshape(&[2, 64], stream)
+            .unwrap()
+            .divide(array!(16.0), stream)
+            .unwrap();
+        let arrays = quantize_with_mode(&weight, 32, 4, QuantizationMode::MxFp4, stream).unwrap();
+        assert_eq!(arrays.weight.shape(), &[2, 8]);
+        assert_eq!(arrays.scales.shape(), &[2, 2]);
+        assert!(arrays.biases.is_none());
+
+        let restored = dequantize_with_mode(
+            &arrays.weight,
+            &arrays.scales,
+            None,
+            32,
+            4,
+            QuantizationMode::MxFp4,
+            stream,
+        )
+        .unwrap();
+        let max_error = weight
+            .subtract(&restored, stream)
+            .unwrap()
+            .abs(stream)
+            .unwrap()
+            .max(None, stream)
+            .unwrap()
+            .item::<f32>(stream);
+        assert!(max_error <= 1.0, "MXFP4 max error was {max_error}");
+
+        let input = Array::ones::<f32>(&[3, 64], stream).unwrap();
+        let actual = quantized_matmul_with_mode(
+            &input,
+            &arrays.weight,
+            &arrays.scales,
+            None,
+            true,
+            32,
+            4,
+            QuantizationMode::MxFp4,
+            stream,
+        )
+        .unwrap();
+        let expected = input
+            .matmul(&restored.transpose(stream).unwrap(), stream)
+            .unwrap();
+        let max_difference = actual
+            .subtract(&expected, stream)
+            .unwrap()
+            .abs(stream)
+            .unwrap()
+            .max(None, stream)
+            .unwrap()
+            .item::<f32>(stream);
+        assert!(
+            max_difference < 1e-3,
+            "MXFP4 qmm difference was {max_difference}"
+        );
+    }
+
+    #[test]
+    fn test_mxfp4_rejects_nonstandard_settings() {
+        let stream = crate::test_stream();
+        let weight = Array::zeros::<f32>(&[2, 64], stream).unwrap();
+        assert!(quantize_with_mode(&weight, 64, 4, QuantizationMode::MxFp4, stream).is_err());
+        assert!(quantize_with_mode(&weight, 32, 8, QuantizationMode::MxFp4, stream).is_err());
     }
 
     // Test adapted from Python test `test_quantized.py/test_qmm`

@@ -26,7 +26,7 @@ use crate::{
     cache::KeyValueCache,
     inspection::ActivationObserver,
     models::input,
-    quantization::AffineQuantization,
+    quantization::WeightQuantization,
     sampler::{DefaultSampler, Sampler},
     utils::{create_causal_mask, rope::RopeVariant, scaled_dot_product_attention},
 };
@@ -89,7 +89,7 @@ impl SwiGluMlp {
         dim: i32,
         hidden_dim: i32,
         bias: bool,
-        quantization: Option<AffineQuantization>,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
@@ -584,18 +584,21 @@ pub fn unloaded_maybe_quantized_linear(
     input_dims: i32,
     output_dims: i32,
     bias: bool,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     match quantization {
-        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
-            input_dims,
-            output_dims,
-            config.group_size,
-            config.bits,
-            bias,
-            stream,
-        )?)),
+        Some(config) => Ok(MaybeQuantized::Quantized(
+            nn::QuantizedLinear::unloaded_with_mode(
+                input_dims,
+                output_dims,
+                config.group_size(),
+                config.bits(),
+                config.mode(),
+                bias,
+                stream,
+            )?,
+        )),
         None => Ok(MaybeQuantized::Original(nn::Linear::unloaded(
             input_dims,
             output_dims,
@@ -610,17 +613,20 @@ pub fn unloaded_maybe_quantized_linear(
 pub fn unloaded_maybe_quantized_embedding(
     embedding_count: i32,
     dimensions: i32,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
     match quantization {
-        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedEmbedding::unloaded(
-            embedding_count,
-            dimensions,
-            config.group_size,
-            config.bits,
-            stream,
-        )?)),
+        Some(config) => Ok(MaybeQuantized::Quantized(
+            nn::QuantizedEmbedding::unloaded_with_mode(
+                embedding_count,
+                dimensions,
+                config.group_size(),
+                config.bits(),
+                config.mode(),
+                stream,
+            )?,
+        )),
         None => Ok(MaybeQuantized::Original(nn::Embedding::unloaded(
             embedding_count,
             dimensions,
@@ -634,7 +640,7 @@ pub fn unloaded_maybe_quantized_embedding(
 pub fn build_unloaded_maybe_quantized_lm_head_with_quantization(
     hidden_size: i32,
     vocab_size: i32,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     unloaded_maybe_quantized_linear(hidden_size, vocab_size, false, quantization, stream)

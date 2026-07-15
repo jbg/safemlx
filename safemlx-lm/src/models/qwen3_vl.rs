@@ -30,11 +30,11 @@ use crate::{
         input as runtime_input, qwen3,
         qwen_vl::grid_thw_from_array,
     },
-    quantization::AffineQuantization,
+    quantization::WeightQuantization,
     utils::{create_attention_mask, AttentionMask},
     weights::{
-        load_arrays_strict, load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
-        StrictLoadConfig, StrictLoadReport,
+        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_quantized_strict,
+        load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -548,7 +548,7 @@ pub fn load_qwen3_vl_model(
 /// layout stays identical for Qwen3-VL and Qwen3.5 multimodal models.
 pub fn load_qwen3_vl_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -619,8 +619,28 @@ pub(crate) fn load_qwen3_vl_gguf_with_metadata(
 pub(crate) fn load_qwen3_vl_gguf_data(
     arrays: HashMap<String, Array>,
     metadata: HashMap<String, GgufMetadataValue>,
+    vision_arrays: HashMap<String, Array>,
+    vision_metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedQwen3VlGguf, Error> {
+    load_qwen3_vl_gguf_data_with_quantization(
+        arrays,
+        metadata,
+        vision_arrays,
+        vision_metadata,
+        None,
+        stream,
+        weights_stream,
+    )
+}
+
+pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
     mut vision_arrays: HashMap<String, Array>,
     vision_metadata: HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen3VlGguf, Error> {
@@ -638,6 +658,12 @@ pub(crate) fn load_qwen3_vl_gguf_data(
         eos_token_ids,
     } = qwen3::prepare_qwen3_gguf_data(arrays, &metadata, &architecture, false, weights_stream)?;
     args.model_type = "qwen3_vl_text".into();
+    if let Some(quantization) = quantization {
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+    }
     if !args.tie_word_embeddings {
         return Err(Error::UnsupportedArchitecture(
             "qwen3vl GGUF with an untied output head is not supported".into(),
@@ -756,7 +782,18 @@ pub(crate) fn load_qwen3_vl_gguf_data(
     let mut model = Model::new(model_args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    if let Some(quantization) = quantization {
+        load_arrays_quantized_strict(
+            &mut model,
+            translated,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    } else {
+        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(LoadedQwen3VlGguf {
@@ -1111,7 +1148,7 @@ mod tests {
         let args = super::parse_model_args_value(config).unwrap();
         assert_eq!(
             args.text_config.quantization,
-            Some(crate::quantization::AffineQuantization::default())
+            Some(crate::quantization::AffineQuantization::default().into())
         );
     }
 

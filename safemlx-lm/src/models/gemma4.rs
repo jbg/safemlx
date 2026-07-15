@@ -15,10 +15,10 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        concatenate_axis,
+        concatenate_axis, dequantize_with_mode,
         indexing::{NewAxis, TryIndexOp},
-        mean_axis, quantized_matmul, quantized_packed_dimension, r#where, rsqrt, tanh,
-        GgufMetadataValue,
+        mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt, tanh,
+        GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -46,14 +46,14 @@ use crate::{
         },
         input,
     },
-    quantization::AffineQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        load_arrays_strict, load_safetensors_quantized_strict, load_safetensors_strict,
-        StrictLoadConfig, StrictLoadReport,
+        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_quantized_strict,
+        load_safetensors_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -291,6 +291,9 @@ pub struct ModelArgs {
     /// Whether Gemma-specific quantized tensors are expected.
     pub quantized: bool,
     #[serde(skip)]
+    /// Model-wide safetensors quantization encoding, when present.
+    pub weight_quantization: Option<WeightQuantization>,
+    #[serde(skip)]
     /// Optional set of parameter weights that are quantized in a mixed checkpoint.
     pub quantized_weights: Option<HashSet<String>>,
     #[serde(skip)]
@@ -397,25 +400,27 @@ struct Gemma4Config {
 }
 
 impl ModelArgs {
-    fn affine_quantization(&self) -> Option<AffineQuantization> {
-        self.quantized.then_some(AffineQuantization {
-            group_size: self.quantization_group_size,
-            bits: self.quantization_bits,
-            mode: crate::quantization::AffineQuantizationMode::Affine,
+    fn weight_quantization(&self) -> Option<WeightQuantization> {
+        self.weight_quantization.or_else(|| {
+            self.quantized.then_some(
+                AffineQuantization::new(self.quantization_group_size, self.quantization_bits)
+                    .expect("validated affine quantization")
+                    .into(),
+            )
         })
     }
 
-    pub(crate) fn quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    pub(crate) fn quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some(*config);
+            return Some((*config).into());
         }
         self.is_quantized(weight_name)
-            .then(|| AffineQuantization::new(self.quantization_group_size, self.quantization_bits))
-            .and_then(Result::ok)
+            .then(|| self.weight_quantization())
+            .flatten()
     }
 
     fn is_quantized(&self, weight_name: &str) -> bool {
@@ -519,18 +524,21 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
 fn maybe_quantized_linear_with_config(
     input_dims: i32,
     output_dims: i32,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     match quantization {
-        Some(config) => Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
-            input_dims,
-            output_dims,
-            config.group_size,
-            config.bits,
-            false,
-            stream,
-        )?)),
+        Some(config) => Ok(MaybeQuantized::Quantized(
+            nn::QuantizedLinear::unloaded_with_mode(
+                input_dims,
+                output_dims,
+                config.group_size(),
+                config.bits(),
+                config.mode(),
+                false,
+                stream,
+            )?,
+        )),
         None => Ok(MaybeQuantized::Original(nn::Linear::unloaded(
             input_dims,
             output_dims,
@@ -542,23 +550,24 @@ fn maybe_quantized_linear_with_config(
 }
 
 pub(super) fn maybe_quantized_linear_with_bias(
-    quantized: bool,
+    quantization: Option<WeightQuantization>,
     input_dims: i32,
     output_dims: i32,
-    group_size: i32,
-    bits: i32,
     bias: bool,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    if quantized {
-        Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded(
-            input_dims,
-            output_dims,
-            group_size,
-            bits,
-            bias,
-            stream,
-        )?))
+    if let Some(config) = quantization {
+        Ok(MaybeQuantized::Quantized(
+            nn::QuantizedLinear::unloaded_with_mode(
+                input_dims,
+                output_dims,
+                config.group_size(),
+                config.bits(),
+                config.mode(),
+                bias,
+                stream,
+            )?,
+        ))
     } else {
         Ok(MaybeQuantized::Original(nn::Linear::unloaded(
             input_dims,
@@ -1090,7 +1099,8 @@ impl Mlp {
         let quantization = if quantized {
             Some(
                 AffineQuantization::new(group_size, bits)
-                    .map_err(|err| Exception::custom(err.to_string()))?,
+                    .map_err(|err| Exception::custom(err.to_string()))?
+                    .into(),
             )
         } else {
             None
@@ -1101,7 +1111,7 @@ impl Mlp {
     fn new_selective(
         dim: i32,
         hidden_dim: i32,
-        quantization: [Option<AffineQuantization>; 3],
+        quantization: [Option<WeightQuantization>; 3],
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
@@ -1188,6 +1198,8 @@ pub struct Gemma4Embedding {
     pub group_size: i32,
     /// Quantization bit width.
     pub bits: i32,
+    /// Quantized weight encoding.
+    pub mode: QuantizationMode,
 }
 
 impl Gemma4Embedding {
@@ -1195,12 +1207,13 @@ impl Gemma4Embedding {
     pub fn unloaded(
         vocab_size: i32,
         hidden_size: i32,
-        quantization: Option<AffineQuantization>,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let quantized = quantization.is_some();
-        let group_size = quantization.map_or(64, |config| config.group_size);
-        let bits = quantization.map_or(4, |config| config.bits);
+        let group_size = quantization.map_or(64, WeightQuantization::group_size);
+        let bits = quantization.map_or(4, WeightQuantization::bits);
+        let mode = quantization.map_or(QuantizationMode::Affine, WeightQuantization::mode);
         let packed_dim = quantized_packed_dimension(hidden_size, bits);
         Ok(Self {
             weight: if quantized {
@@ -1211,13 +1224,17 @@ impl Gemma4Embedding {
             scales: if quantized {
                 Param::<Option<Array>>::unloaded_some(
                     &[vocab_size, hidden_size / group_size],
-                    Dtype::Float32,
+                    if mode == QuantizationMode::MxFp4 {
+                        Dtype::Uint8
+                    } else {
+                        Dtype::Float32
+                    },
                     stream,
                 )?
             } else {
                 Param::new(None)
             },
-            biases: if quantized {
+            biases: if quantization.is_some_and(WeightQuantization::has_biases) {
                 Param::<Option<Array>>::unloaded_some(
                     &[vocab_size, hidden_size / group_size],
                     Dtype::Float32,
@@ -1227,6 +1244,7 @@ impl Gemma4Embedding {
                 Param::new(None)
             },
             quantized,
+            mode,
             hidden_size,
             group_size,
             bits,
@@ -1270,6 +1288,7 @@ impl Gemma4Embedding {
                 None
             }),
             quantized,
+            mode: QuantizationMode::Affine,
             hidden_size,
             group_size,
             bits,
@@ -1294,14 +1313,15 @@ impl Gemma4Embedding {
             .biases
             .as_ref()
             .as_ref()
-            .expect("quantized embedding biases")
-            .try_index_device(&flat, stream)?;
-        let out = safemlx::ops::dequantize(
+            .map(|biases| biases.try_index_device(&flat, stream))
+            .transpose()?;
+        let out = dequantize_with_mode(
             &weight,
             &scales,
-            &biases,
+            biases.as_ref(),
             self.group_size,
             self.bits,
+            self.mode,
             stream,
         )?;
         let shape = original_shape
@@ -1319,19 +1339,16 @@ impl Gemma4Embedding {
                 .as_ref()
                 .as_ref()
                 .expect("quantized embedding scales");
-            let biases = self
-                .biases
-                .as_ref()
-                .as_ref()
-                .expect("quantized embedding biases");
-            return quantized_matmul(
+            let biases = self.biases.as_ref().as_ref();
+            return quantized_matmul_with_mode(
                 x,
                 &self.weight,
                 scales,
-                Some(biases),
+                biases,
                 true,
                 self.group_size,
                 self.bits,
+                self.mode,
                 stream,
             );
         }
@@ -2171,11 +2188,7 @@ impl Gemma4ForConditionalGeneration {
                     args.hidden_size,
                     config.rms_norm_eps,
                     false,
-                    (
-                        args.quantized,
-                        args.quantization_group_size,
-                        args.quantization_bits,
-                    ),
+                    args.weight_quantization(),
                     stream,
                 )
             })
@@ -2192,11 +2205,7 @@ impl Gemma4ForConditionalGeneration {
                     args.hidden_size,
                     config.rms_norm_eps,
                     true,
-                    (
-                        args.quantized,
-                        args.quantization_group_size,
-                        args.quantization_bits,
-                    ),
+                    args.weight_quantization(),
                     stream,
                 )
             })
@@ -2609,6 +2618,16 @@ pub(crate) fn load_gemma4_gguf_data(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
+    load_gemma4_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
+}
+
+pub(crate) fn load_gemma4_gguf_data_with_quantization(
+    arrays: HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedGemma4Gguf, Error> {
     let architecture = gguf_string(&metadata, "general.architecture")?;
     if architecture != "gemma4" {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -2630,10 +2649,19 @@ pub(crate) fn load_gemma4_gguf_data(
         .collect::<HashSet<_>>();
     let quantized_weight_configs = gemma4_gguf_quantized_weight_configs(&translated)?;
     let has_quantized_tensors = !quantized_weights.is_empty();
-    args.quantized_weights = Some(quantized_weights);
-    args.quantized_weight_configs = Some(quantized_weight_configs);
-    if has_quantized_tensors {
+    if let Some(quantization) = quantization {
         args.quantized = true;
+        args.weight_quantization = Some(quantization);
+        args.quantization_group_size = quantization.group_size();
+        args.quantization_bits = quantization.bits();
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(quantized_weights);
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+        if has_quantized_tensors {
+            args.quantized = true;
+        }
     }
 
     let mut model = Model::new(args, stream)?;
@@ -2650,7 +2678,18 @@ pub(crate) fn load_gemma4_gguf_data(
             .allow_unused_prefix(format!("{prefix}.k_norm."));
     }
     let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    if let Some(quantization) = quantization {
+        load_arrays_quantized_strict(
+            &mut model,
+            translated,
+            stream,
+            quantization,
+            &config,
+            &mut report,
+        )?;
+    } else {
+        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -2868,6 +2907,7 @@ fn gemma4_args_from_gguf(
         }),
         attention_k_eq_v,
         quantized: false,
+        weight_quantization: None,
         quantized_weights: None,
         quantized_weight_configs: None,
         quantization_group_size: 64,
@@ -3114,6 +3154,11 @@ fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, E
     }
     config.text_config.model_type = "gemma4".to_string();
     config.text_config.quantized = config.quantization.is_some();
+    config.text_config.weight_quantization = config
+        .quantization
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()?;
     config.text_config.quantization_group_size =
         quantization_i32(&config.quantization, "group_size", 64);
     config.text_config.quantization_bits = quantization_i32(&config.quantization, "bits", 4);
@@ -3192,7 +3237,7 @@ pub fn load_gemma4_model(
 /// without requantization.
 pub fn load_gemma4_model_quantized(
     model_dir: impl AsRef<Path>,
-    quantization: AffineQuantization,
+    quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -3207,14 +3252,15 @@ pub fn load_gemma4_model_quantized(
     ) = get_gemma4_model_config(model_dir)?;
     if !crate::quantization::should_quantize_on_load(
         "Gemma 4",
-        model_args.affine_quantization(),
+        model_args.weight_quantization(),
         quantization,
     )? {
         return load_gemma4_model(model_dir, stream, weights_stream);
     }
     model_args.quantized = true;
-    model_args.quantization_group_size = quantization.group_size;
-    model_args.quantization_bits = quantization.bits;
+    model_args.weight_quantization = Some(quantization);
+    model_args.quantization_group_size = quantization.group_size();
+    model_args.quantization_bits = quantization.bits();
     let mut model = Model::new_with_modalities(
         model_args,
         image_token_id,
@@ -3259,7 +3305,7 @@ fn load_gemma4_weights(
     model_dir: &Path,
     weights_stream: &Stream,
     quantization_stream: &Stream,
-    quantization: Option<AffineQuantization>,
+    quantization: Option<WeightQuantization>,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
@@ -3622,6 +3668,7 @@ mod tests {
             attention_bias: false,
             attention_k_eq_v,
             quantized: false,
+            weight_quantization: None,
             quantized_weights: None,
             quantized_weight_configs: None,
             quantization_group_size: 64,

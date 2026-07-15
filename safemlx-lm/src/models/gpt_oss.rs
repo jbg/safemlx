@@ -13,6 +13,7 @@ use safemlx::{
         indexing::{IntoStrideBy, TryIndexOp},
         sigmoid, topk_route_plan, QuantizationMode,
     },
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -22,11 +23,15 @@ use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
     error::Error,
     models::{common, common::CausalLm, input},
+    quantization::WeightQuantization,
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
-    weights::{load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport},
+    weights::{
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
 };
 
 fn default_head_dim() -> i32 {
@@ -93,6 +98,9 @@ pub struct ModelArgs {
     pub layer_types: Vec<String>,
     /// Published checkpoint MXFP4 metadata.
     pub quantization_config: MxFp4Config,
+    /// Optional encoding used by remaining standard dense matrices.
+    #[serde(default)]
+    pub quantization: Option<WeightQuantization>,
     /// GPT-OSS clipped SwiGLU limit.
     #[serde(default = "default_swiglu_limit")]
     pub swiglu_limit: f32,
@@ -186,16 +194,16 @@ pub struct Attention {
     pub sinks: Param<Array>,
     #[param]
     /// Query projection.
-    pub q_proj: nn::Linear,
+    pub q_proj: MaybeQuantized<nn::Linear>,
     #[param]
     /// Key projection.
-    pub k_proj: nn::Linear,
+    pub k_proj: MaybeQuantized<nn::Linear>,
     #[param]
     /// Value projection.
-    pub v_proj: nn::Linear,
+    pub v_proj: MaybeQuantized<nn::Linear>,
     #[param]
     /// Attention output projection.
-    pub o_proj: nn::Linear,
+    pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
     rope: RopeVariant,
 }
@@ -208,32 +216,32 @@ impl Attention {
             head_dim: args.head_dim,
             scale: 1.0 / (args.head_dim as f32).sqrt(),
             sinks: Param::<Array>::unloaded(&[args.num_attention_heads], Dtype::Float32, stream)?,
-            q_proj: nn::Linear::unloaded(
+            q_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 true,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
-            k_proj: nn::Linear::unloaded(
+            k_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
-            v_proj: nn::Linear::unloaded(
+            v_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
-            o_proj: nn::Linear::unloaded(
+            o_proj: common::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 true,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
             rope: initialize_rope(
@@ -590,7 +598,7 @@ pub struct GptOssModel {
     sliding_window: i32,
     #[param]
     /// Token embedding table.
-    pub embed_tokens: nn::Embedding,
+    pub embed_tokens: MaybeQuantized<nn::Embedding>,
     #[param]
     /// Decoder blocks.
     pub layers: Vec<TransformerBlock>,
@@ -604,10 +612,10 @@ impl GptOssModel {
         Ok(Self {
             layer_types: args.effective_layer_types(),
             sliding_window: args.sliding_window,
-            embed_tokens: nn::Embedding::unloaded(
+            embed_tokens: common::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
             layers: (0..args.num_hidden_layers)
@@ -681,7 +689,7 @@ pub struct Model {
     pub model: GptOssModel,
     #[param]
     /// Untied output projection.
-    pub lm_head: nn::Linear,
+    pub lm_head: MaybeQuantized<nn::Linear>,
 }
 
 impl Model {
@@ -689,11 +697,11 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             model: GptOssModel::new(&args, stream)?,
-            lm_head: nn::Linear::unloaded(
+            lm_head: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                Dtype::Float32,
+                args.quantization,
                 stream,
             )?,
             args,
@@ -771,6 +779,50 @@ pub fn load_model(
     Ok(model)
 }
 
+/// Loads GPT-OSS while MXFP4-quantizing eligible dense matrices one at a time.
+///
+/// Checkpoint-native routed experts are loaded unchanged. The router remains
+/// dense; attention projections, token embeddings, and the LM head use the
+/// requested MXFP4 encoding.
+pub fn load_model_quantized(
+    model_dir: impl AsRef<Path>,
+    quantization: WeightQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    if quantization != WeightQuantization::MxFp4 {
+        return Err(Error::Quantization(
+            "GPT-OSS native MXFP4 experts cannot be implicitly dequantized and requantized to affine"
+                .into(),
+        ));
+    }
+    let model_dir = model_dir.as_ref();
+    let mut args = get_model_args(model_dir)?;
+    if !crate::quantization::should_quantize_on_load(
+        "GPT-OSS dense matrices",
+        args.quantization,
+        quantization,
+    )? {
+        return load_model(model_dir, stream, weights_stream);
+    }
+    args.quantization = Some(quantization);
+    let mut model = Model::new(args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    load_safetensors_dir_quantized_strict(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        quantization,
+        &config,
+        &mut report,
+    )?;
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(model)
+}
+
 /// Loads `tokenizer.json` from a GPT-OSS model directory.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json")).map_err(Into::into)
@@ -820,6 +872,7 @@ mod tests {
             quantization_config: MxFp4Config {
                 quant_method: "mxfp4".into(),
             },
+            quantization: None,
             swiglu_limit: 7.0,
         }
     }

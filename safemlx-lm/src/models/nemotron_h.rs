@@ -475,14 +475,14 @@ impl Mlp {
                 hidden_size,
                 intermediate_size,
                 bias,
-                quantization[0],
+                quantization[0].map(Into::into),
                 stream,
             )?,
             down_proj: common::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 hidden_size,
                 bias,
-                quantization[1],
+                quantization[1].map(Into::into),
                 stream,
             )?,
         })
@@ -841,28 +841,32 @@ impl Attention {
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.q_proj.weight")),
+                args.affine_quantization_for(&format!("{prefix}.q_proj.weight"))
+                    .map(Into::into),
                 stream,
             )?,
             k_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.k_proj.weight")),
+                args.affine_quantization_for(&format!("{prefix}.k_proj.weight"))
+                    .map(Into::into),
                 stream,
             )?,
             v_proj: common::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.v_proj.weight")),
+                args.affine_quantization_for(&format!("{prefix}.v_proj.weight"))
+                    .map(Into::into),
                 stream,
             )?,
             o_proj: common::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.o_proj.weight")),
+                args.affine_quantization_for(&format!("{prefix}.o_proj.weight"))
+                    .map(Into::into),
                 stream,
             )?,
         })
@@ -1051,7 +1055,8 @@ impl Mamba2Mixer {
                 args.use_bias,
                 args.affine_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.in_proj.weight"
-                )),
+                ))
+                .map(Into::into),
                 stream,
             )?,
             conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
@@ -1070,7 +1075,8 @@ impl Mamba2Mixer {
                 args.use_bias,
                 args.affine_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.out_proj.weight"
-                )),
+                ))
+                .map(Into::into),
                 stream,
             )?,
         })
@@ -1624,7 +1630,8 @@ impl NemotronHModel {
         let embeddings = common::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization_for("model.embeddings.weight"),
+            args.affine_quantization_for("model.embeddings.weight")
+                .map(Into::into),
             stream,
         )?;
         let layers = (0..args.num_hidden_layers)
@@ -1772,7 +1779,8 @@ impl Model {
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                args.affine_quantization_for("lm_head.weight"),
+                args.affine_quantization_for("lm_head.weight")
+                    .map(Into::into),
                 stream,
             )?)
         } else {
