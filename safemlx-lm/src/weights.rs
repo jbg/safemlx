@@ -7,7 +7,7 @@ use std::{
 use memmap2::MmapOptions;
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
-    ops::stack_axis,
+    ops::{concatenate_axis, stack_axis},
     transforms::eval,
     Array, Stream,
 };
@@ -579,6 +579,181 @@ where
     Ok(())
 }
 
+/// Strict-loads a model directory while streaming and packing split SwiGLU experts.
+///
+/// Public checkpoints commonly store `w1`, `w2`, and `w3` per expert, while the
+/// runtime uses one expert-major gate/up bank plus a down bank. Completed layer
+/// banks are loaded immediately so all expert layers are never resident at once.
+#[allow(clippy::too_many_arguments)]
+pub fn load_safetensors_dir_strict_with_split_swiglu_experts<M>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    weights_stream: &Stream,
+    transform_stream: &Stream,
+    quantization: Option<WeightQuantization>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+    num_experts: i32,
+) -> Result<(), Error>
+where
+    M: ModuleParameters,
+{
+    if let Some(quantization) = quantization {
+        quantization.validate()?;
+    }
+    let mut expert_parts: HashMap<(String, i32), SwiGluExpertParts> = HashMap::new();
+    let mut params = model.parameters_mut().flatten();
+
+    for file in safetensors_files(model_dir)? {
+        for_each_safetensor_array(file, weights_stream, |key, value| {
+            if let Some((prefix, expert, projection)) =
+                parse_split_swiglu_expert_projection_key(&key)
+            {
+                {
+                    let parts = expert_parts.entry((prefix.clone(), expert)).or_default();
+                    match projection {
+                        SwiGluExpertProjection::Gate => parts.gate = Some(value),
+                        SwiGluExpertProjection::Down => parts.down = Some(value),
+                        SwiGluExpertProjection::Up => parts.up = Some(value),
+                    }
+                }
+                if split_swiglu_expert_prefix_complete(&expert_parts, &prefix, num_experts) {
+                    for (key, value) in pack_split_swiglu_expert_prefix(
+                        &mut expert_parts,
+                        &prefix,
+                        num_experts,
+                        transform_stream,
+                    )? {
+                        if let Some(quantization) = quantization {
+                            load_array_quantized_strict(
+                                &mut params,
+                                key,
+                                value,
+                                transform_stream,
+                                quantization,
+                                config,
+                                report,
+                            )?;
+                        } else {
+                            load_array_strict(&mut params, key, value, config, report);
+                        }
+                    }
+                }
+                Ok(())
+            } else if let Some(quantization) = quantization {
+                load_array_quantized_strict(
+                    &mut params,
+                    key,
+                    value,
+                    transform_stream,
+                    quantization,
+                    config,
+                    report,
+                )
+            } else {
+                load_array_strict(&mut params, key, value, config, report);
+                Ok(())
+            }
+        })?;
+    }
+
+    if let Some((prefix, _)) = expert_parts.keys().next().cloned() {
+        pack_split_swiglu_expert_prefix(&mut expert_parts, &prefix, num_experts, transform_stream)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Projection kind in a split SwiGLU expert checkpoint.
+pub enum SwiGluExpertProjection {
+    /// Gate projection (`w1`).
+    Gate,
+    /// Down projection (`w2`).
+    Down,
+    /// Up projection (`w3`).
+    Up,
+}
+
+#[derive(Default)]
+struct SwiGluExpertParts {
+    gate: Option<Array>,
+    down: Option<Array>,
+    up: Option<Array>,
+}
+
+/// Parses keys like `prefix.experts.17.w1.weight`.
+pub fn parse_split_swiglu_expert_projection_key(
+    key: &str,
+) -> Option<(String, i32, SwiGluExpertProjection)> {
+    let (prefix, rest) = key.split_once(".experts.")?;
+    let mut parts = rest.split('.');
+    let expert = parts.next()?.parse().ok()?;
+    let projection = match parts.next()? {
+        "w1" => SwiGluExpertProjection::Gate,
+        "w2" => SwiGluExpertProjection::Down,
+        "w3" => SwiGluExpertProjection::Up,
+        _ => return None,
+    };
+    if parts.next()? != "weight" || parts.next().is_some() {
+        return None;
+    }
+    Some((format!("{prefix}.experts"), expert, projection))
+}
+
+fn split_swiglu_expert_prefix_complete(
+    expert_parts: &HashMap<(String, i32), SwiGluExpertParts>,
+    prefix: &str,
+    num_experts: i32,
+) -> bool {
+    (0..num_experts).all(|expert| {
+        expert_parts
+            .get(&(prefix.to_string(), expert))
+            .is_some_and(|parts| parts.gate.is_some() && parts.down.is_some() && parts.up.is_some())
+    })
+}
+
+fn pack_split_swiglu_expert_prefix(
+    expert_parts: &mut HashMap<(String, i32), SwiGluExpertParts>,
+    prefix: &str,
+    num_experts: i32,
+    stream: &Stream,
+) -> Result<HashMap<String, Array>, Error> {
+    let mut gate_up = Vec::with_capacity(num_experts as usize);
+    let mut down = Vec::with_capacity(num_experts as usize);
+    for expert in 0..num_experts {
+        let parts = expert_parts
+            .remove(&(prefix.to_string(), expert))
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "checkpoint is missing expert {expert} for '{prefix}'"
+                ))
+            })?;
+        let gate = parts.gate.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "checkpoint is missing {prefix}.{expert}.w1.weight"
+            ))
+        })?;
+        let up = parts.up.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "checkpoint is missing {prefix}.{expert}.w3.weight"
+            ))
+        })?;
+        gate_up.push(concatenate_axis(&[gate, up], 0, stream)?);
+        down.push(parts.down.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "checkpoint is missing {prefix}.{expert}.w2.weight"
+            ))
+        })?);
+    }
+    let gate_up_proj = stack_axis(&gate_up, 0, stream)?;
+    let down_proj = stack_axis(&down, 0, stream)?;
+    eval([&gate_up_proj, &down_proj])?;
+    Ok(HashMap::from([
+        (format!("{prefix}.gate_up_proj"), gate_up_proj),
+        (format!("{prefix}.down_proj"), down_proj),
+    ]))
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Projection kind in a split ReLU2 expert checkpoint.
 pub enum Relu2ExpertProjection {
@@ -719,9 +894,24 @@ mod tests {
     };
 
     use super::{
-        load_arrays_quantized_strict, load_safetensors_quantized_strict, StrictLoadConfig,
-        StrictLoadReport,
+        load_arrays_quantized_strict, load_safetensors_quantized_strict,
+        parse_split_swiglu_expert_projection_key, StrictLoadConfig, StrictLoadReport,
     };
+
+    #[test]
+    fn parses_split_swiglu_expert_names() {
+        let (prefix, expert, projection) = parse_split_swiglu_expert_projection_key(
+            "model.layers.3.feed_forward.experts.17.w3.weight",
+        )
+        .unwrap();
+        assert_eq!(prefix, "model.layers.3.feed_forward.experts");
+        assert_eq!(expert, 17);
+        assert_eq!(projection, super::SwiGluExpertProjection::Up);
+        assert!(parse_split_swiglu_expert_projection_key(
+            "model.layers.3.feed_forward.experts.17.bias"
+        )
+        .is_none());
+    }
 
     #[derive(Debug, Clone, ModuleParameters)]
     struct RewrittenLinear {

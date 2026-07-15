@@ -104,7 +104,17 @@ fn build_gpt(
         .get("general.architecture")
         .and_then(GgufMetadataValue::as_str)
         .unwrap_or_default();
-    if matches!(pre_tokenizer, "qwen2" | "qwen35")
+    if pre_tokenizer == "lfm2" || matches!(architecture, "lfm2" | "lfm2moe") {
+        const LFM2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+            PreTokenizerWrapper::Split(Split::new(
+                SplitPattern::Regex(LFM2_PATTERN.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )?),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ])));
+    } else if matches!(pre_tokenizer, "qwen2" | "qwen35")
         || matches!(architecture, "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe")
     {
         const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -571,6 +581,40 @@ mod tests {
         let encoding = loaded.tokenizer.encode("hello", true).unwrap();
         assert_eq!(encoding.get_ids(), &[8, 0]);
         assert_eq!(loaded.template_kwargs["eos_token"], "<eos>");
+    }
+
+    #[test]
+    fn uses_lfm2_pretokenizer_without_unicode_normalization() {
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("lfm2".into()),
+            ),
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("lfm2".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![
+                    "<eos>".into(),
+                    "a".into(),
+                ])),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![])),
+            ),
+        ]);
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        let serialized = tokenizer.to_string(false).unwrap();
+        assert!(serialized.contains(r"\\p{N}{1,3}"));
+        assert!(serialized.contains("ByteLevel"));
+        assert!(tokenizer.get_normalizer().is_none());
     }
 
     #[test]

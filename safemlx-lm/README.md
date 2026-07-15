@@ -17,7 +17,8 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points
 accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Llama, dense Mistral,
-dense and sparse-MoE Nemotron-H, Qwen3, Qwen3-VL, and dense or MoE Qwen3.5. They also accept the
+dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen3, Qwen3-VL,
+and dense or MoE Qwen3.5. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
 are supported by passing the first
 `-00001-of-NNNNN.gguf` shard; the remaining shards are discovered and
@@ -47,7 +48,7 @@ Q5_0 and Q5_1 tensors are converted to float16 while loading; other GGUF
 quantization types use MLX's bundled converter when
 supported, and unsupported tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `gemma4`,
-`llama`, `mistral`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense
+`llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense
 `qwen35`, and `qwen35moe` architectures, plus dense `qwen3vl` with its separate
 vision projector. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
@@ -102,6 +103,7 @@ checkpoint metadata is an error.
 |---|---:|---:|---:|---:|---|
 | Llama | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Mistral | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
+| LFM2/LFM2.5 and LFM2-MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Alternating short-convolution/attention cache; MoE uses sigmoid top-k routing and packed expert-major SwiGLU execution |
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
 | Gemma 4 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Currently eligible language and modality-bridge projections are quantized; specialized vision/audio components remain dense |

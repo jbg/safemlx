@@ -11,7 +11,7 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        arange, broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, gather_qmm,
+        arange, broadcast_to, concatenate_axis, exp, gather_grouped_rows, gather_qmm,
         grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufMetadataValue,
@@ -29,7 +29,8 @@ use crate::{
     models::{
         common::{
             self, batch_seq, finish_attention, project_logits_maybe_quantized, relu2,
-            reshape_attention_projection, weighted_route_sum, CausalLm, TopKRouterScoreFunction,
+            reshape_attention_projection, weighted_route_sum, CausalLm, DepthwiseConv1d,
+            TopKRouterScoreFunction,
         },
         input,
     },
@@ -940,36 +941,6 @@ impl Module<AttentionInput<'_>> for Attention {
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
-/// Depthwise convolution parameters for Nemotron-H Mamba2.
-pub struct DepthwiseConv1d {
-    #[param]
-    /// Convolution weights shaped `[channels, 1, kernel]`.
-    pub weight: Param<Array>,
-    #[param]
-    /// Optional convolution bias.
-    pub bias: Param<Option<Array>>,
-}
-
-impl DepthwiseConv1d {
-    /// Creates unloaded depthwise convolution parameters.
-    pub fn new(
-        channels: i32,
-        kernel_size: i32,
-        bias: bool,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Ok(Self {
-            weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], Dtype::Float32, stream)?,
-            bias: if bias {
-                Param::<Option<Array>>::unloaded_some(&[channels], Dtype::Float32, stream)?
-            } else {
-                Param::new(None)
-            },
-        })
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 /// Cache state for a Nemotron-H Mamba2 block.
 pub struct Mamba2Cache {
@@ -1103,20 +1074,7 @@ impl Mamba2Mixer {
             cache.offset += seq_len;
         }
 
-        let weight = self.conv1d.weight.as_ref().swap_axes(1, 2, stream)?;
-        let mut out = conv1d(
-            &padded,
-            &weight,
-            Some(1),
-            Some(0),
-            Some(1),
-            Some(channels),
-            stream,
-        )?;
-        if let Some(bias) = self.conv1d.bias.as_ref() {
-            out = out.add(bias, stream)?;
-        }
-        silu(out, stream)
+        silu(self.conv1d.forward_padded(&padded, stream)?, stream)
     }
 
     fn expand_group_states(

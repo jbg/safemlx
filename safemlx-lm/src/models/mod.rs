@@ -46,6 +46,8 @@ mod gemma4_vision;
 pub mod gpt_oss;
 /// Typed runtime input support.
 pub mod input;
+/// Liquid AI LFM2/LFM2.5 dense and MoE text model support.
+pub mod lfm2;
 /// Llama decoder-only model support.
 pub mod llama;
 /// Moshi token language-model support.
@@ -110,6 +112,8 @@ pub enum ModelKind {
     GptOss,
     /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
+    /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
+    Lfm2,
     /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
     NemotronH,
     /// PersonaPlex realtime speech-to-speech architecture.
@@ -148,6 +152,7 @@ impl ModelKind {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "llama" | "mistral" => Ok(Self::Llama),
+            "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
             "qwen3" => Ok(Self::Qwen3),
@@ -256,6 +261,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Llama => llama::validate_model_config_value(config),
+        ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
         ModelKind::Qwen3 => {
@@ -277,6 +283,8 @@ pub enum Model {
     GptOss(gpt_oss::Model),
     /// Llama-compatible dense model.
     Llama(llama::Model),
+    /// Liquid AI LFM2/LFM2.5 model.
+    Lfm2(lfm2::Model),
     /// Nemotron-H hybrid model.
     NemotronH(nemotron_h::Model),
     /// Qwen3 model.
@@ -294,6 +302,7 @@ impl Model {
             Self::Gemma4(model) => model.model_type(),
             Self::GptOss(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
+            Self::Lfm2(model) => model.model_type(),
             Self::NemotronH(model) => model.model_type(),
             Self::Qwen3(model) => model.model_type(),
             Self::Qwen3Vl(model) => model.model_type(),
@@ -367,6 +376,9 @@ impl Model {
             ),
             (Self::NemotronH(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
+            )),
+            (Self::Lfm2(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for lfm2 yet",
             )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
@@ -443,6 +455,9 @@ impl Model {
             (Self::NemotronH(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
             )),
+            (Self::Lfm2(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for lfm2 yet",
+            )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
             )),
@@ -461,6 +476,7 @@ impl Model {
                 Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
                 None => ModelCache::KeyValue(Vec::new()),
             },
+            Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
             Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
@@ -486,6 +502,9 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
@@ -537,6 +556,9 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2(
+                lfm2::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+            ),
             (Self::GptOss(model), ModelCache::GptOss(cache)) => {
                 ModelGenerate::GptOss(gpt_oss::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
@@ -588,6 +610,8 @@ pub enum ModelCache {
     SlidingKeyValue(Vec<Option<SlidingKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
     NemotronH(nemotron_h::Cache),
+    /// Heterogeneous LFM2 attention/convolution cache.
+    Lfm2(lfm2::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35Moe(qwen3_5_moe::Cache),
 }
@@ -611,6 +635,8 @@ where
     Qwen3Vl(qwen3_vl::Generate<'a, S>),
     /// Nemotron-H generation iterator.
     NemotronH(nemotron_h::Generate<'a, S>),
+    /// LFM2 generation iterator.
+    Lfm2(lfm2::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
 }
@@ -627,6 +653,7 @@ where
             Self::GptOss(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::LlamaSliding(generate) => generate.next(),
+            Self::Lfm2(generate) => generate.next(),
             Self::NemotronH(generate) => generate.next(),
             Self::Qwen3(generate) => generate.next(),
             Self::Qwen3Vl(generate) => generate.next(),
@@ -1084,6 +1111,16 @@ fn load_gguf_model_data(
             )?;
             (Model::Llama(loaded.model), loaded.eos_token_ids)
         }
+        "lfm2" | "lfm2moe" => {
+            let loaded = lfm2::load_gguf_data(
+                arrays,
+                metadata,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            (Model::Lfm2(loaded.model), loaded.eos_token_ids)
+        }
         "nemotron_h" | "nemotron_h_moe" => {
             if options.quantization.is_some() {
                 return Err(Error::Quantization(
@@ -1135,7 +1172,7 @@ fn load_gguf_model_data(
             (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
+            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
         ))),
     };
     Ok(LoadedGgufModel {
@@ -1253,6 +1290,12 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
+            ModelKind::Lfm2 => Ok(Model::Lfm2(lfm2::load_model_quantized(
+                model_dir,
+                quantization,
+                stream,
+                weights_stream,
+            )?)),
             ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model_quantized(
                 model_dir,
                 quantization,
@@ -1300,6 +1343,11 @@ fn load_model_for_kind(
             stream,
             weights_stream,
         )?)),
+        ModelKind::Lfm2 => Ok(Model::Lfm2(lfm2::load_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::NemotronH => Ok(Model::NemotronH(nemotron_h::load_nemotron_h_model(
             model_dir,
             stream,
@@ -1341,6 +1389,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
+        ModelKind::Lfm2 => lfm2::load_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
             "PersonaPlex uses the released SentencePiece tokenizer; load it outside the chat tokenizer API".into(),
@@ -2305,6 +2354,36 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 effective_model_type: "mistral".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn check_model_config_reports_supported_lfm2_families() {
+        let dense = json!({
+            "model_type": "lfm2",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 24,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "layer_types": ["conv", "full_attention"]
+        });
+        assert_eq!(
+            check_model_config(&dense),
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Lfm2,
+                model_type: "lfm2".into(),
+                effective_model_type: "lfm2".into(),
+            })
+        );
+        let mut moe = dense;
+        moe["model_type"] = json!("lfm2_moe");
+        moe["moe_intermediate_size"] = json!(8);
+        moe["num_dense_layers"] = json!(1);
+        moe["num_experts"] = json!(4);
+        moe["num_experts_per_tok"] = json!(2);
+        assert!(check_model_config(&moe).is_supported());
     }
 
     #[test]

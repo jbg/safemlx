@@ -11,11 +11,11 @@ use safemlx::{
     module::{Module, Param},
     nn,
     ops::{
-        argpartition_axis, broadcast_to, concatenate_axis, gather_grouped_rows,
-        gather_route_values, grouped_matmul,
+        arange, argpartition_axis, broadcast_to, concatenate_axis, conv1d, gather_grouped_rows,
+        gather_qmm_with_mode, gather_route_values, grouped_matmul,
         indexing::{take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, maximum, r#where, segment_sum_by_index, sigmoid, softmax_axis, sum_axis,
-        topk_route_plan, GroupedRoutePlan,
+        matmul, maximum, quantized_packed_dimension, r#where, segment_sum_by_index, sigmoid,
+        softmax_axis, sum_axis, topk_route_plan, zeros, GroupedRoutePlan,
     },
     quantization::MaybeQuantized,
     random::{self, RandomState},
@@ -39,6 +39,93 @@ pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
 /// Applies the squared ReLU activation used by Nemotron-H dense and MoE MLPs.
 pub fn relu2(x: Array, stream: &Stream) -> Result<Array, Exception> {
     maximum(&x, Array::from_f32(0.0), stream)?.square(stream)
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// PyTorch-layout depthwise convolution parameters shared by recurrent LM blocks.
+///
+/// Checkpoints store weights as `[channels, 1, kernel]`; MLX convolution expects
+/// `[channels, kernel, 1]`, so the forward helper transposes the last two axes.
+pub struct DepthwiseConv1d {
+    #[param]
+    /// Convolution weights shaped `[channels, 1, kernel]`.
+    pub weight: Param<Array>,
+    #[param]
+    /// Optional per-channel bias.
+    pub bias: Param<Option<Array>>,
+    /// Kernel width.
+    pub kernel_size: i32,
+}
+
+impl DepthwiseConv1d {
+    /// Creates unloaded depthwise-convolution parameters.
+    pub fn new(
+        channels: i32,
+        kernel_size: i32,
+        bias: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], Dtype::Float32, stream)?,
+            bias: if bias {
+                Param::<Option<Array>>::unloaded_some(&[channels], Dtype::Float32, stream)?
+            } else {
+                Param::new(None)
+            },
+            kernel_size,
+        })
+    }
+
+    /// Applies a valid depthwise convolution to an already left-padded NLC tensor.
+    pub fn forward_padded(&self, padded: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let channels = padded.dim(-1);
+        let weight = self.weight.as_ref().swap_axes(1, 2, stream)?;
+        let mut output = conv1d(
+            padded,
+            &weight,
+            Some(1),
+            Some(0),
+            Some(1),
+            Some(channels),
+            stream,
+        )?;
+        if let Some(bias) = self.bias.as_ref() {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+/// State retained by a causal depthwise convolution between generation calls.
+pub struct CausalConv1dCache {
+    /// Previous `kernel_size - 1` inputs shaped `[batch, state, channels]`.
+    pub state: Option<Array>,
+    /// Number of consumed tokens.
+    pub offset: i32,
+}
+
+/// Applies a causal depthwise convolution and updates its bounded state.
+pub fn causal_depthwise_conv1d(
+    convolution: &DepthwiseConv1d,
+    input: &Array,
+    cache: Option<&mut CausalConv1dCache>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let batch = input.dim(0);
+    let seq_len = input.dim(1);
+    let channels = input.dim(2);
+    let state_len = convolution.kernel_size - 1;
+    let state = cache
+        .as_ref()
+        .and_then(|cache| cache.state.clone())
+        .unwrap_or(zeros::<f32>(&[batch, state_len, channels], stream)?);
+    let padded = concatenate_axis(&[state, input.clone()], 1, stream)?;
+    if let Some(cache) = cache {
+        cache.state = Some(padded.try_index_device((.., seq_len.., ..), stream)?);
+        cache.offset += seq_len;
+    }
+    convolution.forward_padded(&padded, stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -330,6 +417,18 @@ impl TopKRouter {
         hidden_states: &Array,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
+        self.forward_with_selection_bias(hidden_states, None, stream)
+    }
+
+    /// Returns selected expert ids and weights using an optional bias only for selection.
+    ///
+    /// The gathered route weights always come from the unbiased transformed scores.
+    pub fn forward_with_selection_bias(
+        &mut self,
+        hidden_states: &Array,
+        selection_bias: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
         let scores = match self.score_function {
@@ -338,6 +437,9 @@ impl TopKRouter {
         };
         let mut scores_for_choice = scores.clone();
         if let Some(bias) = self.e_score_correction_bias.as_ref() {
+            scores_for_choice = scores_for_choice.add(bias, stream)?;
+        }
+        if let Some(bias) = selection_bias {
             scores_for_choice = scores_for_choice.add(bias, stream)?;
         }
 
@@ -537,6 +639,247 @@ impl PackedRelu2Experts {
         let down_weights = self.down_proj.as_ref().swap_axes(-1, -2, stream)?;
         let current = grouped_matmul(&hidden, &down_weights, &plan.sorted_group_ids, true, stream)?;
         weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    /// Sets training mode.
+    pub fn training_mode(&mut self, _mode: bool) {}
+}
+
+const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
+const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Packed SwiGLU expert bank with optional MLX affine or MXFP4 projections.
+pub struct PackedSwiGluExperts {
+    /// Number of experts.
+    pub num_experts: i32,
+    /// Model hidden dimension.
+    pub hidden_dim: i32,
+    /// Per-expert intermediate dimension.
+    pub intermediate_dim: i32,
+    /// Optional encoding for the concatenated gate/up projection.
+    pub gate_up_affine: Option<WeightQuantization>,
+    /// Optional encoding for the down projection.
+    pub down_affine: Option<WeightQuantization>,
+    #[param]
+    /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
+    pub gate_up_proj: Param<Array>,
+    #[param]
+    /// Gate/up quantization scales.
+    pub gate_up_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Gate/up quantization biases.
+    pub gate_up_proj_biases: Param<Option<Array>>,
+    #[param]
+    /// Down weights shaped `[experts, hidden, intermediate]`.
+    pub down_proj: Param<Array>,
+    #[param]
+    /// Down quantization scales.
+    pub down_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Down quantization biases.
+    pub down_proj_biases: Param<Option<Array>>,
+}
+
+type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
+
+impl PackedSwiGluExperts {
+    /// Creates an unloaded packed expert bank.
+    pub fn new(
+        num_experts: i32,
+        hidden_dim: i32,
+        intermediate_dim: i32,
+        gate_up_affine: Option<WeightQuantization>,
+        down_affine: Option<WeightQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let projection = |out_features: i32,
+                          in_features: i32,
+                          quantization: Option<WeightQuantization>|
+         -> Result<ExpertProjectionParams, Exception> {
+            if let Some(quantization) = quantization {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            quantized_packed_dimension(in_features, quantization.bits()),
+                        ],
+                        Dtype::Uint32,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / quantization.group_size(),
+                        ],
+                        if quantization == WeightQuantization::MxFp4 {
+                            Dtype::Uint8
+                        } else {
+                            Dtype::Float16
+                        },
+                        stream,
+                    )?,
+                    if quantization.has_biases() {
+                        Param::<Option<Array>>::unloaded_some(
+                            &[
+                                num_experts,
+                                out_features,
+                                in_features / quantization.group_size(),
+                            ],
+                            Dtype::Float16,
+                            stream,
+                        )?
+                    } else {
+                        Param::new(None)
+                    },
+                ))
+            } else {
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[num_experts, out_features, in_features],
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ))
+            }
+        };
+        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) =
+            projection(2 * intermediate_dim, hidden_dim, gate_up_affine)?;
+        let (down_proj, down_proj_scales, down_proj_biases) =
+            projection(hidden_dim, intermediate_dim, down_affine)?;
+        Ok(Self {
+            num_experts,
+            hidden_dim,
+            intermediate_dim,
+            gate_up_affine,
+            down_affine,
+            gate_up_proj,
+            gate_up_proj_scales,
+            gate_up_proj_biases,
+            down_proj,
+            down_proj_scales,
+            down_proj_biases,
+        })
+    }
+
+    fn quantized_grouped_linear(
+        input: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: Option<&Array>,
+        group_ids: &Array,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let routes = input.dim(0);
+        let out_features = weight.dim(-2);
+        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+        gather_qmm_with_mode(
+            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+            weight,
+            scales,
+            biases,
+            Some(&lhs_indices),
+            Some(group_ids),
+            true,
+            quantization.group_size(),
+            quantization.bits(),
+            true,
+            quantization.mode(),
+            stream,
+        )?
+        .reshape(&[routes, out_features], stream)
+    }
+
+    fn forward_chunk(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate_up = if let Some(quantization) = self.gate_up_affine {
+            Self::quantized_grouped_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized gate/up scales"),
+                self.gate_up_proj_biases.as_ref().as_ref(),
+                &plan.sorted_group_ids,
+                quantization,
+                stream,
+            )?
+        } else {
+            grouped_matmul(
+                &hidden,
+                &self.gate_up_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        let activated = silu(gate, stream)?.multiply(up, stream)?;
+        let output = if let Some(quantization) = self.down_affine {
+            Self::quantized_grouped_linear(
+                &activated,
+                self.down_proj.as_ref(),
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized down scales"),
+                self.down_proj_biases.as_ref().as_ref(),
+                &plan.sorted_group_ids,
+                quantization,
+                stream,
+            )?
+        } else {
+            grouped_matmul(
+                &activated,
+                &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
+                &plan.sorted_group_ids,
+                true,
+                stream,
+            )?
+        };
+        weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    /// Evaluates selected experts and reduces route outputs back to source tokens.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
+            return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
+        }
+        let mut outputs = Vec::new();
+        let mut start = 0;
+        while start < num_tokens {
+            let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
+            outputs.push(self.forward_chunk(
+                &hidden_states.try_index_device((start..end, ..), stream)?,
+                &top_k_index.try_index_device((start..end, ..), stream)?,
+                &top_k_weights.try_index_device((start..end, ..), stream)?,
+                stream,
+            )?);
+            start = end;
+        }
+        concatenate_axis(&outputs, 0, stream)
     }
 
     /// Sets training mode.

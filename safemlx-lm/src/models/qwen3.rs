@@ -8,12 +8,9 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, ModuleParametersExt},
     nn,
-    ops::{
-        arange, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode, grouped_matmul,
-        indexing::TryIndexOp, quantized_packed_dimension, topk_route_plan, GgufMetadataValue,
-    },
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -31,7 +28,7 @@ use crate::{
         common::{
             self, apply_rope_and_update_cache, apply_rotary_embeddings_and_update_cache,
             attention_probabilities, batch_seq, finish_attention, project_logits_maybe_quantized,
-            reshape_attention_projection, silu, AttentionInput, CausalLm, SwiGluMlp,
+            reshape_attention_projection, AttentionInput, CausalLm, SwiGluMlp,
             TopKRouterScoreFunction,
         },
         input,
@@ -419,242 +416,8 @@ where
 /// Qwen3 feed-forward block.
 pub type Mlp = SwiGluMlp;
 
-const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
-const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
-
-#[derive(Debug, Clone, ModuleParameters)]
-/// Packed routed-expert bank for Qwen3 MoE.
-pub struct Experts {
-    /// Number of routed experts.
-    pub num_experts: i32,
-    /// Transformer hidden dimension.
-    pub hidden_dim: i32,
-    /// Per-expert intermediate dimension.
-    pub intermediate_dim: i32,
-    /// Optional affine quantization for packed gate/up weights.
-    pub gate_up_affine: Option<WeightQuantization>,
-    /// Optional affine quantization for packed down weights.
-    pub down_affine: Option<WeightQuantization>,
-    #[param]
-    /// Concatenated gate and up weights for all experts.
-    pub gate_up_proj: Param<Array>,
-    #[param]
-    /// Affine scales for gate/up weights.
-    pub gate_up_proj_scales: Param<Option<Array>>,
-    #[param]
-    /// Affine biases for gate/up weights.
-    pub gate_up_proj_biases: Param<Option<Array>>,
-    #[param]
-    /// Down-projection weights for all experts.
-    pub down_proj: Param<Array>,
-    #[param]
-    /// Affine scales for down weights.
-    pub down_proj_scales: Param<Option<Array>>,
-    #[param]
-    /// Affine biases for down weights.
-    pub down_proj_biases: Param<Option<Array>>,
-}
-
-type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
-
-impl Experts {
-    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
-        let prefix = format!("model.layers.{layer_index}.moe.experts");
-        let gate_up_affine = args.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
-        let down_affine = args.weight_quantization_for(&format!("{prefix}.down_proj"));
-        let projection = |out_features: i32,
-                          in_features: i32,
-                          affine: Option<WeightQuantization>|
-         -> Result<ExpertProjectionParams, Exception> {
-            if let Some(affine) = affine {
-                Ok((
-                    Param::<Array>::unloaded(
-                        &[
-                            args.num_experts,
-                            out_features,
-                            quantized_packed_dimension(in_features, affine.bits()),
-                        ],
-                        Dtype::Uint32,
-                        stream,
-                    )?,
-                    Param::<Option<Array>>::unloaded_some(
-                        &[
-                            args.num_experts,
-                            out_features,
-                            in_features / affine.group_size(),
-                        ],
-                        if affine == WeightQuantization::MxFp4 {
-                            Dtype::Uint8
-                        } else {
-                            Dtype::Float16
-                        },
-                        stream,
-                    )?,
-                    if affine.has_biases() {
-                        Param::<Option<Array>>::unloaded_some(
-                            &[
-                                args.num_experts,
-                                out_features,
-                                in_features / affine.group_size(),
-                            ],
-                            Dtype::Float16,
-                            stream,
-                        )?
-                    } else {
-                        Param::new(None)
-                    },
-                ))
-            } else {
-                Ok((
-                    Param::<Array>::unloaded(
-                        &[args.num_experts, out_features, in_features],
-                        Dtype::Float32,
-                        stream,
-                    )?,
-                    Param::new(None),
-                    Param::new(None),
-                ))
-            }
-        };
-        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = projection(
-            2 * args.moe_intermediate_size,
-            args.hidden_size,
-            gate_up_affine,
-        )?;
-        let (down_proj, down_proj_scales, down_proj_biases) =
-            projection(args.hidden_size, args.moe_intermediate_size, down_affine)?;
-        Ok(Self {
-            num_experts: args.num_experts,
-            hidden_dim: args.hidden_size,
-            intermediate_dim: args.moe_intermediate_size,
-            gate_up_affine,
-            down_affine,
-            gate_up_proj,
-            gate_up_proj_scales,
-            gate_up_proj_biases,
-            down_proj,
-            down_proj_scales,
-            down_proj_biases,
-        })
-    }
-
-    fn affine_grouped_linear(
-        input: &Array,
-        weight: &Array,
-        scales: &Array,
-        biases: Option<&Array>,
-        group_ids: &Array,
-        affine: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let routes = input.dim(0);
-        let out_features = weight.dim(-2);
-        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
-        gather_qmm_with_mode(
-            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
-            weight,
-            scales,
-            biases,
-            Some(&lhs_indices),
-            Some(group_ids),
-            true,
-            affine.group_size(),
-            affine.bits(),
-            true,
-            affine.mode(),
-            stream,
-        )?
-        .reshape(&[routes, out_features], stream)
-    }
-
-    fn forward_chunk(
-        &mut self,
-        hidden_states: &Array,
-        top_k_index: &Array,
-        top_k_weights: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let num_tokens = hidden_states.dim(0);
-        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
-        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let Some(affine) = self.gate_up_affine {
-            Self::affine_grouped_linear(
-                &hidden,
-                self.gate_up_proj.as_ref(),
-                self.gate_up_proj_scales
-                    .as_ref()
-                    .as_ref()
-                    .expect("affine gate/up scales"),
-                self.gate_up_proj_biases.as_ref().as_ref(),
-                &plan.sorted_group_ids,
-                affine,
-                stream,
-            )?
-        } else {
-            grouped_matmul(
-                &hidden,
-                &self.gate_up_proj.as_ref().swap_axes(-1, -2, stream)?,
-                &plan.sorted_group_ids,
-                true,
-                stream,
-            )?
-        };
-        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
-        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
-        let current = silu(gate, stream)?.multiply(up, stream)?;
-        let route_output = if let Some(affine) = self.down_affine {
-            Self::affine_grouped_linear(
-                &current,
-                self.down_proj.as_ref(),
-                self.down_proj_scales
-                    .as_ref()
-                    .as_ref()
-                    .expect("affine down scales"),
-                self.down_proj_biases.as_ref().as_ref(),
-                &plan.sorted_group_ids,
-                affine,
-                stream,
-            )?
-        } else {
-            grouped_matmul(
-                &current,
-                &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
-                &plan.sorted_group_ids,
-                true,
-                stream,
-            )?
-        };
-        common::weighted_route_sum(route_output, top_k_weights, &plan, num_tokens, stream)
-    }
-
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        top_k_index: &Array,
-        top_k_weights: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let num_tokens = hidden_states.dim(0);
-        if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
-            return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
-        }
-        let mut outputs = Vec::new();
-        let mut start = 0;
-        while start < num_tokens {
-            let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
-            outputs.push(self.forward_chunk(
-                &hidden_states.try_index_device((start..end, ..), stream)?,
-                &top_k_index.try_index_device((start..end, ..), stream)?,
-                &top_k_weights.try_index_device((start..end, ..), stream)?,
-                stream,
-            )?);
-            start = end;
-        }
-        concatenate_axis(&outputs, 0, stream)
-    }
-
-    fn training_mode(&mut self, _mode: bool) {}
-}
+/// Packed routed-expert bank shared with other SwiGLU MoE architectures.
+pub type Experts = common::PackedSwiGluExperts;
 
 #[derive(Debug, Clone, ModuleParameters)]
 /// Qwen3 sparse MoE feed-forward block.
@@ -685,7 +448,18 @@ impl SparseMoeBlock {
                 },
                 stream,
             )?,
-            experts: Experts::new(args, layer_index, stream)?,
+            experts: Experts::new(
+                args.num_experts,
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.weight_quantization_for(&format!(
+                    "model.layers.{layer_index}.moe.experts.gate_up_proj"
+                )),
+                args.weight_quantization_for(&format!(
+                    "model.layers.{layer_index}.moe.experts.down_proj"
+                )),
+                stream,
+            )?,
         })
     }
 
