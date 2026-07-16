@@ -5,12 +5,38 @@ on:
     paths:
       - ".github/workflows/apple-platforms.yml"
       - "Cargo.toml"
+      - "Cargo.lock"
+      - "safemlx-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
+      - "safemlx-macros/**"
+      - "safemlx-internal-macros/**"
+      - "safemlx-tests/**"
+      - "safemlx-lm/**"
+      - "safemlx-lm-utils/**"
+      - "safemlx-codec/**"
+      - "examples/safemlx-lm-cli/**"
   push:
     branches: [main]
 
 jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Metal toolchain when required
+        run: |
+          if xcrun --toolchain Metal metal --version; then
+            exit 0
+          fi
+          if xcrun metal --version; then
+            exit 0
+          fi
+          xcodebuild -downloadComponent MetalToolchain
+      - name: Test the macOS workspace
+        run: cargo test --workspace
+
   target-mapping:
     runs-on: macos-15
     steps:
