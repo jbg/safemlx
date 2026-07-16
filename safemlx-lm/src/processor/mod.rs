@@ -16,6 +16,7 @@ mod gemma4;
 /// Shared decoded-image operations.
 #[cfg(feature = "image-processing")]
 pub mod image;
+mod inkling;
 #[cfg(feature = "image-processing")]
 mod qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
@@ -258,6 +259,7 @@ pub struct ModelProcessor {
 #[derive(Debug, Clone)]
 enum ProcessorKind {
     Gemma4(gemma4::Gemma4Processor),
+    Inkling(inkling::InklingProcessor),
     #[cfg(feature = "image-processing")]
     Qwen(qwen::QwenProcessor),
 }
@@ -267,6 +269,14 @@ impl ModelProcessor {
         gemma4::Gemma4Processor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {
                 kind: ProcessorKind::Gemma4(processor),
+            })
+        })
+    }
+
+    pub(crate) fn load_inkling(model_dir: &Path) -> Result<Option<Self>, Error> {
+        inkling::InklingProcessor::load(model_dir).map(|processor| {
+            processor.map(|processor| Self {
+                kind: ProcessorKind::Inkling(processor),
             })
         })
     }
@@ -290,6 +300,7 @@ impl ModelProcessor {
         let _ = &encode_text;
         match &self.kind {
             ProcessorKind::Gemma4(processor) => processor.prepare_input(input, encode_text),
+            ProcessorKind::Inkling(processor) => processor.prepare_input(input, encode_text),
             #[cfg(feature = "image-processing")]
             ProcessorKind::Qwen(processor) => processor.prepare_input(input, encode_text),
         }
@@ -307,7 +318,8 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
 
     #[derive(serde::Deserialize)]
     struct TextMetadata {
-        model_type: String,
+        #[serde(default)]
+        model_type: Option<String>,
     }
 
     let model_dir = model_dir.as_ref();
@@ -315,9 +327,10 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
     let effective_type = metadata
         .text_config
         .as_ref()
-        .map(|text| text.model_type.as_str())
+        .and_then(|text| text.model_type.as_deref())
         .unwrap_or(&metadata.model_type);
     match effective_type {
+        "inkling_mm_model" => ModelProcessor::load_inkling(model_dir),
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
             ModelProcessor::load_gemma4(model_dir)
         }

@@ -66,7 +66,7 @@ impl<'a> RgbImageView<'a> {
         self.height
     }
 
-    fn packed_pixels(self) -> Vec<u8> {
+    pub(crate) fn packed_pixels(self) -> Vec<u8> {
         let packed_stride = self.width as usize * 3;
         if self.row_stride == packed_stride {
             return self.pixels[..packed_stride * self.height as usize].to_vec();

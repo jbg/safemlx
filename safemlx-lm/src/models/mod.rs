@@ -44,6 +44,8 @@ mod gemma4_multimodal;
 mod gemma4_vision;
 /// OpenAI GPT-OSS sparse decoder architecture.
 pub mod gpt_oss;
+/// Thinking Machines Lab Inkling multimodal decoder support.
+pub mod inkling;
 /// Typed runtime input support.
 pub mod input;
 /// Liquid AI LFM2/LFM2.5 dense and MoE text model support.
@@ -86,7 +88,8 @@ struct ModelMetadata {
 
 #[derive(Debug, Clone, Deserialize)]
 struct TextModelMetadata {
-    model_type: String,
+    #[serde(default)]
+    model_type: Option<String>,
     #[serde(default)]
     eos_token_id: Option<TokenIdOrIds>,
 }
@@ -114,6 +117,8 @@ pub enum ModelKind {
     Gemma4,
     /// OpenAI GPT-OSS MXFP4 sparse decoder architecture.
     GptOss,
+    /// Thinking Machines Lab Inkling multimodal architecture.
+    Inkling,
     /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
@@ -159,6 +164,7 @@ impl ModelKind {
         match model_type {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
+            "inkling_mm_model" => Ok(Self::Inkling),
             "llama" | "mistral" => Ok(Self::Llama),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -270,6 +276,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     match kind {
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
+        ModelKind::Inkling => inkling::validate_model_config_value(config),
         ModelKind::Llama => llama::validate_model_config_value(config),
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
@@ -293,6 +300,8 @@ pub enum Model {
     Gemma4(gemma4::Model),
     /// OpenAI GPT-OSS model.
     GptOss(gpt_oss::Model),
+    /// Thinking Machines Lab Inkling model.
+    Inkling(inkling::Model),
     /// Llama-compatible dense model.
     Llama(llama::Model),
     /// Liquid AI LFM2/LFM2.5 model.
@@ -317,6 +326,7 @@ impl Model {
         match self {
             Self::Gemma4(model) => model.model_type(),
             Self::GptOss(model) => model.model_type(),
+            Self::Inkling(model) => model.model_type(),
             Self::Llama(model) => model.model_type(),
             Self::Lfm2(model) => model.model_type(),
             Self::NemotronH(model) => model.model_type(),
@@ -417,6 +427,9 @@ impl Model {
             (Self::GptOss(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for gpt_oss yet",
             )),
+            (Self::Inkling(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for Inkling yet",
+            )),
             _ => Err(Exception::custom(
                 "model cache type does not match model kind",
             )),
@@ -492,6 +505,9 @@ impl Model {
             (Self::Lfm2(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for lfm2 yet",
             )),
+            (Self::Inkling(_), _) => Err(Exception::custom(
+                "detailed activation inspection is not implemented for Inkling yet",
+            )),
             (Self::Qwen3Vl(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for qwen3_vl yet",
             )),
@@ -509,6 +525,7 @@ impl Model {
         match self {
             Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
+            Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
             Self::Llama(model) => match model.sliding_window() {
                 Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
                 None => ModelCache::KeyValue(Vec::new()),
@@ -535,6 +552,9 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::GptOss(model), ModelCache::GptOss(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
@@ -609,6 +629,11 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
+                ModelGenerate::Inkling(inkling::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
@@ -657,6 +682,8 @@ pub enum ModelCache {
     Gemma4(gemma4::Cache),
     /// Alternating full/sliding GPT-OSS cache.
     GptOss(gpt_oss::Cache),
+    /// Alternating global/local attention and short-convolution Inkling cache.
+    Inkling(inkling::Cache),
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3-VL key/value cache and multimodal position state.
@@ -684,6 +711,8 @@ where
     Gemma4(gemma4::Generate<'a, S>),
     /// GPT-OSS generation iterator.
     GptOss(gpt_oss::Generate<'a, S>),
+    /// Inkling generation iterator.
+    Inkling(inkling::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
@@ -714,6 +743,7 @@ where
         match self {
             Self::Gemma4(generate) => generate.next(),
             Self::GptOss(generate) => generate.next(),
+            Self::Inkling(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::LlamaSliding(generate) => generate.next(),
             Self::Lfm2(generate) => generate.next(),
@@ -1349,6 +1379,9 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
+            ModelKind::Inkling => Err(Error::Quantization(
+                "Inkling affine/MXFP4 on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without a matching quantized grouped-matmul implementation".into(),
+            )),
             ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model_quantized(
                 model_dir,
                 quantization,
@@ -1419,6 +1452,11 @@ fn load_model_for_kind(
             stream,
             weights_stream,
         )?)),
+        ModelKind::Inkling => Ok(Model::Inkling(inkling::load_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(
             model_dir,
             stream,
@@ -1479,6 +1517,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
+        ModelKind::Inkling => inkling::load_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::Lfm2 => lfm2::load_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
@@ -1572,6 +1611,9 @@ fn load_gguf_tokenizer_from_metadata(
 }
 
 fn effective_model_type(metadata: &ModelMetadata) -> String {
+    if metadata.model_type == "inkling_mm_model" {
+        return metadata.model_type.clone();
+    }
     if matches!(
         metadata.model_type.as_str(),
         "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
@@ -1579,7 +1621,7 @@ fn effective_model_type(metadata: &ModelMetadata) -> String {
         metadata
             .text_config
             .as_ref()
-            .map(|text_config| text_config.model_type.clone())
+            .and_then(|text_config| text_config.model_type.clone())
             .unwrap_or_else(|| metadata.model_type.clone())
     } else if ModelKind::from_model_type(&metadata.model_type).is_ok() {
         metadata.model_type.clone()
@@ -1587,7 +1629,7 @@ fn effective_model_type(metadata: &ModelMetadata) -> String {
         metadata
             .text_config
             .as_ref()
-            .map(|text_config| text_config.model_type.clone())
+            .and_then(|text_config| text_config.model_type.clone())
             .unwrap_or_else(|| metadata.model_type.clone())
     }
 }
@@ -1613,8 +1655,8 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
     if matches!(metadata.model_type.as_str(), "gemma4" | "gemma4_unified")
         || metadata.text_config.as_ref().is_some_and(|text_config| {
             matches!(
-                text_config.model_type.as_str(),
-                "gemma4_text" | "gemma4_unified_text"
+                text_config.model_type.as_deref(),
+                Some("gemma4_text" | "gemma4_unified_text")
             )
         })
     {

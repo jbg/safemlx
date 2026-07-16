@@ -10,8 +10,8 @@ framework on Apple silicon and Linux systems with NVIDIA GPUs:
 - `safemlx-lm-utils`
 - `examples/safemlx-lm-cli` (example `safemlx-lm` generation binary)
 
-This fork carries additional model/runtime support, including Gemma 4 support,
-Gemma 4 assistant drafting, expanded model loading, and chat-template handling
+This fork carries additional model/runtime support, including Gemma 4 and
+Thinking Machines Lab Inkling support, Gemma 4 assistant drafting, expanded model loading, and chat-template handling
 for structured messages and tools.
 
 ## Crates

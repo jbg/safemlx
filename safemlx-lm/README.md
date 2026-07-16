@@ -29,7 +29,7 @@ than the Metal-specialized paths.
 ## GGUF models
 
 The standard `models::load_model` and `models::LoadedModel::load` entry points
-accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Llama, dense Mistral,
+accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Inkling, Llama, dense Mistral,
 dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen3,
 Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and dense or MoE Qwen3.5. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
@@ -123,6 +123,7 @@ checkpoint metadata is an error.
 | Gemma 4 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Currently eligible language and modality-bridge projections are quantized; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 | yes / yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts | no / yes | `LoadedModel` | Native experts stay unchanged; attention projections, embeddings, and LM head can be MXFP4, while the router stays dense |
+| Inkling | yes | no | capability error | `LoadedModel` | Alternating local/global relative-bias attention, four short-convolution states per layer, routed plus shared experts, and native hMLP/dMel towers; MTP draft layers are skipped |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Reuses the hybrid Gated DeltaNet/full-attention runtime and shared-expert MoE implementation; fused checkpoint projections are split while streaming |
@@ -135,7 +136,7 @@ convolutions, modality towers, routers, and packed expert banks stay dense only
 when the architecture explicitly supports that policy, or the request is
 rejected before weights are loaded.
 
-For Gemma 4 or Qwen image prompts, pass text and media as ordered processor
+For Gemma 4, Inkling, or Qwen image prompts, pass text and media as ordered processor
 segments. Media is inserted where the segment appears; callers do not put
 image/video/audio media tokens in rendered prompt text:
 
@@ -174,16 +175,18 @@ let prepared = model.prepare_input(
 )?;
 ```
 
-The optional `image-processing` feature enables architecture-dispatched Gemma 4
-and Qwen processors. Shared code owns decoded-image validation, frame sampling,
+The optional `image-processing` feature enables architecture-dispatched Gemma 4,
+Inkling, and Qwen processors. Shared code owns decoded-image validation, frame sampling,
 and timestamp operations; each processor adds its model-native patch packing,
-prompt format, metadata, and ordered media insertion. Gemma samples up to 32 frames
-by default and encodes each timestamped frame through its vision tower. Qwen
-uses its temporal patch packing and timestamp format. Without the feature,
-callers can still supply Gemma 4 or Qwen `Image/Tensor` and `Video/Tensor`
+prompt format, metadata, and ordered media insertion. Inkling divides images into
+40-pixel patches and feeds its released four-layer hMLP tower. Gemma samples up to
+32 frames by default and encodes each timestamped frame through its vision tower.
+Qwen uses its temporal patch packing and timestamp format. Without the feature,
+callers can still supply Gemma 4, Inkling, or Qwen `Image/Tensor` and `Video/Tensor`
 inputs directly without depending on the `image` crate.
 
-Gemma 4 audio accepts model-native log-mel tensors through the typed input API
+Gemma 4 audio accepts model-native log-mel tensors and Inkling accepts discrete
+dMel IDs through the typed input API
 without optional dependencies. Enable `audio-processing` to prepare mono `f32`
 PCM in the shared processor instead:
 
@@ -205,8 +208,9 @@ let logits = model.prefill_prepared_input_with_cache(&prepared, &mut cache, stre
 ```
 
 The common audio processor validates and resamples neither channels nor sample
-rate: Gemma 4 currently requires mono 16 kHz PCM. It computes the model's log-mel
-features and valid-frame mask. The optional FFT dependency is only enabled by
+rate: Gemma 4 and Inkling currently require mono 16 kHz PCM. It computes each
+model's log-mel features and valid-frame mask; Inkling then quantizes them to its
+16-bin dMel representation. The optional FFT dependency is only enabled by
 `audio-processing`; callers that provide `Audio/Tensor` and `audio_mask` directly
 do not pay that dependency cost.
 
