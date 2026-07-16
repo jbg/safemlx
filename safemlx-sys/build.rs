@@ -15,26 +15,89 @@ fn define_from_env(config: &mut Config, name: &str) {
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_toolkit_root() -> Option<PathBuf> {
+fn toolkit_root_from_compiler(compiler: &Path) -> Option<PathBuf> {
+    let bin_dir = compiler.parent()?;
+    if bin_dir.file_name().is_some_and(|name| name == "x64") {
+        return bin_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+    bin_dir.parent().map(Path::to_path_buf)
+}
+
+#[cfg(feature = "cuda")]
+fn compiler_in_toolkit(root: &Path, target_os: &str) -> Option<PathBuf> {
+    let names: &[&str] = if target_os == "windows" {
+        &["bin/nvcc.exe", "bin/x64/nvcc.exe"]
+    } else {
+        &["bin/nvcc"]
+    };
+    names
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_toolkit_root(target_os: &str) -> Option<PathBuf> {
+    if let Some(compiler) = env::var_os("CMAKE_CUDA_COMPILER").map(PathBuf::from) {
+        if compiler.is_file() {
+            return toolkit_root_from_compiler(&compiler);
+        }
+    }
+
     for name in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
         if let Some(path) = env::var_os(name).map(PathBuf::from) {
-            if path.is_dir() {
+            if compiler_in_toolkit(&path, target_os).is_some() {
                 return Some(path);
             }
         }
     }
 
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|path| path.join("nvcc"))
-        .find(|path| path.is_file())
-        .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
+    if let Some(path) = env::var_os("PATH") {
+        let compiler_name = if target_os == "windows" {
+            "nvcc.exe"
+        } else {
+            "nvcc"
+        };
+        if let Some(root) = env::split_paths(&path)
+            .map(|path| path.join(compiler_name))
+            .find(|path| path.is_file())
+            .and_then(|path| toolkit_root_from_compiler(&path))
+        {
+            return Some(root);
+        }
+    }
+
+    if target_os == "windows" {
+        for variable in ["ProgramW6432", "ProgramFiles"] {
+            let Some(program_files) = env::var_os(variable).map(PathBuf::from) else {
+                continue;
+            };
+            let parent = program_files.join("NVIDIA GPU Computing Toolkit/CUDA");
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            let mut roots = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| compiler_in_toolkit(path, target_os).is_some())
+                .collect::<Vec<_>>();
+            roots.sort();
+            if let Some(root) = roots.pop() {
+                return Some(root);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(feature = "cuda")]
-fn add_cuda_link_search_paths(target_arch: &str) {
+fn add_cuda_link_search_paths(target_os: &str, target_arch: &str) {
     let mut roots = Vec::new();
-    if let Some(root) = cuda_toolkit_root() {
+    if let Some(root) = cuda_toolkit_root(target_os) {
         let cuda_target = match target_arch {
             "aarch64" => "sbsa-linux",
             "x86_64" => "x86_64-linux",
@@ -71,8 +134,14 @@ fn add_cuda_link_search_paths(target_arch: &str) {
 }
 
 #[cfg(feature = "cuda")]
-fn link_cuda_dependencies(target_arch: &str) {
-    add_cuda_link_search_paths(target_arch);
+fn link_cuda_dependencies(target_os: &str, target_arch: &str) {
+    // Windows uses shared mlx/mlxc libraries so CMake retains responsibility
+    // for CUDA's import libraries and delay-load linker options.
+    if target_os != "linux" {
+        return;
+    }
+
+    add_cuda_link_search_paths(target_os, target_arch);
 
     // Keep this list aligned with MLX's CUDA CMake target. CUDA's runtime is
     // selected as shared below so Rust consumers do not need to reproduce
@@ -142,13 +211,64 @@ fn copy_pregenerated_bindings(out_path: PathBuf) {
         .expect("Couldn't copy pregenerated bindings!");
 }
 
-#[cfg(feature = "metal")]
-fn profile_output_dir(out_path: &Path) -> PathBuf {
+fn cargo_profile_dir(out_path: &Path) -> PathBuf {
     out_path
         .ancestors()
         .nth(3)
         .expect("Cargo OUT_DIR did not have the expected layout")
-        .join("safemlx-resources")
+        .to_path_buf()
+}
+
+#[cfg(feature = "metal")]
+fn profile_output_dir(out_path: &Path) -> PathBuf {
+    cargo_profile_dir(out_path).join("safemlx-resources")
+}
+
+fn stage_windows_runtime_dlls(dst: &Path, out_path: &Path) {
+    let mut dlls = Vec::new();
+    for directory in [dst.to_path_buf(), dst.join("bin")] {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+            {
+                println!("cargo:rustc-link-search=native={}", directory.display());
+                dlls.push(path);
+            }
+        }
+    }
+
+    for required in ["mlx.dll", "mlxc.dll"] {
+        if !dlls.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(required))
+        }) {
+            panic!(
+                "MLX's Windows build did not install {required}; checked {} and {}",
+                dst.display(),
+                dst.join("bin").display()
+            );
+        }
+    }
+
+    let profile_dir = cargo_profile_dir(out_path);
+    for output_dir in [
+        profile_dir.clone(),
+        profile_dir.join("deps"),
+        profile_dir.join("examples"),
+    ] {
+        std::fs::create_dir_all(&output_dir)
+            .expect("Couldn't create the Windows runtime DLL output directory");
+        for source in &dlls {
+            let destination = output_dir.join(source.file_name().expect("DLL had no filename"));
+            std::fs::copy(source, destination).expect("Couldn't stage a Windows runtime DLL");
+        }
+    }
+    println!("cargo:metadata=runtime_dir={}", profile_dir.display());
 }
 
 #[cfg(feature = "metal")]
@@ -189,11 +309,18 @@ fn build_and_link_mlx_c(out_path: &Path) {
         env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture was not set by Cargo");
     let target_vendor =
         env::var("CARGO_CFG_TARGET_VENDOR").expect("target vendor was not set by Cargo");
+    #[cfg(feature = "cuda")]
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("target environment was not set");
     let is_apple = target_vendor == "apple";
 
     #[cfg(feature = "cuda")]
-    if target_os != "linux" {
-        panic!("the safemlx `cuda` feature is currently supported only on Linux targets");
+    if target_os != "linux"
+        && !(target_os == "windows" && target_arch == "x86_64" && target_env == "msvc")
+    {
+        panic!(
+            "the safemlx `cuda` feature supports Linux and Windows x86-64 MSVC targets; \
+             target {target} is unsupported"
+        );
     }
 
     #[cfg(feature = "nccl")]
@@ -215,7 +342,13 @@ fn build_and_link_mlx_c(out_path: &Path) {
             "Debug"
         },
     );
-    config.define("BUILD_SHARED_LIBS", "OFF");
+    // On Windows, a DLL boundary lets CMake preserve MLX's transitive native
+    // dependencies and its CUDA delay-load behavior. Other platforms retain
+    // the existing static-library integration.
+    config.define(
+        "BUILD_SHARED_LIBS",
+        if target_os == "windows" { "ON" } else { "OFF" },
+    );
     config.define("MLX_C_BUILD_EXAMPLES", "OFF");
     config.define("MLX_BUILD_GGUF", "OFF");
 
@@ -259,6 +392,16 @@ fn build_and_link_mlx_c(out_path: &Path) {
 
     #[cfg(feature = "cuda")]
     {
+        let toolkit_root = cuda_toolkit_root(&target_os);
+        if target_os == "windows"
+            && toolkit_root.is_none()
+            && env::var_os("CMAKE_CUDA_COMPILER").is_none()
+        {
+            panic!(
+                "could not find nvcc.exe for the Windows CUDA build; set CUDA_PATH, CUDA_HOME, \
+                 CUDAToolkit_ROOT, or CMAKE_CUDA_COMPILER to a CUDA 12.9 or 13.0 toolkit"
+            );
+        }
         config.define("MLX_BUILD_CUDA", "ON");
         config.define("CMAKE_CUDA_RUNTIME_LIBRARY", "Shared");
         config.define(
@@ -277,6 +420,11 @@ fn build_and_link_mlx_c(out_path: &Path) {
         ] {
             define_from_env(&mut config, name);
         }
+        if env::var_os("CUDAToolkit_ROOT").is_none() {
+            if let Some(toolkit_root) = toolkit_root {
+                config.define("CUDAToolkit_ROOT", toolkit_root);
+            }
+        }
         println!("cargo:rerun-if-env-changed=SAFEMLX_CUDA_ARCHITECTURES");
         if let Some(architectures) = env::var_os("SAFEMLX_CUDA_ARCHITECTURES") {
             config.define("MLX_CUDA_ARCHITECTURES", architectures);
@@ -286,9 +434,16 @@ fn build_and_link_mlx_c(out_path: &Path) {
     // build the mlx-c project
     let dst = config.build();
 
+    println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
-    println!("cargo:rustc-link-lib=static=mlxc");
-    println!("cargo:rustc-link-lib=static=mlx");
+    if target_os == "windows" {
+        println!("cargo:rustc-link-lib=dylib=mlxc");
+        println!("cargo:rustc-link-lib=dylib=mlx");
+        stage_windows_runtime_dlls(&dst, out_path);
+    } else {
+        println!("cargo:rustc-link-lib=static=mlxc");
+        println!("cargo:rustc-link-lib=static=mlx");
+    }
 
     if is_apple {
         println!("cargo:rustc-link-lib=c++");
@@ -314,7 +469,7 @@ fn build_and_link_mlx_c(out_path: &Path) {
     }
 
     #[cfg(feature = "cuda")]
-    link_cuda_dependencies(&target_arch);
+    link_cuda_dependencies(&target_os, &target_arch);
 
     #[cfg(feature = "metal")]
     if is_apple {

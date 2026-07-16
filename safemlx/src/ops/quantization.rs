@@ -384,8 +384,11 @@ pub fn gather_qmm_with_mode(
 /// Performs matrix multiplication where `x` is dynamically quantized and `w` is pre-quantized.
 /// This function supports `nvfp4` and `mxfp8` quantization modes.
 ///
-/// Note: This function is only supported on GPU with the CUDA backend (Linux with NVIDIA GPU).
-/// It is not available on macOS.
+/// This operation requires the CUDA backend and is available on supported Linux and Windows
+/// x86-64 CUDA builds. NVFP4 and MXFP8 require a CUDA toolkit new enough to build MLX's QQMM
+/// implementation (CUDA 12.8 or newer in the pinned MLX version), and the selected mode must be
+/// supported by the NVIDIA GPU's compute capability. MLX returns a runtime error when the active
+/// GPU, toolkit, shapes, or quantization parameters do not support the requested operation.
 ///
 /// # Params
 ///
@@ -395,7 +398,7 @@ pub fn gather_qmm_with_mode(
 /// - `group_size`: The quantization group size (default depends on mode: 16 for nvfp4, 32 for mxfp8)
 /// - `bits`: The number of bits per element (default depends on mode: 4 for nvfp4, 8 for mxfp8)
 /// - `mode`: Quantization mode - either "nvfp4" or "mxfp8" (default: "nvfp4")
-#[cfg(target_os = "linux")]
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 #[generate_macro]
 pub fn qqmm<'a>(

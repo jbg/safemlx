@@ -634,7 +634,14 @@ fn invalid_gguf_shards(message: impl Into<String>) -> IoError {
 #[cfg(test)]
 mod tests {
     use crate::{ops::GgufMetadataValue, Array};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    fn io_test_dir() -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_dir = temp_dir.path().join("formats with spaces üñîçødé");
+        std::fs::create_dir(&test_dir).unwrap();
+        (temp_dir, test_dir)
+    }
 
     fn gguf_test_stream() -> crate::Stream {
         crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0))
@@ -671,8 +678,8 @@ mod tests {
     #[test]
     fn test_save_arrays() {
         let stream = crate::test_stream();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("test.safetensors");
+        let (_tmp_dir, test_dir) = io_test_dir();
+        let path = test_dir.join("test tensors.safetensors");
 
         let mut arrays = std::collections::HashMap::new();
         arrays.insert(
@@ -708,8 +715,8 @@ mod tests {
     #[test]
     fn test_save_array() {
         let stream = crate::test_stream();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("test.npy");
+        let (_tmp_dir, test_dir) = io_test_dir();
+        let path = test_dir.join("test array.npy");
 
         let a = Array::ones::<i32>(&[2, 4], stream).unwrap();
         a.save_numpy(&path).unwrap();
@@ -724,8 +731,8 @@ mod tests {
     #[test]
     fn test_load_gguf_with_metadata() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("test.gguf");
+        let (_tmp_dir, test_dir) = io_test_dir();
+        let path = test_dir.join("test metadata.gguf");
         let tensor = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
             .copy(&stream)
             .unwrap();
@@ -767,8 +774,8 @@ mod tests {
     #[test]
     fn test_load_quantized_gguf_without_mlx_gguf() {
         let stream = gguf_test_stream();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("quantized.gguf");
+        let (_tmp_dir, test_dir) = io_test_dir();
+        let path = test_dir.join("quantized weights.gguf");
         let formats = [
             ("q4_0.weight", safemlx_gguf::GgmlType::Q4_0),
             ("q4_1.weight", safemlx_gguf::GgmlType::Q4_1),
