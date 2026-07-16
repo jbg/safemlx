@@ -9,17 +9,150 @@ on:
       - "safemlx-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
+      - "safemlx-lm/**"
+      - "safemlx-codec/**"
+      - "safemlx-tests/**"
+      - "examples/safemlx-lm-cli/**"
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_windows_gpu:
+        description: Run tests on a preconfigured self-hosted Windows NVIDIA runner
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CMAKE_GENERATOR: Ninja
 
 jobs:
-  msvc:
-    runs-on: windows-latest
+  cpu-msvc:
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure the Visual Studio 2022 environment
+        shell: cmd
+        run: |
+          pushd "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+          for /f "delims=" %%x in ('.\vswhere.exe -latest -property InstallationPath') do set VSPATH=%%x
+          popd
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          >>%GITHUB_ENV% set
+      - name: Show native tool versions
+        run: |
+          cmake --version
+          ninja --version
+          Get-Command cl
       - name: Test the pure-Rust GGUF backend
         run: cargo test -p safemlx-gguf
-      - name: Build safemlx with native MLX GGUF disabled
-        run: cargo check -p safemlx-sys -p safemlx --all-targets --no-default-features
+      - name: Build and final-link safemlx tests
+        run: cargo test -p safemlx --lib --no-run --no-default-features
+      - name: Run Windows file-format tests, including Unicode Rust GGUF paths
+        run: cargo test -p safemlx --lib --no-default-features ops::io::tests -- --test-threads=1
+      - name: Build a linked safemlx executable
+        run: cargo build -p safemlx --example tutorial --no-default-features
+      - name: Compile the backend-neutral integration tests
+        run: cargo test -p safemlx-tests --no-run
+
+  cuda-msvc:
+    name: CUDA ${{ matrix.cuda }} / cuDNN 9 / MSVC
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.9"
+            installer: "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_576.57_windows.exe"
+            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda12-archive.zip"
+          - cuda: "13.0"
+            installer: "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_windows.exe"
+            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda13-archive.zip"
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CMAKE_BUILD_PARALLEL_LEVEL: "1"
+      SAFEMLX_CUDA_ARCHITECTURES: "75"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure the Visual Studio 2022 environment
+        shell: cmd
+        run: |
+          pushd "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+          for /f "delims=" %%x in ('.\vswhere.exe -latest -property InstallationPath') do set VSPATH=%%x
+          popd
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          >>%GITHUB_ENV% set
+      - name: Install CUDA ${{ matrix.cuda }} components
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packages = @{
+            "12.9" = @("cudart_12.9", "nvcc_12.9", "cublas_12.9", "cublas_dev_12.9", "cufft_12.9", "cufft_dev_12.9", "nvrtc_12.9", "nvrtc_dev_12.9")
+            "13.0" = @("cudart_13.0", "nvcc_13.0", "cublas_13.0", "cublas_dev_13.0", "cufft_13.0", "cufft_dev_13.0", "nvrtc_13.0", "nvrtc_dev_13.0", "crt_13.0", "nvvm_13.0", "nvptxcompiler_13.0")
+          }
+          $webClient = New-Object System.Net.WebClient
+          $webClient.DownloadFile("${{ matrix.installer }}", "cuda-installer.exe")
+          $arguments = "-s " + ($packages["${{ matrix.cuda }}"] -join " ")
+          $process = Start-Process -FilePath .\cuda-installer.exe -ArgumentList $arguments -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer exited with code $($process.ExitCode)"
+          }
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda }}"
+          if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
+            throw "nvcc.exe was not installed at $cudaPath\bin\nvcc.exe"
+          }
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDAToolkit_ROOT=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_CUDA_COMPILER=$cudaPath\bin\nvcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install cuDNN 9
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $webClient = New-Object System.Net.WebClient
+          $webClient.DownloadFile("${{ matrix.cudnn }}", "cudnn.zip")
+          Expand-Archive -Path cudnn.zip -DestinationPath cudnn-extracted
+          $cudnnPath = (Get-ChildItem -Path cudnn-extracted -Directory)[0].FullName
+          "CUDNN_INCLUDE_PATH=$cudnnPath\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDNN_LIBRARY_PATH=$cudnnPath\lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudnnPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Show native tool versions
+        run: |
+          cmake --version
+          ninja --version
+          Get-Command cl
+          nvcc --version
+      - name: Build and final-link safemlx CUDA tests
+        run: cargo test -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
+      - name: Build the linked CUDA smoke executable
+        run: cargo build -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features
+      - name: Build and final-link safemlx-lm configurations
+        run: cargo test -j 1 -p safemlx-lm --no-default-features --features "cuda,fancy-regex,image-processing,audio-processing" --no-run
+      - name: Build the linked safemlx-lm CLI
+        run: cargo build -j 1 -p safemlx-lm-cli --features cuda
+      - name: Compile CUDA codec and integration tests
+        run: cargo test -j 1 -p safemlx-codec -p safemlx-tests --features cuda --no-run
+
+  cuda-gpu-runtime:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu }}
+    runs-on: [self-hosted, Windows, X64, cuda]
+    env:
+      SAFEMLX_CUDA_ARCHITECTURES: "75"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record GPU and toolkit versions
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: Test the pure-Rust GGUF backend
+        run: cargo test -p safemlx-gguf
+      - name: Run safemlx CUDA tests
+        run: cargo test -p safemlx --features cuda --lib --no-default-features
+      - name: Run CUDA device and numerical smoke test
+        run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
+      - name: Run safemlx-lm CUDA tests
+        run: cargo test -p safemlx-lm --features cuda

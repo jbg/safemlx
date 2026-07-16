@@ -8,18 +8,19 @@ blocks, transforms, optimizers, quantization helpers, optional SafeTensors
 support, and typed GGUF tensor/metadata loading.
 
 This crate targets macOS 14+, iOS/iPadOS 17+, tvOS 17+, and visionOS 1+ on
-Apple silicon, as well as CPU-only and NVIDIA CUDA Linux systems. The default
-feature set enables Accelerate and Metal on Apple targets; those features are
-ignored on Linux, where `cuda` can be selected explicitly. Cross-compilation, Xcode
-Metal-resource integration, and Linux prerequisites are documented in the
+Apple silicon, as well as CPU-only and NVIDIA CUDA Linux systems and native
+Windows x86-64 MSVC. The default feature set enables Accelerate and Metal on
+Apple targets; those features are ignored on Linux and Windows, where `cuda`
+can be selected explicitly. Cross-compilation, Xcode Metal-resource integration,
+and native backend prerequisites are documented in the
 [`safemlx-sys` README](../safemlx-sys/README.md).
 
 ## Features
 
 - `accelerate`: enables Accelerate-backed MLX operations.
-- `cuda`: builds MLX's CUDA backend on Linux.
+- `cuda`: builds MLX's CUDA backend on Linux or Windows x86-64 MSVC.
 - `metal`: enables Metal-backed MLX operations.
-- `nccl`: enables CUDA plus MLX's optional NCCL distributed backend.
+- `nccl`: enables CUDA plus MLX's optional Linux-only NCCL distributed backend.
 - `safetensors`: enables conversion between `Array` and
   `safetensors::TensorView`.
 

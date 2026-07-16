@@ -1,7 +1,7 @@
 # SafeMLX LM
 
 This repository contains Rust crates for running language models with the MLX
-framework on Apple silicon and Linux systems with NVIDIA GPUs:
+framework on Apple silicon and Linux or Windows x86-64 systems with NVIDIA GPUs:
 
 - `safemlx`
 - `safemlx-sys`
@@ -57,6 +57,15 @@ cargo build --release -p safemlx --features cuda
 
 See the [safemlx-sys Linux and CUDA instructions](safemlx-sys/README.md#linux-and-cuda)
 for prerequisites, architecture selection, and NCCL support.
+
+## Windows x86-64 and CUDA
+
+Native Windows uses the MSVC toolchain and a CMake-managed DLL boundary for
+MLX's CUDA dependencies. CUDA 12.9 and 13.0 with cuDNN 9 are compile/link tested;
+runtime GPU validation is optional and is not yet a required hosted check. See
+the [native Windows CUDA instructions](safemlx-sys/README.md#native-windows-x86-64-cuda)
+for Visual Studio requirements, environment variables, PowerShell commands,
+DLL discovery, and troubleshooting. Windows ARM CUDA and NCCL are not supported.
 
 ## Apple mobile and spatial platforms
 

@@ -1,12 +1,11 @@
 //! Custom error types and handler for the c ffi
 
 use crate::Dtype;
-use libc::strdup;
 use std::convert::Infallible;
-use std::ffi::NulError;
+use std::ffi::{CStr, NulError};
 use std::panic::Location;
 use std::sync::Once;
-use std::{cell::Cell, ffi::c_char};
+use std::{cell::Cell, cell::RefCell, ffi::c_char};
 use thiserror::Error;
 
 /// Type alias for a `Result` with an `Exception` error type.
@@ -235,21 +234,23 @@ impl From<Exception> for String {
 
 thread_local! {
     static CLOSURE_ERROR: Cell<Option<Exception>> = const { Cell::new(None) };
-    static LAST_MLX_ERROR: Cell<*mut c_char> = const { Cell::new(std::ptr::null_mut()) };
+    static LAST_MLX_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 static INIT_ERR_HANDLER: Once = Once::new();
 
 #[no_mangle]
 extern "C" fn default_mlx_error_handler(msg: *const c_char, _data: *mut std::ffi::c_void) {
-    unsafe {
-        LAST_MLX_ERROR.with(|last_error| {
-            let previous = last_error.replace(strdup(msg));
-            if !previous.is_null() {
-                libc::free(previous as *mut libc::c_void);
-            }
-        });
-    }
+    let message = unsafe { CStr::from_ptr(msg) }
+        .to_string_lossy()
+        .into_owned();
+    LAST_MLX_ERROR.with(|last_error| {
+        last_error.replace(Some(message));
+    });
+}
+
+fn take_last_mlx_error() -> Option<String> {
+    LAST_MLX_ERROR.with(|last_error| last_error.borrow_mut().take())
 }
 
 fn setup_mlx_error_handler() {
@@ -273,23 +274,7 @@ pub(crate) fn get_and_clear_closure_error() -> Option<Exception> {
 
 #[track_caller]
 pub(crate) fn get_and_clear_last_mlx_error() -> Option<RawException> {
-    LAST_MLX_ERROR.with(|last_error| {
-        let last_err_ptr = last_error.replace(std::ptr::null_mut());
-        if last_err_ptr.is_null() {
-            return None;
-        }
-
-        let last_err = unsafe {
-            std::ffi::CStr::from_ptr(last_err_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-        unsafe {
-            libc::free(last_err_ptr as *mut libc::c_void);
-        }
-
-        Some(RawException { what: last_err })
-    })
+    take_last_mlx_error().map(|what| RawException { what })
 }
 
 /// Error with building a cross-entropy loss function
