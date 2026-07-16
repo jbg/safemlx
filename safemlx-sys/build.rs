@@ -226,7 +226,12 @@ fn profile_output_dir(out_path: &Path) -> PathBuf {
 
 fn stage_windows_runtime_dlls(dst: &Path, out_path: &Path) {
     let mut dlls = Vec::new();
-    for directory in [dst.to_path_buf(), dst.join("bin")] {
+    for directory in [
+        dst.to_path_buf(),
+        dst.join("bin"),
+        dst.join("build"),
+        dst.join("build/bin"),
+    ] {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
@@ -248,9 +253,11 @@ fn stage_windows_runtime_dlls(dst: &Path, out_path: &Path) {
                 .is_some_and(|name| name.eq_ignore_ascii_case(required))
         }) {
             panic!(
-                "MLX's Windows build did not install {required}; checked {} and {}",
+                "MLX's Windows build did not install {required}; checked {}, {}, {}, and {}",
                 dst.display(),
-                dst.join("bin").display()
+                dst.join("bin").display(),
+                dst.join("build").display(),
+                dst.join("build/bin").display()
             );
         }
     }

@@ -47,6 +47,16 @@ else()
   FetchContent_MakeAvailable(mlx)
 endif()
 
+# When MLX is a FetchContent dependency its own install rules are not included
+# in this project's install target. Windows uses a shared-library boundary, so
+# install the MLX DLL and import library beside the mlx-c artifacts explicitly.
+if(WIN32 AND BUILD_SHARED_LIBS)
+  include(GNUInstallDirs)
+  install(TARGETS mlx
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
 # ----------------------------- lib -----------------------------
 
 set(mlxc-src
