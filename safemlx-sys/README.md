@@ -95,6 +95,9 @@ Common configuration failures are usually resolved as follows:
   `bin` directories to `PATH`; do not copy only the import libraries.
 - Unsupported compute capability: set `SAFEMLX_CUDA_ARCHITECTURES` to the GPU's
   architecture. MLX v0.32.0 requires compute capability 7.5 or newer.
+- Non-ASCII NumPy or SafeTensors paths: the pinned MLX file-path overloads use
+  the Windows narrow-character runtime. Use an ASCII path for these two native
+  formats. Rust-backed GGUF I/O supports native Unicode Windows paths.
 
 Windows ARM CUDA and Windows NCCL are intentionally unsupported. Metal and
 Accelerate remain Apple-only. Hosted CI proves MSVC compilation and final

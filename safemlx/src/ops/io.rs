@@ -638,7 +638,14 @@ mod tests {
 
     fn io_test_dir() -> (tempfile::TempDir, PathBuf) {
         let temp_dir = tempfile::tempdir().unwrap();
-        let test_dir = temp_dir.path().join("formats with spaces üñîçødé");
+        let test_dir = temp_dir.path().join("formats with spaces");
+        std::fs::create_dir(&test_dir).unwrap();
+        (temp_dir, test_dir)
+    }
+
+    fn unicode_gguf_test_dir() -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_dir = temp_dir.path().join("GGUF with spaces üñîçødé");
         std::fs::create_dir(&test_dir).unwrap();
         (temp_dir, test_dir)
     }
@@ -731,7 +738,7 @@ mod tests {
     #[test]
     fn test_load_gguf_with_metadata() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-        let (_tmp_dir, test_dir) = io_test_dir();
+        let (_tmp_dir, test_dir) = unicode_gguf_test_dir();
         let path = test_dir.join("test metadata.gguf");
         let tensor = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
             .copy(&stream)
@@ -774,7 +781,7 @@ mod tests {
     #[test]
     fn test_load_quantized_gguf_without_mlx_gguf() {
         let stream = gguf_test_stream();
-        let (_tmp_dir, test_dir) = io_test_dir();
+        let (_tmp_dir, test_dir) = unicode_gguf_test_dir();
         let path = test_dir.join("quantized weights.gguf");
         let formats = [
             ("q4_0.weight", safemlx_gguf::GgmlType::Q4_0),
