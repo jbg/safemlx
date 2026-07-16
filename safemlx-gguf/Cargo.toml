@@ -1,0 +1,16 @@
+[package]
+name = "safemlx-gguf"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Bounded pure-Rust GGUF reader, writer, and MLX affine converter"
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

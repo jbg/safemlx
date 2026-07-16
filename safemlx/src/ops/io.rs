@@ -1,9 +1,9 @@
 use crate::error::{Exception, IoError};
 use crate::ops::{GgufMetadata, GgufMetadataValue};
 use crate::utils::guard::Guarded;
-use crate::utils::io::{Gguf, SafeTensors};
+use crate::utils::io::SafeTensors;
 use crate::utils::SUCCESS;
-use crate::{Array, Stream};
+use crate::{Array, Dtype, Stream};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -107,6 +107,66 @@ impl Array {
     ) -> Result<(HashMap<String, Array>, HashMap<String, GgufMetadataValue>), IoError> {
         let (data, metadata) = load_gguf_shards(path.as_ref(), stream.as_ref(), true)?;
         Ok((data, metadata.expect("metadata was requested")))
+    }
+
+    /// Save dense arrays and typed metadata as a deterministic GGUF v3 file.
+    ///
+    /// This preserves the former MLX writer's dense F32/F16/I8/I16/I32
+    /// support and additionally accepts BF16, I64, and F64. Affine arrays are
+    /// deliberately rejected because their three-array MLX representation does
+    /// not contain enough information for a lossless inverse to GGML blocks.
+    pub fn save_gguf<'a, I, S, V>(
+        arrays: I,
+        metadata: impl Into<Option<&'a HashMap<String, GgufMetadataValue>>>,
+        path: impl AsRef<Path>,
+    ) -> Result<(), IoError>
+    where
+        I: IntoIterator<Item = (S, V)>,
+        S: AsRef<str>,
+        V: AsRef<Array>,
+    {
+        let path = path.as_ref();
+        check_file_extension(path, "gguf")?;
+        let mut owned = Vec::new();
+        for (name, array) in arrays {
+            let evaluated = array.as_ref().evaluated()?;
+            let a = evaluated.as_array();
+            let (ty, data) = gguf_dense_bytes(&evaluated)?;
+            let dimensions = a
+                .shape()
+                .iter()
+                .rev()
+                .map(|&v| {
+                    u64::try_from(v).map_err(|_| {
+                        IoError::InvalidGguf(format!(
+                            "negative dimension in tensor {:?}",
+                            name.as_ref()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            owned.push((name.as_ref().to_owned(), dimensions, ty, data));
+        }
+        let inputs = owned
+            .iter()
+            .map(
+                |(name, dimensions, ggml_type, data)| safemlx_gguf::TensorInput {
+                    name,
+                    dimensions,
+                    ggml_type: *ggml_type,
+                    data,
+                },
+            )
+            .collect::<Vec<_>>();
+        let typed = metadata
+            .into()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let file = std::fs::File::create(path).map_err(|_| IoError::UnableToOpenFile)?;
+        safemlx_gguf::Writer::default().write(file, &typed, &inputs)?;
+        Ok(())
     }
 
     /// Save array to a binary file in `.npy`format.
@@ -222,6 +282,52 @@ impl Array {
     }
 }
 
+fn gguf_dense_bytes(
+    array: &crate::EvaluatedArray<'_>,
+) -> Result<(safemlx_gguf::GgmlType, Vec<u8>), IoError> {
+    macro_rules! bytes {
+        ($ty:ty) => {
+            array
+                .as_slice::<$ty>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+        };
+    }
+    Ok(match array.as_array().dtype() {
+        Dtype::Float32 => (safemlx_gguf::GgmlType::F32, bytes!(f32)),
+        Dtype::Float16 => (
+            safemlx_gguf::GgmlType::F16,
+            array
+                .as_slice::<half::f16>()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        ),
+        Dtype::Bfloat16 => (
+            safemlx_gguf::GgmlType::Bf16,
+            array
+                .as_slice::<half::bf16>()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        ),
+        Dtype::Int8 => (
+            safemlx_gguf::GgmlType::I8,
+            array.as_slice::<i8>().iter().map(|v| *v as u8).collect(),
+        ),
+        Dtype::Int16 => (safemlx_gguf::GgmlType::I16, bytes!(i16)),
+        Dtype::Int32 => (safemlx_gguf::GgmlType::I32, bytes!(i32)),
+        Dtype::Int64 => (safemlx_gguf::GgmlType::I64, bytes!(i64)),
+        Dtype::Float64 => (safemlx_gguf::GgmlType::F64, bytes!(f64)),
+        dtype => {
+            return Err(IoError::InvalidGguf(format!(
+                "dtype {dtype:?} cannot be represented losslessly by GGUF"
+            )))
+        }
+    })
+}
+
 type GgufData = (
     HashMap<String, Array>,
     Option<HashMap<String, GgufMetadataValue>>,
@@ -229,14 +335,13 @@ type GgufData = (
 
 fn load_gguf_shards(
     path: &Path,
-    stream: &Stream,
+    _stream: &Stream,
     with_metadata: bool,
 ) -> Result<GgufData, IoError> {
-    let first_metadata = GgufMetadata::from_file(path)?;
-    let first = Gguf::load_device(path, stream)?;
+    let (first, first_metadata) = load_one_gguf(path)?;
     let split_count = gguf_split_value(&first_metadata, GGUF_SPLIT_COUNT)?.unwrap_or(0);
     if split_count <= 1 {
-        let data = first.data()?;
+        let data = first;
         let metadata = with_metadata.then(|| first_metadata.into_inner());
         return Ok((data, metadata));
     }
@@ -252,7 +357,7 @@ fn load_gguf_shards(
         required_gguf_split_value(&first_metadata, GGUF_SPLIT_TENSORS_COUNT, path)?;
     let shard_paths = gguf_shard_paths(path, split_count)?;
 
-    let mut data = first.data()?;
+    let mut data = first;
     for (split_no, shard_path) in shard_paths.into_iter().enumerate().skip(1) {
         if !shard_path.is_file() {
             return Err(invalid_gguf_shards(format!(
@@ -260,8 +365,7 @@ fn load_gguf_shards(
                 shard_path.display()
             )));
         }
-        let shard_metadata = GgufMetadata::from_file(&shard_path)?;
-        let shard = Gguf::load_device(&shard_path, stream)?;
+        let (shard, shard_metadata) = load_one_gguf(&shard_path)?;
         let actual_split_no =
             required_gguf_split_value(&shard_metadata, GGUF_SPLIT_NO, &shard_path)?;
         if actual_split_no != split_no {
@@ -278,7 +382,7 @@ fn load_gguf_shards(
                 )));
             }
         }
-        for (name, value) in shard.data()? {
+        for (name, value) in shard {
             if data.insert(name.clone(), value).is_some() {
                 return Err(invalid_gguf_shards(format!(
                     "tensor {name:?} is duplicated across GGUF shards"
@@ -296,6 +400,116 @@ fn load_gguf_shards(
 
     let metadata = with_metadata.then(|| first_metadata.into_inner());
     Ok((data, metadata))
+}
+
+fn load_one_gguf(path: &Path) -> Result<(HashMap<String, Array>, GgufMetadata), IoError> {
+    if !path.is_file() {
+        return Err(IoError::NotFile);
+    }
+    if !path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(IoError::UnsupportedFormat);
+    }
+    let mut reader = safemlx_gguf::Reader::open(path)
+        .map_err(|e| IoError::InvalidGguf(format!("{}: {e}", path.display())))?;
+    let metadata = reader
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let descriptors = reader.tensors().to_vec();
+    let mut arrays = HashMap::new();
+    for descriptor in descriptors {
+        let converted = reader.read_tensor(&descriptor).map_err(|e| {
+            IoError::InvalidGguf(format!(
+                "{} tensor {:?}: {e}",
+                path.display(),
+                descriptor.name
+            ))
+        })?;
+        match converted {
+            safemlx_gguf::ConvertedTensor::Dense(dense) => {
+                let shape = mlx_shape_i32(&descriptor.name, &dense.shape)?;
+                let dtype = match dense.dtype {
+                    safemlx_gguf::DenseDtype::F32 => Dtype::Float32,
+                    safemlx_gguf::DenseDtype::F16 => Dtype::Float16,
+                    safemlx_gguf::DenseDtype::Bf16 => Dtype::Bfloat16,
+                    safemlx_gguf::DenseDtype::I8 => Dtype::Int8,
+                    safemlx_gguf::DenseDtype::I16 => Dtype::Int16,
+                    safemlx_gguf::DenseDtype::I32 => Dtype::Int32,
+                    safemlx_gguf::DenseDtype::I64 => Dtype::Int64,
+                    safemlx_gguf::DenseDtype::F64 => Dtype::Float64,
+                };
+                let array =
+                    unsafe { Array::from_raw_data(dense.data.as_ptr().cast(), &shape, dtype) };
+                if arrays.insert(descriptor.name.clone(), array).is_some() {
+                    return Err(IoError::InvalidGguf(format!(
+                        "duplicate tensor {:?}",
+                        descriptor.name
+                    )));
+                }
+            }
+            safemlx_gguf::ConvertedTensor::Affine(affine) => {
+                let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
+                let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
+                let weight = unsafe {
+                    Array::from_raw_data(
+                        affine.weights.as_ptr().cast(),
+                        &weight_shape,
+                        Dtype::Uint32,
+                    )
+                };
+                let scales = unsafe {
+                    Array::from_raw_data(
+                        affine.scales.as_ptr().cast(),
+                        &scale_shape,
+                        Dtype::Float16,
+                    )
+                };
+                let biases = unsafe {
+                    Array::from_raw_data(
+                        affine.biases.as_ptr().cast(),
+                        &scale_shape,
+                        Dtype::Float16,
+                    )
+                };
+                let prefix = descriptor.name.strip_suffix(".weight").ok_or_else(|| {
+                    IoError::InvalidGguf(format!(
+                        "quantized tensor {:?} must end in .weight",
+                        descriptor.name
+                    ))
+                })?;
+                for (name, array) in [
+                    (descriptor.name.clone(), weight),
+                    (format!("{prefix}.scales"), scales),
+                    (format!("{prefix}.biases"), biases),
+                ] {
+                    if arrays.insert(name.clone(), array).is_some() {
+                        return Err(IoError::InvalidGguf(format!(
+                            "generated tensor name {name:?} is duplicated"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok((arrays, metadata))
+}
+
+fn mlx_shape_i32(name: &str, shape: &[u64]) -> Result<Vec<i32>, IoError> {
+    shape
+        .iter()
+        .map(|&v| {
+            i32::try_from(v).map_err(|_| {
+                IoError::InvalidGguf(format!(
+                    "tensor {name:?} dimension {v} exceeds MLX i32 shape limits"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn gguf_tensor_count(data: &HashMap<String, Array>) -> usize {
@@ -419,14 +633,14 @@ fn invalid_gguf_shards(message: impl Into<String>) -> IoError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ops::GgufMetadataValue, transforms::eval, Array};
-    use std::ffi::CString;
+    use crate::{ops::GgufMetadataValue, Array};
     use std::path::Path;
 
     fn gguf_test_stream() -> crate::Stream {
         crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_gguf_shard(
         path: &Path,
         tensor_name: &str,
@@ -439,57 +653,19 @@ mod tests {
     ) {
         let tensor =
             Array::arange::<_, f32>(Some(tensor_value), tensor_value + 1.0, None, stream).unwrap();
-        let scalar_i32 = |value| {
-            Array::arange::<_, i32>(Some(value), value + 1, None, stream)
-                .unwrap()
-                .squeeze(stream)
-                .unwrap()
-        };
-        let split_no_value = scalar_i32(i32::from(split_no));
-        let split_count_value = scalar_i32(i32::from(split_count));
-        let total_tensors_value = scalar_i32(total_tensors);
-        stream.synchronize().unwrap();
-
-        unsafe {
-            let gguf = safemlx_sys::mlx_io_gguf_new();
-            for (key, value) in [
-                ("split.no", &split_no_value),
-                ("split.count", &split_count_value),
-                ("split.tensors.count", &total_tensors_value),
-            ] {
-                let key = CString::new(key).unwrap();
-                assert_eq!(
-                    safemlx_sys::mlx_io_gguf_set_metadata_array(gguf, key.as_ptr(), value.as_ptr(),),
-                    0
-                );
-            }
-            let tensor_name = CString::new(tensor_name).unwrap();
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_array(gguf, tensor_name.as_ptr(), tensor.as_ptr(),),
-                0
-            );
-            let name_key = CString::new("general.name").unwrap();
-            let name = CString::new(name).unwrap();
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_metadata_string(
-                    gguf,
-                    name_key.as_ptr(),
-                    name.as_ptr(),
-                ),
-                0
-            );
-            let path = CString::new(path.to_str().unwrap()).unwrap();
-            let status = safemlx_sys::mlx_save_gguf(path.as_ptr(), gguf);
-            assert_eq!(
-                status,
-                0,
-                "{}",
-                crate::error::get_and_clear_last_mlx_error()
-                    .map(|error| error.what)
-                    .unwrap_or_else(|| "GGUF save failed without an MLX error".into())
-            );
-            assert_eq!(safemlx_sys::mlx_io_gguf_free(gguf), 0);
-        }
+        let metadata = std::collections::HashMap::from([
+            ("split.no".into(), GgufMetadataValue::Uint16(split_no)),
+            ("split.count".into(), GgufMetadataValue::Uint16(split_count)),
+            (
+                "split.tensors.count".into(),
+                GgufMetadataValue::Int32(total_tensors),
+            ),
+            (
+                "general.name".into(),
+                GgufMetadataValue::String(name.into()),
+            ),
+        ]);
+        Array::save_gguf([(tensor_name, &tensor)], Some(&metadata), path).unwrap();
     }
 
     #[test]
@@ -553,54 +729,21 @@ mod tests {
         let tensor = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
             .copy(&stream)
             .unwrap();
-        let answer = Array::from(42i32).copy(&stream).unwrap();
-        eval([&tensor, &answer]).unwrap();
-
-        unsafe {
-            let gguf = safemlx_sys::mlx_io_gguf_new();
-            let tensor_key = CString::new("tensor").unwrap();
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_array(gguf, tensor_key.as_ptr(), tensor.as_ptr()),
-                0
-            );
-            let answer_key = CString::new("answer").unwrap();
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_metadata_array(
-                    gguf,
-                    answer_key.as_ptr(),
-                    answer.as_ptr(),
-                ),
-                0
-            );
-            let name_key = CString::new("general.name").unwrap();
-            let name = CString::new("tiny model").unwrap();
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_metadata_string(
-                    gguf,
-                    name_key.as_ptr(),
-                    name.as_ptr(),
-                ),
-                0
-            );
-            let tags_key = CString::new("general.tags").unwrap();
-            let tags = [CString::new("one").unwrap(), CString::new("two").unwrap()];
-            let mut tag_ptrs = tags.iter().map(|tag| tag.as_ptr()).collect::<Vec<_>>();
-            let tag_vector =
-                safemlx_sys::mlx_vector_string_new_data(tag_ptrs.as_mut_ptr(), tag_ptrs.len());
-            assert_eq!(
-                safemlx_sys::mlx_io_gguf_set_metadata_vector_string(
-                    gguf,
-                    tags_key.as_ptr(),
-                    tag_vector,
-                ),
-                0
-            );
-            assert_eq!(safemlx_sys::mlx_vector_string_free(tag_vector), 0);
-
-            let path = CString::new(path.to_str().unwrap()).unwrap();
-            assert_eq!(safemlx_sys::mlx_save_gguf(path.as_ptr(), gguf), 0);
-            assert_eq!(safemlx_sys::mlx_io_gguf_free(gguf), 0);
-        }
+        let metadata = std::collections::HashMap::from([
+            ("answer".into(), GgufMetadataValue::Int32(42)),
+            (
+                "general.name".into(),
+                GgufMetadataValue::String("tiny model".into()),
+            ),
+            (
+                "general.tags".into(),
+                GgufMetadataValue::Array(crate::ops::GgufMetadataArray::String(vec![
+                    "one".into(),
+                    "two".into(),
+                ])),
+            ),
+        ]);
+        Array::save_gguf([("tensor", &tensor)], Some(&metadata), &path).unwrap();
 
         let (arrays, metadata) = Array::load_gguf_with_metadata(&path, &stream).unwrap();
         assert_eq!(arrays["tensor"].shape(), &[2, 2]);
@@ -619,6 +762,69 @@ mod tests {
             }
             value => panic!("unexpected tags metadata: {value:?}"),
         }
+    }
+
+    #[test]
+    fn test_load_quantized_gguf_without_mlx_gguf() {
+        let stream = gguf_test_stream();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("quantized.gguf");
+        let formats = [
+            ("q4_0.weight", safemlx_gguf::GgmlType::Q4_0),
+            ("q4_1.weight", safemlx_gguf::GgmlType::Q4_1),
+            ("q8_0.weight", safemlx_gguf::GgmlType::Q8_0),
+            ("q2_k.weight", safemlx_gguf::GgmlType::Q2K),
+            ("q3_k.weight", safemlx_gguf::GgmlType::Q3K),
+            ("q4_k.weight", safemlx_gguf::GgmlType::Q4K),
+            ("q5_k.weight", safemlx_gguf::GgmlType::Q5K),
+            ("q6_k.weight", safemlx_gguf::GgmlType::Q6K),
+            ("q5_0_legacy", safemlx_gguf::GgmlType::Q5_0),
+            ("q5_1_legacy", safemlx_gguf::GgmlType::Q5_1),
+        ];
+        let payloads = formats
+            .iter()
+            .map(|(_, ty)| vec![0; ty.block_and_bytes().unwrap().1 as usize])
+            .collect::<Vec<_>>();
+        let dimensions = formats
+            .iter()
+            .map(|(_, ty)| [ty.block_and_bytes().unwrap().0])
+            .collect::<Vec<_>>();
+        let inputs = formats
+            .iter()
+            .zip(&payloads)
+            .zip(&dimensions)
+            .map(
+                |(((name, ty), data), dimensions)| safemlx_gguf::TensorInput {
+                    name,
+                    dimensions,
+                    ggml_type: *ty,
+                    data,
+                },
+            )
+            .collect::<Vec<_>>();
+        safemlx_gguf::Writer::default()
+            .write(
+                std::fs::File::create(&path).unwrap(),
+                &std::collections::BTreeMap::new(),
+                &inputs,
+            )
+            .unwrap();
+        let arrays = Array::load_gguf(&path, &stream).unwrap();
+        for (name, _) in &formats[..8] {
+            let prefix = name.strip_suffix(".weight").unwrap();
+            assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint32);
+            assert_eq!(
+                arrays[&format!("{prefix}.scales")].dtype(),
+                crate::Dtype::Float16
+            );
+            assert_eq!(
+                arrays[&format!("{prefix}.biases")].dtype(),
+                crate::Dtype::Float16
+            );
+        }
+        assert_eq!(arrays["q5_0_legacy"].dtype(), crate::Dtype::Float16);
+        assert_eq!(arrays["q5_1_legacy"].dtype(), crate::Dtype::Float16);
+        assert_eq!(arrays.len(), 26);
     }
 
     #[test]

@@ -1444,109 +1444,6 @@ extern "C" {
     #[doc = " Free IO writer.\n\n Note that MLX arrays are lazily evaluated, so the underlying object may\n be not freed right away. The ``free()`` callback from ``mlx_io_vtable``\n will be called when the underlying object is actually freed."]
     pub fn mlx_io_writer_free(io: mlx_io_writer) -> ::std::os::raw::c_int;
 }
-#[doc = " A MLX GGUF object."]
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct mlx_io_gguf_ {
-    pub ctx: *mut ::std::os::raw::c_void,
-}
-#[doc = " A MLX GGUF object."]
-pub type mlx_io_gguf = mlx_io_gguf_;
-extern "C" {
-    pub fn mlx_io_gguf_new() -> mlx_io_gguf;
-}
-extern "C" {
-    pub fn mlx_io_gguf_free(io: mlx_io_gguf) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_keys(
-        keys: *mut mlx_vector_string,
-        io: mlx_io_gguf,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_metadata_keys(
-        keys: *mut mlx_vector_string,
-        io: mlx_io_gguf,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_array(
-        arr: *mut mlx_array,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_metadata_array(
-        arr: *mut mlx_array,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_metadata_string(
-        str_: *mut mlx_string,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_get_metadata_vector_string(
-        vstr: *mut mlx_vector_string,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_has_metadata_array(
-        flag: *mut bool,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_has_metadata_string(
-        flag: *mut bool,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_has_metadata_vector_string(
-        flag: *mut bool,
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_set_array(
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-        arr: mlx_array,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_set_metadata_array(
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-        marr: mlx_array,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_set_metadata_string(
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-        mstr: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_io_gguf_set_metadata_vector_string(
-        io: mlx_io_gguf,
-        key: *const ::std::os::raw::c_char,
-        mvstr: mlx_vector_string,
-    ) -> ::std::os::raw::c_int;
-}
 pub const mlx_compile_mode__MLX_COMPILE_MODE_DISABLED: mlx_compile_mode_ = 0;
 pub const mlx_compile_mode__MLX_COMPILE_MODE_NO_SIMPLIFY: mlx_compile_mode_ = 1;
 pub const mlx_compile_mode__MLX_COMPILE_MODE_NO_FUSE: mlx_compile_mode_ = 2;
@@ -2224,13 +2121,6 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn mlx_load_gguf(
-        gguf: *mut mlx_io_gguf,
-        file: *const ::std::os::raw::c_char,
-        s: mlx_stream,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
     pub fn mlx_load_safetensors_reader(
         res_0: *mut mlx_map_string_to_array,
         res_1: *mut mlx_map_string_to_string,
@@ -2251,12 +2141,6 @@ extern "C" {
 }
 extern "C" {
     pub fn mlx_save(file: *const ::std::os::raw::c_char, a: mlx_array) -> ::std::os::raw::c_int;
-}
-extern "C" {
-    pub fn mlx_save_gguf(
-        file: *const ::std::os::raw::c_char,
-        gguf: mlx_io_gguf,
-    ) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn mlx_save_safetensors_writer(

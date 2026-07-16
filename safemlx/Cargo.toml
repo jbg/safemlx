@@ -21,6 +21,7 @@ targets = [
 ]
 
 [dependencies]
+safemlx-gguf.workspace = true
 safemlx-sys = { workspace = true, default-features = false }
 safemlx-internal-macros.workspace = true
 safemlx-macros.workspace = true

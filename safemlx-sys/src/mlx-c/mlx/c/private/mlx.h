@@ -7,7 +7,6 @@
 #include "mlx/c/private/distributed_group.h"
 #include "mlx/c/private/enums.h"
 #include "mlx/c/private/export.h"
-#include "mlx/c/private/gguf.h"
 #include "mlx/c/private/graph_utils.h"
 #include "mlx/c/private/io.h"
 #include "mlx/c/private/map.h"

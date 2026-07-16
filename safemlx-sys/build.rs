@@ -217,6 +217,7 @@ fn build_and_link_mlx_c(out_path: &Path) {
     );
     config.define("BUILD_SHARED_LIBS", "OFF");
     config.define("MLX_C_BUILD_EXAMPLES", "OFF");
+    config.define("MLX_BUILD_GGUF", "OFF");
 
     if let Some(platform) = mobile_target {
         config.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
@@ -286,16 +287,8 @@ fn build_and_link_mlx_c(out_path: &Path) {
     let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
-    println!(
-        "cargo:rustc-link-search=native={}/build/_deps/mlx-build/mlx/io",
-        dst.display()
-    );
     println!("cargo:rustc-link-lib=static=mlxc");
     println!("cargo:rustc-link-lib=static=mlx");
-    // MLX links its GGUF parser privately. Static Rust consumers must name the
-    // parser archive as well because CMake's transitive link interface is not
-    // preserved when Cargo links the installed archives directly.
-    println!("cargo:rustc-link-lib=static=gguflib");
 
     if is_apple {
         println!("cargo:rustc-link-lib=c++");
@@ -316,7 +309,6 @@ fn build_and_link_mlx_c(out_path: &Path) {
         println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
 
-    #[cfg(feature = "accelerate")]
     if is_apple {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }

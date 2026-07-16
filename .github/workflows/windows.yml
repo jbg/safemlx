@@ -1,0 +1,25 @@
+name: Windows builds
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "safemlx-gguf/**"
+      - "safemlx/**"
+      - "safemlx-sys/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the pure-Rust GGUF backend
+        run: cargo test -p safemlx-gguf
+      - name: Build safemlx with native MLX GGUF disabled
+        run: cargo check -p safemlx-sys -p safemlx --all-targets --no-default-features

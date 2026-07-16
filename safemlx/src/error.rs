@@ -66,6 +66,12 @@ impl From<Infallible> for IoError {
     }
 }
 
+impl From<safemlx_gguf::Error> for IoError {
+    fn from(error: safemlx_gguf::Error) -> Self {
+        Self::InvalidGguf(error.to_string())
+    }
+}
+
 impl From<RawException> for IoError {
     #[track_caller]
     fn from(e: RawException) -> Self {

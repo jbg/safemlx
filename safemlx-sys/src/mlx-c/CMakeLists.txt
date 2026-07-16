@@ -28,6 +28,7 @@ set(MLX_BUILD_TESTS OFF)
 set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
+set(MLX_BUILD_GGUF OFF)
 
 if(MLX_C_USE_SYSTEM_MLX)
   find_package(MLX REQUIRED)
@@ -38,21 +39,6 @@ else()
     GIT_TAG v0.32.0
     PATCH_COMMAND
       ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-q5-k.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-k-quants.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-q6-k.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-q6-prefill.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-gguf-native-q2-q3-k.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-apple-mobile-platforms.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
       COMMAND ${CMAKE_COMMAND}
