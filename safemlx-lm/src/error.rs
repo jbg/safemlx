@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid runtime parallel topology, tensor placement, or partition request.
+    #[error("parallel placement error: {0}")]
+    Parallel(String),
+
     /// Invalid or unsupported checkpoint quantization request.
     #[error("checkpoint quantization error: {0}")]
     Quantization(String),

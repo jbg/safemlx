@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::{
     error::Error,
-    models::{moshi, personaplex, ModelLoadOptions},
+    models::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -207,6 +207,7 @@ pub fn load_model_with_options(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedRealtimeModel, Error> {
+    ensure_executable_load_options(options)?;
     match realtime_model_kind(&model_dir)? {
         RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::Moshi(match options.quantization {
             Some(quantization) => {

@@ -88,6 +88,72 @@ currently handled.
 safemlx-lm = { version = "0.4", features = ["image-processing"] }
 ```
 
+### Rank-aware checkpoint placement
+
+Runtime parallel topology is configured independently of a model's
+`config.json`. `ParallelTopology` uses pipeline-major, tensor, then expert rank
+ordering (expert is the fastest-changing coordinate). The process-local device
+index is always explicit: a global rank identifies a process in the distributed
+group and must not be reused as a local GPU index.
+
+```rust,ignore
+use safemlx::{distributed::{self, Backend}, DeviceType, Stream};
+use safemlx_lm::{
+    parallel::load_safetensors_partition_on_streams,
+    weights::StrictLoadConfig,
+    DeviceAssignment, ModelLoadOptions, ParallelTopology, PlacementPlan,
+};
+
+let group = distributed::init(true, Backend::Ring)?;
+let topology = ParallelTopology::from_group(
+    &group,
+    2, // tensor-parallel size
+    1, // pipeline-parallel size
+    1, // expert-parallel size
+    DeviceAssignment::new(DeviceType::Gpu, local_device_index),
+)?;
+let stream = Stream::new_with_device(&topology.device.device()?);
+
+let mut plan = PlacementPlan::new(topology);
+plan.insert_tensor_parallel("model.layers.0.self_attn.q_proj.weight", 0);
+let partition = load_safetensors_partition_on_streams(
+    model_dir,
+    &plan,
+    cpu_weights_stream,
+    &stream,
+    &StrictLoadConfig::default(),
+)?;
+
+// Shared dispatch also carries the snapshot, including quantization options.
+let options = ModelLoadOptions::default().with_parallel_topology(topology);
+```
+
+Indexed safetensors placement is resolved before payload files are opened, so
+remote-only shards are skipped. Selected tensor views are sliced before their
+final execution-stream copy and evaluated while the mmap is alive. Strict
+validation still rejects missing local tensors, malformed local shapes, and
+unexpected checkpoint tensors; explicitly omitted remote tensors are scoped out
+without weakening ordinary strict loading. Quantized weight/scales/biases can be
+registered together with `PlacementPlan::insert_quantized_companions`.
+
+A checkpoint's DeepSeek `ep_size` remains checkpoint layout/compatibility
+metadata and retains its existing validation. Runtime
+`expert_parallel_size` only describes this inference job; it does not override
+or reinterpret the checkpoint field.
+
+This phase provides rank-aware loading and placement, not distributed forward
+execution. Non-singleton `ModelLoadOptions` therefore return a capability error
+from the ordinary executable `Model` loader; use the explicit `RankPartition`
+artifact until pipeline communication, tensor-parallel layers, and expert token
+routing are implemented.
+
+The two-process Ring proof is opt-in:
+
+```sh
+cargo test -p safemlx-lm --test distributed_partition_ring \
+  ring_two_process_partition_load -- --ignored --exact --nocapture
+```
+
 Dense safetensors checkpoints and unquantized F32/F16/BF16 GGUF checkpoints can be affine- or
 MXFP4-quantized while loading through the same architecture-dispatched API used for ordinary
 loading:

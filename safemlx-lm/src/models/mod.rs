@@ -24,6 +24,7 @@ use tokenizers::Tokenizer;
 use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
 use crate::models::common::generation::CausalLm;
+use crate::parallel::ParallelTopology;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::WeightQuantization;
@@ -152,6 +153,13 @@ pub enum ModelKind {
 pub struct ModelLoadOptions {
     /// Optional MLX weight encoding requested during dense checkpoint loading.
     pub quantization: Option<WeightQuantization>,
+    /// Optional validated runtime topology and process-local device assignment.
+    ///
+    /// Singleton topologies preserve normal model loading. Non-replicated
+    /// topologies must currently be loaded with
+    /// [`crate::parallel::load_safetensors_partition`], because distributed
+    /// forward execution is not implemented yet.
+    pub parallel: Option<ParallelTopology>,
 }
 
 impl ModelLoadOptions {
@@ -159,7 +167,32 @@ impl ModelLoadOptions {
     pub fn with_quantization(quantization: impl Into<WeightQuantization>) -> Self {
         Self {
             quantization: Some(quantization.into()),
+            parallel: None,
         }
+    }
+
+    /// Adds a validated runtime parallel topology to these options.
+    pub fn with_parallel_topology(mut self, topology: ParallelTopology) -> Self {
+        self.parallel = Some(topology);
+        self
+    }
+
+    /// Creates load options for a validated runtime parallel topology.
+    pub fn with_parallel(topology: ParallelTopology) -> Self {
+        Self::default().with_parallel_topology(topology)
+    }
+}
+
+pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Result<(), Error> {
+    if options
+        .parallel
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        Err(Error::Parallel(
+            "non-replicated loading cannot return an executable Model yet; build a PlacementPlan and use parallel::load_safetensors_partition (distributed forward execution is a later phase)".into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -845,6 +878,7 @@ impl LoadedModel {
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
+        ensure_executable_load_options(options)?;
         if is_gguf_file(model_dir) {
             let sidecar_dir = gguf_sidecar_dir(model_dir);
             let LoadedGgufModel {
@@ -1400,6 +1434,7 @@ pub fn load_model_with_options(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    ensure_executable_load_options(options)?;
     if is_gguf_file(model_dir) {
         return Ok(load_gguf_model_data(model_dir, false, options, stream, weights_stream)?.model);
     }
@@ -1420,6 +1455,7 @@ fn load_model_for_kind(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    ensure_executable_load_options(options)?;
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
         return match kind {

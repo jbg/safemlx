@@ -1,4 +1,10 @@
-use std::{borrow::Borrow, collections::HashMap, hash::Hash, path::Path, rc::Rc};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    path::Path,
+    rc::Rc,
+};
 
 use crate::{
     error::{Exception, IoError},
@@ -292,6 +298,53 @@ pub trait ModuleParametersExt: ModuleParameters {
         self.eval()
     }
 
+    /// Copy and evaluate only the named module parameters on the given stream.
+    ///
+    /// This is the selective counterpart to [`Self::copy_to_stream`] for
+    /// rank-aware loaders. Unknown names are rejected before any copy occurs,
+    /// and parameters outside `names` are never evaluated or copied.
+    fn copy_parameters_to_stream<I, S>(
+        &mut self,
+        names: I,
+        stream: impl AsRef<Stream>,
+    ) -> Result<(), Exception>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let names = names
+            .into_iter()
+            .map(|name| name.as_ref().to_string())
+            .collect::<HashSet<_>>();
+        let stream = stream.as_ref();
+        {
+            let params = self.parameters().flatten();
+            if let Some(missing) = names
+                .iter()
+                .find(|name| !params.contains_key(name.as_str()))
+            {
+                return Err(Exception::custom(format!(
+                    "unknown module parameter selected for stream copy: {missing}"
+                )));
+            }
+        }
+        {
+            let mut params = self.parameters_mut().flatten();
+            for name in &names {
+                let param = params
+                    .get_mut(name.as_str())
+                    .expect("parameter selection was validated");
+                **param = param.copy(stream)?;
+            }
+        }
+        let params = self.parameters().flatten();
+        crate::transforms::eval(
+            names
+                .iter()
+                .map(|name| *params.get(name.as_str()).expect("parameter was validated")),
+        )
+    }
+
     /// Save module parameters to a file in `safetensors` format.
     fn save_safetensors(&self, path: impl AsRef<Path>) -> Result<(), IoError> {
         let params = self.parameters().flatten();
@@ -301,3 +354,41 @@ pub trait ModuleParametersExt: ModuleParameters {
 }
 
 impl<T: ModuleParameters> ModuleParametersExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{macros::ModuleParameters, module::Param, Device, DeviceType};
+
+    #[derive(ModuleParameters)]
+    #[module(root = crate)]
+    struct TwoParameters {
+        #[param]
+        local: Param<Array>,
+        #[param]
+        remote: Param<Array>,
+    }
+
+    #[test]
+    fn selective_stream_copy_does_not_touch_unselected_parameters() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let mut module = TwoParameters {
+            local: Param::new(Array::from_slice(&[1i32, 2], &[2])),
+            remote: Param::new(Array::from_slice(&[3i32, 4], &[2])),
+        };
+        let local_before = module.local.as_ptr().ctx;
+        let remote_before = module.remote.as_ptr().ctx;
+        module
+            .copy_parameters_to_stream(["local"], &stream)
+            .unwrap();
+        assert_ne!(module.local.as_ptr().ctx, local_before);
+        assert_eq!(module.remote.as_ptr().ctx, remote_before);
+
+        let local_after = module.local.as_ptr().ctx;
+        assert!(module
+            .copy_parameters_to_stream(["does_not_exist"], &stream)
+            .is_err());
+        assert_eq!(module.local.as_ptr().ctx, local_after);
+        assert_eq!(module.remote.as_ptr().ctx, remote_before);
+    }
+}

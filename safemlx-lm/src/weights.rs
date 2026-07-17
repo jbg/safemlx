@@ -61,7 +61,7 @@ impl StrictLoadConfig {
         self
     }
 
-    fn is_unused_allowed(&self, key: &str) -> bool {
+    pub(crate) fn is_unused_allowed(&self, key: &str) -> bool {
         self.allowed_unused_prefixes
             .iter()
             .any(|prefix| key.starts_with(prefix))
@@ -452,6 +452,7 @@ pub fn load_safetensors_dir_lenient<M: ModuleParameters>(
 /// Hugging Face safetensors index file.
 pub struct WeightMap {
     /// Index metadata.
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
     /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,

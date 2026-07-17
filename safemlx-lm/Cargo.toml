@@ -49,3 +49,4 @@ rustfft = { version = "6", optional = true }
 
 [dev-dependencies]
 lazy_static = "1"
+tempfile.workspace = true

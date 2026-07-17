@@ -20,6 +20,8 @@ pub mod inspection;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;
+/// Runtime parallel topology, tensor placement plans, and selective checkpoint loading.
+pub mod parallel;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;
@@ -37,6 +39,9 @@ pub mod weights;
 pub use models::{
     check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
     ModelLoadOptions, SupportedModelConfig,
+};
+pub use parallel::{
+    DeviceAssignment, ParallelTopology, PlacementPlan, RankPartition, TensorPlacement,
 };
 pub use realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
