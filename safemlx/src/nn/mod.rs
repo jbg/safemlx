@@ -9,6 +9,7 @@ mod activation;
 mod container;
 mod convolution;
 mod convolution_transpose;
+pub mod distributed;
 mod dropout;
 mod embedding;
 mod init;

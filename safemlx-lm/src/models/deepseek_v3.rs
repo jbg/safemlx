@@ -1714,6 +1714,34 @@ impl DecoderLayer {
         let mut observer = None;
         self.forward_impl(x, mask, cache, stream, "", &mut observer)
     }
+
+    /// Executes a rank-local tensor-parallel block.
+    ///
+    /// The layer must have head/intermediate projections constructed with
+    /// local dimensions and row projections loaded with input-axis shards.
+    /// Attention and feed-forward residual deltas are reduced exactly once.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let mut observer = None;
+        let attention =
+            self.self_attn
+                .forward_impl(&normalized, mask, cache, stream, "", &mut observer)?;
+        let attention = safemlx::distributed::all_sum(&attention, group, stream)?;
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = self
+            .mlp
+            .forward_impl(&normalized, stream, "", &mut observer)?;
+        let feed_forward = safemlx::distributed::all_sum(&feed_forward, group, stream)?;
+        hidden.add(feed_forward, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]

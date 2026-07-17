@@ -33,6 +33,8 @@ pub mod quantization;
 pub mod realtime;
 /// Token sampling strategies.
 pub mod sampler;
+/// Executable pure tensor-parallel model loading and inference.
+pub mod tensor_parallel;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
 pub mod utils;
 /// Strict safetensors loading and validation utilities.

@@ -168,9 +168,9 @@ the same two collectives for the small token id and EOS/stop flag. Other ranks
 never mutate sampler or PRNG state and only the last rank should print text.
 
 There is currently no microbatch overlap, so prefill and decode latency include
-all stages in series. Pipeline training/backward, multimodal models, distributed
-cache sharding, tensor-parallel linear layers, expert token dispatch, and
-pipeline GGUF are not supported.
+all stages in series. Pipeline training/backward, multimodal models, expert
+token dispatch, hybrid pipeline/tensor execution, and pipeline GGUF are not
+supported.
 
 A checkpoint's DeepSeek `ep_size` remains checkpoint layout/compatibility
 metadata and retains its existing validation. Runtime
@@ -189,6 +189,68 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring \
 See `cargo run -p safemlx-lm --example pipeline_generate -- MODEL_DIR` for the
 minimal rank-aware prefill/decode probe. Launch one process per stage with the
 Ring environment (`MLX_RANK` and `MLX_HOSTFILE`) configured for all processes.
+
+### Executable tensor parallelism
+
+Pure tensor parallelism uses `TP > 1`, `PP = 1`, and `EP = 1`. Hybrid TP+PP
+and TP+EP configurations fail before checkpoint payloads are opened because
+Ring and JACCL cannot reliably form the required subgroups in the vendored MLX
+version. Use `tensor_parallel::load_tensor_parallel_model` with a topology
+whose tensor size equals the world size.
+
+All-to-sharded (column-parallel) projections take a complete replicated input,
+shard weight/output rows, and keep the output local without communication.
+Sharded-to-all (row-parallel) projections take a final-feature input shard,
+compute a full-width partial result, all-sum it, and add ordinary linear bias
+once after reduction. Affine quantization `biases` are per-group metadata and
+stay with their packed weight shards; they are distinct from ordinary linear
+bias. Row partitions must align with the affine group, the MXFP4 32-value
+group, or DeepSeek's 128-by-128 block-FP8 grid.
+
+Llama Q/K/V and gate/up outputs are sharded. RoPE, attention, SiLU, and the
+gated product remain local; only attention output and MLP down projections
+all-sum. Query heads, KV heads, and intermediate width must divide TP, and the
+local query/KV ratio must preserve GQA. Each cache contains only local K/V
+heads, including bounded sliding-window caches.
+
+DeepSeek keeps Q-LoRA input, compressed KV latent projection/normalization,
+and routing replicated. Head-expanded MLA projections use contiguous head
+shards, while output projection all-sums once. Compressed-latent caches remain
+rank-local and work for both prefill and absorbed decode. Routed and shared
+experts retain all expert identities on each rank but shard their intermediate
+dimension; their combined residual delta is all-summed once.
+
+Embedding and output rows use balanced contiguous vocabulary ranges, including
+uneven vocabulary sizes. Embedding masks out non-local ids then all-sums hidden
+states. `forward_local_logits` returns the local range; `forward`, `prefill`,
+and `decode` pad and gather shards along the final logits axis. Sampling occurs
+only on the designated rank, which alone mutates sampler/PRNG state, and only
+the selected token and stop flag are synchronized.
+
+Rank-aware safetensors selection happens before execution-device
+materialization. Indexed payload shards with no local tensors are not opened.
+Dense, MLX affine/MXFP4, DeepSeek native block-FP8, official split-expert, and
+local on-load quantization paths are supported subject to alignment. TP GGUF is
+rejected early because its reader cannot guarantee bounded local-range loads.
+
+Ring is useful for correctness testing. Practical low-latency TP should use
+JACCL or NCCL where available. Run the collective proof with:
+
+```sh
+cargo test -p safemlx --test distributed_ring \
+  ring_two_process_loopback -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
+  ring_two_process_tensor_parallel -- --ignored --exact --nocapture
+```
+
+The model-level probe is:
+
+```sh
+cargo run -p safemlx-lm --example tensor_parallel_generate -- MODEL_DIR
+```
+
+Launch every rank with the same token input and configured `MLX_RANK` and
+`MLX_HOSTFILE`; only rank zero prints generated tokens in the example.
 
 Dense safetensors checkpoints and unquantized F32/F16/BF16 GGUF checkpoints can be affine- or
 MXFP4-quantized while loading through the same architecture-dispatched API used for ordinary

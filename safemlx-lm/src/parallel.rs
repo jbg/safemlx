@@ -15,6 +15,7 @@ use std::{
 use memmap2::MmapOptions;
 use safemlx::{
     distributed::{self, Group},
+    ops::indexing::TryIndexOp,
     transforms::eval,
     Array, Device, DeviceType, Stream,
 };
@@ -342,6 +343,18 @@ pub enum TensorPlacement {
         /// Total shard count.
         parts: usize,
     },
+    /// Materialize an explicit contiguous source-tensor range.
+    ///
+    /// Unlike [`Self::Shard`], ranges may be uneven. They are intended for
+    /// balanced vocabulary partitions and other validated nonuniform layouts.
+    Range {
+        /// Source tensor axis being sliced.
+        axis: usize,
+        /// Inclusive element offset on `axis`.
+        start: usize,
+        /// Exclusive element offset on `axis`.
+        end: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +456,30 @@ impl PlacementPlan {
         );
     }
 
+    /// Adds this rank's balanced tensor-parallel range on `axis`.
+    pub fn insert_balanced_tensor_parallel(
+        &mut self,
+        target: impl Into<String>,
+        axis: usize,
+        dimension: usize,
+    ) -> Result<Range<usize>, Error> {
+        let range = balanced_contiguous_range(
+            dimension,
+            self.topology.tensor_parallel_size,
+            self.topology.tensor_parallel_rank,
+            false,
+        )?;
+        self.insert(
+            target,
+            TensorPlacement::Range {
+                axis,
+                start: range.start,
+                end: range.end,
+            },
+        );
+        Ok(range)
+    }
+
     /// Returns an explicit tensor placement by rewritten target name.
     pub fn placement(&self, target: &str) -> Option<&TensorPlacement> {
         self.tensors.get(target).map(|plan| &plan.placement)
@@ -517,6 +554,9 @@ fn validate_plan_entry(plan: &TensorPlan, topology: ParallelTopology) -> Result<
                 "tensor shard index {index} is invalid for {parts} parts"
             )))
         }
+        TensorPlacement::Range { start, end, .. } if start >= end => Err(Error::Parallel(format!(
+            "tensor range {start}..{end} must be non-empty"
+        ))),
         placement => {
             if let Some(shape) = &plan.expected_source_shape {
                 validate_placement(placement, shape, topology)?;
@@ -560,6 +600,21 @@ fn validate_placement(
         TensorPlacement::Shard { axis, index, parts } => {
             TensorSlice::for_shape(shape, *axis, *index, *parts).map(|_| ())
         }
+        TensorPlacement::Range { axis, start, end } => {
+            if *axis >= shape.len() {
+                return Err(Error::Parallel(format!(
+                    "tensor range axis {axis} is outside rank {} shape {shape:?}",
+                    shape.len()
+                )));
+            }
+            if start >= end || *end > shape[*axis] {
+                return Err(Error::Parallel(format!(
+                    "tensor range {start}..{end} is invalid for dimension {} on axis {axis}",
+                    shape[*axis]
+                )));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -597,6 +652,13 @@ fn resolve_placement(
         TensorPlacement::Shard { axis, index, parts } => {
             ResolvedPlacement::Shard(TensorSlice::for_shape(shape, *axis, *index, *parts)?)
         }
+        TensorPlacement::Range { axis, start, end } => ResolvedPlacement::Shard(TensorSlice {
+            axis: *axis,
+            start: *start,
+            end: *end,
+            index: 0,
+            parts: 1,
+        }),
     })
 }
 
@@ -667,7 +729,8 @@ impl PartitionReport {
             let locally_required = match tensor.placement {
                 TensorPlacement::Replicated
                 | TensorPlacement::Local
-                | TensorPlacement::Shard { .. } => true,
+                | TensorPlacement::Shard { .. }
+                | TensorPlacement::Range { .. } => true,
                 TensorPlacement::Omit => false,
                 TensorPlacement::Rank { rank } => rank == plan.topology.global_rank,
                 TensorPlacement::PipelineStage { stage } => {
@@ -838,25 +901,22 @@ fn load_selected_shard(
             ResolvedPlacement::Shard(slice) => {
                 let source_value =
                     Array::try_from(view).map_err(|error| Error::Other(Box::new(error)))?;
-                let parts = i32::try_from(slice.parts).map_err(|_| {
-                    Error::Parallel("tensor shard count does not fit in i32".into())
-                })?;
                 let axis = i32::try_from(slice.axis)
                     .map_err(|_| Error::Parallel("tensor axis does not fit in i32".into()))?;
-                // Move the sharded axis to the front, where equal `split`
-                // produces lazy contiguous range views. Only the selected
-                // view is moved back and evaluated/copied, so other ranks'
-                // pieces do not become execution-device allocations.
+                // Move the sharded axis to the front, select only this rank's
+                // validated contiguous range, and move it back. The selected
+                // view remains lazy and local-slice-sized.
                 let front = if slice.axis == 0 {
                     source_value
                 } else {
                     source_value.move_axis(axis, 0, source_stream)?
                 };
-                let selected = front
-                    .split(parts, Some(0), source_stream)?
-                    .into_iter()
-                    .nth(slice.index)
-                    .expect("validated shard index");
+                let start = i32::try_from(slice.start).map_err(|_| {
+                    Error::Parallel("tensor slice start does not fit in i32".into())
+                })?;
+                let end = i32::try_from(slice.end)
+                    .map_err(|_| Error::Parallel("tensor slice end does not fit in i32".into()))?;
+                let selected = front.try_index_device(start..end, source_stream)?;
                 let selected = if slice.axis == 0 {
                     selected
                 } else {
@@ -1076,6 +1136,34 @@ mod tests {
         let mut invalid = PlacementPlan::new(topology(1, 0, 1, 1, 1));
         invalid.insert("bad_owner", TensorPlacement::Rank { rank: 1 });
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn plan_supports_balanced_uneven_ranges() {
+        let mut plan = PlacementPlan::new(topology(3, 2, 3, 1, 1));
+        let range = plan
+            .insert_balanced_tensor_parallel("embedding.weight", 0, 11)
+            .unwrap();
+        assert_eq!(range, 8..11);
+        assert_eq!(
+            plan.placement("embedding.weight"),
+            Some(&TensorPlacement::Range {
+                axis: 0,
+                start: 8,
+                end: 11,
+            })
+        );
+        plan.insert_expected(
+            "head.weight",
+            vec![11, 4],
+            TensorPlacement::Range {
+                axis: 0,
+                start: 8,
+                end: 11,
+            },
+        )
+        .unwrap();
+        plan.validate().unwrap();
     }
 
     #[test]

@@ -156,8 +156,8 @@ pub struct ModelLoadOptions {
     /// Optional validated runtime topology and process-local device assignment.
     ///
     /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must be loaded with [`crate::pipeline::load_pipeline_model`]
-    /// or [`crate::pipeline::load_pipeline_model_with_options`].
+    /// topologies must be loaded through the explicit [`crate::pipeline`] or
+    /// [`crate::tensor_parallel`] APIs.
     pub parallel: Option<ParallelTopology>,
 }
 
@@ -183,12 +183,27 @@ impl ModelLoadOptions {
 }
 
 pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Result<(), Error> {
-    if options
+    if let Some(topology) = options
         .parallel
-        .is_some_and(|topology| !topology.is_replicated())
+        .filter(|topology| !topology.is_replicated())
     {
         Err(Error::Parallel(
-            "non-replicated loading cannot return the complete single-device Model type; use pipeline::load_pipeline_model_with_options for executable pure pipeline parallelism".into(),
+            if topology.tensor_parallel_size > 1
+                && topology.pipeline_parallel_size == 1
+                && topology.expert_parallel_size == 1
+            {
+                "non-replicated pure tensor-parallel loading cannot return the complete Model type; use tensor_parallel::load_tensor_parallel_model_with_options"
+                    .into()
+            } else if topology.pipeline_parallel_size > 1
+                && topology.tensor_parallel_size == 1
+                && topology.expert_parallel_size == 1
+            {
+                "non-replicated pure pipeline loading cannot return the complete Model type; use pipeline::load_pipeline_model_with_options"
+                    .into()
+            } else {
+                "hybrid TP+PP, TP+EP, and PP+EP model loading is unsupported; use a pure tensor- or pipeline-parallel topology"
+                    .into()
+            },
         ))
     } else {
         Ok(())

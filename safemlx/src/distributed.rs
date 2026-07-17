@@ -22,6 +22,8 @@ use std::{ffi::c_char, marker::PhantomData, rc::Rc, str::FromStr};
 
 use crate::{
     error::{Exception, Result},
+    ops::indexing::TryIndexOp,
+    ops::{concatenate_axis, zeros_dtype},
     utils::{guard::Guarded, runtime_lock, SUCCESS},
     Array, Device, DeviceType, Dtype, Stream,
 };
@@ -284,6 +286,132 @@ pub fn all_gather(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> R
         stream.as_ref(),
         safemlx_sys::mlx_distributed_all_gather,
     )
+}
+
+/// Gather equal-shaped shards along an arbitrary existing tensor axis.
+///
+/// MLX's primitive all-gather always concatenates on axis zero. This helper
+/// moves `axis` to the front, performs the collective, and restores the
+/// original axis order without forcing evaluation.
+pub fn all_gather_axis(
+    input: &Array,
+    axis: i32,
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let ndim = input.ndim();
+    if ndim == 0 {
+        return Err(Exception::custom(
+            "axis all-gather requires a non-scalar input",
+        ));
+    }
+    let ndim_i32 =
+        i32::try_from(ndim).map_err(|_| Exception::custom("input rank does not fit in i32"))?;
+    let axis = if axis < 0 { axis + ndim_i32 } else { axis };
+    if !(0..ndim_i32).contains(&axis) {
+        return Err(Exception::custom(format!(
+            "all-gather axis {axis} is outside input rank {ndim}"
+        )));
+    }
+    if axis == 0 {
+        return all_gather(input, group, stream);
+    }
+    let front = input.move_axis(axis, 0, stream)?;
+    let gathered = all_gather(&front, group, stream)?;
+    gathered.move_axis(0, axis, stream)
+}
+
+/// Gather unequal contiguous shards along an arbitrary tensor axis.
+///
+/// `widths` contains the logical width contributed by every rank, in group
+/// rank order. Local shards are padded to the largest width for the primitive
+/// all-gather, then padding is removed before the original axis is restored.
+/// This is useful for balanced vocabulary partitions when the vocabulary size
+/// is not divisible by the tensor-parallel degree.
+pub fn all_gather_uneven_axis(
+    input: &Array,
+    axis: i32,
+    widths: &[usize],
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    if widths.len() != group.size() {
+        return Err(Exception::custom(format!(
+            "uneven all-gather received {} widths for group size {}",
+            widths.len(),
+            group.size()
+        )));
+    }
+    let ndim = input.ndim();
+    if ndim == 0 {
+        return Err(Exception::custom(
+            "uneven axis all-gather requires a non-scalar input",
+        ));
+    }
+    let ndim_i32 =
+        i32::try_from(ndim).map_err(|_| Exception::custom("input rank does not fit in i32"))?;
+    let axis = if axis < 0 { axis + ndim_i32 } else { axis };
+    if !(0..ndim_i32).contains(&axis) {
+        return Err(Exception::custom(format!(
+            "uneven all-gather axis {axis} is outside input rank {ndim}"
+        )));
+    }
+    let rank = group.rank();
+    let local_width = usize::try_from(input.shape()[axis as usize])
+        .map_err(|_| Exception::custom("input shape contains a negative dimension"))?;
+    if local_width != widths[rank] {
+        return Err(Exception::custom(format!(
+            "rank {rank} local width {local_width} does not match declared width {}",
+            widths[rank]
+        )));
+    }
+    let max_width = widths.iter().copied().max().unwrap_or(0);
+    if max_width == 0 {
+        return Err(Exception::custom(
+            "uneven all-gather requires at least one non-empty shard",
+        ));
+    }
+
+    let front = if axis == 0 {
+        input.clone()
+    } else {
+        input.move_axis(axis, 0, stream)?
+    };
+    let padded = if local_width == max_width {
+        front
+    } else {
+        let mut padding_shape = front.shape().to_vec();
+        padding_shape[0] = i32::try_from(max_width - local_width)
+            .map_err(|_| Exception::custom("padding width does not fit in i32"))?;
+        let padding = zeros_dtype(&padding_shape, front.dtype(), stream)?;
+        concatenate_axis(&[&front, &padding], 0, stream)?
+    };
+    let gathered = all_gather(&padded, group, stream)?;
+    let max_width_i32 = i32::try_from(max_width)
+        .map_err(|_| Exception::custom("maximum shard width does not fit in i32"))?;
+    let mut shards = Vec::with_capacity(widths.len());
+    for (rank, &width) in widths.iter().enumerate() {
+        let start = i32::try_from(rank)
+            .ok()
+            .and_then(|rank| rank.checked_mul(max_width_i32))
+            .ok_or_else(|| Exception::custom("gathered shard offset exceeds i32"))?;
+        let end = start
+            .checked_add(
+                i32::try_from(width)
+                    .map_err(|_| Exception::custom("shard width does not fit in i32"))?,
+            )
+            .ok_or_else(|| Exception::custom("gathered shard end exceeds i32"))?;
+        shards.push(gathered.try_index_device(start..end, stream)?);
+    }
+    let shard_refs = shards.iter().collect::<Vec<_>>();
+    let trimmed = concatenate_axis(&shard_refs, 0, stream)?;
+    if axis == 0 {
+        Ok(trimmed)
+    } else {
+        trimmed.move_axis(0, axis, stream)
+    }
 }
 
 /// Sum across `group` and scatter equal axis-zero chunks to each rank.

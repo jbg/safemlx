@@ -618,7 +618,7 @@ fn insert_module_plan(
     }
 }
 
-fn assign_module(
+pub(crate) fn assign_module(
     module: &mut impl ModuleParameters,
     prefix: &str,
     tensors: &mut HashMap<String, Array>,
@@ -1404,7 +1404,7 @@ impl DeepSeekStage {
     }
 }
 
-fn load_deepseek_experts(
+pub(crate) fn load_deepseek_experts(
     moe: &mut deepseek_v3::Moe,
     layer: usize,
     dimensions: (i32, i32, i32),
