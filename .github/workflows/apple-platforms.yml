@@ -35,7 +35,12 @@ jobs:
           fi
           xcodebuild -downloadComponent MetalToolchain
       - name: Test the macOS workspace
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace -- \
+            --skip cpu_stream_creation_is_concurrent_safe \
+            --skip async_eval_cpu_streams_are_concurrent_safe
+      - name: Test concurrent MLX use
+        run: cargo test --workspace concurrent_safe -- --test-threads=1
 
   target-mapping:
     runs-on: macos-15
