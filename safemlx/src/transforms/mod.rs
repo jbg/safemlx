@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn async_eval_cpu_streams_are_concurrent_safe() {
         std::thread::scope(|scope| {
-            for _ in 0..16 {
+            for _ in 0..crate::test_concurrency() {
                 scope.spawn(|| {
                     for _ in 0..64 {
                         let stream = crate::Stream::new_with_device(&crate::Device::new(

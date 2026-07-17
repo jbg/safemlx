@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn cpu_stream_creation_is_concurrent_safe() {
         std::thread::scope(|scope| {
-            for _ in 0..16 {
+            for _ in 0..crate::test_concurrency() {
                 scope.spawn(|| {
                     for _ in 0..64 {
                         let stream =

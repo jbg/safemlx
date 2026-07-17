@@ -341,6 +341,15 @@ pub(crate) fn test_key(seed: u64, stream: &Stream) -> Array {
     state.next_key(stream).unwrap()
 }
 
+#[cfg(test)]
+/// Return a capacity-aware worker count for concurrency stress tests.
+pub(crate) fn test_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(2)
+        .clamp(2, 16)
+}
+
 pub(crate) mod constants {
     /// The default length of the stack-allocated vector in `SmallVec<[T; DEFAULT_STACK_VEC_LEN]>`
     pub(crate) const DEFAULT_STACK_VEC_LEN: usize = 4;
