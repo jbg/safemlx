@@ -4,6 +4,8 @@
 //! only the component groups they use.
 
 pub mod attention;
+/// Block-scaled E4M3 projections shared by native FP8 model families.
+pub mod block_fp8;
 pub mod convolution;
 pub mod generation;
 pub mod layers;

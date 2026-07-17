@@ -41,6 +41,206 @@ pub trait KeyValueCache {
     ) -> Result<(Array, Array), Exception>;
 }
 
+const COMPRESSED_LATENT_CACHE_STEP: i32 = 256;
+
+/// Compressed attention cache that stores one latent KV vector and one rotary
+/// key vector per token, independent of the number of attention heads.
+///
+/// This representation is used by Multi-head Latent Attention (MLA). Arrays
+/// have shape `[batch, sequence, dimension]`; head-specific keys and values are
+/// reconstructed transiently by the attention implementation.
+#[derive(Debug, Clone)]
+pub struct CompressedLatentCache {
+    latent_storage: Option<Array>,
+    rotary_key_storage: Option<Array>,
+    latent: Option<Array>,
+    rotary_key: Option<Array>,
+    offset: i32,
+    length: i32,
+    capacity: i32,
+    step: i32,
+}
+
+impl Default for CompressedLatentCache {
+    fn default() -> Self {
+        Self {
+            latent_storage: None,
+            rotary_key_storage: None,
+            latent: None,
+            rotary_key: None,
+            offset: 0,
+            length: 0,
+            capacity: 0,
+            step: COMPRESSED_LATENT_CACHE_STEP,
+        }
+    }
+}
+
+impl CompressedLatentCache {
+    /// Creates an empty compressed latent cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of cached tokens.
+    pub fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    /// Returns the allocated token capacity of the backing arrays.
+    pub fn capacity(&self) -> i32 {
+        self.capacity
+    }
+
+    /// Returns the retained latent and rotary-key arrays, when initialized.
+    pub fn arrays(&self) -> Option<(&Array, &Array)> {
+        Some((self.latent.as_ref()?, self.rotary_key.as_ref()?))
+    }
+
+    /// Clears all retained state.
+    pub fn clear(&mut self) {
+        self.latent_storage = None;
+        self.rotary_key_storage = None;
+        self.latent = None;
+        self.rotary_key = None;
+        self.offset = 0;
+        self.length = 0;
+        self.capacity = 0;
+    }
+
+    fn grown_capacity(&self, required: i32) -> i32 {
+        let chunks = (required + self.step - 1) / self.step;
+        chunks * self.step
+    }
+
+    fn padded(array: &Array, capacity: i32, stream: &Stream) -> Result<Array, Exception> {
+        let mut shape = array.shape().to_vec();
+        shape[1] = capacity;
+        zeros_dtype(&shape, array.dtype(), stream)
+    }
+
+    fn refresh_logical_arrays(&mut self, stream: &Stream) -> Result<(), Exception> {
+        self.latent = Some(
+            self.latent_storage
+                .as_ref()
+                .expect("latent cache storage initialized")
+                .try_index_device((.., ..self.length, ..), stream)?,
+        );
+        self.rotary_key = Some(
+            self.rotary_key_storage
+                .as_ref()
+                .expect("rotary-key cache storage initialized")
+                .try_index_device((.., ..self.length, ..), stream)?,
+        );
+        Ok(())
+    }
+
+    /// Appends compressed states and returns the full states to attend over.
+    pub fn update_and_fetch(
+        &mut self,
+        latent: Array,
+        rotary_key: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        if latent.ndim() != 3 || rotary_key.ndim() != 3 {
+            return Err(Exception::custom(
+                "compressed latent cache expects rank-3 [batch, sequence, dimension] arrays",
+            ));
+        }
+        if latent.dim(0) != rotary_key.dim(0) || latent.dim(1) != rotary_key.dim(1) {
+            return Err(Exception::custom(
+                "compressed latent and rotary-key cache updates must share batch and sequence dimensions",
+            ));
+        }
+        if let (Some(previous_latent), Some(previous_rotary)) =
+            (&self.latent_storage, &self.rotary_key_storage)
+        {
+            if previous_latent.dim(0) != latent.dim(0)
+                || previous_latent.dim(2) != latent.dim(2)
+                || previous_rotary.dim(0) != rotary_key.dim(0)
+                || previous_rotary.dim(2) != rotary_key.dim(2)
+            {
+                return Err(Exception::custom(
+                    "compressed latent cache update dimensions do not match retained state",
+                ));
+            }
+        }
+
+        let new_tokens = latent.dim(1);
+        let required = self.length + new_tokens;
+        if self.latent_storage.is_none() {
+            self.capacity = self.grown_capacity(required);
+            if self.capacity == required {
+                self.latent_storage = Some(latent);
+                self.rotary_key_storage = Some(rotary_key);
+                self.length = required;
+                self.offset += new_tokens;
+                self.refresh_logical_arrays(stream)?;
+                return Ok((
+                    self.latent
+                        .as_ref()
+                        .expect("latent cache initialized")
+                        .clone(),
+                    self.rotary_key
+                        .as_ref()
+                        .expect("rotary-key cache initialized")
+                        .clone(),
+                ));
+            }
+            self.latent_storage = Some(Self::padded(&latent, self.capacity, stream)?);
+            self.rotary_key_storage = Some(Self::padded(&rotary_key, self.capacity, stream)?);
+        } else if required > self.capacity {
+            let new_capacity = self.grown_capacity(required);
+            let padding = new_capacity - self.capacity;
+            let latent_padding = Self::padded(&latent, padding, stream)?;
+            let rotary_padding = Self::padded(&rotary_key, padding, stream)?;
+            self.latent_storage = Some(concatenate_axis(
+                &[
+                    self.latent_storage
+                        .take()
+                        .expect("latent cache storage initialized"),
+                    latent_padding,
+                ],
+                1,
+                stream,
+            )?);
+            self.rotary_key_storage = Some(concatenate_axis(
+                &[
+                    self.rotary_key_storage
+                        .take()
+                        .expect("rotary-key cache storage initialized"),
+                    rotary_padding,
+                ],
+                1,
+                stream,
+            )?);
+            self.capacity = new_capacity;
+        }
+
+        self.latent_storage
+            .as_mut()
+            .expect("latent cache storage initialized")
+            .try_index_mut_device((.., self.length..required, ..), &latent, stream)?;
+        self.rotary_key_storage
+            .as_mut()
+            .expect("rotary-key cache storage initialized")
+            .try_index_mut_device((.., self.length..required, ..), &rotary_key, stream)?;
+        self.length = required;
+        self.offset += new_tokens;
+        self.refresh_logical_arrays(stream)?;
+        Ok((
+            self.latent
+                .as_ref()
+                .expect("latent cache initialized")
+                .clone(),
+            self.rotary_key
+                .as_ref()
+                .expect("rotary-key cache initialized")
+                .clone(),
+        ))
+    }
+}
+
 impl<T> KeyValueCache for &'_ mut T
 where
     T: KeyValueCache,

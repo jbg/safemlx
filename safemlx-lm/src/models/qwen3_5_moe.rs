@@ -3,7 +3,7 @@
 use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 
 #[cfg(not(feature = "cuda"))]
-use safemlx::fast::{MetalKernel, MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
+use safemlx::fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
 use safemlx::{
     builder::Builder,
     error::Exception,
@@ -11,8 +11,8 @@ use safemlx::{
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
-        arange, broadcast_to, concatenate_axis, conv1d, dequantize, exp, gather_grouped_rows,
-        gather_qmm_with_mode, grouped_matmul,
+        broadcast_to, concatenate_axis, conv1d, dequantize, exp, gather_grouped_rows,
+        grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         matmul, quantized_matmul_with_mode, quantized_packed_dimension, sigmoid, stack_axis,
         sum_axis, topk_route_plan, zeros, GgufMetadataValue, QuantizationMode,
@@ -46,7 +46,7 @@ use crate::{
         },
         input as runtime_input,
     },
-    quantization::{quantize_tensor, AffineQuantization, QuantizedTensor, WeightQuantization},
+    quantization::{AffineQuantization, QuantizedTensor, WeightQuantization},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -86,16 +86,8 @@ impl<'de> Deserialize<'de> for LayerType {
 #[cfg(not(feature = "cuda"))]
 thread_local! {
     static RECURRENT_DELTA_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
-    static FP8_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static FP8_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static FP8_GROUPED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static FP8_GROUPED_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
-#[cfg(not(feature = "cuda"))]
-const FP8_LINEAR_OUT_TILE: i32 = 16;
-#[cfg(not(feature = "cuda"))]
-const FP8_TILED_ROW_THRESHOLD: i32 = 8;
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
 #[cfg(not(feature = "cuda"))]
@@ -549,7 +541,7 @@ impl ModelArgs {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum QwenWeightFormat {
+pub(crate) enum QwenWeightFormat {
     Dense,
     Fp8,
     Affine(WeightQuantization),
@@ -564,7 +556,7 @@ impl QwenWeightFormat {
         }
     }
 
-    fn affine(self) -> Option<WeightQuantization> {
+    pub(crate) fn affine(self) -> Option<WeightQuantization> {
         match self {
             Self::Affine(affine) => Some(affine),
             Self::Dense | Self::Fp8 => None,
@@ -603,7 +595,7 @@ pub struct QwenLinear {
 }
 
 impl QwenLinear {
-    fn new(
+    pub(crate) fn new(
         input_dims: i32,
         output_dims: i32,
         bias: bool,
@@ -614,7 +606,10 @@ impl QwenLinear {
             QwenWeightFormat::Dense => (vec![output_dims, input_dims], Dtype::Float32),
             QwenWeightFormat::Fp8 => (vec![output_dims, input_dims], Dtype::Uint8),
             QwenWeightFormat::Affine(quantization) => (
-                vec![output_dims, input_dims / (32 / quantization.bits())],
+                vec![
+                    output_dims,
+                    quantized_packed_dimension(input_dims, quantization.bits()),
+                ],
                 Dtype::Uint32,
             ),
         };
@@ -666,7 +661,7 @@ impl QwenLinear {
         })
     }
 
-    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
+    pub(crate) fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         let mut output = if let Some(scales) = self.scales.as_ref() {
             quantized_matmul_with_mode(
                 input,
@@ -680,7 +675,7 @@ impl QwenLinear {
                 stream,
             )?
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            fp8_linear(input, self.weight.as_ref(), scale, stream)?
+            common::block_fp8::linear(input, self.weight.as_ref(), scale, stream)?
         } else {
             matmul(input, self.weight.as_ref().transpose(stream)?, stream)?
         };
@@ -691,379 +686,25 @@ impl QwenLinear {
     }
 
     fn training_mode(&mut self, _mode: bool) {}
-}
 
-fn fp8_linear(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    #[cfg(feature = "cuda")]
-    {
-        return fp8_linear_portable(input, weight, scale, stream);
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    {
-        let input_shape = input.shape();
-        let in_dim = input.dim(-1);
-        let out_dim = weight.dim(0);
-        let rows = (input.size() as i32) / in_dim;
-        let input = input.reshape(&[rows, in_dim], stream)?;
-        let scale_cols = scale.dim(-1);
-
-        let out = if rows <= FP8_TILED_ROW_THRESHOLD {
-            fp8_linear_tiled(
-                &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
-            )?
+    pub(crate) fn dequantized_weight(&self, stream: &Stream) -> Result<Array, Exception> {
+        if let Some(scales) = self.scales.as_ref() {
+            safemlx::ops::dequantize_with_mode(
+                self.weight.as_ref(),
+                scales,
+                self.biases.as_ref().as_ref(),
+                self.group_size,
+                self.bits,
+                self.mode,
+                stream,
+            )
+        } else if let Some(scale) = self.weight_scale_inv.as_ref() {
+            common::block_fp8::dequantize(self.weight.as_ref(), scale, stream)
         } else {
-            fp8_linear_scalar(
-                &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
-            )?
-        };
-
-        let mut output_shape = input_shape.to_vec();
-        if let Some(last) = output_shape.last_mut() {
-            *last = out_dim;
+            Ok(self.weight.as_ref().clone())
         }
-        out.reshape(&output_shape, stream)
     }
 }
-
-#[cfg(feature = "cuda")]
-fn fp8_linear_portable(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let out_dim = weight.dim(0);
-    let in_dim = weight.dim(1);
-    let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 0, stream)?;
-    let scale = Array::repeat_axis::<f32>(scale, 128, 1, stream)?;
-    let scale = scale.try_index_device((..out_dim, ..in_dim), stream)?;
-    let weight = weight
-        .from_fp8(Dtype::Float32, stream)?
-        .multiply(scale, stream)?;
-    matmul(input, weight.transpose(stream)?, stream)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn fp8_linear_tiled(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    rows: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let out_grid = ceil_div(out_dim, FP8_LINEAR_OUT_TILE) * FP8_LINEAR_OUT_TILE;
-
-    FP8_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(fp8_linear_kernel()?);
-        }
-        let config = MetalKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([out_grid, rows * 16, 1])
-            .with_thread_group([16, 16, 1])
-            .with_output_arg([rows, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale], &config, stream)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn fp8_linear_scalar(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    rows: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    FP8_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(fp8_linear_scalar_kernel()?);
-        }
-        let config = MetalKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([rows * out_dim, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg([rows, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("scalar FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale], &config, stream)
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn fp8_linear_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "qwen35_moe_fp8_linear_k16",
-        ["input", "weight", "scale"],
-        ["out"],
-        concat!(
-            "uint out_col = thread_position_in_grid.x;",
-            "uint row = thread_position_in_grid.y / 16;",
-            "uint lane_k = thread_position_in_grid.y % 16;",
-            "uint local_col = thread_position_in_grid.x % 16;",
-            "uint input_base = row * IN_DIM;",
-            "threadgroup float partial[16][16];",
-            "float acc = 0.0f;",
-            "if (out_col < OUT_DIM) {",
-            " for (uint k = lane_k; k < IN_DIM; k += 16) {",
-            "  uint8_t raw = weight[out_col * IN_DIM + k];",
-            "  float x = float(input[input_base + k]);",
-            "  uint scale_col = k / 128;",
-            "  float s = float(scale[(out_col / 128) * SCALE_COLS + scale_col]);",
-            "  acc += x * fp8_e4m3_to_float(raw) * s;",
-            "}",
-            "}",
-            "partial[lane_k][local_col] = acc;",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "if (lane_k == 0 && out_col < OUT_DIM) {",
-            "  float sum = 0.0f;",
-            "  for (uint lane = 0; lane < 16; ++lane) {",
-            "    sum += partial[lane][local_col];",
-            "  }",
-            "  out[row * OUT_DIM + out_col] = sum;",
-            "}"
-        ),
-        FP8_METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "qwen35_moe_fp8_linear_scalar",
-        ["input", "weight", "scale"],
-        ["out"],
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint out_col = elem % OUT_DIM;",
-            "uint row = elem / OUT_DIM;",
-            "float acc = 0.0f;",
-            "uint weight_base = out_col * IN_DIM;",
-            "uint input_base = row * IN_DIM;",
-            "uint scale_row = out_col / 128;",
-            "for (uint k = 0; k < IN_DIM; ++k) {",
-            "  uint8_t raw = weight[weight_base + k];",
-            "  float w = fp8_e4m3_to_float(raw);",
-            "  float s = float(scale[scale_row * SCALE_COLS + (k / 128)]);",
-            "  acc += float(input[input_base + k]) * w * s;",
-            "}",
-            "out[elem] = acc;"
-        ),
-        FP8_METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-fn grouped_fp8_linear(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    group_ids: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    #[cfg(feature = "cuda")]
-    {
-        let out_dim = weight.dim(1);
-        let in_dim = weight.dim(2);
-        let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 1, stream)?;
-        let scale = Array::repeat_axis::<f32>(scale, 128, 2, stream)?;
-        let scale = scale.try_index_device((.., ..out_dim, ..in_dim), stream)?;
-        let weight = weight
-            .from_fp8(Dtype::Float32, stream)?
-            .multiply(scale, stream)?;
-        return grouped_matmul(
-            input,
-            weight.swap_axes(-1, -2, stream)?,
-            group_ids,
-            true,
-            stream,
-        );
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    {
-        let routes = input.dim(0);
-        let in_dim = input.dim(-1);
-        let out_dim = weight.dim(1);
-        let scale_cols = scale.dim(-1);
-        if routes <= FP8_TILED_ROW_THRESHOLD {
-            return grouped_fp8_linear_tiled(
-                input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
-            );
-        }
-
-        grouped_fp8_linear_scalar(
-            input, weight, scale, group_ids, routes, in_dim, out_dim, scale_cols, stream,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn grouped_fp8_linear_tiled(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    group_ids: &Array,
-    routes: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let out_grid = ceil_div(out_dim, FP8_LINEAR_OUT_TILE) * FP8_LINEAR_OUT_TILE;
-    FP8_GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(grouped_fp8_linear_kernel()?);
-        }
-        let config = MetalKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_OUT", scale.dim(1))
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([out_grid, routes * 16, 1])
-            .with_thread_group([16, 16, 1])
-            .with_output_arg([routes, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("grouped FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale, group_ids], &config, stream)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(feature = "cuda"))]
-fn grouped_fp8_linear_scalar(
-    input: &Array,
-    weight: &Array,
-    scale: &Array,
-    group_ids: &Array,
-    routes: i32,
-    in_dim: i32,
-    out_dim: i32,
-    scale_cols: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    FP8_GROUPED_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(grouped_fp8_linear_scalar_kernel()?);
-        }
-        let config = MetalKernelConfig::new()
-            .with_template_arg_int("IN_DIM", in_dim)
-            .with_template_arg_int("OUT_DIM", out_dim)
-            .with_template_arg_int("SCALE_OUT", scale.dim(1))
-            .with_template_arg_int("SCALE_COLS", scale_cols)
-            .with_grid([routes * out_dim, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg([routes, out_dim], Dtype::Float32);
-        cell.borrow()
-            .as_ref()
-            .expect("scalar grouped FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale, group_ids], &config, stream)
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn grouped_fp8_linear_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "qwen35_moe_grouped_fp8_linear_k16",
-        ["input", "weight", "scale", "group_ids"],
-        ["out"],
-        concat!(
-            "uint out_col = thread_position_in_grid.x;",
-            "uint route = thread_position_in_grid.y / 16;",
-            "uint lane_k = thread_position_in_grid.y % 16;",
-            "uint local_col = thread_position_in_grid.x % 16;",
-            "uint expert = uint(group_ids[route]);",
-            "uint input_base = route * IN_DIM;",
-            "threadgroup float partial[16][16];",
-            "float acc = 0.0f;",
-            "if (out_col < OUT_DIM) {",
-            " for (uint k = lane_k; k < IN_DIM; k += 16) {",
-            "  uint weight_idx = (expert * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint scale_idx = (expert * SCALE_OUT + (out_col / 128)) * SCALE_COLS + (k / 128);",
-            "  float x = float(input[input_base + k]);",
-            "  acc += x * fp8_e4m3_to_float(weight[weight_idx]) * float(scale[scale_idx]);",
-            " }",
-            "}",
-            "partial[lane_k][local_col] = acc;",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "if (lane_k == 0 && out_col < OUT_DIM) {",
-            "  float sum = 0.0f;",
-            "  for (uint lane = 0; lane < 16; ++lane) {",
-            "    sum += partial[lane][local_col];",
-            "  }",
-            "  out[route * OUT_DIM + out_col] = sum;",
-            "}"
-        ),
-        FP8_METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn grouped_fp8_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "qwen35_moe_grouped_fp8_linear_scalar",
-        ["input", "weight", "scale", "group_ids"],
-        ["out"],
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint out_col = elem % OUT_DIM;",
-            "uint route = elem / OUT_DIM;",
-            "uint expert = uint(group_ids[route]);",
-            "float acc = 0.0f;",
-            "uint weight_base = (expert * OUT_DIM + out_col) * IN_DIM;",
-            "uint input_base = route * IN_DIM;",
-            "uint scale_base = (expert * SCALE_OUT + (out_col / 128)) * SCALE_COLS;",
-            "for (uint k = 0; k < IN_DIM; ++k) {",
-            "  uint8_t raw = weight[weight_base + k];",
-            "  float w = fp8_e4m3_to_float(raw);",
-            "  float s = float(scale[scale_base + (k / 128)]);",
-            "  acc += float(input[input_base + k]) * w * s;",
-            "}",
-            "out[elem] = acc;"
-        ),
-        FP8_METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-const FP8_METAL_HEADER: &str = concat!(
-    "float fp8_e4m3_to_float(uint8_t bits) {",
-    "  uint16_t v = uint16_t(bits & 127) << 7;",
-    "  half converted = as_type<half>(v);",
-    "  converted *= 256.0h;",
-    "  return (bits & 128) ? -float(converted) : float(converted);",
-    "}\n",
-);
 
 fn default_layer_type(index: usize) -> LayerType {
     if (index + 1) % 4 == 0 {
@@ -2433,35 +2074,6 @@ impl Experts {
         })
     }
 
-    fn affine_grouped_linear(
-        input: &Array,
-        weight: &Array,
-        scales: &Array,
-        biases: Option<&Array>,
-        group_ids: &Array,
-        affine: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let routes = input.dim(0);
-        let out_features = weight.dim(-2);
-        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
-        gather_qmm_with_mode(
-            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
-            weight,
-            scales,
-            biases,
-            Some(&lhs_indices),
-            Some(group_ids),
-            true,
-            affine.group_size(),
-            affine.bits(),
-            true,
-            affine.mode(),
-            stream,
-        )?
-        .reshape(&[routes, out_features], stream)
-    }
-
     /// Evaluates routed experts for flattened token hidden states.
     pub fn forward(
         &mut self,
@@ -2669,7 +2281,7 @@ impl Experts {
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate_up = if let Some(affine) = self.gate_up_affine {
-            Self::affine_grouped_linear(
+            common::moe::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -2682,7 +2294,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
-            grouped_fp8_linear(
+            common::block_fp8::grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 scale,
@@ -2704,7 +2316,7 @@ impl Experts {
         let current = silu(gate, stream)?.multiply(up, stream)?;
 
         let current = if let Some(affine) = self.down_affine {
-            Self::affine_grouped_linear(
+            common::moe::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 self.down_proj_scales
@@ -2717,7 +2329,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
-            grouped_fp8_linear(
+            common::block_fp8::grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 scale,
@@ -2758,7 +2370,7 @@ impl Experts {
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         observer.observe(&format!("{prefix}.expert_major_input"), &hidden)?;
         let gate_up = if let Some(affine) = self.gate_up_affine {
-            Self::affine_grouped_linear(
+            common::moe::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -2771,7 +2383,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
-            grouped_fp8_linear(
+            common::block_fp8::grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 scale,
@@ -2802,7 +2414,7 @@ impl Experts {
         observer.observe(&format!("{prefix}.expert_major_down_proj_input"), &current)?;
 
         let route_output = if let Some(affine) = self.down_affine {
-            Self::affine_grouped_linear(
+            common::moe::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 self.down_proj_scales
@@ -2815,7 +2427,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
-            grouped_fp8_linear(
+            common::block_fp8::grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 scale,
@@ -4724,38 +4336,7 @@ fn quantize_packed_expert_tensor(
     quantization: WeightQuantization,
     stream: &Stream,
 ) -> Result<QuantizedTensor, Error> {
-    if value.ndim() != 3 || !value.dtype().is_float() {
-        return Err(Error::Quantization(format!(
-            "expected a floating-point rank-3 expert bank, got shape {:?} and dtype {:?}",
-            value.shape(),
-            value.dtype()
-        )));
-    }
-    let shape = value.shape();
-    let experts = shape[0];
-    let output_dims = shape[1];
-    let input_dims = shape[2];
-    let matrix = value.reshape(&[experts * output_dims, input_dims], stream)?;
-    let quantized = quantize_tensor(&matrix, quantization, stream)?;
-    let packed_per_int = 32 / quantization.bits();
-    Ok(QuantizedTensor {
-        weight: quantized
-            .weight
-            .reshape(&[experts, output_dims, input_dims / packed_per_int], stream)?,
-        scales: quantized.scales.reshape(
-            &[experts, output_dims, input_dims / quantization.group_size()],
-            stream,
-        )?,
-        biases: quantized
-            .biases
-            .map(|biases| {
-                biases.reshape(
-                    &[experts, output_dims, input_dims / quantization.group_size()],
-                    stream,
-                )
-            })
-            .transpose()?,
-    })
+    common::moe::quantize_expert_bank(value, quantization, stream)
 }
 
 fn load_qwen3_5_moe_affine_safetensors_strict(

@@ -164,6 +164,154 @@ impl Drop for MetalKernel {
     }
 }
 
+/// Dispatch configuration for a custom CUDA kernel.
+///
+/// Metal and CUDA custom kernels expose the same output, grid, thread-group,
+/// and template-argument controls in MLX, so both backends intentionally share
+/// one configuration representation.
+#[cfg(feature = "cuda")]
+pub type CudaKernelConfig = MetalKernelConfig;
+
+/// A JIT-compiled custom CUDA kernel.
+#[cfg(feature = "cuda")]
+pub struct CudaKernel {
+    c_kernel: safemlx_sys::mlx_fast_cuda_kernel,
+    name: String,
+    input_names: Vec<String>,
+    output_names: Vec<String>,
+}
+
+#[cfg(feature = "cuda")]
+impl fmt::Debug for CudaKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaKernel")
+            .field("name", &self.name)
+            .field("input_names", &self.input_names)
+            .field("output_names", &self.output_names)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CudaKernel {
+    /// Creates a custom CUDA kernel from a function body and optional header.
+    pub fn new<Name, Inputs, InputName, Outputs, OutputName, Source, Header>(
+        name: Name,
+        input_names: Inputs,
+        output_names: Outputs,
+        source: Source,
+        header: Header,
+        ensure_row_contiguous: bool,
+        shared_memory: i32,
+    ) -> Result<Self>
+    where
+        Name: Into<String>,
+        Inputs: IntoIterator<Item = InputName>,
+        InputName: Into<String>,
+        Outputs: IntoIterator<Item = OutputName>,
+        OutputName: Into<String>,
+        Source: Into<String>,
+        Header: Into<String>,
+    {
+        crate::error::ensure_mlx_error_handler();
+
+        let name = name.into();
+        let input_names: Vec<String> = input_names.into_iter().map(Into::into).collect();
+        let output_names: Vec<String> = output_names.into_iter().map(Into::into).collect();
+        let source = source.into();
+        let header = header.into();
+        let c_name = cstring(&name)?;
+        let c_source = cstring(&source)?;
+        let c_header = cstring(&header)?;
+        let c_input_names = VectorString::try_from_strings(&input_names)?;
+        let c_output_names = VectorString::try_from_strings(&output_names)?;
+        let c_kernel = unsafe {
+            safemlx_sys::mlx_fast_cuda_kernel_new(
+                c_name.as_ptr(),
+                c_input_names.as_ptr(),
+                c_output_names.as_ptr(),
+                c_source.as_ptr(),
+                c_header.as_ptr(),
+                ensure_row_contiguous,
+                shared_memory,
+            )
+        };
+        if c_kernel.ctx.is_null() {
+            let what = crate::error::get_and_clear_last_mlx_error()
+                .map(|error| error.what)
+                .unwrap_or_else(|| "failed to create CUDA kernel".to_string());
+            return Err(Exception::custom(what));
+        }
+        Ok(Self {
+            c_kernel,
+            name,
+            input_names,
+            output_names,
+        })
+    }
+
+    /// Applies the kernel and returns all configured outputs.
+    pub fn apply_device<I, A>(
+        &self,
+        inputs: I,
+        config: &CudaKernelConfig,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Vec<Array>>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        let inputs = VectorArray::try_from_iter(inputs.into_iter())?;
+        let raw_config = RawCudaKernelConfig::try_from_config(config)?;
+        let outputs = Vec::<Array>::try_from_op(|outputs| unsafe {
+            safemlx_sys::mlx_fast_cuda_kernel_apply(
+                outputs,
+                self.c_kernel,
+                inputs.as_ptr(),
+                raw_config.as_ptr(),
+                stream.as_ref().as_ptr(),
+            )
+        })?;
+        if outputs.len() != config.output_count() {
+            return Err(Exception::custom(format!(
+                "CUDA kernel returned {} outputs, expected {}",
+                outputs.len(),
+                config.output_count()
+            )));
+        }
+        Ok(outputs)
+    }
+
+    /// Applies the kernel and requires exactly one configured output.
+    pub fn apply_one_device<I, A>(
+        &self,
+        inputs: I,
+        config: &CudaKernelConfig,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        let mut outputs = self.apply_device(inputs, config, stream)?;
+        match outputs.len() {
+            1 => Ok(outputs.remove(0)),
+            count => Err(Exception::custom(format!(
+                "CUDA kernel returned {count} outputs, expected 1"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaKernel {
+    fn drop(&mut self) {
+        unsafe {
+            safemlx_sys::mlx_fast_cuda_kernel_free(self.c_kernel);
+        }
+    }
+}
+
 /// Result returned by stateful recurrent kernels.
 ///
 /// The first value is the emitted sequence, including the single-token
@@ -621,6 +769,107 @@ impl Drop for RawMetalKernelConfig {
     fn drop(&mut self) {
         unsafe {
             safemlx_sys::mlx_fast_metal_kernel_config_free(self.c_config);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct RawCudaKernelConfig {
+    c_config: safemlx_sys::mlx_fast_cuda_kernel_config,
+}
+
+#[cfg(feature = "cuda")]
+impl RawCudaKernelConfig {
+    fn try_from_config(config: &CudaKernelConfig) -> Result<Self> {
+        crate::error::ensure_mlx_error_handler();
+        let c_config = unsafe { safemlx_sys::mlx_fast_cuda_kernel_config_new() };
+        if c_config.ctx.is_null() {
+            let what = crate::error::get_and_clear_last_mlx_error()
+                .map(|error| error.what)
+                .unwrap_or_else(|| "failed to create CUDA kernel config".to_string());
+            return Err(Exception::custom(what));
+        }
+        let raw = Self { c_config };
+        raw.populate(config)?;
+        Ok(raw)
+    }
+
+    fn as_ptr(&self) -> safemlx_sys::mlx_fast_cuda_kernel_config {
+        self.c_config
+    }
+
+    fn populate(&self, config: &CudaKernelConfig) -> Result<()> {
+        for output in &config.outputs {
+            check_status(unsafe {
+                safemlx_sys::mlx_fast_cuda_kernel_config_add_output_arg(
+                    self.c_config,
+                    output.shape.as_ptr(),
+                    output.shape.len(),
+                    output.dtype.into(),
+                )
+            })?;
+        }
+        if let Some([x, y, z]) = config.grid {
+            check_status(unsafe {
+                safemlx_sys::mlx_fast_cuda_kernel_config_set_grid(self.c_config, x, y, z)
+            })?;
+        }
+        if let Some([x, y, z]) = config.thread_group {
+            check_status(unsafe {
+                safemlx_sys::mlx_fast_cuda_kernel_config_set_thread_group(self.c_config, x, y, z)
+            })?;
+        }
+        if let Some(value) = config.init_value {
+            check_status(unsafe {
+                safemlx_sys::mlx_fast_cuda_kernel_config_set_init_value(self.c_config, value)
+            })?;
+        }
+        check_status(unsafe {
+            safemlx_sys::mlx_fast_cuda_kernel_config_set_verbose(self.c_config, config.verbose)
+        })?;
+        for template_arg in &config.template_args {
+            match template_arg {
+                MetalKernelTemplateArg::Dtype { name, dtype } => {
+                    let name = cstring(name)?;
+                    check_status(unsafe {
+                        safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_dtype(
+                            self.c_config,
+                            name.as_ptr(),
+                            (*dtype).into(),
+                        )
+                    })?;
+                }
+                MetalKernelTemplateArg::Int { name, value } => {
+                    let name = cstring(name)?;
+                    check_status(unsafe {
+                        safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_int(
+                            self.c_config,
+                            name.as_ptr(),
+                            *value,
+                        )
+                    })?;
+                }
+                MetalKernelTemplateArg::Bool { name, value } => {
+                    let name = cstring(name)?;
+                    check_status(unsafe {
+                        safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_bool(
+                            self.c_config,
+                            name.as_ptr(),
+                            *value,
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for RawCudaKernelConfig {
+    fn drop(&mut self) {
+        unsafe {
+            safemlx_sys::mlx_fast_cuda_kernel_config_free(self.c_config);
         }
     }
 }

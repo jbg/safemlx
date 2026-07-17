@@ -14,9 +14,119 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::{inspection::ActivationObserver, quantization::WeightQuantization};
+use crate::{
+    error::Error,
+    inspection::ActivationObserver,
+    quantization::{quantize_tensor, QuantizedTensor, WeightQuantization},
+};
 
 use super::layers::{relu2, silu};
+
+/// Applies one affine-quantized packed expert projection to expert-major rows.
+///
+/// The packed weight and its metadata keep the expert dimension leading, so
+/// this is usable by any checkpoint layout once split experts have been
+/// assembled into `[experts, output, input]` banks.
+pub fn affine_grouped_linear(
+    input: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    group_ids: &Array,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    affine_grouped_linear_with_transpose(
+        input,
+        weight,
+        scales,
+        biases,
+        group_ids,
+        quantization,
+        true,
+        stream,
+    )
+}
+
+/// Applies an affine packed grouped projection in either matrix direction.
+pub fn affine_grouped_linear_with_transpose(
+    input: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    group_ids: &Array,
+    quantization: WeightQuantization,
+    transpose: bool,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let routes = input.dim(0);
+    let out_features = if transpose {
+        weight.dim(-2)
+    } else {
+        weight.dim(-1) * 32 / quantization.bits()
+    };
+    let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+    gather_qmm_with_mode(
+        input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+        weight,
+        scales,
+        biases,
+        Some(&lhs_indices),
+        Some(group_ids),
+        transpose,
+        quantization.group_size(),
+        quantization.bits(),
+        true,
+        quantization.mode(),
+        stream,
+    )?
+    .reshape(&[routes, out_features], stream)
+}
+
+/// Quantizes a floating-point rank-3 packed expert bank while preserving its
+/// leading expert dimension in the emitted weight, scale, and bias tensors.
+pub fn quantize_expert_bank(
+    value: &Array,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<QuantizedTensor, Error> {
+    if value.ndim() != 3 || !value.dtype().is_float() {
+        return Err(Error::Quantization(format!(
+            "expected a floating-point rank-3 expert bank, got shape {:?} and dtype {:?}",
+            value.shape(),
+            value.dtype()
+        )));
+    }
+    let shape = value.shape();
+    let experts = shape[0];
+    let output_dims = shape[1];
+    let input_dims = shape[2];
+    let matrix = value.reshape(&[experts * output_dims, input_dims], stream)?;
+    let quantized = quantize_tensor(&matrix, quantization, stream)?;
+    Ok(QuantizedTensor {
+        weight: quantized.weight.reshape(
+            &[
+                experts,
+                output_dims,
+                quantized_packed_dimension(input_dims, quantization.bits()),
+            ],
+            stream,
+        )?,
+        scales: quantized.scales.reshape(
+            &[experts, output_dims, input_dims / quantization.group_size()],
+            stream,
+        )?,
+        biases: quantized
+            .biases
+            .map(|biases| {
+                biases.reshape(
+                    &[experts, output_dims, input_dims / quantization.group_size()],
+                    stream,
+                )
+            })
+            .transpose()?,
+    })
+}
 
 /// Router score transform used before top-k expert selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -151,7 +261,19 @@ impl TopKRouter {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
+        let logits = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+            matmul(
+                &flat.as_dtype(Dtype::Float32, stream)?,
+                &self
+                    .weight
+                    .as_ref()
+                    .as_dtype(Dtype::Float32, stream)?
+                    .transpose(stream)?,
+                stream,
+            )?
+        } else {
+            matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
+        };
         let scores = match self.score_function {
             TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
             TopKRouterScoreFunction::Sigmoid => sigmoid(logits, stream)?,
@@ -187,10 +309,22 @@ impl TopKRouter {
         hidden_states: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?;
+        let logits = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+            matmul(
+                &flat.as_dtype(Dtype::Float32, stream)?,
+                &self
+                    .weight
+                    .as_ref()
+                    .as_dtype(Dtype::Float32, stream)?
+                    .transpose(stream)?,
+                stream,
+            )?
+        } else {
+            matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
+        };
         observer.observe(&format!("{prefix}.router_logits"), &logits)?;
         let scores = match self.score_function {
             TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
@@ -278,7 +412,12 @@ impl TopKRouter {
             stream,
         )?
         .gt(Array::from_int(0), stream)?;
-        let masked_scores = r#where(&group_mask, scores_for_choice, Array::from_f32(0.0), stream)?;
+        let masked_scores = r#where(
+            &group_mask,
+            scores_for_choice,
+            Array::from_f32(f32::NEG_INFINITY),
+            stream,
+        )?;
         argpartition_axis(masked_scores, -self.top_k, -1, stream)?
             .try_index_device((.., -self.top_k..), stream)
     }
@@ -487,35 +626,6 @@ impl PackedSwiGluExperts {
         })
     }
 
-    fn quantized_grouped_linear(
-        input: &Array,
-        weight: &Array,
-        scales: &Array,
-        biases: Option<&Array>,
-        group_ids: &Array,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let routes = input.dim(0);
-        let out_features = weight.dim(-2);
-        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
-        gather_qmm_with_mode(
-            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
-            weight,
-            scales,
-            biases,
-            Some(&lhs_indices),
-            Some(group_ids),
-            true,
-            quantization.group_size(),
-            quantization.bits(),
-            true,
-            quantization.mode(),
-            stream,
-        )?
-        .reshape(&[routes, out_features], stream)
-    }
-
     fn forward_chunk(
         &mut self,
         hidden_states: &Array,
@@ -527,7 +637,7 @@ impl PackedSwiGluExperts {
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate_up = if let Some(quantization) = self.gate_up_affine {
-            Self::quantized_grouped_linear(
+            affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -552,7 +662,7 @@ impl PackedSwiGluExperts {
         let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
         let activated = silu(gate, stream)?.multiply(up, stream)?;
         let output = if let Some(quantization) = self.down_affine {
-            Self::quantized_grouped_linear(
+            affine_grouped_linear(
                 &activated,
                 self.down_proj.as_ref(),
                 self.down_proj_scales

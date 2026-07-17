@@ -35,6 +35,8 @@ use crate::{
 
 /// Shared building blocks used by multiple decoder-only model families.
 pub mod common;
+/// DeepSeek-V3 and DeepSeek-R1 decoder support.
+pub mod deepseek_v3;
 /// Gemma 4 text model support.
 pub mod gemma4;
 /// Gemma 4 assistant draft-model support.
@@ -113,6 +115,8 @@ impl TokenIdOrIds {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Supported model-family dispatch target.
 pub enum ModelKind {
+    /// DeepSeek-V3/R1 MLA and MoE architecture.
+    DeepSeekV3,
     /// Gemma 4 text architecture.
     Gemma4,
     /// OpenAI GPT-OSS MXFP4 sparse decoder architecture.
@@ -162,6 +166,7 @@ impl ModelLoadOptions {
 impl ModelKind {
     fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
+            "deepseek_v3" => Ok(Self::DeepSeekV3),
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "inkling_mm_model" => Ok(Self::Inkling),
@@ -274,6 +279,7 @@ pub fn check_model_dir(model_dir: impl AsRef<Path>) -> ModelConfigSupport {
 
 fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     match kind {
+        ModelKind::DeepSeekV3 => deepseek_v3::validate_model_config_value(config),
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),
@@ -296,6 +302,8 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
 
 /// Loaded model value for any architecture supported by this crate.
 pub enum Model {
+    /// DeepSeek-V3/R1 model.
+    DeepSeekV3(deepseek_v3::Model),
     /// Gemma 4 text model.
     Gemma4(gemma4::Model),
     /// OpenAI GPT-OSS model.
@@ -324,6 +332,7 @@ impl Model {
     /// Returns the effective model type used for dispatch.
     pub fn model_type(&self) -> &str {
         match self {
+            Self::DeepSeekV3(model) => model.model_type(),
             Self::Gemma4(model) => model.model_type(),
             Self::GptOss(model) => model.model_type(),
             Self::Inkling(model) => model.model_type(),
@@ -340,9 +349,9 @@ impl Model {
 
     /// Runs a detailed instrumented forward pass for supported model families.
     ///
-    /// Llama, Qwen3, Qwen3.5 MoE, and Gemma4 currently report detailed layer
-    /// activations. Other families return an error until their family-specific
-    /// inspection paths are wired.
+    /// DeepSeek-V3/R1, Llama, Qwen3, Qwen3.5 MoE, and Gemma4 currently report
+    /// detailed layer activations. Other families return an error until their
+    /// family-specific inspection paths are wired.
     pub fn forward_with_observer(
         &mut self,
         input_tokens: &Array,
@@ -352,6 +361,16 @@ impl Model {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
         match (self, cache) {
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => model
+                .forward_with_observer(
+                    deepseek_v3::ModelInput {
+                        inputs: input_tokens,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    observer,
+                ),
             (Self::Llama(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
                 llama::ModelInput {
                     inputs: input_tokens,
@@ -451,6 +470,19 @@ impl Model {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
         match (self, cache) {
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
+                let logits = model.forward_with_observer(
+                    deepseek_v3::ModelInput {
+                        inputs: &prompt_tokens,
+                        mask: None,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
@@ -523,6 +555,7 @@ impl Model {
     /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
+            Self::DeepSeekV3(model) => ModelCache::DeepSeekV3(model.new_cache()),
             Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
             Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
@@ -582,6 +615,9 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             _ => Err(Exception::custom(
@@ -670,6 +706,11 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                ModelGenerate::DeepSeekV3(deepseek_v3::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
             _ => panic!("model cache type does not match model kind"),
         }
     }
@@ -678,6 +719,8 @@ impl Model {
 /// Cache value matching a [`Model`] variant.
 #[derive(Clone)]
 pub enum ModelCache {
+    /// Compressed latent MLA cache for DeepSeek-V3/R1.
+    DeepSeekV3(deepseek_v3::Cache),
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
     /// Alternating full/sliding GPT-OSS cache.
@@ -707,6 +750,8 @@ pub enum ModelGenerate<'a, S = DefaultSampler>
 where
     S: Sampler,
 {
+    /// DeepSeek-V3/R1 generation iterator.
+    DeepSeekV3(deepseek_v3::Generate<'a, S>),
     /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, S>),
     /// GPT-OSS generation iterator.
@@ -741,6 +786,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            Self::DeepSeekV3(generate) => generate.next(),
             Self::Gemma4(generate) => generate.next(),
             Self::GptOss(generate) => generate.next(),
             Self::Inkling(generate) => generate.next(),
@@ -1186,6 +1232,16 @@ fn load_gguf_model_data(
     validate_gguf_quantization_source(&arrays, &metadata, options.quantization)?;
 
     let (model, eos_token_ids) = match architecture.as_str() {
+        "deepseek2" => {
+            let loaded = deepseek_v3::load_gguf_data(
+                arrays,
+                metadata,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            (Model::DeepSeekV3(loaded.model), loaded.eos_token_ids)
+        }
         "gemma4" => {
             let loaded = gemma4::load_gemma4_gguf_data_with_quantization(
                 arrays,
@@ -1267,7 +1323,7 @@ fn load_gguf_model_data(
             (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
+            "GGUF architecture {other:?}; supported GGUF architectures are deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
         ))),
     };
     Ok(LoadedGgufModel {
@@ -1367,6 +1423,14 @@ fn load_model_for_kind(
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
         return match kind {
+            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
+                deepseek_v3::load_model_quantized(
+                    model_dir,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model_quantized(
                 model_dir,
                 quantization,
@@ -1442,6 +1506,11 @@ fn load_model_for_kind(
     }
 
     match kind {
+        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(deepseek_v3::load_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
         ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(
             model_dir,
             stream,
@@ -1515,6 +1584,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     }
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
+        ModelKind::DeepSeekV3 => deepseek_v3::load_tokenizer(model_dir),
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
         ModelKind::Inkling => inkling::load_tokenizer(model_dir),

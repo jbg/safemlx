@@ -389,7 +389,7 @@ pub fn quantize_tensor(
             Ok(array.reshape(&shape, stream)?)
         }
     };
-    let packed_dims = input_dims / (32 / config.bits());
+    let packed_dims = ops::quantized_packed_dimension(input_dims, config.bits());
     let group_dims = input_dims / config.group_size();
     Ok(QuantizedTensor {
         weight: restore_shape(arrays.weight, packed_dims)?,
