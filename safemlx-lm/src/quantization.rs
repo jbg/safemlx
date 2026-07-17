@@ -201,7 +201,12 @@ impl From<AffineQuantization> for WeightQuantization {
 struct WeightQuantizationMetadata {
     group_size: i32,
     bits: i32,
+    #[serde(default = "default_weight_quantization_mode")]
     mode: String,
+}
+
+fn default_weight_quantization_mode() -> String {
+    "affine".to_string()
 }
 
 impl Serialize for WeightQuantization {
@@ -718,6 +723,17 @@ mod tests {
             json!({"group_size": 32, "bits": 8, "mode": "mxfp4"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn omitted_quantization_mode_defaults_to_affine() {
+        let quantization =
+            serde_json::from_value::<WeightQuantization>(json!({"group_size": 64, "bits": 4}))
+                .unwrap();
+        assert_eq!(
+            quantization,
+            WeightQuantization::Affine(AffineQuantization::new(64, 4).unwrap())
+        );
     }
 
     #[test]
