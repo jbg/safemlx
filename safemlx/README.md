@@ -33,6 +33,35 @@ Add this to your `Cargo.toml`:
 safemlx = "0.1"
 ```
 
+## Distributed MLX
+
+The `distributed` module wraps MLX groups, collectives, and point-to-point
+operations with owned handles and explicit streams. Non-strict initialization
+keeps MLX's useful singleton fallback:
+
+```rust
+use safemlx::{distributed::{self, Backend}, Array, Device, DeviceType, Stream};
+
+let group = distributed::init(false, Backend::Any)?;
+let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+let input = Array::ones::<f32>(&[2], &stream)?;
+let sum = distributed::all_sum(&input, &group, &stream)?;
+# Ok::<(), safemlx::error::Exception>(())
+```
+
+Choose process-local devices with `distributed::device_for_local_rank`. A
+global distributed rank is not a local GPU index because ranks may span
+machines. In a one-process-per-visible-GPU launch, the local device index is
+often zero: `CUDA_VISIBLE_DEVICES` has already restricted each process to one
+GPU.
+
+The real two-process Ring integration test is opt-in because it launches child
+processes and opens loopback sockets. Run it on Unix with:
+
+```console
+cargo test -p safemlx --test distributed_ring ring_two_process_loopback -- --ignored --exact --nocapture
+```
+
 ## Versioning
 
 The `safemlx` crates use normal Rust semantic versioning. The initial

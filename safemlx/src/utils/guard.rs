@@ -390,6 +390,63 @@ impl Guarded for crate::Stream {
     type Guard = MaybeUninitStream;
 }
 
+pub(crate) struct MaybeUninitDistributedGroup {
+    pub(crate) ptr: safemlx_sys::mlx_distributed_group,
+    pub(crate) init_success: bool,
+}
+
+impl Default for MaybeUninitDistributedGroup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MaybeUninitDistributedGroup {
+    fn new() -> Self {
+        // SAFETY: This creates an empty C handle which this guard owns until a
+        // successful operation transfers it to `distributed::Group`.
+        unsafe {
+            Self {
+                ptr: safemlx_sys::mlx_distributed_group_new(),
+                init_success: false,
+            }
+        }
+    }
+}
+
+impl Drop for MaybeUninitDistributedGroup {
+    fn drop(&mut self) {
+        if !self.init_success {
+            // SAFETY: The guard exclusively owns this handle. The C API accepts
+            // and safely frees both empty and initialized group handles.
+            unsafe {
+                safemlx_sys::mlx_distributed_group_free(self.ptr);
+            }
+        }
+    }
+}
+
+impl Guard<crate::distributed::Group> for MaybeUninitDistributedGroup {
+    type MutRawPtr = *mut safemlx_sys::mlx_distributed_group;
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        &mut self.ptr
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.init_success = success;
+    }
+
+    fn try_into_guarded(self) -> Result<crate::distributed::Group, Exception> {
+        debug_assert!(self.init_success);
+        Ok(crate::distributed::Group::from_owned_ptr(self.ptr))
+    }
+}
+
+impl Guarded for crate::distributed::Group {
+    type Guard = MaybeUninitDistributedGroup;
+}
+
 pub(crate) struct MaybeUninitSafeTensors {
     pub(crate) c_data: safemlx_sys::mlx_map_string_to_array,
     pub(crate) c_metadata: safemlx_sys::mlx_map_string_to_string,

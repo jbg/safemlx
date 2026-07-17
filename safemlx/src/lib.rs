@@ -300,6 +300,7 @@ pub mod builder;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod device;
+pub mod distributed;
 mod dtype;
 pub mod error;
 pub mod fast;

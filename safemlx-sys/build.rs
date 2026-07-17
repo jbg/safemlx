@@ -450,6 +450,18 @@ fn build_and_link_mlx_c(out_path: &Path) {
     } else {
         println!("cargo:rustc-link-lib=static=mlxc");
         println!("cargo:rustc-link-lib=static=mlx");
+        // MLX builds JACCL as a separate static archive when the host SDK and
+        // deployment target support it. CMake propagates that dependency to
+        // CMake consumers, but Cargo links the installed archives directly.
+        // Only request it when CMake actually produced it so older Apple SDKs
+        // and non-Apple targets keep using MLX's no-JACCL implementation.
+        if is_apple
+            && [dst.join("lib/libjaccl.a"), dst.join("build/lib/libjaccl.a")]
+                .iter()
+                .any(|path| path.is_file())
+        {
+            println!("cargo:rustc-link-lib=static=jaccl");
+        }
     }
 
     if is_apple {
