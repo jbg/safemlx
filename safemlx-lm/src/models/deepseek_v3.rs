@@ -414,18 +414,18 @@ impl ModelArgs {
         Ok(())
     }
 
-    fn is_moe_layer(&self, layer: i32) -> bool {
+    pub(crate) fn is_moe_layer(&self, layer: i32) -> bool {
         layer >= self.first_k_dense_replace && layer % self.moe_layer_freq == 0
     }
 
-    fn native_fp8_config(&self) -> Option<&Fp8QuantizationConfig> {
+    pub(crate) fn native_fp8_config(&self) -> Option<&Fp8QuantizationConfig> {
         match &self.quantization_config {
             Some(DeepSeekQuantizationConfig::Fp8(config)) => Some(config),
             Some(DeepSeekQuantizationConfig::Affine(_)) | None => None,
         }
     }
 
-    fn affine_quantization(&self) -> Result<Option<WeightQuantization>, Error> {
+    pub(crate) fn affine_quantization(&self) -> Result<Option<WeightQuantization>, Error> {
         let config_affine = match &self.quantization_config {
             Some(DeepSeekQuantizationConfig::Affine(quantization)) => Some(*quantization),
             Some(DeepSeekQuantizationConfig::Fp8(_)) | None => None,
@@ -464,7 +464,7 @@ impl ModelArgs {
         }
     }
 
-    fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         self.weight_format_for(weight_name).affine()
     }
 }
@@ -1575,7 +1575,7 @@ impl FeedForward {
         matches!(self, Self::Moe(_))
     }
 
-    fn moe_mut(&mut self) -> Option<&mut Moe> {
+    pub(crate) fn moe_mut(&mut self) -> Option<&mut Moe> {
         match self {
             Self::Moe(moe) => Some(moe),
             Self::Dense(_) => None,
@@ -1601,7 +1601,7 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             self_attn: MultiHeadLatentAttention::new(args, layer, stream)?,
             mlp: FeedForward::new(args, layer, stream)?,
@@ -1702,6 +1702,17 @@ impl DecoderLayer {
             &output,
         )?;
         Ok(output)
+    }
+
+    pub(crate) fn forward_stage(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut observer = None;
+        self.forward_impl(x, mask, cache, stream, "", &mut observer)
     }
 }
 

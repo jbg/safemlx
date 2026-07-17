@@ -88,7 +88,7 @@ currently handled.
 safemlx-lm = { version = "0.4", features = ["image-processing"] }
 ```
 
-### Rank-aware checkpoint placement
+### Executable pipeline parallelism
 
 Runtime parallel topology is configured independently of a model's
 `config.json`. `ParallelTopology` uses pipeline-major, tensor, then expert rank
@@ -99,60 +99,96 @@ group and must not be reused as a local GPU index.
 ```rust,ignore
 use safemlx::{distributed::{self, Backend}, DeviceType, Stream};
 use safemlx_lm::{
-    parallel::load_safetensors_partition_on_streams,
-    weights::StrictLoadConfig,
-    DeviceAssignment, ModelLoadOptions, ParallelTopology, PlacementPlan,
+    pipeline::{load_pipeline_model_with_options, PipelineStep},
+    DeviceAssignment, ModelLoadOptions, ParallelTopology,
 };
 
 let group = distributed::init(true, Backend::Ring)?;
 let topology = ParallelTopology::from_group(
     &group,
-    2, // tensor-parallel size
-    1, // pipeline-parallel size
+    1, // tensor-parallel size
+    2, // pipeline-parallel size
     1, // expert-parallel size
     DeviceAssignment::new(DeviceType::Gpu, local_device_index),
 )?;
 let stream = Stream::new_with_device(&topology.device.device()?);
 
-let mut plan = PlacementPlan::new(topology);
-plan.insert_tensor_parallel("model.layers.0.self_attn.q_proj.weight", 0);
-let partition = load_safetensors_partition_on_streams(
-    model_dir,
-    &plan,
-    cpu_weights_stream,
-    &stream,
-    &StrictLoadConfig::default(),
-)?;
-
-// Shared dispatch also carries the snapshot, including quantization options.
 let options = ModelLoadOptions::default().with_parallel_topology(topology);
+let mut model = load_pipeline_model_with_options(
+    model_dir,
+    options,
+    &stream,
+    cpu_weights_stream,
+)?;
+let mut cache = model.new_cache();
+let step = PipelineStep::new(1, prompt_length)?;
+let logits = model.forward_pipeline(
+    (group.rank() == 0).then_some(&prompt_tokens),
+    step,
+    None,
+    &mut cache,
+    &group,
+    &stream,
+)?;
 ```
 
+Pure pipeline parallelism currently requires `PP > 1`, `TP = 1`, and `EP = 1`.
+Hybrid TP+PP and PP+EP jobs fail before checkpoint payloads are loaded. The
+ordinary `Model` loader remains a complete single-device API and directs
+non-replicated requests to the explicit pipeline loader.
+
+Decoder layers use balanced contiguous placement from
+`ParallelTopology::layer_range`. Stage zero owns token embedding and its local
+layers. Intermediate stages own only their local layers and constants. The last
+stage owns its local layers, final normalization, and the language-model head.
+For tied Llama weights, the embedding table is present only on stage zero and
+the last stage. DeepSeek routed and shared experts stay with their decoder
+layer; expert banks for remote layers are filtered before packing.
+
 Indexed safetensors placement is resolved before payload files are opened, so
-remote-only shards are skipped. Selected tensor views are sliced before their
-final execution-stream copy and evaluated while the mmap is alive. Strict
-validation still rejects missing local tensors, malformed local shapes, and
-unexpected checkpoint tensors; explicitly omitted remote tensors are scoped out
-without weakening ordinary strict loading. Quantized weight/scales/biases can be
-registered together with `PlacementPlan::insert_quantized_companions`.
+remote-only shards are skipped and remote tensors never become MLX arrays.
+Quantized companions remain colocated. Dense and supported prequantized
+safetensors are supported for Llama-compatible models. DeepSeek supports its
+official split-expert safetensors, native block-FP8 and affine layouts, and
+local expert-bank packing. Requested on-load quantization is applied only to
+selected local tensors. Pipeline GGUF is rejected early because the current
+GGUF reader cannot guarantee local-layer bounded memory.
+
+`PipelineCache` contains only the local global-layer range: standard or
+sliding-window KV entries for Llama and compressed-latent entries for DeepSeek.
+Cache reuse and reset are explicit. Every stage recreates causal mask state from
+the shared `PipelineStep` and its local cache offset; explicit masks must be
+supplied consistently by every rank.
+
+Execution is correctness-first and serial: receive from the predecessor,
+execute local layers, then send to the successor. Lazy point-to-point arrays are
+evaluated and their stream synchronized at each boundary. Logits stay on the
+last stage. `sample_and_synchronize` samples only there, then all ranks enter
+the same two collectives for the small token id and EOS/stop flag. Other ranks
+never mutate sampler or PRNG state and only the last rank should print text.
+
+There is currently no microbatch overlap, so prefill and decode latency include
+all stages in series. Pipeline training/backward, multimodal models, distributed
+cache sharding, tensor-parallel linear layers, expert token dispatch, and
+pipeline GGUF are not supported.
 
 A checkpoint's DeepSeek `ep_size` remains checkpoint layout/compatibility
 metadata and retains its existing validation. Runtime
 `expert_parallel_size` only describes this inference job; it does not override
 or reinterpret the checkpoint field.
 
-This phase provides rank-aware loading and placement, not distributed forward
-execution. Non-singleton `ModelLoadOptions` therefore return a capability error
-from the ordinary executable `Model` loader; use the explicit `RankPartition`
-artifact until pipeline communication, tensor-parallel layers, and expert token
-routing are implemented.
-
-The two-process Ring proof is opt-in:
+The phase-two partition proof and executable pipeline Ring proof are opt-in:
 
 ```sh
 cargo test -p safemlx-lm --test distributed_partition_ring \
   ring_two_process_partition_load -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_pipeline -- --ignored --exact --nocapture
 ```
+
+See `cargo run -p safemlx-lm --example pipeline_generate -- MODEL_DIR` for the
+minimal rank-aware prefill/decode probe. Launch one process per stage with the
+Ring environment (`MLX_RANK` and `MLX_HOSTFILE`) configured for all processes.
 
 Dense safetensors checkpoints and unquantized F32/F16/BF16 GGUF checkpoints can be affine- or
 MXFP4-quantized while loading through the same architecture-dispatched API used for ordinary

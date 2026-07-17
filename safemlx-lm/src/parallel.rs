@@ -644,6 +644,14 @@ impl RankPartition {
     pub fn opened_shards(&self) -> &[PathBuf] {
         &self.opened_shards
     }
+
+    /// Consumes the partition and returns its locally materialized tensors.
+    ///
+    /// Pipeline stage constructors use this to move arrays directly into
+    /// stage-local modules without cloning the partition or its arrays.
+    pub fn into_tensors(self) -> HashMap<String, Array> {
+        self.tensors
+    }
 }
 
 #[derive(Default)]

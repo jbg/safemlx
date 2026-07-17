@@ -22,6 +22,8 @@ pub mod inspection;
 pub mod models;
 /// Runtime parallel topology, tensor placement plans, and selective checkpoint loading.
 pub mod parallel;
+/// Executable pure pipeline-parallel model loading and inference.
+pub mod pipeline;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;

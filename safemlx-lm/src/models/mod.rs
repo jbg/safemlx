@@ -156,9 +156,8 @@ pub struct ModelLoadOptions {
     /// Optional validated runtime topology and process-local device assignment.
     ///
     /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must currently be loaded with
-    /// [`crate::parallel::load_safetensors_partition`], because distributed
-    /// forward execution is not implemented yet.
+    /// topologies must be loaded with [`crate::pipeline::load_pipeline_model`]
+    /// or [`crate::pipeline::load_pipeline_model_with_options`].
     pub parallel: Option<ParallelTopology>,
 }
 
@@ -189,7 +188,7 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
         .is_some_and(|topology| !topology.is_replicated())
     {
         Err(Error::Parallel(
-            "non-replicated loading cannot return an executable Model yet; build a PlacementPlan and use parallel::load_safetensors_partition (distributed forward execution is a later phase)".into(),
+            "non-replicated loading cannot return the complete single-device Model type; use pipeline::load_pipeline_model_with_options for executable pure pipeline parallelism".into(),
         ))
     } else {
         Ok(())

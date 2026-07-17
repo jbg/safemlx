@@ -115,11 +115,11 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn weight_quantization(&self) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
 
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+    pub(crate) fn affine_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
@@ -445,7 +445,7 @@ impl TransformerBlock {
         Self::new_for_layer(args, 0, stream)
     }
 
-    fn new_for_layer(
+    pub(crate) fn new_for_layer(
         args: &ModelArgs,
         layer_index: i32,
         stream: &Stream,
