@@ -470,22 +470,14 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
                             .optional_compact_binding("down_proj_biases", stream)
                             .map_err(|error| Exception::custom(error.to_string()))?,
                     );
-                    eval(
-                        [&bank.gate_up_proj, &bank.down_proj]
-                            .into_iter()
-                            .map(|value| value.as_ref())
-                            .chain(bank.gate_up_proj_scales.as_ref().as_ref())
-                            .chain(bank.gate_up_proj_biases.as_ref().as_ref())
-                            .chain(bank.down_proj_scales.as_ref().as_ref())
-                            .chain(bank.down_proj_biases.as_ref().as_ref()),
-                    )?;
-                    stream.synchronize()?;
                     expert_cache
                         .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
                         .map_err(|error| Exception::custom(error.to_string()))?;
                     let output = bank.forward(flat, acquired.compact_routes(), weights, stream)?;
                     eval([&output])?;
-                    stream.synchronize()?;
+                    acquired
+                        .complete_pending()
+                        .map_err(|error| Exception::custom(error.to_string()))?;
                     Ok(output)
                 },
             )?;

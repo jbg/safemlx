@@ -12,7 +12,9 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::weight_store::{StoredDtype, TensorSelection, WeightLease, WeightStore};
+use crate::weight_store::{
+    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightStore,
+};
 
 /// Scalar encoding produced by a derived-weight recipe.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -265,37 +267,43 @@ impl DerivedWeightRecipe {
 
     /// Materializes this recipe on the host source stream.
     ///
-    /// All source leases remain live until the derived output has been
-    /// evaluated and the source stream synchronized.
+    /// All source leases remain live until the derived output has been evaluated.
     pub fn materialize(
         &self,
         store: &dyn WeightStore,
         source_stream: &Stream,
     ) -> Result<Array, WeightRecipeError> {
+        self.prepare_materialization(store, source_stream)?.finish()
+    }
+
+    /// Schedules a recipe while retaining all mmap-backed source selections.
+    pub(crate) fn prepare_materialization(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError> {
         self.infer(store)?;
-        let mut leases = Vec::new();
-        let output = self.materialize_inner(store, source_stream, &mut leases)?;
-        eval([&output])?;
-        source_stream.synchronize()?;
-        drop(leases);
-        Ok(output)
+        let mut sources = Vec::new();
+        let output = self.materialize_inner(store, source_stream, &mut sources)?;
+        Ok(PendingWeightRecipe { output, sources })
     }
 
     fn materialize_inner(
         &self,
         store: &dyn WeightStore,
         stream: &Stream,
-        leases: &mut Vec<WeightLease>,
+        sources: &mut Vec<PendingWeightMaterialization>,
     ) -> Result<Array, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
                 let lease = store.acquire(key, selection.clone())?;
-                let array = lease.materialize(stream, stream)?;
-                leases.push(lease);
+                let pending = lease.prepare_materialization(stream, stream)?;
+                let array = pending.output().clone();
+                sources.push(pending);
                 Ok(array)
             }
             Self::Concatenate { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, leases)?;
+                let arrays = materialize_inputs(inputs, store, stream, sources)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(concatenate_axis(
                     &references,
@@ -304,7 +312,7 @@ impl DerivedWeightRecipe {
                 )?)
             }
             Self::Stack { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, leases)?;
+                let arrays = materialize_inputs(inputs, store, stream, sources)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(stack_axis(
                     &references,
@@ -313,7 +321,7 @@ impl DerivedWeightRecipe {
                 )?)
             }
             Self::Reshape { input, shape } => {
-                let array = input.materialize_inner(store, stream, leases)?;
+                let array = input.materialize_inner(store, stream, sources)?;
                 let shape = shape
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "reshape dimension"))
@@ -321,7 +329,7 @@ impl DerivedWeightRecipe {
                 Ok(array.reshape(&shape, stream)?)
             }
             Self::Transpose { input, axes } => {
-                let array = input.materialize_inner(store, stream, leases)?;
+                let array = input.materialize_inner(store, stream, sources)?;
                 let axes = axes
                     .iter()
                     .map(|axis| usize_to_i32(*axis, "transpose axis"))
@@ -329,10 +337,30 @@ impl DerivedWeightRecipe {
                 Ok(array.transpose_axes(&axes, stream)?)
             }
             Self::Cast { input, dtype } => {
-                let array = input.materialize_inner(store, stream, leases)?;
+                let array = input.materialize_inner(store, stream, sources)?;
                 Ok(array.as_dtype(*dtype, stream)?)
             }
         }
+    }
+}
+
+/// Lazy recipe output and the source mappings required to evaluate it safely.
+pub(crate) struct PendingWeightRecipe {
+    output: Array,
+    sources: Vec<PendingWeightMaterialization>,
+}
+
+impl PendingWeightRecipe {
+    pub(crate) fn into_parts(self) -> (Array, Vec<PendingWeightMaterialization>) {
+        (self.output, self.sources)
+    }
+
+    fn finish(self) -> Result<Array, WeightRecipeError> {
+        eval([&self.output])?;
+        for source in self.sources {
+            source.complete();
+        }
+        Ok(self.output)
     }
 }
 
@@ -340,11 +368,11 @@ fn materialize_inputs(
     inputs: &[DerivedWeightRecipe],
     store: &dyn WeightStore,
     stream: &Stream,
-    leases: &mut Vec<WeightLease>,
+    sources: &mut Vec<PendingWeightMaterialization>,
 ) -> Result<Vec<Array>, WeightRecipeError> {
     inputs
         .iter()
-        .map(|input| input.materialize_inner(store, stream, leases))
+        .map(|input| input.materialize_inner(store, stream, sources))
         .collect()
 }
 

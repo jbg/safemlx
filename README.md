@@ -67,6 +67,11 @@ Pure expert parallelism uses the same cache and catalogs only each rank's owned
 global experts. Other MoE families and GGUF are rejected rather than silently
 falling back to eager expert banks.
 
+The route readback, batched pending-residency protocol, remaining synchronous
+evaluation boundaries, and the event-backed completion API needed for genuine
+cross-stream overlap are described in
+[`safemlx-lm/EXPERT_CACHE_SYNCHRONIZATION.md`](safemlx-lm/EXPERT_CACHE_SYNCHRONIZATION.md).
+
 ## Crates
 
 The crates use SafeMLX package names on crates.io to avoid confusion with the

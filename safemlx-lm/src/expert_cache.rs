@@ -10,7 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use safemlx::{ops::concatenate_axis, transforms::eval, Array, Dtype, Stream};
+use safemlx::{
+    ops::{concatenate_axis, r#where, segment_sum},
+    transforms::eval,
+    Array, Dtype, Stream,
+};
 
 use crate::{
     layerwise::LayerwiseLoadOptions,
@@ -174,7 +178,10 @@ pub struct ExpertPassStatistics {
     pub peak_compact_bank_bytes: u64,
     /// Cumulative compact-bank construction time.
     pub compact_bank_time: Duration,
-    /// Time waiting on synchronous expert materialization or promotion.
+    /// Time preparing and reserving expert materialization or promotion.
+    ///
+    /// Deferred device completion is charged to the dependent expert output,
+    /// not this counter.
     pub materialization_wait: Duration,
     /// Host-tier cache activity.
     pub host: ExpertTierStatistics,
@@ -228,6 +235,7 @@ pub struct ExpertCache {
     manager: ResidencyManager,
     catalog: BTreeMap<ExpertIdentity, u64>,
     layer_expert_counts: BTreeMap<usize, usize>,
+    layer_global_spans: BTreeMap<usize, usize>,
     host_budget: Option<u64>,
     scratch_limit: u64,
     statistics: Mutex<ExpertStatistics>,
@@ -252,6 +260,7 @@ impl ExpertCache {
         let mut definitions = Vec::new();
         let mut specs = Vec::new();
         let mut layer_expert_counts = BTreeMap::new();
+        let mut layer_global_spans = BTreeMap::new();
         for entry in entries {
             if catalog.insert(entry.identity, entry.bytes).is_some() {
                 return Err(ExpertCacheError::DuplicateExpert {
@@ -259,6 +268,12 @@ impl ExpertCache {
                 });
             }
             *layer_expert_counts.entry(entry.identity.layer).or_insert(0) += 1;
+            layer_global_spans
+                .entry(entry.identity.layer)
+                .and_modify(|span: &mut usize| {
+                    *span = (*span).max(entry.identity.global_expert + 1)
+                })
+                .or_insert(entry.identity.global_expert + 1);
             specs.push(OffloadUnitSpec::new(
                 entry.identity.unit_id(),
                 entry.bytes,
@@ -278,6 +293,7 @@ impl ExpertCache {
             manager,
             catalog,
             layer_expert_counts,
+            layer_global_spans,
             host_budget: options.experts.host_budget_bytes(),
             scratch_limit: options.compact_bank_scratch_bytes,
             statistics: Mutex::new(ExpertStatistics::default()),
@@ -291,8 +307,9 @@ impl ExpertCache {
 
     /// Discovers, validates, coalesces, and acquires routed experts.
     ///
-    /// Router ids are evaluated together and synchronized once. The returned
-    /// leases must remain live until compact-bank output evaluation completes.
+    /// A device-side demand histogram bounds host readback by the layer's
+    /// global expert count. Original routes remain on-device and are rewritten
+    /// through a compact-id lookup table after validation.
     pub fn acquire_routes(
         &self,
         layer: usize,
@@ -308,20 +325,71 @@ impl ExpertCache {
                 actual: routed_ids.dtype(),
             });
         }
-        let normalized = if routed_ids.dtype() == Dtype::Int32 {
-            routed_ids.clone()
+        let global_span = self
+            .layer_global_spans
+            .get(&layer)
+            .copied()
+            .ok_or(ExpertCacheError::UnknownLayer { layer })?;
+        let global_span_i32 = i32::try_from(global_span)
+            .map_err(|_| ExpertCacheError::ExpertCountOverflow { layer, global_span })?;
+        let flat_routes = routed_ids.reshape(&[-1], stream)?;
+        let below_span = flat_routes.lt(Array::from_int(global_span_i32), stream)?;
+        let valid = if matches!(routed_ids.dtype(), Dtype::Uint32 | Dtype::Uint64) {
+            below_span
         } else {
-            routed_ids.as_dtype(Dtype::Int32, stream)?
+            flat_routes
+                .ge(Array::from_int(0), stream)?
+                .logical_and(below_span, stream)?
         };
-        eval([&normalized])?;
-        stream.synchronize()?;
-        let evaluated = normalized.evaluated()?;
-        self.acquire_route_slice(
-            layer,
-            evaluated.as_slice::<i32>(),
-            routed_ids.shape(),
-            pass,
+        let invalid = valid.logical_not(stream)?.count_nonzero(stream)?;
+        let flat = if routed_ids.dtype() == Dtype::Int32 {
+            flat_routes
+        } else {
+            flat_routes.as_dtype(Dtype::Int32, stream)?
+        };
+        let safe_ids = r#where(
+            &valid,
+            flat.clone(),
+            Array::zeros::<i32>(&[flat.size() as i32], stream)?,
             stream,
+        )?;
+        let demand_values = Array::ones::<i32>(&[flat.size() as i32], stream)?;
+        let histogram = segment_sum(&demand_values, &safe_ids, global_span_i32, 0, stream)?;
+        eval([&histogram, &invalid])?;
+        let invalid_count = invalid.evaluated()?.as_slice::<i32>()[0];
+        if invalid_count != 0 {
+            return Err(ExpertCacheError::InvalidRouteSet {
+                layer,
+                invalid_count: invalid_count as usize,
+                global_span,
+            });
+        }
+        let histogram = histogram.evaluated()?;
+        let mut demand = BTreeMap::new();
+        for (global_expert, count) in histogram.as_slice::<i32>().iter().copied().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let identity = ExpertIdentity::new(layer, global_expert);
+            if !self.catalog.contains_key(&identity) {
+                return Err(ExpertCacheError::MissingOwnedExpert { identity });
+            }
+            demand.insert(identity, count as u64);
+        }
+        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
+        let mut lookup = vec![-1i32; global_span];
+        for (compact, identity) in compact_ids.iter().enumerate() {
+            lookup[identity.global_expert] = compact as i32;
+        }
+        let lookup = Array::from_slice(&lookup, &[global_span_i32]).copy(stream)?;
+        let normalized = flat.reshape(routed_ids.shape(), stream)?;
+        let compact_routes = lookup.take(&normalized, stream)?;
+        self.acquire_demand(
+            demand,
+            compact_ids,
+            compact_routes,
+            routed_ids.size() as u64,
+            pass,
         )
     }
 
@@ -368,6 +436,34 @@ impl ExpertCache {
             *count = count.saturating_add(1);
         }
 
+        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
+        let translations = compact_ids
+            .iter()
+            .enumerate()
+            .map(|(compact, identity)| (*identity, compact as i32))
+            .collect::<BTreeMap<_, _>>();
+        let compact_values = routed_ids
+            .iter()
+            .map(|id| translations[&ExpertIdentity::new(layer, *id as usize)])
+            .collect::<Vec<_>>();
+        let compact_routes = Array::from_slice(&compact_values, route_shape).copy(stream)?;
+        self.acquire_demand(
+            demand,
+            compact_ids,
+            compact_routes,
+            routed_ids.len() as u64,
+            pass,
+        )
+    }
+
+    fn acquire_demand(
+        &self,
+        demand: BTreeMap<ExpertIdentity, u64>,
+        compact_ids: Vec<ExpertIdentity>,
+        compact_routes: Array,
+        route_count: u64,
+        pass: ExpertPass,
+    ) -> Result<AcquiredExperts, ExpertCacheError> {
         let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
             total
                 .checked_add(self.catalog[identity])
@@ -380,26 +476,14 @@ impl ExpertCache {
                 distinct_experts: demand.len(),
             });
         }
-
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        let translations = compact_ids
-            .iter()
-            .enumerate()
-            .map(|(compact, identity)| (*identity, compact as i32))
-            .collect::<BTreeMap<_, _>>();
-        let compact_values = routed_ids
-            .iter()
-            .map(|id| translations[&ExpertIdentity::new(layer, *id as usize)])
-            .collect::<Vec<_>>();
-        let compact_routes = Array::from_slice(&compact_values, route_shape).copy(stream)?;
-
         let before = self.resident_snapshot()?;
         let started = Instant::now();
-        let mut leases = Vec::with_capacity(compact_ids.len());
         let mut host_hits = 0u64;
         let mut host_misses = 0u64;
         let mut device_hits = 0u64;
         let mut device_misses = 0u64;
+        let mut requests = Vec::with_capacity(compact_ids.len());
+        let mut host_requests = Vec::new();
         for identity in &compact_ids {
             let unit = identity.unit_id();
             let route_demand = demand[identity];
@@ -415,31 +499,27 @@ impl ExpertCache {
             } else {
                 device_misses = device_misses.saturating_add(1);
             }
-
-            if !device_hit && self.host_budget != Some(0) {
-                match self
-                    .manager
-                    .acquire_with_demand(&unit, MemoryTier::Host, route_demand)
-                {
-                    Ok(host) => drop(host),
-                    Err(ResidencyError::BudgetExhausted {
-                        tier: MemoryTier::Host,
-                        ..
-                    }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            } else if host_hit {
-                let host =
-                    self.manager
-                        .acquire_with_demand(&unit, MemoryTier::Host, route_demand)?;
-                drop(host);
+            if host_hit || (!device_hit && self.host_budget != Some(0)) {
+                host_requests.push((unit.clone(), route_demand));
             }
-            leases.push(self.manager.acquire_with_demand(
-                &unit,
-                MemoryTier::Device,
-                route_demand,
-            )?);
+            requests.push((unit, route_demand));
         }
+        if !host_requests.is_empty() {
+            match self
+                .manager
+                .acquire_many_with_demand(&host_requests, MemoryTier::Host)
+            {
+                Ok(host) => drop(host),
+                Err(ResidencyError::BudgetExhausted {
+                    tier: MemoryTier::Host,
+                    ..
+                }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let leases = self
+            .manager
+            .acquire_many_deferred_with_demand(&requests, MemoryTier::Device)?;
         let wait = started.elapsed();
         let after = self.resident_snapshot()?;
         let (host_evictions, host_eviction_bytes) = before.evicted(&after, MemoryTier::Host);
@@ -450,13 +530,12 @@ impl ExpertCache {
             .lock()
             .map_err(|_| ExpertCacheError::StatisticsPoisoned)?;
         let stats = statistics.pass_mut(pass);
-        let routes = routed_ids.len() as u64;
         let distinct = compact_ids.len() as u64;
-        stats.requested_routes = stats.requested_routes.saturating_add(routes);
+        stats.requested_routes = stats.requested_routes.saturating_add(route_count);
         stats.distinct_experts = stats.distinct_experts.saturating_add(distinct);
         stats.coalesced_duplicates = stats
             .coalesced_duplicates
-            .saturating_add(routes.saturating_sub(distinct));
+            .saturating_add(route_count.saturating_sub(distinct));
         stats.materialization_wait = stats.materialization_wait.saturating_add(wait);
         stats.host.requests = stats.host.requests.saturating_add(distinct);
         stats.host.hits = stats.host.hits.saturating_add(host_hits);
@@ -635,6 +714,14 @@ impl AcquiredExperts {
         &self.leases
     }
 
+    /// Releases pending transfer sources after compact expert output evaluation.
+    pub fn complete_pending(&self) -> Result<(), ExpertCacheError> {
+        for lease in &self.leases {
+            lease.complete_pending()?;
+        }
+        Ok(())
+    }
+
     /// Concatenates one required per-expert binding along its leading axis.
     pub fn compact_binding(&self, name: &str, stream: &Stream) -> Result<Array, ExpertCacheError> {
         let values = self
@@ -714,6 +801,24 @@ pub enum ExpertCacheError {
     UnknownLayer {
         /// Missing decoder layer identity.
         layer: usize,
+    },
+    /// A layer's global expert span cannot be represented by MLX indexing.
+    #[error("layer {layer} global expert span {global_span} exceeds MLX i32 indexing")]
+    ExpertCountOverflow {
+        /// Decoder layer identity.
+        layer: usize,
+        /// Required global expert span.
+        global_span: usize,
+    },
+    /// Device-side validation found one or more out-of-range routes.
+    #[error("layer {layer} contains {invalid_count} routed ids outside 0..{global_span}")]
+    InvalidRouteSet {
+        /// Decoder layer identity.
+        layer: usize,
+        /// Number of invalid route rows.
+        invalid_count: usize,
+        /// Valid global expert span.
+        global_span: usize,
     },
     /// A route id was negative or otherwise invalid.
     #[error("invalid routed expert id {expert} for layer {layer}; this rank catalogs {known_owned_experts} owned experts")]
@@ -912,6 +1017,51 @@ mod tests {
         assert_eq!(report.decode.device.hits, 2);
         assert_eq!(report.owned_experts, 3);
         assert_eq!(report.owned_bytes, 48);
+    }
+
+    #[test]
+    fn device_histogram_preserves_duplicate_routes_and_validates_before_loading() {
+        let (_dir, store) = fixture();
+        let cache = cache(store, 32, 32, 32, CacheEvictionPolicy::LeastRecentlyUsed);
+        let execution = stream();
+        let routes = Array::from_slice(&[2i32, 0, 2, 0], &[2, 2]);
+        let acquired = cache
+            .acquire_routes(2, &routes, ExpertPass::Prefill, &execution)
+            .unwrap();
+        assert_eq!(
+            acquired.identities(),
+            &[ExpertIdentity::new(2, 0), ExpertIdentity::new(2, 2)]
+        );
+        assert_eq!(acquired.demand(), &[2, 2]);
+        assert_eq!(
+            acquired
+                .compact_routes()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[1, 0, 1, 0]
+        );
+        drop(acquired);
+
+        let invalid = Array::from_slice(&[-1i32, 0], &[2]);
+        assert!(matches!(
+            cache.acquire_routes(2, &invalid, ExpertPass::Decode, &execution),
+            Err(ExpertCacheError::InvalidRouteSet {
+                invalid_count: 1,
+                ..
+            })
+        ));
+        let report = cache.report().unwrap();
+        assert_eq!(report.decode.requested_routes, 0);
+
+        let narrowing_alias = Array::from_slice(&[1u64 << 32], &[1]);
+        assert!(matches!(
+            cache.acquire_routes(2, &narrowing_alias, ExpertPass::Decode, &execution),
+            Err(ExpertCacheError::InvalidRouteSet {
+                invalid_count: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -656,7 +656,7 @@ impl WeightStore for SafetensorsWeightStore {
 ///
 /// The lease deliberately has no method returning a borrowed or mmap-derived
 /// MLX array. [`Self::materialize`] is the only array-producing operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WeightLease {
     key: String,
     metadata: WeightMetadata,
@@ -703,18 +703,29 @@ impl WeightLease {
 
     /// Safely materializes the selected tensor onto `execution_stream`.
     ///
-    /// MLX does not expose an event/fence primitive in the pinned C API. The
-    /// source and execution streams are therefore both synchronized after
-    /// explicit evaluation. This guarantees that the returned copy no longer
-    /// depends lazily on the mmap before this method can release its internal
-    /// safetensors view or before the caller can drop the lease. If the runtime
-    /// cannot synchronize, the mapping is conservatively retained for process
-    /// lifetime rather than risk releasing bytes still referenced by MLX.
+    /// The returned copy is explicitly evaluated while this lease and its
+    /// mmap-derived source array remain live. Batched residency callers use
+    /// [`Self::prepare_materialization`] to evaluate several outputs together.
+    /// An incomplete pending value synchronizes conservatively during drop.
     pub fn materialize(
         &self,
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<Array, WeightStoreError> {
+        self.clone()
+            .prepare_materialization(source_stream, execution_stream)?
+            .finish()
+    }
+
+    /// Schedules materialization while retaining every mmap-backed dependency.
+    ///
+    /// The returned value must be explicitly completed after its output is
+    /// evaluated. Dropping it early conservatively synchronizes both streams.
+    pub(crate) fn prepare_materialization(
+        self,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
         let checkpoint = SafeTensors::deserialize(&self.shard.mmap).map_err(|error| {
             WeightStoreError::MalformedSafetensors {
                 path: self.shard.path.clone(),
@@ -747,7 +758,7 @@ impl WeightLease {
                 .map_err(|source| self.mlx_error("copy", source)),
             TensorSelection::Range { axis, start, end } => materialize_range(
                 &self.key,
-                source_value,
+                source_value.clone(),
                 &self.metadata.shape,
                 *axis,
                 *start,
@@ -763,35 +774,15 @@ impl WeightLease {
                 source_stream,
                 execution_stream,
             ),
-        };
-        let materialized = materialized.and_then(|value| {
-            eval([&value])
-                .map_err(|source| self.mlx_error("evaluation", source))
-                .map(|()| value)
-        });
-
-        // Synchronize even when selection, copy, or evaluation failed. Some
-        // earlier operations may already have been submitted and still borrow
-        // the mmap-derived source pointer.
-        let source_sync = source_stream.synchronize();
-        let execution_sync = execution_stream.synchronize();
-        if let Err(source) = source_sync {
-            self.retain_mapping_after_sync_failure();
-            return Err(WeightStoreError::Synchronization {
-                key: self.key.clone(),
-                stream: "source stream",
-                source,
-            });
-        }
-        if let Err(source) = execution_sync {
-            self.retain_mapping_after_sync_failure();
-            return Err(WeightStoreError::Synchronization {
-                key: self.key.clone(),
-                stream: "execution stream",
-                source,
-            });
-        }
-        materialized
+        }?;
+        Ok(PendingWeightMaterialization {
+            output: materialized,
+            _source: source_value,
+            lease: Some(self),
+            source_stream: source_stream.clone(),
+            execution_stream: execution_stream.clone(),
+            completed: false,
+        })
     }
 
     fn mlx_error(
@@ -811,6 +802,57 @@ impl WeightLease {
         // unknowable. Permanently retaining one Arc is conservative and avoids
         // releasing bytes that submitted MLX work may still reference.
         std::mem::forget(Arc::clone(&self.shard));
+    }
+}
+
+/// Scheduled tensor materialization that still pins its mmap-backed sources.
+pub(crate) struct PendingWeightMaterialization {
+    output: Array,
+    _source: Array,
+    lease: Option<WeightLease>,
+    source_stream: Stream,
+    execution_stream: Stream,
+    completed: bool,
+}
+
+impl PendingWeightMaterialization {
+    /// Returns the lazy materialized output.
+    pub(crate) fn output(&self) -> &Array {
+        &self.output
+    }
+
+    /// Evaluates this output and releases its source dependencies.
+    pub(crate) fn finish(mut self) -> Result<Array, WeightStoreError> {
+        eval([&self.output]).map_err(|source| {
+            self.lease
+                .as_ref()
+                .expect("pending materialization retains its lease")
+                .mlx_error("evaluation", source)
+        })?;
+        self.completed = true;
+        self.lease.take();
+        Ok(self.output.clone())
+    }
+
+    /// Marks a batch member complete after a containing output was evaluated.
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+        self.lease.take();
+    }
+}
+
+impl Drop for PendingWeightMaterialization {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let source = self.source_stream.synchronize();
+        let execution = self.execution_stream.synchronize();
+        if source.is_err() || execution.is_err() {
+            if let Some(lease) = &self.lease {
+                lease.retain_mapping_after_sync_failure();
+            }
+        }
     }
 }
 

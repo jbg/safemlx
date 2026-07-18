@@ -542,16 +542,15 @@ pub fn compact_local_routes(
         .eq(Array::from_int(assignment.rank as i32), stream)?
         .logical_and(valid, stream)?;
     let compact = mask.compact_indices(stream)?;
-    eval([&invalid, &compact.count])?;
     let started = std::time::Instant::now();
-    stream.synchronize()?;
+    eval([&invalid, &compact.count])?;
+    let synchronization_time = started.elapsed();
     if invalid.clone().try_item::<i32>(stream)? != 0 {
         return Err(Error::Parallel(
             "route contains a globally invalid expert id".into(),
         ));
     }
     let local_routes = compact.count.clone().try_item::<i32>(stream)? as usize;
-    let synchronization_time = started.elapsed();
     let positions = compact
         .indices
         .try_index_device(..local_routes as i32, stream)?;
@@ -1430,7 +1429,6 @@ impl ExpertParallelModel {
         };
         let finished = distributed::all_sum(&local_finished, group, stream)?;
         eval([&token, &finished])?;
-        stream.synchronize()?;
         Ok(SynchronizedToken {
             token,
             finished: finished.try_item::<i32>(stream)? != 0,
@@ -1710,14 +1708,11 @@ fn execute_cached_deepseek(
     optional!(down_proj_scale_inv, "down_proj_scale_inv");
     optional!(down_proj_scales, "down_proj_scales");
     optional!(down_proj_biases, "down_proj_biases");
-    let parameters = bank.parameters().flatten();
-    eval(parameters.values().copied())?;
-    stream.synchronize()?;
     cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
     let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
     let output = bank.forward_local(hidden, acquired.compact_routes(), &weights, stream)?;
     eval([&output])?;
-    stream.synchronize()?;
+    acquired.complete_pending()?;
     Ok(output)
 }
 
@@ -1749,14 +1744,11 @@ fn execute_cached_qwen3(
         Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
     bank.down_proj_biases =
         Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    let parameters = bank.parameters().flatten();
-    eval(parameters.values().copied())?;
-    stream.synchronize()?;
     cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
     let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
     let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
     eval([&output])?;
-    stream.synchronize()?;
+    acquired.complete_pending()?;
     Ok(output)
 }
 
@@ -1920,7 +1912,6 @@ fn quantize_qwen3_local_experts(
                     .into_iter()
                     .chain(quantized.biases.as_ref()),
             )?;
-            stream.synchronize()?;
             tensors.insert(key.clone(), quantized.weight);
             tensors.insert(format!("{key}_scales"), quantized.scales);
             if let Some(biases) = quantized.biases {

@@ -598,16 +598,15 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
                             .optional_compact_binding("down_proj_biases", stream)
                             .map_err(|error| Exception::custom(error.to_string()))?,
                     );
-                    let parameters = bank.parameters().flatten();
-                    eval(parameters.values().copied())?;
-                    stream.synchronize()?;
                     expert_cache
                         .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
                         .map_err(|error| Exception::custom(error.to_string()))?;
                     let output =
                         bank.forward_local(flat, acquired.compact_routes(), weights, stream)?;
                     eval([&output])?;
-                    stream.synchronize()?;
+                    acquired
+                        .complete_pending()
+                        .map_err(|error| Exception::custom(error.to_string()))?;
                     Ok(output)
                 },
             )?;
