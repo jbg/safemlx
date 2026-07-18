@@ -70,12 +70,14 @@ identifiers breaking ties. RAII `ResidentUnitLease` values explicitly pin the
 requested tier while in use. Callers should not retain cloned MLX arrays beyond
 a lease when authoritative residency accounting is required.
 
-Prefetch and execution-window lookahead honor `OffloadConfig::prefetch_depth`,
-but run synchronously: they prepare residency ahead of demand without
-overlapping transfer and compute. Transfer, stall, eviction, current, and peak
-residency observations feed the existing offload telemetry, while mapped-shard
-diagnostics remain separate. Background workers and event-backed overlap are
-not implemented.
+Ordinary `LayerwiseHost` prefetch and execution-window lookahead honor
+`OffloadConfig::prefetch_depth`, but run synchronously. Experimental dense disk
+streaming adds a bounded, joined CPU worker for disk-to-host layer warming.
+Device promotion remains on the ordered execution path because MLX does not
+expose the cross-stream events or fences needed for arbitrary transfer/compute
+overlap. Transfer, stall, eviction, current, and peak residency observations
+feed the offload telemetry, while mapped-shard and process page-fault
+diagnostics remain separate.
 
 `ResidentLayerGroup` adds named, deterministic ordered-unit preparation and
 explicit trimming even under an unlimited device budget. Independent groups
@@ -84,6 +86,58 @@ can be cleared without disturbing each other. `LayerwiseModel<A>` preserves the
 compatible homogeneous-KV path. `GeneralLayerwiseModel<A>` adds associated
 input and cache types, heterogeneous runtime units, full-cache access, and
 central retained-state evaluation for recurrent and multimodal adapters.
+
+## Experimental dense disk streaming
+
+`WeightResidency::DenseDiskStream(DenseDiskStreamLoadOptions)` keeps ordinary
+decoder and execution-stack layers disk planned and array-free at model load.
+Its device and host parameter budgets are always finite. Protected host and
+device lookahead depths are independent; older cacheable copies remain resident
+until deterministic LRU or LFU eviction is needed. A zero host budget is an
+explicit direct disk-to-device mode and requires zero host lookahead and queue
+capacity. The persistent `SafetensorsWeightStore` remains the canonical cold
+source and its mapped-shard cache stays independently bounded.
+
+This mode is experimental and capacity-oriented. A dense decoder touches
+essentially every layer for every token. If neither the logical layer caches nor
+the operating system page cache retains the working set, small-token
+autoregressive decode can approach reading the checkpoint once per generated
+token and may be extremely slow. Background host prefetch can hide some page
+fault and materialization latency, but it cannot remove required bytes. The
+library promises correctness and bounded logical layer residency, not a
+throughput improvement.
+
+Dense disk streaming is mainly appropriate for capacity-first experiments,
+large prefill or offline batches, quantized checkpoints, fast local storage,
+and workloads that benefit from OS page-cache retention. On Apple silicon, CPU
+and GPU arrays share physical unified memory, so logical host/device tiers do
+not create additional physical capacity. Pinned embeddings, final norms and
+output projections, activations, KV or recurrent state, kernels, allocator
+caches, and temporary compact expert banks are outside streamed-layer totals.
+Exact physical disk I/O is not observable from mmap telemetry: logical misses,
+mapping hits and misses, known logical transfer bytes, and minor/major page
+faults are distinct observations.
+
+Direct dense streaming of an MoE checkpoint streams the complete layer,
+including its expert bank. Use
+`WeightResidency::SparseExpertCacheWithDenseLayers` when expert-granular reuse
+is desired while non-expert layer weights remain disk streamed. Existing
+`ExpertCacheLoadOptions::non_expert` continues to select eager host-backed
+non-expert semantics for `SparseExpertCache`.
+
+Pure Llama/Mistral and DeepSeek-V3/R1 pipeline stages stream locally: each rank
+catalogs its contiguous global layer range and owns a separate worker and
+residency report. The first stage alone owns the input embedding, and the final
+stage alone owns final normalization and output projection weights.
+
+The `llama_residency` example accepts `--dense-disk-stream` together with
+`--stream-host-budget`, `--stream-device-budget`,
+`--stream-host-lookahead`, `--stream-device-lookahead`, and
+`--stream-queue-capacity`. It reports load-time residency, first-process and
+repeated-process prefill latency, decode latency, cache occupancy, logical
+transfers, queue waits, mappings, and available process page-fault samples.
+Those labels do not imply physically cold or warm storage, and the example
+never drops operating-system caches.
 
 `DerivedWeightRecipe` composes checkpoint selection and renaming,
 concatenation, stacking, reshape, axis permutation, and dtype cast. Recipes are
@@ -404,6 +458,8 @@ cargo test -p safemlx-lm --test distributed_partition_ring \
   ring_two_process_partition_load -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture
 ```
 
 See `cargo run -p safemlx-lm --example pipeline_generate -- MODEL_DIR` for the
