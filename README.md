@@ -26,9 +26,16 @@ copies on explicit streams, applies pinned, windowed, and cacheable policies,
 evicts eligible units deterministically, and protects in-use arrays with RAII
 leases. Prefetch and execution windows are synchronous and feed existing
 offload telemetry. Apple CPU and GPU tiers share physical unified memory, so
-their logical budgets do not increase physical capacity. No model family uses
-layerwise offload yet, and background or event-backed prefetch is not
-implemented.
+their logical budgets do not increase physical capacity. Llama and Mistral
+safetensors have an explicit layerwise host-offload loader that keeps decoder
+weights on a CPU stream and moves a bounded layer window to the execution
+device. Static weights and KV caches stay on the device, and existing packed
+affine or MXFP4 tensors remain packed. Transfers are synchronous because MLX
+does not expose stream events. This expands capacity on discrete CUDA systems;
+on Metal it validates scheduling and logical residency within unified memory.
+The standard fully resident loader is unchanged. GGUF, load-time conversion,
+other model families, pinned host buffers, and asynchronous overlap are not
+supported by this path.
 
 ## Crates
 

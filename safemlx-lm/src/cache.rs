@@ -32,6 +32,12 @@ pub trait KeyValueCache {
     /// Returns the maximum retained sequence length for sliding-window caches.
     fn max_size(&self) -> Option<i32>;
 
+    /// Returns retained cache arrays that must be materialized before weights
+    /// used to produce them can be released.
+    fn retained_arrays(&self) -> Vec<&Array> {
+        Vec::new()
+    }
+
     /// Adds the newest keys and values and returns the full keys and values to attend over.
     fn update_and_fetch(
         &mut self,
@@ -265,6 +271,10 @@ where
         T::max_size(self)
     }
 
+    fn retained_arrays(&self) -> Vec<&Array> {
+        T::retained_arrays(self)
+    }
+
     fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -343,6 +353,10 @@ impl KeyValueCache for SlidingKeyValueCache {
 
     fn max_size(&self) -> Option<i32> {
         Some(self.max_size)
+    }
+
+    fn retained_arrays(&self) -> Vec<&Array> {
+        self.keys.iter().chain(self.values.iter()).collect()
     }
 
     fn update_and_fetch(
@@ -474,6 +488,10 @@ impl KeyValueCache for ConcatKeyValueCache {
 
     fn max_size(&self) -> Option<i32> {
         self.max_size
+    }
+
+    fn retained_arrays(&self) -> Vec<&Array> {
+        self.keys.iter().chain(self.values.iter()).collect()
     }
 
     fn update_and_fetch(

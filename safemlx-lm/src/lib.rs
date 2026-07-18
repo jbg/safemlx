@@ -11,6 +11,9 @@
 //! weight units without coupling them to a model family.
 //! [`weight_store`] catalogs safetensors checkpoints and safely materializes
 //! lazily acquired selections from bounded persistent mappings.
+//! [`llama_host_offload`] provides an explicit Llama/Mistral safetensors path
+//! that keeps decoder weights on a CPU stream and executes them through a
+//! bounded synchronous device-layer window.
 
 #![warn(missing_docs)]
 
@@ -25,6 +28,10 @@ pub mod gemma4_mtp;
 mod gguf_tokenizer;
 /// Lightweight activation inspection hooks.
 pub mod inspection;
+/// Explicit Llama/Mistral layerwise host-offload loading and inference.
+pub mod llama_host_offload;
+/// Canonical unloaded-module checkpoint binding and resident assignment helpers.
+pub mod module_binding;
 /// Planning contracts and telemetry for weight residency management.
 pub mod offload;
 // pub mod generate;
@@ -54,6 +61,10 @@ pub mod weight_store;
 /// Strict safetensors loading and validation utilities.
 pub mod weights;
 
+pub use llama_host_offload::{
+    load_llama_host_offloaded_model, load_llama_host_offloaded_model_with_options,
+    LlamaHostOffloadOptions, OffloadedLlamaCache, OffloadedLlamaMetadata, OffloadedLlamaModel,
+};
 pub use models::{
     check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
     ModelLoadOptions, SupportedModelConfig,

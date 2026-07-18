@@ -194,6 +194,25 @@ pub struct ResidencyBlocker {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// An ordered layer window had no units.
+    #[error("device layer window requires at least one ordered unit")]
+    EmptyLayerWindow,
+    /// The configured device layer window exceeded the ordered unit count.
+    #[error("device layer window depth {depth} exceeds {layer_count} ordered units")]
+    OversizedLayerWindow {
+        /// Requested resident-layer bound.
+        depth: usize,
+        /// Available ordered units.
+        layer_count: usize,
+    },
+    /// A layer index was outside the ordered sequence.
+    #[error("device layer index {index} is outside {layer_count} ordered units")]
+    InvalidLayerIndex {
+        /// Requested index.
+        index: usize,
+        /// Available ordered units.
+        layer_count: usize,
+    },
     /// A binding name was empty or whitespace-only.
     #[error("weight binding names must not be empty")]
     InvalidBindingName,
@@ -449,6 +468,102 @@ impl ResidencyReport {
 #[derive(Clone)]
 pub struct ResidencyManager {
     inner: Arc<ManagerInner>,
+}
+
+/// Deterministic controller for a bounded ordered device-layer window.
+///
+/// The current layer counts toward `depth`. Preparation is synchronous and
+/// explicit trimming is performed even when the manager has an unlimited
+/// device budget, so stale decoder copies cannot accumulate.
+#[derive(Debug, Clone)]
+pub struct DeviceLayerWindow {
+    units: Vec<OffloadUnitId>,
+    depth: usize,
+}
+
+impl DeviceLayerWindow {
+    /// Creates a controller for a non-empty ordered unit sequence.
+    pub fn new(
+        units: impl IntoIterator<Item = OffloadUnitId>,
+        depth: usize,
+    ) -> Result<Self, ResidencyError> {
+        let units = units.into_iter().collect::<Vec<_>>();
+        if units.is_empty() {
+            return Err(ResidencyError::EmptyLayerWindow);
+        }
+        if depth == 0 || depth > units.len() {
+            return Err(ResidencyError::OversizedLayerWindow {
+                depth,
+                layer_count: units.len(),
+            });
+        }
+        let unique = units.iter().collect::<BTreeSet<_>>();
+        if unique.len() != units.len() {
+            return Err(ResidencyError::DuplicateUnitDefinition {
+                id: units
+                    .iter()
+                    .find(|id| units.iter().filter(|candidate| *candidate == *id).count() > 1)
+                    .expect("duplicate exists")
+                    .clone(),
+            });
+        }
+        Ok(Self { units, depth })
+    }
+
+    /// Returns the maximum number of decoder units kept on the device.
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns decoder units in execution order.
+    pub fn units(&self) -> &[OffloadUnitId] {
+        &self.units
+    }
+
+    /// Returns the desired window beginning at `current`.
+    pub fn desired(&self, current: usize) -> Result<&[OffloadUnitId], ResidencyError> {
+        if current >= self.units.len() {
+            return Err(ResidencyError::InvalidLayerIndex {
+                index: current,
+                layer_count: self.units.len(),
+            });
+        }
+        let end = current.saturating_add(self.depth).min(self.units.len());
+        Ok(&self.units[current..end])
+    }
+
+    /// Synchronously prepares and trims the window beginning at `current`.
+    pub fn prepare(
+        &self,
+        manager: &ResidencyManager,
+        current: usize,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
+        let desired = self.desired(current)?;
+        let outcomes = manager.prepare_window(desired, desired, MemoryTier::Device)?;
+        self.trim_to(manager, desired)?;
+        Ok(outcomes)
+    }
+
+    /// Explicitly evicts every managed device copy outside `desired`.
+    pub fn trim_to(
+        &self,
+        manager: &ResidencyManager,
+        desired: &[OffloadUnitId],
+    ) -> Result<(), ResidencyError> {
+        let desired = desired.iter().collect::<BTreeSet<_>>();
+        for id in &self.units {
+            if !desired.contains(id) {
+                manager.evict(id, MemoryTier::Device)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears protection and removes every managed device-layer copy.
+    pub fn clear(&self, manager: &ResidencyManager) -> Result<(), ResidencyError> {
+        manager.prepare_window(&[], &[], MemoryTier::Device)?;
+        self.trim_to(manager, &[])
+    }
 }
 
 impl ResidencyManager {
@@ -1894,6 +2009,46 @@ mod tests {
             16
         );
         assert!(report.weight_store().mapping_hits > 0);
+    }
+
+    #[test]
+    fn ordered_device_window_trims_stale_units_with_unlimited_budget() {
+        let (_dir, store) = fixture_store();
+        let manager = manager(
+            store,
+            OffloadConfig::new(None, Some(24), 2).unwrap(),
+            [
+                spec("a", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+                spec("b", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+                spec("c", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+            ],
+            [single("a", "a"), single("b", "b"), single("c", "c")],
+        );
+        manager.initialize().unwrap();
+        let window = DeviceLayerWindow::new([id("a"), id("b"), id("c")], 2).unwrap();
+
+        window.prepare(&manager, 0).unwrap();
+        let first = manager.report().unwrap();
+        assert!(state(&first, "a").device_resident());
+        assert!(state(&first, "b").device_resident());
+        assert!(!state(&first, "c").device_resident());
+
+        let lease = manager.acquire(&id("b"), MemoryTier::Device).unwrap();
+        window.prepare(&manager, 1).unwrap();
+        let second = manager.report().unwrap();
+        assert!(!state(&second, "a").device_resident());
+        assert!(state(&second, "b").device_resident());
+        assert!(state(&second, "c").device_resident());
+        assert_eq!(state(&second, "b").device_pins(), 1);
+        drop(lease);
+
+        window.clear(&manager).unwrap();
+        assert!(manager
+            .report()
+            .unwrap()
+            .units()
+            .iter()
+            .all(|unit| !unit.device_resident()));
     }
 
     #[cfg(target_os = "macos")]

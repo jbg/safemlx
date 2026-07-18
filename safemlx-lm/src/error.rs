@@ -19,6 +19,14 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid or failed Llama-compatible layerwise host offload.
+    #[error(transparent)]
+    LlamaHostOffload(#[from] crate::llama_host_offload::LlamaHostOffloadError),
+
+    /// Invalid module-to-checkpoint or resident-lease binding.
+    #[error(transparent)]
+    ModuleBinding(#[from] crate::module_binding::ModuleBindingError),
+
     /// Persistent checkpoint catalog, mapping, or materialization failure.
     #[error(transparent)]
     WeightStore(#[from] crate::weight_store::WeightStoreError),

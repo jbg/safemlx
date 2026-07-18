@@ -36,9 +36,9 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-Models still retain their materialized arrays after loading; no model adapter
-uses layerwise offload yet. Background prefetch and model execution through
-resident-unit leases are not implemented.
+The ordinary model loaders still retain their materialized arrays. Llama and
+Mistral safetensors additionally have an explicit layerwise host-offload path;
+other model families continue to use their existing loading behavior.
 
 ## Offload planning and observability
 
@@ -73,25 +73,57 @@ residency observations feed the existing offload telemetry, while mapped-shard
 diagnostics remain separate. Background workers and event-backed overlap are
 not implemented.
 
-This runtime is an executable residency primitive, not complete model offload.
-Existing checkpoint and model-loading behavior is unchanged, and no Llama,
-Qwen, DeepSeek, pipeline-, tensor-, or expert-parallel model code swaps weights
-through the manager. Distributed callers can construct units from only their
-rank-local ranges or indices; the manager has no rank or collective logic.
+`DeviceLayerWindow` adds deterministic ordered-unit preparation and explicit
+trimming even under an unlimited device budget. The Llama adapter uses it to
+execute temporary decoder blocks directly from resident leases. Qwen,
+DeepSeek, and the distributed adapters do not yet swap weights through the
+manager. Distributed callers can construct units from only their rank-local
+ranges or indices; the manager has no rank or collective logic.
 
 On Apple silicon, CPU and GPU execution share the same physical unified-memory
 pool. Logical host/device accounting is useful for residency policy, but does
 not imply additional physical capacity. Choosing CPU execution can change
 execution behavior, wired memory, and residency pressure. On a discrete CUDA
-system, host-resident weights may occupy separate physical memory, with transfer
-costs. Dense autoregressive model execution through this primitive is not
-implemented.
+system, host-resident weights occupy separate physical memory, making this a
+capacity-expanding option at the cost of synchronous layer transfers.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated
 native allocations. The pinned MLX 0.32.0 C surface has whole-stream
 synchronization but no event/fence primitive, so residency execution uses
 conservative stream synchronization until an event-backed API is available.
+
+## Llama-compatible layerwise host offload
+
+`llama_host_offload::load_llama_host_offloaded_model` and
+`load_llama_host_offloaded_model_with_options` load dense or already-packed
+MLX affine/MXFP4 Llama and Mistral safetensors. They do not change the standard
+fully resident loader.
+
+The embedding, final normalization, untied output projection when present,
+activations, and KV cache remain on the execution device. Every decoder layer
+is initialized on the caller's CPU stream and remains host-resident. Decoder
+copies move through a bounded device window whose size is
+`OffloadConfig::prefetch_depth()` and includes the current layer. A temporary
+unloaded block receives handle clones from its resident lease, executes, and is
+dropped after the output and updated cache have been evaluated and the stream
+has synchronized. Packed weights, scales, and biases move unchanged; they are
+not dequantized or repacked.
+
+Host budgets must contain all decoder weights. Device budgets must contain
+pinned static weights plus the largest permitted consecutive layer window.
+Residency reports account for parameter copies only; activations, KV state,
+kernels, and allocator cache can make MLX peak memory larger. On Apple silicon,
+logical CPU/GPU totals refer to one unified physical memory pool and do not
+increase model capacity. Discrete CUDA memory is the capacity-expanding target.
+
+Transfers are synchronous because the pinned MLX API exposes whole-stream
+synchronization but no events. GGUF, load-time quantization, other model
+families, pinned host buffers, KV-cache offload, and asynchronous transfer or
+compute overlap are not supported by this loader. The opt-in
+`llama_host_offload` example accepts a real checkpoint directory and reports
+latency, throughput, logical residency, transfer telemetry, allocator samples,
+and mapped-shard diagnostics.
 
 ## Linux and CUDA
 

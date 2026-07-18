@@ -61,6 +61,10 @@ jobs:
         # Some generated CUDA translation units are memory-intensive. Keep the
         # native build serialized so standard hosted runners do not OOM.
         run: cargo test -j 1 -p safemlx --features cuda --lib --no-run
+      - name: Compile language-model tests and host-offload example with CUDA
+        run: |
+          cargo test -j 1 -p safemlx-lm --features cuda --lib --no-run
+          cargo check -j 1 -p safemlx-lm --features cuda --example llama_host_offload
       - name: Check the CUDA language-model CLI
         run: cargo check -j 1 -p safemlx-lm-cli --features cuda
 
@@ -72,3 +76,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run CUDA device smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke
+      - name: Run tiny offloaded Llama parity on CUDA
+        run: cargo test --release -p safemlx-lm --features cuda llama_host_offload::tests::host_offload_dense_prefill_decode_parity --lib -- --exact

@@ -589,9 +589,7 @@ fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<Str
 }
 
 fn checkpoint_name(parameter_name: &str) -> String {
-    parameter_name
-        .replace(".inner.weight", ".weight")
-        .replace(".inner.bias", ".bias")
+    crate::module_binding::canonical_checkpoint_name(parameter_name)
 }
 
 fn infer_activation_dtype(partition: &RankPartition) -> Dtype {
