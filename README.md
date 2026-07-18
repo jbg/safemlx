@@ -14,6 +14,15 @@ This fork carries additional model/runtime support, including Gemma 4 and
 Thinking Machines Lab Inkling support, Gemma 4 assistant drafting, expanded model loading, and chat-template handling
 for structured messages and tools.
 
+`safemlx-lm` also exposes persistent, lazy safetensors checkpoint storage.
+Checkpoint keys can be cataloged without creating MLX arrays, selected tensors
+are safely materialized through mmap-pinning leases, and mapped payload shards
+are reused under a deterministic bound. Rank-aware loading resolves placement
+before materialization so remote-only indexed shards stay unopened. This does
+not add a layer scheduler, background prefetch, parameter eviction, or
+executable CPU/disk offload; loaded models continue to retain materialized
+arrays.
+
 ## Crates
 
 The crates use SafeMLX package names on crates.io to avoid confusion with the

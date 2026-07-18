@@ -6,24 +6,20 @@
 //! describes how the current inference job is arranged.
 
 use std::{
-    collections::{HashMap, HashSet},
-    fs::File,
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
 };
 
-use memmap2::MmapOptions;
 use safemlx::{
     distributed::{self, Group},
-    ops::indexing::TryIndexOp,
-    transforms::eval,
     Array, Device, DeviceType, Stream,
 };
-use safetensors::SafeTensors;
 
 use crate::{
     error::Error,
-    weights::{StrictLoadConfig, WeightMap},
+    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weights::StrictLoadConfig,
 };
 
 /// Explicit process-local execution-device assignment.
@@ -843,189 +839,90 @@ pub fn load_safetensors_partition_on_streams(
     execution_stream: &Stream,
     config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
-    let model_dir = model_dir.as_ref();
+    let store = SafetensorsWeightStore::open(model_dir)?;
+    load_safetensors_partition_from_store_on_streams(
+        &store,
+        plan,
+        source_stream,
+        execution_stream,
+        config,
+    )
+}
+
+/// Selectively loads a rank partition from a reusable checkpoint store.
+pub fn load_safetensors_partition_from_store(
+    store: &(impl WeightStore + ?Sized),
+    plan: &PlacementPlan,
+    stream: &Stream,
+    config: &StrictLoadConfig,
+) -> Result<RankPartition, Error> {
+    load_safetensors_partition_from_store_on_streams(store, plan, stream, stream, config)
+}
+
+/// Selectively loads a rank partition from a reusable checkpoint store using
+/// explicit source and execution streams.
+///
+/// Placement is resolved from catalog metadata before a lease materializes an
+/// array. Remote-only indexed shards are therefore never acquired or mapped.
+pub fn load_safetensors_partition_from_store_on_streams(
+    store: &(impl WeightStore + ?Sized),
+    plan: &PlacementPlan,
+    source_stream: &Stream,
+    execution_stream: &Stream,
+    config: &StrictLoadConfig,
+) -> Result<RankPartition, Error> {
     plan.validate()?;
     plan.topology.validate_execution_stream(execution_stream)?;
-    let index_path = model_dir.join("model.safetensors.index.json");
     let mut report = PartitionReport::default();
     let mut tensors = HashMap::new();
-    let mut opened_shards = Vec::new();
+    let mut opened_shards = BTreeSet::new();
 
-    if index_path.exists() {
-        let index: WeightMap = serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
-        let mut selected_by_file: HashMap<String, HashSet<String>> = HashMap::new();
-        for (source, file) in &index.weight_map {
-            match plan.source_plan(source, config) {
-                SourcePlan::Unexpected => report.unexpected.push(source.clone()),
-                SourcePlan::Known { tensor, .. } => {
-                    let potentially_local = !matches!(tensor.placement, TensorPlacement::Omit)
-                        && !matches!(tensor.placement, TensorPlacement::Rank { rank } if rank != plan.topology.global_rank)
-                        && !matches!(tensor.placement, TensorPlacement::PipelineStage { stage } if stage != plan.topology.pipeline_parallel_rank);
-                    if potentially_local {
-                        selected_by_file
-                            .entry(file.clone())
-                            .or_default()
-                            .insert(source.clone());
-                    }
-                }
-            }
-        }
-        let mut files = selected_by_file.into_iter().collect::<Vec<_>>();
-        files.sort_by(|left, right| left.0.cmp(&right.0));
-        for (file, selected_sources) in files {
-            let path = model_dir.join(file);
-            load_selected_shard(
-                &path,
-                Some(&selected_sources),
-                plan,
-                source_stream,
-                execution_stream,
-                config,
-                &mut tensors,
-                &mut report,
-            )?;
-            opened_shards.push(path);
-        }
-    } else {
-        let path = if model_dir
-            .extension()
-            .is_some_and(|ext| ext == "safetensors")
-        {
-            model_dir.to_path_buf()
-        } else {
-            model_dir.join("model.safetensors")
+    for source in store.keys() {
+        let SourcePlan::Known { target, tensor } = plan.source_plan(&source, config) else {
+            report.unexpected.push(source);
+            continue;
         };
-        load_selected_shard(
-            &path,
-            None,
-            plan,
-            source_stream,
-            execution_stream,
-            config,
-            &mut tensors,
-            &mut report,
-        )?;
-        opened_shards.push(path);
+        let potentially_local = !matches!(tensor.placement, TensorPlacement::Omit)
+            && !matches!(tensor.placement, TensorPlacement::Rank { rank } if rank != plan.topology.global_rank)
+            && !matches!(tensor.placement, TensorPlacement::PipelineStage { stage } if stage != plan.topology.pipeline_parallel_rank);
+        if !potentially_local {
+            continue;
+        }
+
+        let metadata = store.metadata(&source)?;
+        let resolved =
+            resolve_placement(&tensor, &metadata.shape, plan.topology).map_err(|error| {
+                Error::Parallel(format!("checkpoint tensor {source} -> {target}: {error}"))
+            })?;
+        let selection = match resolved {
+            ResolvedPlacement::Omit => continue,
+            ResolvedPlacement::Materialize => TensorSelection::Full,
+            ResolvedPlacement::Shard(slice) => TensorSelection::Range {
+                axis: slice.axis,
+                start: slice.start,
+                end: slice.end,
+            },
+            ResolvedPlacement::Indices { axis, indices } => {
+                TensorSelection::Indices { axis, indices }
+            }
+        };
+        let lease = store.acquire(&source, selection)?;
+        let value = lease.materialize(source_stream, execution_stream)?;
+        opened_shards.insert(lease.backing_shard().to_path_buf());
+        report.loaded.insert(target.clone());
+        if tensors.insert(target.clone(), value).is_some() {
+            return Err(Error::Parallel(format!(
+                "multiple checkpoint tensors resolved to local target {target}"
+            )));
+        }
     }
 
     report.finish(plan, config)?;
     Ok(RankPartition {
         topology: plan.topology,
         tensors,
-        opened_shards,
+        opened_shards: opened_shards.into_iter().collect(),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn load_selected_shard(
-    path: &Path,
-    _selected_sources: Option<&HashSet<String>>,
-    plan: &PlacementPlan,
-    source_stream: &Stream,
-    execution_stream: &Stream,
-    config: &StrictLoadConfig,
-    output: &mut HashMap<String, Array>,
-    report: &mut PartitionReport,
-) -> Result<(), Error> {
-    let file = File::open(path)?;
-    // SAFETY: the mapping remains alive through explicit evaluation and stream
-    // synchronization of every Array/view derived from it below.
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let checkpoint =
-        SafeTensors::deserialize(&mmap).map_err(|error| Error::Other(Box::new(error)))?;
-    for (source, view) in checkpoint.iter() {
-        let SourcePlan::Known { target, tensor } = plan.source_plan(source, config) else {
-            report.unexpected.push(source.to_string());
-            continue;
-        };
-        let shape = view.shape().to_vec();
-        let resolved = resolve_placement(&tensor, &shape, plan.topology).map_err(|error| {
-            Error::Parallel(format!("checkpoint tensor {source} -> {target}: {error}"))
-        })?;
-        let value = match resolved {
-            ResolvedPlacement::Omit => continue,
-            ResolvedPlacement::Materialize => {
-                let source_value =
-                    Array::try_from(view).map_err(|error| Error::Other(Box::new(error)))?;
-                source_value.copy(execution_stream)?
-            }
-            ResolvedPlacement::Shard(slice) => {
-                let source_value =
-                    Array::try_from(view).map_err(|error| Error::Other(Box::new(error)))?;
-                let axis = i32::try_from(slice.axis)
-                    .map_err(|_| Error::Parallel("tensor axis does not fit in i32".into()))?;
-                // Move the sharded axis to the front, select only this rank's
-                // validated contiguous range, and move it back. The selected
-                // view remains lazy and local-slice-sized.
-                let front = if slice.axis == 0 {
-                    source_value
-                } else {
-                    source_value.move_axis(axis, 0, source_stream)?
-                };
-                let start = i32::try_from(slice.start).map_err(|_| {
-                    Error::Parallel("tensor slice start does not fit in i32".into())
-                })?;
-                let end = i32::try_from(slice.end)
-                    .map_err(|_| Error::Parallel("tensor slice end does not fit in i32".into()))?;
-                let selected = front.try_index_device(start..end, source_stream)?;
-                let selected = if slice.axis == 0 {
-                    selected
-                } else {
-                    selected.move_axis(0, axis, source_stream)?
-                };
-                let selected = if slice.axis == 0 {
-                    selected
-                } else {
-                    // An inner-axis range is a non-contiguous view. Compact
-                    // only this rank's selected view before final placement;
-                    // the temporary is local-slice-sized, never source-sized.
-                    let local_shape = slice
-                        .local_shape(&shape)
-                        .into_iter()
-                        .map(|dimension| {
-                            i32::try_from(dimension).map_err(|_| {
-                                Error::Parallel("local tensor dimension does not fit in i32".into())
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    selected
-                        .flatten(None, None, source_stream)?
-                        .reshape(&local_shape, source_stream)?
-                };
-                selected.copy(execution_stream)?
-            }
-            ResolvedPlacement::Indices { axis, indices } => {
-                let source_value =
-                    Array::try_from(view).map_err(|error| Error::Other(Box::new(error)))?;
-                let axis = i32::try_from(axis)
-                    .map_err(|_| Error::Parallel("tensor axis does not fit in i32".into()))?;
-                let indices = indices
-                    .iter()
-                    .map(|index| {
-                        i32::try_from(*index)
-                            .map_err(|_| Error::Parallel("tensor index does not fit in i32".into()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let index_count = i32::try_from(indices.len()).map_err(|_| {
-                    Error::Parallel("tensor index count does not fit in i32".into())
-                })?;
-                let indices = Array::from_slice(&indices, &[index_count]).copy(source_stream)?;
-                source_value
-                    .take_axis(&indices, axis, source_stream)?
-                    .copy(execution_stream)?
-            }
-        };
-        eval([&value])?;
-        source_stream.synchronize()?;
-        execution_stream.synchronize()?;
-        report.loaded.insert(target.clone());
-        if output.insert(target.clone(), value).is_some() {
-            return Err(Error::Parallel(format!(
-                "multiple checkpoint tensors resolved to local target {target}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

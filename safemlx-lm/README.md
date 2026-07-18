@@ -13,6 +13,33 @@ contributors.
 This fork adds model/runtime support including Gemma 4 loading, Gemma 4
 assistant drafting, expanded model dispatch, and related generation utilities.
 
+## Persistent safetensors storage
+
+The public `safemlx_lm::weight_store` module catalogs safetensors checkpoints
+without materializing tensor arrays. `SafetensorsWeightStore` accepts a direct
+payload file, a directory containing `model.safetensors`, or a Hugging
+Face-style sharded index. Indexed construction reads only the index; payload
+shards and their tensor metadata are mapped lazily when a tensor is acquired.
+
+An acquired `WeightLease` pins its mapped bytes. Full tensors, contiguous axis
+ranges, and ordered axis indices are selected before the result is copied to a
+caller-provided execution stream. Materialization evaluates and conservatively
+synchronizes its source and execution streams before returning, so the result
+cannot retain a lazy dependency on mmap storage after the lease is dropped.
+The deterministic mapped-shard cache has a configurable nonzero per-store bound. A live
+lease pins its cache entry; if every entry at the bound is leased, acquisition
+returns a structured capacity error instead of exceeding the limit.
+
+Rank-aware loading uses the same store and selection implementation. Placement
+is resolved before execution-stream materialization, and indexed shards that
+contain only remote tensors remain untouched. Cache hits and memory-mapped page
+faults are not reported as known physical disk transfers because logical
+materialization and storage I/O are different measurements.
+
+This is storage infrastructure, not executable CPU or disk offload. Models
+still retain their materialized arrays after loading. There is no layer
+scheduler, residency manager, background prefetch, or model-parameter eviction.
+
 ## Offload planning and observability
 
 Distributed placement decides which tensors a rank owns. Residency is a
@@ -29,7 +56,7 @@ On Apple silicon, CPU and GPU execution share the same physical unified-memory
 pool. Choosing CPU execution does not increase total model capacity, although
 it can change execution behavior, wired memory, and residency pressure. On a
 discrete CUDA system, a future implementation may use host-resident weights to
-extend effective capacity beyond VRAM, with transfer costs. Disk streaming is a
+extend effective capacity beyond VRAM, with transfer costs. Disk streaming is
 not implemented; dense autoregressive decode would repeatedly wait on storage
 and is therefore expected to be slow rather than a general high-performance
 path.
@@ -205,7 +232,7 @@ metadata and retains its existing validation. Runtime
 `expert_parallel_size` only describes this inference job; it does not override
 or reinterpret the checkpoint field.
 
-The phase-two partition proof and executable pipeline Ring proof are opt-in:
+The partition and executable pipeline Ring proofs are opt-in:
 
 ```sh
 cargo test -p safemlx-lm --test distributed_partition_ring \

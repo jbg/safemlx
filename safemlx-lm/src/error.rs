@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Persistent checkpoint catalog, mapping, or materialization failure.
+    #[error(transparent)]
+    WeightStore(#[from] crate::weight_store::WeightStoreError),
+
     /// Invalid architecture-independent offload planning request.
     #[error(transparent)]
     Offload(#[from] crate::offload::OffloadError),

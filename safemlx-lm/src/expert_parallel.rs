@@ -13,9 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use memmap2::MmapOptions;
-use safetensors::SafeTensors;
-
 use safemlx::{
     distributed::{self, Group},
     module::{ModuleParameters, Param},
@@ -30,12 +27,14 @@ use crate::{
     inspection::ActivationObserver,
     models::{deepseek_v3, qwen3, ModelKind, ModelLoadOptions},
     parallel::{
-        load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
+        load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
+        TensorPlacement,
     },
     pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
     quantization::{should_quantize_on_load, WeightQuantization},
     sampler::Sampler,
-    weights::{transform_split_swiglu_experts, StrictLoadConfig, WeightMap},
+    weight_store::{SafetensorsWeightStore, WeightStore},
+    weights::{transform_split_swiglu_experts, StrictLoadConfig},
 };
 
 use crate::models::{
@@ -1540,21 +1539,6 @@ fn finalize_qwen3_expert_bank(
     Ok(bytes)
 }
 
-fn checkpoint_keys(model_dir: &Path) -> Result<Vec<String>, Error> {
-    let index = model_dir.join("model.safetensors.index.json");
-    if index.exists() {
-        let map: WeightMap = serde_json::from_str(&std::fs::read_to_string(index)?)?;
-        let mut keys = map.weight_map.into_keys().collect::<Vec<_>>();
-        keys.sort();
-        return Ok(keys);
-    }
-    let file = std::fs::File::open(model_dir.join("model.safetensors"))?;
-    // SAFETY: this read-only mapping outlives SafeTensors metadata traversal.
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap).map_err(|error| Error::Other(Box::new(error)))?;
-    Ok(tensors.names().into_iter().map(str::to_owned).collect())
-}
-
 fn split_expert_id(name: &str) -> Option<usize> {
     let (_, rest) = name.split_once(".mlp.experts.")?;
     rest.split('.').next()?.parse().ok()
@@ -1571,13 +1555,13 @@ fn localize_split_expert_name(name: &str, assignment: &ExpertAssignment) -> Opti
 }
 
 fn expert_placement_plan(
-    model_dir: &Path,
+    store: &(impl WeightStore + ?Sized),
     topology: ParallelTopology,
     assignment: &ExpertAssignment,
 ) -> Result<(PlacementPlan, bool), Error> {
     let mut plan = PlacementPlan::replicated(topology);
     let mut has_split = false;
-    for key in checkpoint_keys(model_dir)? {
+    for key in store.keys() {
         if let Some(global) = split_expert_id(&key) {
             has_split = true;
             let placement = if assignment.owner(global) == Some(assignment.rank()) {
@@ -1697,7 +1681,8 @@ fn load_deepseek_ep(
     }
     let assignment =
         resolve_model_assignment(assignment, source_args.n_routed_experts as usize, topology)?;
-    let (plan, _) = expert_placement_plan(model_dir, topology, &assignment)?;
+    let store = SafetensorsWeightStore::open(model_dir)?;
+    let (plan, _) = expert_placement_plan(&store, topology, &assignment)?;
     let mut strict = StrictLoadConfig::default();
     for index in 0..source_args.num_nextn_predict_layers {
         strict = strict.allow_unused_prefix(format!(
@@ -1705,8 +1690,13 @@ fn load_deepseek_ep(
             source_args.num_hidden_layers + index
         ));
     }
-    let partition =
-        load_safetensors_partition_on_streams(model_dir, &plan, weights_stream, stream, &strict)?;
+    let partition = load_safetensors_partition_from_store_on_streams(
+        &store,
+        &plan,
+        weights_stream,
+        stream,
+        &strict,
+    )?;
     let opened_checkpoint_shards = partition.opened_shards().to_vec();
     let mut tensors = partition.into_tensors();
     let mut model = deepseek_v3::Model::new(target_args, stream)?;
@@ -1813,9 +1803,10 @@ fn load_qwen3_ep(
     }
     let assignment =
         resolve_model_assignment(assignment, source_args.num_experts as usize, topology)?;
-    let (plan, has_split) = expert_placement_plan(model_dir, topology, &assignment)?;
-    let partition = load_safetensors_partition_on_streams(
-        model_dir,
+    let store = SafetensorsWeightStore::open(model_dir)?;
+    let (plan, has_split) = expert_placement_plan(&store, topology, &assignment)?;
+    let partition = load_safetensors_partition_from_store_on_streams(
+        &store,
         &plan,
         weights_stream,
         stream,

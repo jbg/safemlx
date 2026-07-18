@@ -8,6 +8,8 @@
 //!
 //! [`offload`] contains architecture-independent residency planning and
 //! observability contracts. It does not yet move or evict model weights.
+//! [`weight_store`] catalogs safetensors checkpoints and safely materializes
+//! lazily acquired selections from bounded persistent mappings.
 
 #![warn(missing_docs)]
 
@@ -44,6 +46,8 @@ pub mod sampler;
 pub mod tensor_parallel;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
 pub mod utils;
+/// Persistent checkpoint catalogs, leases, and bounded safetensors mappings.
+pub mod weight_store;
 /// Strict safetensors loading and validation utilities.
 pub mod weights;
 
