@@ -456,6 +456,17 @@ impl Model {
         }
     }
 
+    /// Returns sparse routed-expert cache telemetry when enabled.
+    pub fn expert_cache_report(
+        &self,
+    ) -> Result<Option<crate::expert_cache::ExpertCacheReport>, Error> {
+        match self {
+            Self::DeepSeekV3Layerwise(model) => model.expert_cache_report(),
+            Self::Qwen3Layerwise(model) => model.expert_cache_report(),
+            _ => Ok(None),
+        }
+    }
+
     /// Returns the effective model type used for dispatch.
     pub fn model_type(&self) -> &str {
         match self {
@@ -1151,6 +1162,13 @@ impl LoadedModel {
         self.model.residency_report()
     }
 
+    /// Returns sparse routed-expert cache telemetry when enabled.
+    pub fn expert_cache_report(
+        &self,
+    ) -> Result<Option<crate::expert_cache::ExpertCacheReport>, Error> {
+        self.model.expert_cache_report()
+    }
+
     /// Loads a supported model directory or GGUF file with its tokenizer.
     ///
     /// GGUF tokenizers are reconstructed from embedded metadata. A sibling
@@ -1179,9 +1197,9 @@ impl LoadedModel {
         let model_dir = model_dir.as_ref();
         ensure_executable_load_options(options)?;
         if is_gguf_file(model_dir) {
-            if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+            if !matches!(options.weight_residency, WeightResidency::FullyResident) {
                 return Err(Error::UnsupportedArchitecture(
-                    "layerwise host residency requires safetensors; GGUF is unsupported".into(),
+                    "host-backed weight residency requires safetensors; GGUF is unsupported".into(),
                 ));
             }
             let sidecar_dir = gguf_sidecar_dir(model_dir);
@@ -1740,9 +1758,9 @@ pub fn load_model_with_options(
     let model_dir = model_dir.as_ref();
     ensure_executable_load_options(options)?;
     if is_gguf_file(model_dir) {
-        if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+        if !matches!(options.weight_residency, WeightResidency::FullyResident) {
             return Err(Error::UnsupportedArchitecture(
-                "layerwise host residency requires safetensors; GGUF is unsupported".into(),
+                "host-backed weight residency requires safetensors; GGUF is unsupported".into(),
             ));
         }
         return Ok(load_gguf_model_data(model_dir, false, options, stream, weights_stream)?.model);
@@ -1765,6 +1783,36 @@ fn load_model_for_kind(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     ensure_executable_load_options(options)?;
+    if let WeightResidency::SparseExpertCache(expert_cache) = options.weight_residency {
+        if options.quantization.is_some() {
+            return Err(Error::Quantization(format!(
+                "load-time quantization is unsupported for {} sparse expert caching; use a matching checkpoint-native packed format",
+                kind.model_type_name()
+            )));
+        }
+        return match kind {
+            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
+                crate::deepseek_v3::load_deepseek_v3_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
+                crate::qwen3::load_qwen3_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "sparse expert caching supports DeepSeek-V3/R1 and sparse Qwen3, not {}",
+                kind.model_type_name()
+            ))),
+        };
+    }
     if let WeightResidency::LayerwiseHost(layerwise) = options.weight_residency {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(

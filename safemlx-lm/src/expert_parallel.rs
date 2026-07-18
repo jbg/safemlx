@@ -15,6 +15,7 @@ use std::{
 
 use safemlx::{
     distributed::{self, Group},
+    error::Exception,
     module::{ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum_by_index, zeros_dtype},
     transforms::eval,
@@ -24,18 +25,24 @@ use safemlx::{
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
     error::Error,
+    expert_cache::{
+        AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertPass,
+    },
     inspection::ActivationObserver,
     models::{deepseek_v3, qwen3, ModelKind, ModelLoadOptions},
     parallel::{
         load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
         TensorPlacement,
     },
-    pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
+    pipeline::{assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken},
     quantization::{should_quantize_on_load, WeightQuantization},
     sampler::Sampler,
     weight_store::{SafetensorsWeightStore, WeightStore},
     weights::{transform_split_swiglu_experts, StrictLoadConfig},
 };
+
+use crate::layerwise::WeightResidency;
 
 use crate::models::{
     common::moe::{quantize_expert_bank, PackedRelu2Experts, PackedSwiGluExperts},
@@ -585,6 +592,36 @@ pub fn dispatch_replicated(
     group: &Group,
     stream: &Stream,
 ) -> Result<ReturnedRoutes, Error> {
+    dispatch_replicated_with(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        group,
+        stream,
+        |routes, stream| {
+            bank.execute_local_routes(&routes.hidden, &routes.local_expert_ids, stream)
+        },
+    )
+}
+
+/// Dispatches replicated routes while delegating exact local route execution.
+///
+/// The callback receives both global and owner-local ids after the existing
+/// validated route compaction, so cache-backed banks can retain global identity
+/// without duplicating transport or recombination.
+pub fn dispatch_replicated_with<F>(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    group: &Group,
+    stream: &Stream,
+    execute: F,
+) -> Result<ReturnedRoutes, Error>
+where
+    F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
+{
     let total_started = Instant::now();
     if group.rank() != assignment.rank || group.size() != assignment.group_size {
         return Err(Error::Parallel(
@@ -608,7 +645,7 @@ pub fn dispatch_replicated(
     let local_output = if statistics.local_routes == 0 {
         zeros_dtype(hidden_states.shape(), hidden_states.dtype(), stream)?
     } else {
-        let output = bank.execute_local_routes(&routes.hidden, &routes.local_expert_ids, stream)?;
+        let output = execute(&routes, stream)?;
         if output.ndim() != 2 || output.dim(0) != statistics.local_routes as i32 {
             return Err(Error::Parallel(format!(
                 "local expert bank returned invalid shape {:?}",
@@ -962,6 +999,8 @@ pub struct ExpertParallelInfo {
     pub local_parameter_bytes: usize,
     /// Bytes in local routed-expert tensors.
     pub routed_expert_bytes: usize,
+    /// Bytes in all cold, warm, or hot routed experts owned by this rank.
+    pub owned_expert_bytes: usize,
     /// Bytes in replicated tensors.
     pub replicated_parameter_bytes: usize,
     /// Checkpoint shards opened by this rank.
@@ -1023,6 +1062,7 @@ pub struct ExpertParallelModel {
     topology: ParallelTopology,
     info: ExpertParallelInfo,
     architecture: ExpertArchitecture,
+    expert_cache: Option<ExpertCache>,
     latest_statistics: RoutingStatistics,
     cumulative_statistics: RoutingStatistics,
 }
@@ -1040,6 +1080,15 @@ impl ExpertParallelModel {
     /// Returns placement, assignment, and memory diagnostics.
     pub fn info(&self) -> &ExpertParallelInfo {
         &self.info
+    }
+
+    /// Returns dynamic rank-owned expert residency when sparse caching is active.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Error::from)
     }
 
     /// Allocates an empty architecture-appropriate replicated cache.
@@ -1124,48 +1173,190 @@ impl ExpertParallelModel {
             )));
         }
         let mut statistics = RoutingStatistics::default();
-        let logits = match (&mut self.architecture, cache) {
-            (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => model
-                .forward_expert_parallel(
-                    tokens,
-                    mask,
-                    cache,
-                    &self.info.assignment,
-                    group,
-                    &mut statistics,
-                    observer,
-                    stream,
-                )?,
-            (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3(cache)) => model
-                .forward_expert_parallel(
-                    qwen3::ModelInput {
-                        inputs: tokens,
+        let logits = if let Some(expert_cache) = self.expert_cache.as_ref() {
+            if observer.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "detailed activation observation is unavailable for sparse expert-cached expert parallelism"
+                        .into(),
+                ));
+            }
+            let pass = if tokens.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            let assignment = &self.info.assignment;
+            match (&mut self.architecture, cache) {
+                (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
                         mask,
                         cache,
-                    },
-                    &self.info.assignment,
-                    group,
-                    &mut statistics,
-                    observer,
-                    stream,
-                )?,
-            (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Sliding(cache)) => model
-                .forward_expert_parallel(
-                qwen3::ModelInput {
-                    inputs: tokens,
-                    mask,
-                    cache,
-                },
-                &self.info.assignment,
-                group,
-                &mut statistics,
-                observer,
-                stream,
-            )?,
-            _ => {
-                return Err(Error::Parallel(
-                    "expert-parallel cache architecture mismatch".into(),
-                ))
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_deepseek(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_qwen3(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Sliding(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_qwen3(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                _ => {
+                    return Err(Error::Parallel(
+                        "expert-parallel cache architecture mismatch".into(),
+                    ))
+                }
+            }
+        } else {
+            match (&mut self.architecture, cache) {
+                (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                    model.forward_expert_parallel(
+                        tokens,
+                        mask,
+                        cache,
+                        &self.info.assignment,
+                        group,
+                        &mut statistics,
+                        observer,
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3(cache)) => model
+                    .forward_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        &self.info.assignment,
+                        group,
+                        &mut statistics,
+                        observer,
+                        stream,
+                    )?,
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Sliding(cache)) => {
+                    model.forward_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        &self.info.assignment,
+                        group,
+                        &mut statistics,
+                        observer,
+                        stream,
+                    )?
+                }
+                _ => {
+                    return Err(Error::Parallel(
+                        "expert-parallel cache architecture mismatch".into(),
+                    ))
+                }
             }
         };
         materialize_timing_phase([&logits])?;
@@ -1472,6 +1663,103 @@ fn parameter_bytes(module: &impl ModuleParameters) -> usize {
         .sum()
 }
 
+fn parameter_bytes_excluding(module: &impl ModuleParameters, marker: &str) -> usize {
+    module
+        .parameters()
+        .flatten()
+        .into_iter()
+        .filter(|(name, _)| !name.contains(marker))
+        .map(|(_, value)| value.nbytes())
+        .sum()
+}
+
+fn execute_cached_deepseek(
+    args: &deepseek_v3::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let mut bank = RoutedExperts::new_compact(
+        args,
+        layer as i32,
+        acquired.identities().len() as i32,
+        stream,
+    )?;
+    macro_rules! required {
+        ($field:ident, $name:literal) => {
+            bank.$field = Param::new(Some(acquired.compact_binding($name, stream)?));
+        };
+    }
+    macro_rules! optional {
+        ($field:ident, $name:literal) => {
+            bank.$field = Param::new(acquired.optional_compact_binding($name, stream)?);
+        };
+    }
+    required!(gate_proj, "gate_proj");
+    optional!(gate_proj_scale_inv, "gate_proj_scale_inv");
+    optional!(gate_proj_scales, "gate_proj_scales");
+    optional!(gate_proj_biases, "gate_proj_biases");
+    required!(up_proj, "up_proj");
+    optional!(up_proj_scale_inv, "up_proj_scale_inv");
+    optional!(up_proj_scales, "up_proj_scales");
+    optional!(up_proj_biases, "up_proj_biases");
+    required!(down_proj, "down_proj");
+    optional!(down_proj_scale_inv, "down_proj_scale_inv");
+    optional!(down_proj_scales, "down_proj_scales");
+    optional!(down_proj_biases, "down_proj_biases");
+    let parameters = bank.parameters().flatten();
+    eval(parameters.values().copied())?;
+    stream.synchronize()?;
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward_local(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    stream.synchronize()?;
+    Ok(output)
+}
+
+fn execute_cached_qwen3(
+    args: &qwen3::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let mut bank = PackedSwiGluExperts::new(
+        acquired.identities().len() as i32,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+        stream,
+    )?;
+    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.gate_up_proj_scales =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+    bank.gate_up_proj_biases =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_scales =
+        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_biases =
+        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+    let parameters = bank.parameters().flatten();
+    eval(parameters.values().copied())?;
+    stream.synchronize()?;
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    stream.synchronize()?;
+    Ok(output)
+}
+
 fn expert_bank_needs_slicing(
     bank_experts: i32,
     assignment: &ExpertAssignment,
@@ -1651,6 +1939,23 @@ fn load_deepseek_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
+    if let WeightResidency::SparseExpertCache(expert_options) = options.weight_residency {
+        return load_deepseek_cached_ep(
+            model_dir,
+            topology,
+            options,
+            expert_options,
+            assignment,
+            stream,
+            weights_stream,
+        );
+    }
+    if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+        return Err(Error::Parallel(
+            "expert-parallel loading does not accept whole-block layerwise residency; select sparse expert caching or fully resident loading"
+                .into(),
+        ));
+    }
     let source_args = deepseek_v3::get_model_args(model_dir)?;
     if source_args.n_routed_experts <= 0 {
         return Err(Error::Parallel(
@@ -1763,11 +2068,13 @@ fn load_deepseek_ep(
             assignment,
             local_parameter_bytes,
             routed_expert_bytes,
+            owned_expert_bytes: routed_expert_bytes,
             replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
             opened_checkpoint_shards,
             exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture: ExpertArchitecture::DeepSeek(model),
+        expert_cache: None,
         latest_statistics: Default::default(),
         cumulative_statistics: Default::default(),
     })
@@ -1781,6 +2088,23 @@ fn load_qwen3_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
+    if let WeightResidency::SparseExpertCache(expert_options) = options.weight_residency {
+        return load_qwen3_cached_ep(
+            model_dir,
+            topology,
+            options,
+            expert_options,
+            assignment,
+            stream,
+            weights_stream,
+        );
+    }
+    if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+        return Err(Error::Parallel(
+            "expert-parallel loading does not accept whole-block layerwise residency; select sparse expert caching or fully resident loading"
+                .into(),
+        ));
+    }
     let source_args = qwen3::get_qwen3_model_args(model_dir)?;
     if source_args.num_experts <= 0 {
         return Err(Error::Parallel(
@@ -1880,11 +2204,195 @@ fn load_qwen3_ep(
             assignment,
             local_parameter_bytes,
             routed_expert_bytes,
+            owned_expert_bytes: routed_expert_bytes,
             replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
             opened_checkpoint_shards,
             exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture: ExpertArchitecture::Qwen3(model),
+        expert_cache: None,
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    })
+}
+
+fn expert_cache_base_plan(store: &dyn WeightStore, topology: ParallelTopology) -> PlacementPlan {
+    let mut plan = PlacementPlan::replicated(topology);
+    for key in store.keys() {
+        if key.contains(".mlp.experts.") {
+            plan.insert(key, TensorPlacement::Omit);
+        }
+    }
+    plan
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_deepseek_cached_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    expert_options: ExpertCacheLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if options.quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported with sparse expert-cached expert parallelism; use checkpoint-native weights"
+                .into(),
+        ));
+    }
+    let args = deepseek_v3::get_model_args(model_dir)?;
+    args.validate()?;
+    let assignment =
+        resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
+    let store = std::sync::Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        expert_options.non_expert.max_mapped_shards,
+    )?);
+    let plan = expert_cache_base_plan(store.as_ref(), topology);
+    let mut strict = StrictLoadConfig::default();
+    for index in 0..args.num_nextn_predict_layers {
+        strict =
+            strict.allow_unused_prefix(format!("model.layers.{}.", args.num_hidden_layers + index));
+    }
+    let partition = load_safetensors_partition_from_store_on_streams(
+        store.as_ref(),
+        &plan,
+        weights_stream,
+        stream,
+        &strict,
+    )?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let mut tensors = partition.into_tensors();
+    let mut model = deepseek_v3::Model::new(args.clone(), stream)?;
+    assign_module(&mut model, "", &mut tensors, None, stream)?;
+    if !tensors.is_empty() {
+        let mut unused = tensors.into_keys().collect::<Vec<_>>();
+        unused.sort();
+        return Err(Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused,
+        });
+    }
+    let entries = crate::deepseek_v3::deepseek_expert_catalog(&args, store.as_ref())?
+        .into_iter()
+        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
+        .collect::<Vec<_>>();
+    let owned_expert_bytes_u64 = entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>();
+    let owned_expert_bytes = usize::try_from(owned_expert_bytes_u64)
+        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
+    let expert_cache = ExpertCache::new(
+        std::sync::Arc::clone(&store),
+        entries,
+        expert_options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    let replicated_parameter_bytes = parameter_bytes_excluding(&model, ".mlp.experts.");
+    Ok(ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: ModelKind::DeepSeekV3,
+            assignment,
+            local_parameter_bytes: replicated_parameter_bytes,
+            routed_expert_bytes: 0,
+            owned_expert_bytes,
+            replicated_parameter_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture: ExpertArchitecture::DeepSeek(model),
+        expert_cache: Some(expert_cache),
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_qwen3_cached_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    expert_options: ExpertCacheLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if options.quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported with sparse expert-cached expert parallelism; use checkpoint-native weights"
+                .into(),
+        ));
+    }
+    let args = qwen3::get_qwen3_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::Parallel(
+            "Qwen3 config is dense and has no routed experts".into(),
+        ));
+    }
+    let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
+    let store = std::sync::Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        expert_options.non_expert.max_mapped_shards,
+    )?);
+    let plan = expert_cache_base_plan(store.as_ref(), topology);
+    let partition = load_safetensors_partition_from_store_on_streams(
+        store.as_ref(),
+        &plan,
+        weights_stream,
+        stream,
+        &StrictLoadConfig::default(),
+    )?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let mut tensors = partition.into_tensors();
+    let mut model = qwen3::Model::new(args.clone(), stream)?;
+    assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+        name.contains(".mlp.experts.")
+    })?;
+    if !tensors.is_empty() {
+        let mut unused = tensors.into_keys().collect::<Vec<_>>();
+        unused.sort();
+        return Err(Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused,
+        });
+    }
+    let entries = crate::qwen3::qwen3_expert_catalog(&args, store.as_ref())?
+        .into_iter()
+        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
+        .collect::<Vec<_>>();
+    let owned_expert_bytes_u64 = entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>();
+    let owned_expert_bytes = usize::try_from(owned_expert_bytes_u64)
+        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
+    let expert_cache = ExpertCache::new(
+        std::sync::Arc::clone(&store),
+        entries,
+        expert_options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    let replicated_parameter_bytes = parameter_bytes_excluding(&model, ".mlp.experts.");
+    Ok(ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: ModelKind::Qwen3,
+            assignment,
+            local_parameter_bytes: replicated_parameter_bytes,
+            routed_expert_bytes: 0,
+            owned_expert_bytes,
+            replicated_parameter_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture: ExpertArchitecture::Qwen3(model),
+        expert_cache: Some(expert_cache),
         latest_statistics: Default::default(),
         cumulative_statistics: Default::default(),
     })
@@ -2066,6 +2574,44 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[2, 64, 1]
+        );
+
+        let expert_options = ExpertCacheLoadOptions::new(
+            crate::layerwise::LayerwiseLoadOptions::new(
+                crate::offload::OffloadConfig::new(None, None, 1).unwrap(),
+            ),
+            crate::offload::OffloadConfig::new(Some(1 << 20), Some(0), 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let options = ModelLoadOptions::with_parallel(rank_one_topology())
+            .with_weight_residency(WeightResidency::SparseExpertCache(expert_options));
+        let assignment = ExpertAssignment::round_robin(4, 2, 1).unwrap();
+        let cached = load_expert_parallel_model_with_options_and_assignment(
+            fixture.path(),
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 2);
+        assert_eq!(report.host_resident_experts, 0);
+        assert_eq!(report.device_resident_experts, 0);
+        assert_eq!(cached.info.routed_expert_bytes, 0);
+        assert!(cached.info.owned_expert_bytes > 0);
+        assert_eq!(
+            report
+                .residency
+                .units()
+                .iter()
+                .map(|unit| unit.id().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "expert.layer.00000.global.00001",
+                "expert.layer.00000.global.00003"
+            ]
         );
     }
 

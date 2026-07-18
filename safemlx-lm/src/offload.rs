@@ -36,6 +36,16 @@ pub enum ResidencyPolicy {
     Cacheable,
 }
 
+/// Deterministic eviction ordering for cacheable residency units.
+#[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CacheEvictionPolicy {
+    /// Evict the least recently used cacheable copy first.
+    #[default]
+    LeastRecentlyUsed,
+    /// Evict the least frequently used copy, using recency and unit id as ties.
+    LeastFrequentlyUsed,
+}
+
 /// A stable logical identifier for one independently managed offload unit.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OffloadUnitId(String);
@@ -75,6 +85,7 @@ pub struct OffloadConfig {
     device_budget_bytes: Option<u64>,
     host_budget_bytes: Option<u64>,
     prefetch_depth: usize,
+    eviction_policy: CacheEvictionPolicy,
 }
 
 impl OffloadConfig {
@@ -94,6 +105,7 @@ impl OffloadConfig {
             device_budget_bytes,
             host_budget_bytes,
             prefetch_depth,
+            eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
         })
     }
 
@@ -111,6 +123,17 @@ impl OffloadConfig {
     pub const fn prefetch_depth(self) -> usize {
         self.prefetch_depth
     }
+
+    /// Selects deterministic cache eviction without changing tier budgets.
+    pub const fn with_eviction_policy(mut self, policy: CacheEvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        self
+    }
+
+    /// Returns the configured cache eviction ordering.
+    pub const fn eviction_policy(self) -> CacheEvictionPolicy {
+        self.eviction_policy
+    }
 }
 
 impl Default for OffloadConfig {
@@ -119,6 +142,7 @@ impl Default for OffloadConfig {
             device_budget_bytes: None,
             host_budget_bytes: None,
             prefetch_depth: 1,
+            eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
         }
     }
 }

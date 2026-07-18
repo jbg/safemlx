@@ -1386,6 +1386,20 @@ impl RoutedExperts {
         Ok(())
     }
 
+    /// Creates an unloaded compact bank preserving the layer's checkpoint format.
+    pub(crate) fn new_compact(
+        args: &ModelArgs,
+        layer: i32,
+        num_experts: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut compact_args = args.clone();
+        compact_args.n_routed_experts = num_experts;
+        let mut bank = Self::new(&compact_args, layer)?;
+        bank.initialize_unloaded_banks(&compact_args, stream)?;
+        Ok(bank)
+    }
+
     fn projection(
         input: &Array,
         weight: &Array,
@@ -1980,6 +1994,41 @@ impl DecoderLayer {
         self.forward_impl(x, mask, cache, stream, "", &mut observer)
     }
 
+    /// Executes a block while delegating routed-expert evaluation to a compact bank.
+    pub(crate) fn forward_sparse_experts<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let mut observer = None;
+        let attention =
+            self.self_attn
+                .forward_impl(&normalized, mask, cache, stream, "", &mut observer)?;
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward_impl(&normalized, stream, "", &mut observer)?,
+            FeedForward::Moe(moe) => {
+                let shape = normalized.shape();
+                let flat = normalized.reshape(&[-1, normalized.dim(-1)], stream)?;
+                let (indices, weights) = moe.gate.forward(&flat, stream)?;
+                let routed = execute(&flat, &indices, &weights, stream)?;
+                let shared = moe
+                    .shared_experts
+                    .forward_impl(&flat, stream, "", &mut observer)?;
+                routed.add(shared, stream)?.reshape(shape, stream)?
+            }
+        };
+        hidden.add(feed_forward, stream)
+    }
+
     /// Executes a rank-local tensor-parallel block.
     ///
     /// The layer must have head/intermediate projections constructed with
@@ -2284,6 +2333,56 @@ impl Model {
                 &format!("model.layers.{index}"),
                 layer_observer,
                 stream,
+            )?;
+        }
+        hidden = self.model.norm.forward(&hidden, stream)?;
+        self.lm_head.forward(&hidden, stream)
+    }
+
+    /// Runs pure expert parallelism with externally supplied cache-backed experts.
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
+        let offset = cache.offset();
+        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
+            Some(create_causal_mask(
+                hidden.dim(1),
+                Some(offset),
+                None,
+                None,
+                stream,
+            )?)
+        } else {
+            None
+        };
+        let mask = mask.or(generated_mask.as_ref());
+        if cache.layers.len() != self.model.layers.len() {
+            return Err(Exception::custom(
+                "DeepSeek EP cache layer count does not match model",
+            ));
+        }
+        for (index, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(&mut cache.layers)
+            .enumerate()
+        {
+            hidden = layer.forward_sparse_experts(
+                &hidden,
+                mask,
+                Some(layer_cache),
+                stream,
+                |flat, indices, weights, stream| execute(index, flat, indices, weights, stream),
             )?;
         }
         hidden = self.model.norm.forward(&hidden, stream)?;

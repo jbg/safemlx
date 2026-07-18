@@ -17,8 +17,8 @@ use safemlx::{transforms::eval, Array, DeviceType, Stream};
 
 use crate::{
     offload::{
-        MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
-        PrefetchOutcome, ResidencyPolicy, TransferDirection,
+        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
+        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
     },
     weight_recipe::{DerivedWeightRecipe, WeightRecipeError},
     weight_store::{TensorSelection, WeightStore, WeightStoreDiagnostics, WeightStoreError},
@@ -913,6 +913,19 @@ impl ResidencyManager {
         id: &OffloadUnitId,
         tier: MemoryTier,
     ) -> Result<ResidentUnitLease, ResidencyError> {
+        self.acquire_with_demand(id, tier, 1)
+    }
+
+    /// Ensures residency and records route-weighted demand for eviction policy.
+    ///
+    /// `demand` may be larger than one when duplicate routed-expert requests
+    /// share a single acquisition. Frequency counters saturate on overflow.
+    pub fn acquire_with_demand(
+        &self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+        demand: u64,
+    ) -> Result<ResidentUnitLease, ResidencyError> {
         validate_target(tier, "acquire")?;
         let mut state = self.lock()?;
         require_initialized(&state)?;
@@ -940,12 +953,28 @@ impl ResidencyManager {
                 context: "resident lease count",
             })?;
         copy.last_used = tick;
+        copy.frequency = copy.frequency.saturating_add(demand);
         Ok(ResidentUnitLease {
             id: id.clone(),
             tier,
             arrays: Arc::clone(&copy.arrays),
             manager: Arc::downgrade(&self.inner),
         })
+    }
+
+    /// Returns whether a logical copy currently resides in a memory tier.
+    pub fn is_resident(
+        &self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+    ) -> Result<bool, ResidencyError> {
+        validate_target(tier, "is_resident")?;
+        let state = self.lock()?;
+        Ok(state
+            .units
+            .get(id)
+            .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
+            .is_resident(tier))
     }
 
     /// Replaces the protected window and synchronously prepares bounded lookahead.
@@ -1167,6 +1196,7 @@ struct ResidentCopy {
     bytes: u64,
     pins: u64,
     last_used: u64,
+    frequency: u64,
 }
 
 struct ResidentArrays {
@@ -1344,6 +1374,7 @@ fn ensure_resident(
         bytes: actual,
         pins: 0,
         last_used: tick,
+        frequency: 0,
     };
     let unit = state
         .units
@@ -1514,10 +1545,14 @@ fn eviction_candidate(state: &ManagerState, tier: MemoryTier) -> Option<OffloadU
                 ResidencyPolicy::Cacheable => 1u8,
                 ResidencyPolicy::Pinned => return None,
             };
-            Some((priority, copy.last_used, unit.spec.id().clone()))
+            let frequency = match state.plan.config().eviction_policy() {
+                CacheEvictionPolicy::LeastRecentlyUsed => 0,
+                CacheEvictionPolicy::LeastFrequentlyUsed => copy.frequency,
+            };
+            Some((priority, frequency, copy.last_used, unit.spec.id().clone()))
         })
         .min()
-        .map(|(_, _, id)| id)
+        .map(|(_, _, _, id)| id)
 }
 
 fn blockers(state: &ManagerState, tier: MemoryTier) -> Vec<ResidencyBlocker> {
@@ -1582,12 +1617,18 @@ fn set_tier_bytes(state: &mut ManagerState, tier: MemoryTier, bytes: u64) {
 }
 
 fn next_tick(state: &mut ManagerState) -> Result<u64, ResidencyError> {
-    state.tick = state
-        .tick
-        .checked_add(1)
-        .ok_or(ResidencyError::ArithmeticOverflow {
-            context: "residency recency counter",
-        })?;
+    if state.tick == u64::MAX {
+        for unit in state.units.values_mut() {
+            if let Some(copy) = unit.host.as_mut() {
+                copy.last_used /= 2;
+            }
+            if let Some(copy) = unit.device.as_mut() {
+                copy.last_used /= 2;
+            }
+        }
+        state.tick /= 2;
+    }
+    state.tick += 1;
     Ok(state.tick)
 }
 

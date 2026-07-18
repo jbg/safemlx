@@ -623,6 +623,20 @@ pub(crate) fn assign_module(
     quantize_on_load: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<(), Error> {
+    assign_module_excluding(module, prefix, tensors, quantize_on_load, stream, |_| false)
+}
+
+pub(crate) fn assign_module_excluding<F>(
+    module: &mut impl ModuleParameters,
+    prefix: &str,
+    tensors: &mut HashMap<String, Array>,
+    quantize_on_load: Option<WeightQuantization>,
+    stream: &Stream,
+    excluded: F,
+) -> Result<(), Error>
+where
+    F: Fn(&str) -> bool,
+{
     let mut params = module.parameters_mut().flatten();
     let destinations = params
         .iter()
@@ -634,6 +648,7 @@ pub(crate) fn assign_module(
             };
             (name, value.shape().to_vec())
         })
+        .filter(|(name, _)| !excluded(name))
         .collect::<HashMap<_, _>>();
     let mut loaded = HashMap::new();
 
@@ -686,7 +701,9 @@ pub(crate) fn assign_module(
         } else {
             format!("{prefix}.{local_name}")
         };
-        if let Some(value) = loaded.remove(&destination) {
+        if excluded(&destination) {
+            continue;
+        } else if let Some(value) = loaded.remove(&destination) {
             if parameter.shape() != value.shape() {
                 return Err(Error::Parallel(format!(
                     "pipeline tensor {destination} has shape {:?}, expected {:?}",

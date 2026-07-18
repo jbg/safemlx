@@ -327,6 +327,12 @@ pub fn load_llama_model(
                 weights_stream,
             )?)
         }
+        WeightResidency::SparseExpertCache(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "sparse expert caching is supported only for DeepSeek-V3/R1 and sparse Qwen3"
+                    .into(),
+            ));
+        }
     };
     Ok(LlamaModel { execution })
 }
@@ -481,6 +487,7 @@ impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
 
     fn forward_layer<C: KeyValueCache>(
         &self,
+        _index: usize,
         layer: &mut Self::Layer,
         hidden: &Array,
         cache: &mut C,

@@ -129,7 +129,7 @@ impl ModelArgs {
         }
     }
 
-    fn is_moe(&self) -> bool {
+    pub(crate) fn is_moe(&self) -> bool {
         self.num_experts > 0
     }
 }
@@ -923,6 +923,41 @@ impl TransformerBlock {
         hidden.add(mlp, stream)
     }
 
+    /// Executes a block while delegating routed-expert evaluation to a compact bank.
+    pub(crate) fn forward_sparse_experts<C, F>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let AttentionInput { x, mask, cache } = input;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let attention = self.self_attn.forward(
+            AttentionInput {
+                x: &normed,
+                mask,
+                cache,
+            },
+            stream,
+        )?;
+        let hidden = x.add(attention, stream)?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normed, stream)?,
+            FeedForward::Moe(moe) => {
+                let shape = normed.shape();
+                let flat = normed.reshape(&[-1, normed.dim(-1)], stream)?;
+                let (indices, weights) = moe.gate.forward(&flat, stream)?;
+                execute(&flat, &indices, &weights, stream)?.reshape(shape, stream)?
+            }
+        };
+        hidden.add(feed_forward, stream)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_expert_parallel<C>(
         &mut self,
@@ -1308,6 +1343,62 @@ impl Model {
         let hidden = self
             .model
             .forward_expert_parallel(input, assignment, group, statistics, observer, stream)?;
+        project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &hidden,
+            stream,
+        )
+    }
+
+    /// Runs pure expert parallelism with externally supplied cache-backed experts.
+    pub(crate) fn forward_cached_expert_parallel<C, F>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let ModelInput {
+            inputs,
+            mask,
+            cache,
+        } = input;
+        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => match create_attention_mask(&hidden, cache, Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => unreachable!("array mask requested"),
+                None => None,
+            },
+        };
+        if cache.is_empty() {
+            *cache = (0..self.model.layers.len())
+                .map(|_| Some(C::default()))
+                .collect();
+        }
+        for (index, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(cache.iter_mut())
+            .enumerate()
+        {
+            hidden = layer.forward_sparse_experts(
+                AttentionInput {
+                    x: &hidden,
+                    mask: mask.as_ref(),
+                    cache: layer_cache.as_mut(),
+                },
+                stream,
+                |flat, indices, weights, stream| execute(index, flat, indices, weights, stream),
+            )?;
+        }
+        let hidden = self.model.norm.forward(&hidden, stream)?;
         project_logits_maybe_quantized(
             &mut self.lm_head,
             &mut self.model.embed_tokens,

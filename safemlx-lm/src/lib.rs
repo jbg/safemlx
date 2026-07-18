@@ -14,6 +14,9 @@
 //! [`layerwise`] provides a model-family adapter contract and a reusable
 //! host-backed decoder engine. [`llama`] exposes one Llama/Mistral model API
 //! across fully resident and layerwise-host residency policies.
+//! [`expert_cache`] adds opt-in expert-granular hot-device, warm-host, and
+//! cold-checkpoint residency for DeepSeek-V3/R1 and sparse Qwen3, including
+//! rank-owned expert-parallel catalogs and separate prefill/decode telemetry.
 
 #![warn(missing_docs)]
 
@@ -23,6 +26,8 @@ pub mod cache;
 pub mod deepseek_v3;
 /// Error types returned by the language-model runtime.
 pub mod error;
+/// Architecture-independent sparse routed-expert caching and telemetry.
+pub mod expert_cache;
 /// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
 pub mod expert_parallel;
 /// Multimodal layerwise-host execution for Gemma 4.

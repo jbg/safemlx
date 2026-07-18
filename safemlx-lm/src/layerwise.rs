@@ -68,6 +68,8 @@ pub enum WeightResidency {
     FullyResident,
     /// Keep decoder weights on a host stream and execute through a bounded device window.
     LayerwiseHost(LayerwiseLoadOptions),
+    /// Keep non-expert decoder weights layerwise while caching routed experts independently.
+    SparseExpertCache(crate::expert_cache::ExpertCacheLoadOptions),
 }
 
 impl Default for WeightResidency {
@@ -161,6 +163,31 @@ pub trait LayerwiseModelAdapter: Sized {
     fn layer_checkpoint_prefix(&self, index: usize) -> String;
     /// Returns the stable residency unit name for one decoder block.
     fn layer_unit_name(&self, index: usize) -> String;
+    /// Populates one temporary decoder block from its protected lease.
+    fn populate_layer(
+        &self,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        Ok(populate_module_from_lease(layer, lease)?)
+    }
+    /// Builds direct or derived bindings for one decoder block.
+    fn layer_bindings(
+        &self,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<crate::residency::WeightBinding>, Error> {
+        Ok(build_module_bindings(
+            layer,
+            &self.layer_checkpoint_prefix(index),
+            store,
+        )?)
+    }
+    /// Returns checkpoint keys consumed by dependent units outside the block unit.
+    fn additional_consumed_checkpoint_keys(&self, _store: &dyn WeightStore) -> Vec<String> {
+        Vec::new()
+    }
     /// Executes the architecture's input embedding.
     fn embed(&mut self, inputs: &Array, stream: &Stream) -> Result<Array, Error>;
     /// Prepares masks or other state shared by the decoder-block loop.
@@ -174,6 +201,7 @@ pub trait LayerwiseModelAdapter: Sized {
     /// Executes one populated decoder block.
     fn forward_layer<C: KeyValueCache>(
         &self,
+        index: usize,
         layer: &mut Self::Layer,
         hidden: &Array,
         cache: &mut C,
@@ -252,6 +280,16 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
 
     /// Returns the stable residency unit name for one runtime unit.
     fn layer_unit_name(&self, group: usize, index: usize) -> String;
+    /// Populates one temporary execution unit from its protected lease.
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        Ok(populate_module_from_lease(layer, lease)?)
+    }
 
     /// Builds direct or derived bindings for one runtime unit.
     fn layer_bindings(
@@ -266,6 +304,11 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
             &self.layer_checkpoint_prefix(group, index),
             store,
         )?)
+    }
+
+    /// Returns checkpoint keys consumed by dependent units outside execution groups.
+    fn additional_consumed_checkpoint_keys(&self, _store: &dyn WeightStore) -> Vec<String> {
+        Vec::new()
     }
 
     /// Executes one populated unit while inspecting and mutating the complete cache.
@@ -393,6 +436,16 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
         &self.adapter
     }
 
+    /// Returns the mutable adapter for loader-time dependent-unit setup.
+    pub(crate) fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
+    /// Returns a shared handle to the persistent checkpoint store.
+    pub(crate) fn weight_store_arc(&self) -> Arc<SafetensorsWeightStore> {
+        Arc::clone(&self.store)
+    }
+
     /// Returns the persistent checkpoint store.
     pub fn weight_store(&self) -> &SafetensorsWeightStore {
         &self.store
@@ -453,7 +506,8 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
                     {
                         let lease = self.residency.acquire(id, MemoryTier::Device)?;
                         let mut layer = self.adapter.new_layer(group_index, index, stream)?;
-                        populate_module_from_lease(&mut layer, &lease)?;
+                        self.adapter
+                            .populate_layer(group_index, index, &mut layer, &lease)?;
                         hidden = self.adapter.forward_layer(
                             group_index,
                             index,
@@ -612,6 +666,8 @@ pub fn load_general_layerwise_model<A: GeneralLayerwiseModelAdapter>(
         )?);
     }
 
+    consumed.extend(adapter.additional_consumed_checkpoint_keys(store.as_ref()));
+
     validate_unused(store.as_ref(), &consumed, options.strict_loading, |key| {
         adapter.ignores_checkpoint_key(key)
     })?;
@@ -661,6 +717,16 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         &self.adapter
     }
 
+    /// Returns the mutable architecture adapter for loader-time dependent-unit setup.
+    pub(crate) fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
+    /// Returns a shared handle to the persistent checkpoint store.
+    pub(crate) fn weight_store_arc(&self) -> Arc<SafetensorsWeightStore> {
+        Arc::clone(&self.store)
+    }
+
     /// Returns parameter-residency metadata.
     pub const fn metadata(&self) -> &LayerwiseModelMetadata {
         &self.metadata
@@ -706,13 +772,18 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
             {
                 let lease = self.residency.acquire(id, MemoryTier::Device)?;
                 let mut layer = self.adapter.new_layer(index, stream)?;
-                populate_module_from_lease(&mut layer, &lease)?;
+                self.adapter.populate_layer(&mut layer, &lease)?;
                 let layer_cache = cache[index]
                     .as_mut()
                     .ok_or(LayerwiseModelError::MissingLayerCache { index })?;
-                h = self
-                    .adapter
-                    .forward_layer(&mut layer, &h, layer_cache, &context, stream)?;
+                h = self.adapter.forward_layer(
+                    index,
+                    &mut layer,
+                    &h,
+                    layer_cache,
+                    &context,
+                    stream,
+                )?;
 
                 // MLX is lazy. Materialize both the activation and every cache
                 // handle updated by this block before its lease can be dropped.
@@ -802,11 +873,7 @@ pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
     let mut host_layer_bytes = 0u64;
     for index in 0..layer_count {
         let layer = adapter.new_layer(index, stream)?;
-        let bindings = build_module_bindings(
-            &layer,
-            &adapter.layer_checkpoint_prefix(index),
-            store.as_ref(),
-        )?;
+        let bindings = adapter.layer_bindings(index, &layer, store.as_ref())?;
         let bytes = binding_bytes(&bindings)?;
         host_layer_bytes =
             host_layer_bytes
@@ -830,6 +897,8 @@ pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
         layer_ids.push(id);
         layer_bytes.push(bytes);
     }
+
+    consumed.extend(adapter.additional_consumed_checkpoint_keys(store.as_ref()));
 
     validate_unused(store.as_ref(), &consumed, options.strict_loading, |key| {
         adapter.ignores_checkpoint_key(key)

@@ -173,10 +173,23 @@ pub fn populate_module_from_lease(
     module: &mut impl ModuleParameters,
     lease: &ResidentUnitLease,
 ) -> Result<(), ModuleBindingError> {
+    populate_module_from_lease_excluding(module, lease, |_| false)
+}
+
+/// Assigns non-excluded module parameters from a protected resident unit.
+pub fn populate_module_from_lease_excluding<F>(
+    module: &mut impl ModuleParameters,
+    lease: &ResidentUnitLease,
+    excluded: F,
+) -> Result<(), ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
     let resident_names = lease.binding_names().collect::<BTreeSet<_>>();
     let mut params = module.parameters_mut().flatten();
     let expected_names = params
         .keys()
+        .filter(|name| !excluded(name))
         .map(|name| name.to_string())
         .collect::<BTreeSet<_>>();
 
@@ -199,6 +212,9 @@ pub fn populate_module_from_lease(
     }
 
     for (name, parameter) in &mut params {
+        if excluded(name) {
+            continue;
+        }
         let value = lease.array(name)?;
         if parameter.shape() != value.shape() {
             return Err(ModuleBindingError::ResidentShapeMismatch {

@@ -1,15 +1,24 @@
 //! Unified fully resident and layerwise-host Qwen3 execution.
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use safemlx::{
-    error::Exception, module::Module, nn, ops::indexing::TryIndexOp, quantization::MaybeQuantized,
+    error::Exception,
+    module::{Module, Param},
+    nn,
+    ops::indexing::TryIndexOp,
+    quantization::MaybeQuantized,
+    transforms::eval,
     Array, Dtype, Stream,
 };
 
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_layerwise_model, LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel,
         LayerwiseModelAdapter, StaticUnitBindings,
@@ -26,10 +35,13 @@ use crate::{
         input,
         qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
-    module_binding::{build_module_bindings, populate_module_from_lease},
-    residency::{ResidencyReport, ResidentUnitLease},
+    module_binding::{
+        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+    },
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_store::{SafetensorsWeightStore, WeightStore},
+    weight_recipe::DerivedWeightRecipe,
+    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "qwen3.static.embedding";
@@ -57,6 +69,17 @@ impl Qwen3LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when that residency mode is active.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Error::from)
     }
 
     /// Returns the persistent checkpoint store.
@@ -128,12 +151,49 @@ pub fn load_qwen3_layerwise_model(
     })
 }
 
+/// Loads sparse Qwen3 with layerwise non-expert weights and expert-granular caching.
+pub fn load_qwen3_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_qwen3_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3 sparse-MoE checkpoint".into(),
+        ));
+    }
+    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut execution = load_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = qwen3_expert_catalog(&args, store.as_ref())?;
+    let cache = ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    execution.adapter_mut().expert_cache = Some(cache);
+    Ok(Qwen3LayerwiseModel { execution })
+}
+
 /// Dense and sparse-MoE Qwen3 adapter sharing one complete-block execution path.
 pub struct Qwen3LayerwiseAdapter {
     args: ModelArgs,
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl Qwen3LayerwiseAdapter {
@@ -162,7 +222,15 @@ impl Qwen3LayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            sparse_expert_cache: false,
+            expert_cache: None,
         })
+    }
+
+    fn new_sparse(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
     }
 
     /// Returns normalized model arguments.
@@ -247,6 +315,51 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
         format!("qwen3.layer.{index:05}")
     }
 
+    fn populate_layer(
+        &self,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("mlp.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn layer_bindings(
+        &self,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings = build_module_bindings(layer, &format!("model.layers.{index}"), store)?;
+        if self.sparse_expert_cache {
+            Ok(bindings
+                .into_iter()
+                .filter(|binding| !binding.name().starts_with("mlp.experts."))
+                .collect())
+        } else {
+            Ok(bindings)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn embed(&mut self, inputs: &Array, stream: &Stream) -> Result<Array, Error> {
         Ok(self.embedding.forward(inputs, stream)?)
     }
@@ -275,12 +388,103 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
 
     fn forward_layer<C: KeyValueCache>(
         &self,
+        index: usize,
         layer: &mut Self::Layer,
         hidden: &Array,
         cache: &mut C,
         context: &Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
+        if self.sparse_expert_cache {
+            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Qwen3 sparse expert cache was not initialized".into(),
+                )
+            })?;
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            let output = layer.forward_sparse_experts(
+                AttentionInput {
+                    x: hidden,
+                    mask: context.mask.as_ref(),
+                    cache: Some(cache),
+                },
+                stream,
+                |flat, indices, weights, stream| {
+                    let acquired = expert_cache
+                        .acquire_routes(index, indices, pass, stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    if acquired.is_empty() {
+                        return Err(Exception::custom(
+                            "Qwen3 router selected no experts for a non-empty routed block",
+                        ));
+                    }
+                    let started = Instant::now();
+                    let prefix = format!("model.layers.{index}.mlp.experts");
+                    let mut bank = resident::Experts::new(
+                        acquired.identities().len() as i32,
+                        self.args.hidden_size,
+                        self.args.moe_intermediate_size,
+                        self.args
+                            .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                        self.args
+                            .weight_quantization_for(&format!("{prefix}.down_proj")),
+                        stream,
+                    )?;
+                    bank.gate_up_proj = Param::new(
+                        acquired
+                            .compact_binding("gate_up_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_up_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_up_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj = Param::new(
+                        acquired
+                            .compact_binding("down_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    eval(
+                        [&bank.gate_up_proj, &bank.down_proj]
+                            .into_iter()
+                            .map(|value| value.as_ref())
+                            .chain(bank.gate_up_proj_scales.as_ref().as_ref())
+                            .chain(bank.gate_up_proj_biases.as_ref().as_ref())
+                            .chain(bank.down_proj_scales.as_ref().as_ref())
+                            .chain(bank.down_proj_biases.as_ref().as_ref()),
+                    )?;
+                    stream.synchronize()?;
+                    expert_cache
+                        .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let output = bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+                    eval([&output])?;
+                    stream.synchronize()?;
+                    Ok(output)
+                },
+            )?;
+            return Ok(output);
+        }
         Ok(layer.forward(
             AttentionInput {
                 x: hidden,
@@ -300,6 +504,140 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
             stream,
         )?)
     }
+}
+
+pub(crate) fn qwen3_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    for layer in 0..usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("Qwen3 layer count is negative".into()))?
+    {
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        let packed_gate_up = format!("{prefix}.gate_up_proj");
+        let packed_down = format!("{prefix}.down_proj");
+        for expert in 0..usize::try_from(args.num_experts)
+            .map_err(|_| Error::UnsupportedArchitecture("Qwen3 expert count is negative".into()))?
+        {
+            let identity = ExpertIdentity::new(layer, expert);
+            let mut bindings = Vec::new();
+            if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
+                for (name, key) in [
+                    ("gate_up_proj", packed_gate_up.clone()),
+                    ("down_proj", packed_down.clone()),
+                ] {
+                    bindings.push(recipe_binding(
+                        name,
+                        DerivedWeightRecipe::source(
+                            key,
+                            TensorSelection::Range {
+                                axis: 0,
+                                start: expert,
+                                end: expert + 1,
+                            },
+                        ),
+                        store,
+                    )?);
+                }
+                for (name, key) in [
+                    ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
+                    ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
+                    ("down_proj_scales", format!("{packed_down}_scales")),
+                    ("down_proj_biases", format!("{packed_down}_biases")),
+                ] {
+                    if keys.contains(&key) {
+                        bindings.push(recipe_binding(
+                            name,
+                            DerivedWeightRecipe::source(
+                                key,
+                                TensorSelection::Range {
+                                    axis: 0,
+                                    start: expert,
+                                    end: expert + 1,
+                                },
+                            ),
+                            store,
+                        )?);
+                    }
+                }
+            } else {
+                if args
+                    .weight_quantization_for(&format!("{prefix}.gate_up_proj"))
+                    .is_some()
+                    || args
+                        .weight_quantization_for(&format!("{prefix}.down_proj"))
+                        .is_some()
+                {
+                    return Err(Error::Quantization(
+                        "split Qwen3 experts cannot be lazily load-time quantized; use checkpoint-native packed expert weights"
+                            .into(),
+                    ));
+                }
+                let gate = split_expert_key(&keys, &prefix, expert, &["gate_proj", "w1"])?;
+                let up = split_expert_key(&keys, &prefix, expert, &["up_proj", "w3"])?;
+                let down = split_expert_key(&keys, &prefix, expert, &["down_proj", "w2"])?;
+                bindings.push(recipe_binding(
+                    "gate_up_proj",
+                    DerivedWeightRecipe::Stack {
+                        axis: 0,
+                        inputs: vec![DerivedWeightRecipe::Concatenate {
+                            axis: 0,
+                            inputs: vec![
+                                DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                                DerivedWeightRecipe::source(up, TensorSelection::Full),
+                            ],
+                        }],
+                    },
+                    store,
+                )?);
+                bindings.push(recipe_binding(
+                    "down_proj",
+                    DerivedWeightRecipe::Stack {
+                        axis: 0,
+                        inputs: vec![DerivedWeightRecipe::source(down, TensorSelection::Full)],
+                    },
+                    store,
+                )?);
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Qwen3 expert byte total overflowed".into())
+                })
+            })?;
+            let unit = OffloadUnit::new(identity.unit_id(), bindings)?;
+            entries.push(ExpertCatalogEntry::new(identity, unit, bytes)?);
+        }
+    }
+    Ok(entries)
+}
+
+fn recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let bytes = recipe.infer(store)?.byte_len();
+    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+}
+
+fn split_expert_key(
+    keys: &BTreeSet<String>,
+    prefix: &str,
+    expert: usize,
+    projections: &[&str],
+) -> Result<String, Error> {
+    projections
+        .iter()
+        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
+        .find(|key| keys.contains(key))
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen3 checkpoint is missing split expert {expert} projection {:?}",
+                projections
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -480,5 +818,63 @@ mod tests {
     #[test]
     fn qwen3_sparse_moe_layerwise_prefill_and_cached_decode_parity() {
         parity(true, 1);
+    }
+
+    #[test]
+    fn qwen3_sparse_expert_cache_prefill_and_decode_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = qwen3::Model::new(args(true), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture);
+
+        let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
+        let expert_options = ExpertCacheLoadOptions::new(
+            non_expert,
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached = load_qwen3_sparse_expert_cache_model(
+            dir.path(),
+            expert_options,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cached_cache = cached.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(
+                    qwen3::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut resident_cache,
+                    },
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, None, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 12);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
+        assert!(report.prefill.compact_banks > 0);
+        assert!(report.decode.compact_banks > 0);
+        assert_eq!(
+            cached_cache[0].as_ref().unwrap().offset(),
+            resident_cache[0].as_ref().unwrap().offset()
+        );
     }
 }

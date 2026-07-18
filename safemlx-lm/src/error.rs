@@ -35,6 +35,10 @@ pub enum Error {
     #[error(transparent)]
     WeightStore(#[from] crate::weight_store::WeightStoreError),
 
+    /// Invalid checkpoint-derived weight recipe.
+    #[error(transparent)]
+    WeightRecipe(#[from] crate::weight_recipe::WeightRecipeError),
+
     /// Invalid architecture-independent offload planning request.
     #[error(transparent)]
     Offload(#[from] crate::offload::OffloadError),
@@ -42,6 +46,10 @@ pub enum Error {
     /// Invalid or failed weight residency operation.
     #[error(transparent)]
     Residency(#[from] crate::residency::ResidencyError),
+
+    /// Invalid sparse expert catalog, routing, capacity, or execution request.
+    #[error(transparent)]
+    ExpertCache(#[from] crate::expert_cache::ExpertCacheError),
 
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]

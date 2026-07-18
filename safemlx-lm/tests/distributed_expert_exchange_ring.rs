@@ -3,6 +3,7 @@
 use std::{
     net::TcpListener,
     process::{Child, Command, Output, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -14,11 +15,22 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    expert_parallel::{
-        all_to_all_v, dispatch_sharded, profile_expert_parallel_timings, ExpertAssignment,
-        ShardedRouteBlocks,
+    error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
     },
-    models::{common::moe::PackedRelu2Experts, deepseek_v3::RoutedExperts},
+    expert_parallel::{
+        all_to_all_v, dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
+        DispatchedRoutes, ExpertAssignment, LocalExpertBank, ShardedRouteBlocks,
+    },
+    layerwise::LayerwiseLoadOptions,
+    models::{
+        common::moe::{PackedRelu2Experts, PackedSwiGluExperts},
+        deepseek_v3::RoutedExperts,
+    },
+    offload::OffloadConfig,
+    residency::{OffloadUnit, WeightBinding},
+    weight_store::{SafetensorsWeightStore, TensorSelection},
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 
@@ -127,6 +139,37 @@ fn fp8_route_output(hidden: f32, local_expert: usize, weight: f32) -> f32 {
     let gate = scale * hidden;
     let silu = gate / (1.0 + (-gate).exp());
     weight * silu * (scale * hidden) * scale
+}
+
+fn execute_cached_qwen_routes(
+    cache: &ExpertCache,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let acquired = cache.acquire_routes(0, &routes.global_expert_ids, pass, stream)?;
+    let started = Instant::now();
+    let gate_up = acquired.compact_binding("gate_up_proj", stream)?;
+    let down = acquired.compact_binding("down_proj", stream)?;
+    eval([&gate_up, &down])?;
+    let mut bank = PackedSwiGluExperts {
+        num_experts: acquired.identities().len() as i32,
+        hidden_dim: 1,
+        intermediate_dim: 1,
+        gate_up_affine: None,
+        down_affine: None,
+        gate_up_proj: Param::new(gate_up),
+        gate_up_proj_scales: Param::new(None),
+        gate_up_proj_biases: Param::new(None),
+        down_proj: Param::new(down),
+        down_proj_scales: Param::new(None),
+        down_proj_biases: Param::new(None),
+    };
+    cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
+    let output = bank.execute_local_routes(&routes.hidden, acquired.compact_routes(), stream)?;
+    eval([&output])?;
+    stream.synchronize()?;
+    Ok(output)
 }
 
 #[test]
@@ -246,6 +289,112 @@ fn expert_exchange_ring_worker() {
     assert_eq!(fp8_dispatched.statistics.sent_routes, 4);
     assert_eq!(fp8_dispatched.statistics.received_routes, 4);
     assert_eq!(fp8_dispatched.statistics.synchronization_count, 6);
+
+    let qwen_gate_up = [1.0f32, 1.0, 2.0, 1.0, 1.0, 2.0, 0.5, 3.0];
+    let qwen_down = [1.0f32, 1.5, 2.0, 0.5];
+    let qwen_hidden = f32_array(&[1.0, 2.0], &[2, 1], &stream);
+    let qwen_ids = i32_array(&[0, 1, 2, 3], &[2, 2], &stream);
+    let qwen_weights = f32_array(&[0.25, 0.75, 0.4, 0.6], &[2, 2], &stream);
+    let mut full_qwen = PackedSwiGluExperts {
+        num_experts: 4,
+        hidden_dim: 1,
+        intermediate_dim: 1,
+        gate_up_affine: None,
+        down_affine: None,
+        gate_up_proj: Param::new(f32_array(&qwen_gate_up, &[4, 2, 1], &stream)),
+        gate_up_proj_scales: Param::new(None),
+        gate_up_proj_biases: Param::new(None),
+        down_proj: Param::new(f32_array(&qwen_down, &[4, 1, 1], &stream)),
+        down_proj_scales: Param::new(None),
+        down_proj_biases: Param::new(None),
+    };
+    let expected_qwen = full_qwen
+        .forward(&qwen_hidden, &qwen_ids, &qwen_weights, &stream)
+        .unwrap();
+    let qwen_assignment = ExpertAssignment::round_robin(4, 2, expected_rank).unwrap();
+    let store =
+        Arc::new(SafetensorsWeightStore::open(std::env::var_os(PAYLOAD_FILE).unwrap()).unwrap());
+    let entries = qwen_assignment
+        .local_global_expert_ids()
+        .iter()
+        .copied()
+        .map(|expert| {
+            let identity = ExpertIdentity::new(0, expert);
+            let bindings = [
+                WeightBinding::new(
+                    "gate_up_proj",
+                    "qwen_gate_up",
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: expert,
+                        end: expert + 1,
+                    },
+                    8,
+                )
+                .unwrap(),
+                WeightBinding::new(
+                    "down_proj",
+                    "qwen_down",
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: expert,
+                        end: expert + 1,
+                    },
+                    4,
+                )
+                .unwrap(),
+            ];
+            let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
+            ExpertCatalogEntry::new(identity, unit, 12).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let cache = ExpertCache::new(
+        store,
+        entries,
+        ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::default(),
+            OffloadConfig::new(Some(24), Some(24), 1).unwrap(),
+            24,
+        )
+        .unwrap(),
+        stream.clone(),
+        stream.clone(),
+    )
+    .unwrap();
+    let cached_qwen = dispatch_replicated_with(
+        &qwen_hidden,
+        &qwen_ids,
+        &qwen_weights,
+        &qwen_assignment,
+        &group,
+        &stream,
+        |routes, stream| execute_cached_qwen_routes(&cache, routes, ExpertPass::Prefill, stream),
+    )
+    .unwrap();
+    eval([&expected_qwen, &cached_qwen.reduced_output]).unwrap();
+    stream.synchronize().unwrap();
+    let expected_qwen = expected_qwen.evaluated().unwrap();
+    assert_f32_close(&cached_qwen.reduced_output, expected_qwen.as_slice::<f32>());
+
+    let cached_decode = dispatch_replicated_with(
+        &qwen_hidden,
+        &qwen_ids,
+        &qwen_weights,
+        &qwen_assignment,
+        &group,
+        &stream,
+        |routes, stream| execute_cached_qwen_routes(&cache, routes, ExpertPass::Decode, stream),
+    )
+    .unwrap();
+    assert_f32_close(
+        &cached_decode.reduced_output,
+        expected_qwen.as_slice::<f32>(),
+    );
+    let report = cache.report().unwrap();
+    assert_eq!(report.owned_experts, 2);
+    assert_eq!(report.prefill.distinct_experts, 2);
+    assert_eq!(report.decode.distinct_experts, 2);
+    assert_eq!(report.decode.device.hits, 2);
 }
 
 struct ChildGuard(Vec<Child>);
@@ -296,6 +445,14 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
     let r0d1 = i32_bytes(&[11, 12]);
     let r1d0 = Vec::<u8>::new();
     let r1d1 = i32_bytes(&[21]);
+    let f32_bytes = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let qwen_gate_up = f32_bytes(&[1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 0.5, 3.0]);
+    let qwen_down = f32_bytes(&[1.0, 1.5, 2.0, 0.5]);
     serialize_to_file(
         [
             (
@@ -313,6 +470,14 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
             (
                 "r1d1",
                 TensorView::new(TensorDtype::I32, vec![1, 1], &r1d1).unwrap(),
+            ),
+            (
+                "qwen_gate_up",
+                TensorView::new(TensorDtype::F32, vec![4, 2, 1], &qwen_gate_up).unwrap(),
+            ),
+            (
+                "qwen_down",
+                TensorView::new(TensorDtype::F32, vec![4, 1, 1], &qwen_down).unwrap(),
             ),
         ],
         None,

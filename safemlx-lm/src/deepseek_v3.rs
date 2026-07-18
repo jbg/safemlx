@@ -1,18 +1,23 @@
 //! Layerwise-host execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::{Module, ModuleParameters, Param},
     nn,
     ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
+    transforms::eval,
     Array, Dtype, Stream,
 };
 
 use crate::{
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
@@ -24,8 +29,9 @@ use crate::{
     },
     module_binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
     weight_recipe::DerivedWeightRecipe,
     weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
@@ -54,6 +60,17 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when that residency mode is active.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Error::from)
     }
 
     /// Returns the persistent checkpoint store.
@@ -124,12 +141,45 @@ pub fn load_deepseek_v3_layerwise_model(
     })
 }
 
+/// Loads DeepSeek-V3/R1 with layerwise non-expert weights and expert-granular caching.
+pub fn load_deepseek_v3_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_model_args(model_dir)?;
+    args.validate()?;
+    let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = deepseek_expert_catalog(&args, store.as_ref())?;
+    let cache = ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    execution.adapter_mut().expert_cache = Some(cache);
+    Ok(DeepSeekV3LayerwiseModel { execution })
+}
+
 /// Adapter for compressed MLA and mixed dense/MoE DeepSeek decoder blocks.
 pub struct DeepSeekV3LayerwiseAdapter {
     args: ModelArgs,
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl DeepSeekV3LayerwiseAdapter {
@@ -154,8 +204,16 @@ impl DeepSeekV3LayerwiseAdapter {
                 args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
+            sparse_expert_cache: false,
+            expert_cache: None,
             args,
         })
+    }
+
+    fn new_sparse(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
     }
 
     /// Returns the validated architecture arguments.
@@ -383,6 +441,24 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         format!("deepseek_v3.layer.{index:05}")
     }
 
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("mlp.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
     fn layer_bindings(
         &self,
         _group: usize,
@@ -391,12 +467,32 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
-        Ok(build_module_bindings_with_recipes(
+        let bindings = build_module_bindings_with_recipes(
             layer,
             &prefix,
             store,
             self.recipes_for_layer(layer, index, store)?,
-        )?)
+        )?;
+        if self.sparse_expert_cache {
+            Ok(bindings
+                .into_iter()
+                .filter(|binding| !binding.name().starts_with("mlp.experts."))
+                .collect())
+        } else {
+            Ok(bindings)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn forward_layer(
@@ -410,6 +506,113 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
+        if self.sparse_expert_cache && self.args.is_moe_layer(index as i32) {
+            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "DeepSeek-V3 sparse expert cache was not initialized".into(),
+                )
+            })?;
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            let output = layer.forward_sparse_experts(
+                hidden,
+                context.mask.as_ref(),
+                Some(&mut cache.layers[index]),
+                stream,
+                |flat, indices, weights, stream| {
+                    let acquired = expert_cache
+                        .acquire_routes(index, indices, pass, stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    if acquired.is_empty() {
+                        return Err(Exception::custom(
+                            "DeepSeek-V3 router selected no experts for a non-empty routed block",
+                        ));
+                    }
+                    let started = Instant::now();
+                    let mut bank = resident::RoutedExperts::new_compact(
+                        &self.args,
+                        index as i32,
+                        acquired.identities().len() as i32,
+                        stream,
+                    )?;
+                    bank.gate_proj = Param::new(Some(
+                        acquired
+                            .compact_binding("gate_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    ));
+                    bank.gate_proj_scale_inv = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_proj_scale_inv", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.up_proj = Param::new(Some(
+                        acquired
+                            .compact_binding("up_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    ));
+                    bank.up_proj_scale_inv = Param::new(
+                        acquired
+                            .optional_compact_binding("up_proj_scale_inv", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.up_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("up_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.up_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("up_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj = Param::new(Some(
+                        acquired
+                            .compact_binding("down_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    ));
+                    bank.down_proj_scale_inv = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_scale_inv", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    let parameters = bank.parameters().flatten();
+                    eval(parameters.values().copied())?;
+                    stream.synchronize()?;
+                    expert_cache
+                        .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let output =
+                        bank.forward_local(flat, acquired.compact_routes(), weights, stream)?;
+                    eval([&output])?;
+                    stream.synchronize()?;
+                    Ok(output)
+                },
+            )?;
+            return Ok(output);
+        }
         Ok(layer.forward_stage(
             hidden,
             context.mask.as_ref(),
@@ -451,6 +654,101 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
     }
 }
 
+pub(crate) fn deepseek_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let normalized = normalized_checkpoint_keys(store);
+    let mut entries = Vec::new();
+    for layer in 0..usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("DeepSeek-V3 layer count is negative".into()))?
+    {
+        if !args.is_moe_layer(layer as i32) {
+            continue;
+        }
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        for expert in 0..usize::try_from(args.n_routed_experts).map_err(|_| {
+            Error::UnsupportedArchitecture("DeepSeek-V3 expert count is negative".into())
+        })? {
+            let identity = ExpertIdentity::new(layer, expert);
+            let mut bindings = Vec::new();
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let packed = normalized.get(&format!("{prefix}.{projection}"));
+                for (runtime_suffix, checkpoint_component, required) in [
+                    ("", "weight", true),
+                    ("_scale_inv", "weight_scale_inv", false),
+                    ("_scales", "scales", false),
+                    ("_biases", "biases", false),
+                ] {
+                    let binding_name = format!("{projection}{runtime_suffix}");
+                    let recipe = if let Some(packed_key) = packed {
+                        let runtime = format!("{prefix}.{projection}{runtime_suffix}");
+                        match normalized.get(&runtime) {
+                            Some(raw) => Some(DerivedWeightRecipe::source(
+                                raw.clone(),
+                                TensorSelection::Range {
+                                    axis: 0,
+                                    start: expert,
+                                    end: expert + 1,
+                                },
+                            )),
+                            None if required => Some(DerivedWeightRecipe::source(
+                                packed_key.clone(),
+                                TensorSelection::Range {
+                                    axis: 0,
+                                    start: expert,
+                                    end: expert + 1,
+                                },
+                            )),
+                            None => None,
+                        }
+                    } else {
+                        let runtime =
+                            format!("{prefix}.{expert}.{projection}.{checkpoint_component}");
+                        match normalized.get(&runtime) {
+                            Some(raw) => Some(DerivedWeightRecipe::Stack {
+                                axis: 0,
+                                inputs: vec![DerivedWeightRecipe::source(
+                                    raw.clone(),
+                                    TensorSelection::Full,
+                                )],
+                            }),
+                            None if required => {
+                                return Err(Error::UnsupportedArchitecture(format!(
+                                    "DeepSeek-V3 checkpoint is missing expert tensor {runtime}"
+                                )));
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(recipe) = recipe {
+                        bindings.push(deepseek_recipe_binding(&binding_name, recipe, store)?);
+                    }
+                }
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "DeepSeek-V3 expert byte total overflowed".into(),
+                    )
+                })
+            })?;
+            let unit = OffloadUnit::new(identity.unit_id(), bindings)?;
+            entries.push(ExpertCatalogEntry::new(identity, unit, bytes)?);
+        }
+    }
+    Ok(entries)
+}
+
+fn deepseek_recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let bytes = recipe.infer(store)?.byte_len();
+    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+}
+
 /// DeepSeek token generation using layerwise-host execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, DeepSeekV3LayerwiseModel, Cache, S>;
@@ -465,8 +763,9 @@ mod tests {
         Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
-    use super::load_deepseek_v3_layerwise_model;
+    use super::{load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model};
     use crate::{
+        expert_cache::ExpertCacheLoadOptions,
         layerwise::LayerwiseLoadOptions,
         models::deepseek_v3::{self as resident, FeedForward, Model, ModelArgs, ModelInput},
         module_binding::canonical_checkpoint_name,
@@ -573,7 +872,7 @@ mod tests {
         }
     }
 
-    fn write_fixture(dir: &Path, model: &Model, fp8: bool, stream: &Stream) {
+    fn write_fixture(dir: &Path, model: &Model, fp8: bool, split_experts: bool, stream: &Stream) {
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in model.parameters().flatten() {
             let name = canonical_checkpoint_name(&name);
@@ -592,7 +891,9 @@ mod tests {
                             .then_some((projection, runtime_suffix, checkpoint_component))
                     })
                 });
-            if let Some((projection, runtime_suffix, checkpoint_component)) = packed {
+            if let Some((projection, runtime_suffix, checkpoint_component)) =
+                packed.filter(|_| split_experts)
+            {
                 let suffix = format!(".experts.{projection}{runtime_suffix}");
                 let prefix = name.strip_suffix(&suffix).unwrap();
                 for expert in 0..model.args.n_routed_experts {
@@ -633,7 +934,7 @@ mod tests {
         let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, fp8, gpu.stream());
+        write_fixture(dir.path(), &fixture, fp8, true, gpu.stream());
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
@@ -696,5 +997,70 @@ mod tests {
     #[test]
     fn deepseek_v3_native_fp8_split_moe_layerwise_parity() {
         parity(true, 1);
+    }
+
+    #[test]
+    fn deepseek_v3_sparse_expert_cache_layout_parity_and_telemetry() {
+        sparse_expert_cache_parity(false, true);
+        sparse_expert_cache_parity(false, false);
+        sparse_expert_cache_parity(true, true);
+    }
+
+    fn sparse_expert_cache_parity(fp8: bool, split_experts: bool) {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, fp8, split_experts, gpu.stream());
+
+        let mut resident = if split_experts {
+            resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+        } else {
+            fixture
+        };
+        let expert_options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached = load_deepseek_v3_sparse_expert_cache_model(
+            dir.path(),
+            expert_options,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = resident::Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected, if fp8 { 2e-4 } else { 3e-5 });
+            assert_eq!(cached_cache.offset(), resident_cache.offset());
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 4);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
+        assert!(report.prefill.compact_banks > 0);
+        assert!(report.decode.compact_banks > 0);
     }
 }
