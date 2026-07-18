@@ -14,22 +14,26 @@ use safemlx::{
     distributed::{self, Backend},
     error::Exception,
     module::{Module, ModuleParameters, Param},
-    ops::indexing::TryIndexOp,
+    ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
     transforms::eval,
     Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
 use safemlx_lm::{
     cache::{ConcatKeyValueCache, SlidingKeyValueCache},
+    expert_cache::ExpertCacheLoadOptions,
     expert_parallel::{
         load_expert_parallel_model_with_options,
         load_expert_parallel_model_with_options_and_assignment, profile_expert_parallel_timings,
         ExpertAssignment,
     },
     inspection::{ActivationObserver, MoeRoutingObservation},
-    models::{deepseek_v3, qwen3, ModelLoadOptions},
+    models::{
+        deepseek_v3, gpt_oss, inkling, lfm2, nemotron_h, qwen3, qwen3_5_moe, qwen3_vl,
+        ModelLoadOptions,
+    },
     quantization::{AffineQuantization, WeightQuantization},
     sampler::DefaultSampler,
-    DeviceAssignment, ParallelTopology,
+    DeviceAssignment, ParallelTopology, WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
@@ -38,6 +42,7 @@ const EXPECTED_FILE: &str = "SAFEMLX_LM_EXPERT_MODEL_EXPECTED";
 const ARCHITECTURE: &str = "SAFEMLX_LM_EXPERT_MODEL_ARCHITECTURE";
 const ENCODING: &str = "SAFEMLX_LM_EXPERT_MODEL_ENCODING";
 const ASSIGNMENT: &str = "SAFEMLX_LM_EXPERT_MODEL_ASSIGNMENT";
+const RESIDENCY: &str = "SAFEMLX_LM_EXPERT_MODEL_RESIDENCY";
 
 struct EpObserver {
     names: Vec<String>,
@@ -110,12 +115,15 @@ fn expert_parallel_model_ring_worker() {
     let architecture = std::env::var(ARCHITECTURE).unwrap();
     let encoding = std::env::var(ENCODING).unwrap_or_else(|_| "dense".into());
     let assignment_kind = std::env::var(ASSIGNMENT).unwrap_or_else(|_| "balanced".into());
+    let residency = std::env::var(RESIDENCY).unwrap_or_else(|_| "resident".into());
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
     let hidden_size = config["hidden_size"].as_i64().unwrap() as i32;
     let moe_intermediate_size = config["moe_intermediate_size"].as_i64().unwrap() as usize;
     let num_layers = config["num_hidden_layers"].as_i64().unwrap() as usize;
-    let moe_layers = if architecture == "DeepSeekV3" {
+    let moe_layers = if let Some(value) = config.get("test_moe_layers") {
+        value.as_u64().unwrap() as usize
+    } else if architecture == "DeepSeekV3" {
         let dense_prefix = config["first_k_dense_replace"].as_i64().unwrap() as usize;
         let frequency = config["moe_layer_freq"].as_i64().unwrap() as usize;
         (0..num_layers)
@@ -137,6 +145,10 @@ fn expert_parallel_model_ring_worker() {
     let mut options = ModelLoadOptions::with_parallel(topology);
     if encoding == "affine" {
         options.quantization = Some(quantization);
+    }
+    if residency == "sparse-cache" {
+        options.weight_residency =
+            WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default());
     }
     let assignment = match assignment_kind.as_str() {
         "balanced" => None,
@@ -169,7 +181,10 @@ fn expert_parallel_model_ring_worker() {
     };
     assert_eq!(info.assignment.local_global_expert_ids(), expected_experts);
     let dense_routed_bytes = 2 * moe_layers * 3 * moe_intermediate_size * hidden_size as usize * 4;
-    if encoding == "dense" {
+    if residency == "sparse-cache" {
+        assert_eq!(info.routed_expert_bytes, 0);
+        assert!(info.owned_expert_bytes > 0);
+    } else if encoding == "dense" {
         assert_eq!(info.routed_expert_bytes, dense_routed_bytes);
     } else {
         assert!(
@@ -190,9 +205,10 @@ fn expert_parallel_model_ring_worker() {
     if checkpoint.join("replicated.safetensors").exists() {
         assert!(opened.contains(&"replicated.safetensors".to_string()));
         for expert in 0..4 {
+            let expected_open = residency != "sparse-cache" && expected_experts.contains(&expert);
             assert_eq!(
                 opened.contains(&format!("expert-{expert}.safetensors")),
-                expected_experts.contains(&expert),
+                expected_open,
                 "rank {expected_rank} opened the wrong expert shards: {opened:?}"
             );
         }
@@ -217,7 +233,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" {
+    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
 
@@ -241,7 +257,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" {
+    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
     assert_eq!(cache.offset(), 4);
@@ -263,7 +279,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" {
+    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
     let third = model
@@ -284,45 +300,49 @@ fn expert_parallel_model_ring_worker() {
     );
     assert_eq!(cache.offset(), 5);
 
-    let mut observed_cache = model.new_cache();
-    let mut observer = EpObserver {
-        names: Vec::new(),
-        routing_observations: 0,
-        saw_local: false,
-        saw_reduced: false,
-        saw_shared: false,
-        hidden_size,
-        routes: 3,
-    };
-    let observed = model
-        .forward_with_observer(
-            &prompt,
-            None,
-            &mut observed_cache,
-            &group,
-            &mut observer,
-            stream,
-        )
-        .unwrap();
-    assert_close(&observed, &expected["prefill"]);
-    assert_eq!(observer.routing_observations, moe_layers);
-    assert!(observer.saw_local);
-    assert!(observer.saw_reduced);
-    assert_eq!(observer.saw_shared, architecture == "DeepSeekV3");
-    assert!(observer.names.iter().any(|name| name.contains("local")));
-    assert!(observer.names.iter().any(|name| name.contains("reduced")));
+    if residency != "sparse-cache" {
+        let mut observed_cache = model.new_cache();
+        let mut observer = EpObserver {
+            names: Vec::new(),
+            routing_observations: 0,
+            saw_local: false,
+            saw_reduced: false,
+            saw_shared: false,
+            hidden_size,
+            routes: 3,
+        };
+        let observed = model
+            .forward_with_observer(
+                &prompt,
+                None,
+                &mut observed_cache,
+                &group,
+                &mut observer,
+                stream,
+            )
+            .unwrap();
+        assert_close(&observed, &expected["prefill"]);
+        assert_eq!(observer.routing_observations, moe_layers);
+        assert!(observer.saw_local);
+        assert!(observer.saw_reduced);
+        assert_eq!(observer.saw_shared, architecture == "DeepSeekV3");
+        assert!(observer.names.iter().any(|name| name.contains("local")));
+        assert!(observer.names.iter().any(|name| name.contains("reduced")));
+    }
     let timings = model.latest_routing_statistics();
     assert!(timings.total_time > Duration::ZERO);
     assert!(timings.model_time > Duration::ZERO);
-    assert!(timings.router_time > Duration::ZERO);
     assert!(timings.compaction_time > Duration::ZERO);
     assert!(timings.expert_time > Duration::ZERO);
     assert!(timings.reduction_time > Duration::ZERO);
     assert_eq!(timings.exchange_time, Duration::ZERO);
-    assert_eq!(
-        timings.shared_expert_time > Duration::ZERO,
-        architecture == "DeepSeekV3"
-    );
+    if residency != "sparse-cache" {
+        assert!(timings.router_time > Duration::ZERO);
+        assert_eq!(
+            timings.shared_expert_time > Duration::ZERO,
+            architecture == "DeepSeekV3"
+        );
+    }
 
     if architecture == "Qwen3" {
         let mut sliding_cache = model.new_qwen3_sliding_cache(2).unwrap();
@@ -882,6 +902,225 @@ fn write_deepseek_fp8_fixture(directory: &Path) {
     split_deepseek_checkpoint(&model, directory, stream);
 }
 
+fn initialize_zero_fixture(model: &mut impl ModuleParameters, stream: &Stream) {
+    for (name, parameter) in model.parameters_mut().flatten() {
+        let shape = parameter.shape().to_vec();
+        let dtype = parameter.dtype();
+        *parameter = if name.ends_with("_scales") {
+            Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
+        } else if name.ends_with("norm.weight")
+            || name.ends_with("layernorm.weight")
+            || name.ends_with("global_scale")
+            || name.as_ref() == "model.norm_f.weight"
+        {
+            ones_dtype(&shape, dtype, stream).unwrap()
+        } else {
+            zeros_dtype(&shape, dtype, stream).unwrap()
+        };
+    }
+}
+
+fn save_zero_fixture(
+    model: &mut impl ModuleParameters,
+    config: &serde_json::Value,
+    directory: &Path,
+    stream: &Stream,
+    output_vocab: i32,
+) {
+    initialize_zero_fixture(model, stream);
+    let arrays = model
+        .parameters()
+        .flatten()
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                safemlx_lm::module_binding::canonical_checkpoint_name(&name),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    save_arrays(&directory.join("model.safetensors"), &arrays);
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(config).unwrap(),
+    )
+    .unwrap();
+    let zero_token = zeros_dtype(&[1, 1], Dtype::Float32, stream).unwrap();
+    save_arrays(
+        &directory.join("expected.safetensors"),
+        &[
+            (
+                "prefill".into(),
+                zeros_dtype(&[1, 3, output_vocab], Dtype::Float32, stream).unwrap(),
+            ),
+            (
+                "decode".into(),
+                zeros_dtype(&[1, 1, output_vocab], Dtype::Float32, stream).unwrap(),
+            ),
+            (
+                "decode_second".into(),
+                zeros_dtype(&[1, 1, output_vocab], Dtype::Float32, stream).unwrap(),
+            ),
+            ("first_token".into(), zero_token.clone()),
+            ("second_token".into(), zero_token.clone()),
+            ("third_token".into(), zero_token),
+        ],
+    );
+}
+
+fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static str, PathBuf)> {
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let mut fixtures = Vec::new();
+
+    let config = serde_json::json!({
+        "model_type": "gpt_oss", "hidden_size": 32, "intermediate_size": 32,
+        "moe_intermediate_size": 32, "num_hidden_layers": 2, "test_moe_layers": 2,
+        "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 32,
+        "vocab_size": 32, "num_local_experts": 4, "num_experts_per_tok": 2,
+        "rms_norm_eps": 1e-5, "sliding_window": 4, "max_position_embeddings": 64,
+        "rope_theta": 150000.0, "layer_types": ["sliding_attention", "full_attention"],
+        "quantization_config": {"quant_method": "mxfp4"}, "swiglu_limit": 7.0
+    });
+    let directory = root.join("gpt-oss-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut model =
+        gpt_oss::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    fixtures.push(("GPT-OSS sparse expert cache", "GptOss", directory));
+
+    let config = serde_json::json!({
+        "model_type": "lfm2_moe", "vocab_size": 32, "hidden_size": 16,
+        "intermediate_size": 24, "moe_intermediate_size": 8, "num_hidden_layers": 2,
+        "test_moe_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "max_position_embeddings": 64, "norm_eps": 1e-5,
+        "layer_types": ["full_attention", "full_attention"], "conv_L_cache": 3,
+        "conv_bias": false, "block_auto_adjust_ff_dim": false,
+        "tie_word_embeddings": false, "num_dense_layers": 0, "num_experts": 4,
+        "num_experts_per_tok": 2, "norm_topk_prob": true, "use_expert_bias": true
+    });
+    let directory = root.join("lfm2-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut model =
+        lfm2::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    fixtures.push(("LFM2 sparse expert cache", "Lfm2", directory));
+
+    let config = serde_json::json!({
+        "model_type": "nemotron_h", "vocab_size": 32, "hidden_size": 8,
+        "intermediate_size": 12, "moe_intermediate_size": 6,
+        "moe_shared_expert_intermediate_size": 10, "num_hidden_layers": 2,
+        "test_moe_layers": 1, "hybrid_override_pattern": "E*", "num_attention_heads": 2,
+        "num_key_value_heads": 1, "head_dim": 4, "max_position_embeddings": 64,
+        "mamba_num_heads": 2, "mamba_head_dim": 4, "n_groups": 1,
+        "ssm_state_size": 4, "conv_kernel": 3, "chunk_size": 2,
+        "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+        "tie_word_embeddings": false, "torch_dtype": "float32"
+    });
+    let directory = root.join("nemotron-h-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut model =
+        nemotron_h::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    fixtures.push(("Nemotron-H sparse expert cache", "NemotronH", directory));
+
+    let config = serde_json::json!({
+        "model_type": "inkling_mm_model", "hidden_size": 16, "moe_intermediate_size": 8,
+        "num_hidden_layers": 2, "test_moe_layers": 2, "eos_token_id": 1,
+        "text_config": {
+            "hidden_size": 16, "num_hidden_layers": 2, "vocab_size": 32,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+            "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1, "swa_head_dim": 8,
+            "sliding_window_size": 4, "local_layer_ids": [0], "dense_mlp_idx": 0,
+            "sconv_kernel_size": 3, "d_rel": 4, "rel_extent": 8,
+            "intermediate_size": 8, "dense_intermediate_size": 16,
+            "moe_intermediate_size": 8, "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "n_shared_experts": 1, "route_scale": 1.0, "use_sconv": true,
+            "use_embed_norm": true, "shared_expert_sink": true, "use_gate_bias": true,
+            "norm_after_topk": true, "use_global_scale": true, "gate_activation": "sigmoid",
+            "hidden_act": "silu", "attention_dropout": 0.0, "q_bias": false,
+            "o_bias": false, "logits_mup_width_multiplier": 2.0
+        }
+    });
+    let directory = root.join("inkling-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut model =
+        inkling::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    fixtures.push(("Inkling sparse expert cache", "Inkling", directory));
+
+    for (next, label, architecture) in [
+        (true, "Qwen3-Next sparse expert cache", "Qwen3Next"),
+        (false, "Qwen3.5 sparse expert cache", "Qwen35Moe"),
+    ] {
+        let config = serde_json::json!({
+            "model_type": if next { "qwen3_next" } else { "qwen3_5_moe_text" },
+            "vocab_size": 32, "hidden_size": 16, "num_hidden_layers": 2,
+            "test_moe_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 8, "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": false, "linear_conv_kernel_dim": 3,
+            "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "intermediate_size": 0, "moe_intermediate_size": 8,
+            "shared_expert_intermediate_size": 8, "num_experts_per_tok": 2,
+            "num_experts": 4, "norm_topk_prob": true,
+            "layer_types": ["full_attention", "full_attention"]
+        });
+        let directory = root.join(if next {
+            "qwen3-next-sparse"
+        } else {
+            "qwen35-sparse"
+        });
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut model = qwen3_5_moe::Model::new(
+            serde_json::from_value(config.clone()).unwrap(),
+            None,
+            None,
+            None,
+            stream,
+        )
+        .unwrap();
+        save_zero_fixture(&mut model, &config, &directory, stream, 32);
+        fixtures.push((label, architecture, directory));
+    }
+
+    let config = serde_json::json!({
+        "model_type": "qwen3_vl_moe", "hidden_size": 12, "moe_intermediate_size": 8,
+        "num_hidden_layers": 2, "test_moe_layers": 2, "image_token_id": 30,
+        "video_token_id": 31, "tie_word_embeddings": true,
+        "text_config": {
+            "model_type": "qwen3_vl_moe_text", "hidden_size": 12, "num_hidden_layers": 2,
+            "intermediate_size": 24, "num_attention_heads": 1, "rms_norm_eps": 1e-6,
+            "vocab_size": 32, "num_key_value_heads": 1, "max_position_embeddings": 128,
+            "rope_theta": 10000.0, "head_dim": 12, "tie_word_embeddings": true,
+            "moe_intermediate_size": 8, "num_experts": 4, "num_experts_per_tok": 2,
+            "norm_topk_prob": true, "rope_scaling": {
+                "rope_type": "default", "mrope_interleaved": true, "mrope_section": [2, 2, 2]
+            }
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": 16, "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "window_size": 8, "out_hidden_size": 12,
+            "fullatt_block_indexes": [0], "deepstack_visual_indexes": []
+        }
+    });
+    let directory = root.join("qwen3-vl-moe-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let args = qwen3_vl::get_qwen3_vl_model_args(&directory).unwrap();
+    let mut model = qwen3_vl::Model::new(args, stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    fixtures.push(("Qwen3-VL-MoE sparse expert cache", "Qwen3VlMoe", directory));
+
+    fixtures
+}
+
 struct ChildGuard(Vec<Child>);
 
 impl ChildGuard {
@@ -917,6 +1156,7 @@ fn run_ring_fixture(
     architecture: &str,
     encoding: &str,
     assignment: &str,
+    residency: &str,
     checkpoint: &Path,
     expected_file: &str,
 ) {
@@ -948,6 +1188,7 @@ fn run_ring_fixture(
                 .env(ARCHITECTURE, architecture)
                 .env(ENCODING, encoding)
                 .env(ASSIGNMENT, assignment)
+                .env(RESIDENCY, residency)
                 .env_remove("MLX_RING_VERBOSE")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1028,6 +1269,7 @@ fn ring_two_process_model_parity() {
         "Qwen3",
         "dense",
         "balanced",
+        "resident",
         &qwen,
         "expected.safetensors",
     );
@@ -1036,6 +1278,7 @@ fn ring_two_process_model_parity() {
         "DeepSeekV3",
         "dense",
         "balanced",
+        "resident",
         &deepseek,
         "expected.safetensors",
     );
@@ -1044,6 +1287,7 @@ fn ring_two_process_model_parity() {
         "Qwen3",
         "affine",
         "balanced",
+        "resident",
         &qwen_packed,
         "expected-affine.safetensors",
     );
@@ -1052,6 +1296,7 @@ fn ring_two_process_model_parity() {
         "DeepSeekV3",
         "affine",
         "balanced",
+        "resident",
         &deepseek,
         "expected-affine.safetensors",
     );
@@ -1060,6 +1305,7 @@ fn ring_two_process_model_parity() {
         "DeepSeekV3",
         "fp8",
         "balanced",
+        "resident",
         &deepseek_fp8,
         "expected-fp8.safetensors",
     );
@@ -1068,6 +1314,7 @@ fn ring_two_process_model_parity() {
         "Qwen3",
         "affine",
         "round-robin",
+        "resident",
         &qwen_packed,
         "expected-affine.safetensors",
     );
@@ -1076,7 +1323,28 @@ fn ring_two_process_model_parity() {
         "DeepSeekV3",
         "dense",
         "explicit",
+        "resident",
         &deepseek,
         "expected.safetensors",
     );
+    run_ring_fixture(
+        "Qwen3 sparse expert cache",
+        "Qwen3",
+        "dense",
+        "balanced",
+        "sparse-cache",
+        &qwen,
+        "expected.safetensors",
+    );
+    for (label, architecture, checkpoint) in write_additional_sparse_fixtures(fixture.path()) {
+        run_ring_fixture(
+            label,
+            architecture,
+            "dense",
+            "balanced",
+            "sparse-cache",
+            &checkpoint,
+            "expected.safetensors",
+        );
+    }
 }

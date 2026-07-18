@@ -63,7 +63,9 @@ tiers share unified physical memory, so these logical tiers do not increase
 total capacity. GGUF, load-time conversion, and KV cache offload are not
 supported by this path.
 
-DeepSeek-V3/R1 and sparse Qwen3 safetensors can cache routed experts separately:
+Supported safetensors MoE models can cache routed experts separately. This
+includes DeepSeek-V3/R1, GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3,
+Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE:
 
 ```sh
 cargo run --release -p safemlx-lm-cli -- \

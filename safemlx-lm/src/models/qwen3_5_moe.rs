@@ -749,6 +749,15 @@ impl Cache {
             .unwrap_or(0)
     }
 
+    pub(crate) fn reset(&mut self) {
+        for layer in &mut self.layers {
+            match layer {
+                LayerCache::FullAttention(cache) => cache.clear(),
+                LayerCache::LinearAttention(cache) => *cache = LinearAttentionCache::default(),
+            }
+        }
+    }
+
     fn prefill_state_dependency(&self, stream: &Stream) -> Result<Option<Array>, Exception> {
         let mut dependency: Option<Array> = None;
         for layer in &self.layers {
@@ -3254,6 +3263,64 @@ impl Qwen35MoeTextModel {
         profile_array(PerfComponent::FinalNorm, &h)?;
         Ok(h)
     }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        input: ModelInput<'_>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let ModelInput {
+            inputs,
+            inputs_embeds,
+            mask,
+            mut cache,
+        } = input;
+        let mut h = match inputs_embeds {
+            Some(inputs_embeds) => inputs_embeds.clone(),
+            None => self.embed_tokens.forward(inputs, stream)?,
+        };
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => {
+                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
+                if h.dim(1) > 1 {
+                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
+                        Some(AttentionMask::Array(mask)) => Some(mask),
+                        Some(AttentionMask::Causal) => {
+                            return Err(Exception::custom("Only `Array` mask is supported"));
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let cache = cache.as_mut().ok_or_else(|| {
+            Exception::custom("cached expert parallelism requires a Qwen hybrid cache")
+        })?;
+        for (index, (layer, layer_cache)) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            h = layer.forward_sparse_experts(
+                BlockInput {
+                    x: &h,
+                    mask: mask.as_ref(),
+                    cache: Some(layer_cache),
+                },
+                stream,
+                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+            )?;
+        }
+        self.norm.forward(&h, stream)
+    }
 }
 
 /// Input for a Qwen3.5 MoE text forward pass.
@@ -3518,6 +3585,30 @@ impl Model {
             hidden_states
         };
         self.project_logits(&hidden_states, stream)
+    }
+
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.reject_multimodal_tokens(inputs, false, stream)?;
+        let hidden = self.model.forward_with_expert_executor(
+            ModelInput {
+                inputs,
+                inputs_embeds: None,
+                mask: None,
+                cache: Some(cache),
+            },
+            execute,
+            stream,
+        )?;
+        self.project_logits(&hidden, stream)
     }
 
     /// Forward pass that reports activations to an observer.

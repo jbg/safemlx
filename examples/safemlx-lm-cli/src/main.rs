@@ -129,7 +129,7 @@ struct Cli {
     #[arg(long)]
     layerwise_host: bool,
 
-    /// Cache routed DeepSeek or Qwen3 experts independently on host and device.
+    /// Cache routed experts independently for any supported safetensors MoE model.
     #[arg(long)]
     expert_cache: bool,
 

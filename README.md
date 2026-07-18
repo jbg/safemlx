@@ -77,10 +77,12 @@ Apple unified memory does not provide extra physical capacity for the logical
 host and device tiers. Disk-backed inference therefore depends heavily on
 routing locality and filesystem page-cache behavior. Storage diagnostics report
 mapped-shard activity and logical transfers, not exact physical disk reads.
-Pure expert parallelism uses the DeepSeek and Qwen3 cache paths and catalogs
-only each rank's owned global experts. GGUF remains fully resident and is
-rejected for sparse caching rather than silently falling back to eager expert
-banks.
+Pure expert parallelism can combine the same sparse cache with DeepSeek-V3/R1,
+GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and
+Qwen3.5-MoE. Each rank catalogs and can acquire only its owned global experts;
+remote expert tensors are omitted before checkpoint payload materialization.
+GGUF remains fully resident and is rejected for sparse caching rather than
+silently falling back to eager expert banks.
 
 The route readback, batched pending-residency protocol, remaining synchronous
 evaluation boundaries, and the event-backed completion API needed for genuine

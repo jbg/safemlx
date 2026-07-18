@@ -379,6 +379,16 @@ impl Cache {
     pub fn offset(&self) -> i32 {
         self.layers.first().map_or(0, |layer| layer.kv.offset())
     }
+
+    pub(crate) fn reset(&mut self) {
+        for layer in &mut self.layers {
+            match &mut layer.kv {
+                InklingKvCache::Global(cache) => cache.clear(),
+                InklingKvCache::Sliding(cache) => cache.clear(),
+            }
+            layer.convolutions = std::array::from_fn(|_| CausalConv1dCache::default());
+        }
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1129,6 +1139,37 @@ impl TextModel {
         }
         self.norm.forward(&hidden, stream)
     }
+
+    fn forward_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut hidden = self.embed(tokens, stream)?;
+        for (index, (layer, layer_cache)) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            hidden = if layer.moe.is_some() {
+                layer.forward_with_expert_executor(
+                    &hidden,
+                    Some(layer_cache),
+                    stream,
+                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+                )?
+            } else {
+                layer.forward(&hidden, Some(layer_cache), stream)?
+            };
+        }
+        self.norm.forward(&hidden, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1449,6 +1490,32 @@ impl Model {
         Ok(logits)
     }
 
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut hidden = self
+            .model
+            .forward_with_expert_executor(tokens, cache, execute, stream)?;
+        hidden = hidden.divide(
+            Array::from_f32(self.args.text_config.logits_mup_width_multiplier),
+            stream,
+        )?;
+        let mut logits = self.lm_head.forward(&hidden, stream)?;
+        if let Some(size) = self.args.text_config.unpadded_vocab_size {
+            if size < logits.dim(-1) {
+                logits = logits.try_index_device((.., .., ..size), stream)?;
+            }
+        }
+        Ok(logits)
+    }
+
     fn prepare_typed_prefill(
         &mut self,
         input: input::ModelInput<'_>,
@@ -1698,7 +1765,7 @@ pub fn load_model(
     Ok(model)
 }
 
-fn transform_weight(
+pub(crate) fn transform_weight(
     key: String,
     mut value: Array,
     stream: &Stream,

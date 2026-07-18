@@ -15,8 +15,9 @@
 //! host-backed decoder engine. [`llama`] exposes one Llama/Mistral model API
 //! across fully resident and layerwise-host residency policies.
 //! [`expert_cache`] adds opt-in expert-granular hot-device, warm-host, and
-//! cold-checkpoint residency for DeepSeek-V3/R1 and sparse Qwen3, including
-//! rank-owned expert-parallel catalogs and separate prefill/decode telemetry.
+//! cold-checkpoint residency for every supported safetensors MoE family,
+//! including rank-owned expert-parallel catalogs and separate prefill/decode
+//! telemetry.
 
 #![warn(missing_docs)]
 

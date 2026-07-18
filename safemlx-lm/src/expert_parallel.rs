@@ -30,7 +30,10 @@ use crate::{
         ExpertCatalogEntry, ExpertPass,
     },
     inspection::ActivationObserver,
-    models::{deepseek_v3, qwen3, ModelKind, ModelLoadOptions},
+    models::{
+        deepseek_v3, gpt_oss, inkling, lfm2, nemotron_h, qwen3, qwen3_5_moe, qwen3_next, qwen3_vl,
+        ModelKind, ModelLoadOptions,
+    },
     parallel::{
         load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
         TensorPlacement,
@@ -1017,6 +1020,18 @@ pub enum ExpertParallelCache {
     Qwen3(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3 bounded sliding-window key/value cache.
     Qwen3Sliding(Vec<Option<SlidingKeyValueCache>>),
+    /// GPT-OSS alternating full/sliding attention cache.
+    GptOss(gpt_oss::Cache),
+    /// Inkling attention and convolution cache.
+    Inkling(inkling::Cache),
+    /// LFM2 heterogeneous attention/convolution cache.
+    Lfm2(lfm2::Cache),
+    /// Nemotron-H heterogeneous recurrent/attention cache.
+    NemotronH(nemotron_h::Cache),
+    /// Qwen3-Next/Qwen3.5 heterogeneous attention cache.
+    QwenHybrid(qwen3_5_moe::Cache),
+    /// Qwen3-VL-MoE multimodal-RoPE text cache.
+    Qwen3Vl(qwen3_vl::Cache),
 }
 
 impl ExpertParallelCache {
@@ -1032,6 +1047,12 @@ impl ExpertParallelCache {
                 .iter_mut()
                 .flatten()
                 .for_each(SlidingKeyValueCache::clear),
+            Self::GptOss(cache) => cache.reset(),
+            Self::Inkling(cache) => cache.reset(),
+            Self::Lfm2(cache) => cache.reset(),
+            Self::NemotronH(cache) => cache.reset(),
+            Self::QwenHybrid(cache) => cache.reset(),
+            Self::Qwen3Vl(cache) => *cache = qwen3_vl::Cache::default(),
         }
     }
 
@@ -1047,6 +1068,16 @@ impl ExpertParallelCache {
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
+            Self::GptOss(cache) => cache.offset(),
+            Self::Inkling(cache) => cache.offset(),
+            Self::Lfm2(cache) => cache.offset(),
+            Self::NemotronH(cache) => cache.offset(),
+            Self::QwenHybrid(cache) => cache.offset(),
+            Self::Qwen3Vl(cache) => cache
+                .kv
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
         }
     }
 }
@@ -1054,6 +1085,12 @@ impl ExpertParallelCache {
 enum ExpertArchitecture {
     DeepSeek(deepseek_v3::Model),
     Qwen3(qwen3::Model),
+    GptOss(gpt_oss::Model),
+    Inkling(inkling::Model),
+    Lfm2(lfm2::Model),
+    NemotronH(nemotron_h::Model),
+    QwenHybrid(qwen3_5_moe::Model),
+    Qwen3Vl(qwen3_vl::Model),
 }
 
 /// Executable rank-local pure expert-parallel model.
@@ -1095,6 +1132,16 @@ impl ExpertParallelModel {
         match &self.architecture {
             ExpertArchitecture::DeepSeek(model) => ExpertParallelCache::DeepSeek(model.new_cache()),
             ExpertArchitecture::Qwen3(_) => ExpertParallelCache::Qwen3(Vec::new()),
+            ExpertArchitecture::GptOss(model) => ExpertParallelCache::GptOss(model.new_cache()),
+            ExpertArchitecture::Inkling(model) => ExpertParallelCache::Inkling(model.new_cache()),
+            ExpertArchitecture::Lfm2(model) => ExpertParallelCache::Lfm2(model.new_cache()),
+            ExpertArchitecture::NemotronH(model) => {
+                ExpertParallelCache::NemotronH(model.new_cache())
+            }
+            ExpertArchitecture::QwenHybrid(model) => {
+                ExpertParallelCache::QwenHybrid(model.new_cache())
+            }
+            ExpertArchitecture::Qwen3Vl(model) => ExpertParallelCache::Qwen3Vl(model.new_cache()),
         }
     }
 
@@ -1111,7 +1158,7 @@ impl ExpertParallelModel {
                     .map(|_| Some(SlidingKeyValueCache::new(max_size)))
                     .collect(),
             )),
-            ExpertArchitecture::DeepSeek(_) => Err(Error::Parallel(
+            _ => Err(Error::Parallel(
                 "sliding key/value caches are only available for Qwen3 expert parallelism".into(),
             )),
         }
@@ -1304,6 +1351,227 @@ impl ExpertParallelModel {
                         stream,
                     )?
                 }
+                (ExpertArchitecture::GptOss(model), ExpertParallelCache::GptOss(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_gpt_oss(
+                                        &args,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Inkling(model), ExpertParallelCache::Inkling(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_inkling(
+                                        &args,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Lfm2(model), ExpertParallelCache::Lfm2(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_lfm2(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::NemotronH(model), ExpertParallelCache::NemotronH(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_nemotron_h(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::QwenHybrid(model), ExpertParallelCache::QwenHybrid(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_qwen_hybrid(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Qwen3Vl(model), ExpertParallelCache::Qwen3Vl(cache)) => {
+                    let args = model.args.text_config.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_qwen3_at(
+                                        &args,
+                                        layer,
+                                        "model.language_model.layers",
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
                 _ => {
                     return Err(Error::Parallel(
                         "expert-parallel cache architecture mismatch".into(),
@@ -1469,7 +1737,7 @@ fn validate_pure_expert(topology: ParallelTopology) -> Result<(), Error> {
     Ok(())
 }
 
-/// Loads an executable pure-EP DeepSeek-V3/R1 or Qwen3 sparse-MoE model.
+/// Loads an executable pure expert-parallel safetensors MoE model.
 pub fn load_expert_parallel_model(
     model_dir: impl AsRef<Path>,
     topology: ParallelTopology,
@@ -1566,7 +1834,30 @@ fn load_expert_parallel_model_impl(
                 weights_stream,
             )
         }
-        Some(model_type) => Err(Error::UnsupportedArchitecture(format!("expert-parallel execution supports DeepSeek-V3/R1 and Qwen3 sparse MoE, not {model_type}"))),
+        Some("gpt_oss") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::GptOss, stream, weights_stream,
+        ),
+        Some("inkling_mm_model") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::Inkling, stream, weights_stream,
+        ),
+        Some("lfm2" | "lfm2_moe") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::Lfm2, stream, weights_stream,
+        ),
+        Some("nemotron_h") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::NemotronH, stream, weights_stream,
+        ),
+        Some("qwen3_next") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::Qwen3Next, stream, weights_stream,
+        ),
+        Some("qwen3_vl_moe" | "qwen3_vl_moe_text") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::Qwen3VlMoe, stream, weights_stream,
+        ),
+        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => load_additional_cached_ep(
+            model_dir, topology, options, assignment, ModelKind::Qwen35Moe, stream, weights_stream,
+        ),
+        Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
+            "expert-parallel execution requires a supported safetensors MoE architecture, not {model_type}"
+        ))),
         None => Err(Error::UnsupportedArchitecture("expert-parallel model config is missing model_type".into())),
     }
 }
@@ -1724,8 +2015,21 @@ fn execute_cached_qwen3(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    execute_cached_qwen3_at(args, layer, "model.layers", hidden, acquired, cache, stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cached_qwen3_at(
+    args: &qwen3::ModelArgs,
+    layer: usize,
+    layer_root: &str,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
     let started = Instant::now();
-    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let prefix = format!("{layer_root}.{layer}.mlp.experts");
     let mut bank = PackedSwiGluExperts::new(
         acquired.identities().len() as i32,
         args.hidden_size,
@@ -1750,6 +2054,174 @@ fn execute_cached_qwen3(
     eval([&output])?;
     acquired.complete_pending()?;
     Ok(output)
+}
+
+fn execute_cached_gpt_oss(
+    args: &gpt_oss::ModelArgs,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let mut compact_args = args.clone();
+    compact_args.num_local_experts = acquired.identities().len() as i32;
+    let mut bank = gpt_oss::Experts::new(&compact_args, stream)?;
+    bank.gate_up_proj_blocks = Param::new(acquired.compact_binding("gate_up_proj_blocks", stream)?);
+    bank.gate_up_proj_scales = Param::new(acquired.compact_binding("gate_up_proj_scales", stream)?);
+    bank.gate_up_proj_bias = Param::new(acquired.compact_binding("gate_up_proj_bias", stream)?);
+    bank.down_proj_blocks = Param::new(acquired.compact_binding("down_proj_blocks", stream)?);
+    bank.down_proj_scales = Param::new(acquired.compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_bias = Param::new(acquired.compact_binding("down_proj_bias", stream)?);
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
+}
+
+fn execute_cached_inkling(
+    args: &inkling::ModelArgs,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let text = &args.text_config;
+    let mut bank = PackedSwiGluExperts::new(
+        acquired.identities().len() as i32,
+        text.hidden_size,
+        text.moe_intermediate_size(),
+        None,
+        None,
+        stream,
+    )?;
+    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
+}
+
+fn execute_cached_lfm2(
+    args: &lfm2::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let prefix = format!("model.layers.{layer}.feed_forward.experts");
+    let mut bank = PackedSwiGluExperts::new(
+        acquired.identities().len() as i32,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+        stream,
+    )?;
+    populate_swiglu_bank(&mut bank, acquired, stream)?;
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
+}
+
+fn execute_cached_nemotron_h(
+    args: &nemotron_h::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let prefix = format!("model.layers.{layer}.moe.experts");
+    let mut bank = nemotron_h::Experts::new(
+        acquired.identities().len() as i32,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        [
+            args.affine_quantization_for(&format!("{prefix}.up_proj")),
+            args.affine_quantization_for(&format!("{prefix}.down_proj")),
+        ],
+        stream,
+    )?;
+    bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
+    bank.up_proj_scales = Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
+    bank.up_proj_biases = Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_scales =
+        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_biases =
+        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
+}
+
+fn execute_cached_qwen_hybrid(
+    args: &qwen3_5_moe::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let mut compact_args = args.clone();
+    compact_args.num_experts = acquired.identities().len() as i32;
+    let mut bank = qwen3_5_moe::Experts::new(&compact_args, layer, stream)?;
+    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.gate_up_proj_scale_inv =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_scale_inv", stream)?);
+    bank.gate_up_proj_scales =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+    bank.gate_up_proj_biases =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_scale_inv =
+        Param::new(acquired.optional_compact_binding("down_proj_scale_inv", stream)?);
+    bank.down_proj_scales =
+        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_biases =
+        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward_chunked(hidden, &routes, &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
+}
+
+fn populate_swiglu_bank(
+    bank: &mut PackedSwiGluExperts,
+    acquired: &AcquiredExperts,
+    stream: &Stream,
+) -> Result<(), Error> {
+    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.gate_up_proj_scales =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+    bank.gate_up_proj_biases =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_scales =
+        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_biases =
+        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+    Ok(())
 }
 
 fn expert_bank_needs_slicing(
@@ -2207,14 +2679,475 @@ fn load_qwen3_ep(
     })
 }
 
-fn expert_cache_base_plan(store: &dyn WeightStore, topology: ParallelTopology) -> PlacementPlan {
+fn expert_cache_base_plan(
+    store: &dyn WeightStore,
+    topology: ParallelTopology,
+    kind: ModelKind,
+) -> PlacementPlan {
     let mut plan = PlacementPlan::replicated(topology);
     for key in store.keys() {
-        if key.contains(".mlp.experts.") {
+        if is_routed_expert_key(kind, &key) {
             plan.insert(key, TensorPlacement::Omit);
         }
     }
     plan
+}
+
+fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
+    match kind {
+        ModelKind::Lfm2 => key.contains(".feed_forward.experts."),
+        ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
+        ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),
+        _ => key.contains(".mlp.experts."),
+    }
+}
+
+fn rank_owned_expert_cache(
+    store: &std::sync::Arc<SafetensorsWeightStore>,
+    entries: Vec<ExpertCatalogEntry>,
+    assignment: &ExpertAssignment,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(ExpertCache, usize), Error> {
+    let entries = entries
+        .into_iter()
+        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
+        .collect::<Vec<_>>();
+    let owned_expert_bytes =
+        usize::try_from(entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>())
+            .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
+    let cache = ExpertCache::new(
+        std::sync::Arc::clone(store),
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    Ok((cache, owned_expert_bytes))
+}
+
+fn transform_partition_tensors<F>(
+    tensors: std::collections::HashMap<String, Array>,
+    mut transform: F,
+) -> Result<std::collections::HashMap<String, Array>, Error>
+where
+    F: FnMut(String, Array) -> Result<Vec<(String, Array)>, Error>,
+{
+    let mut transformed = std::collections::HashMap::with_capacity(tensors.len());
+    for (key, value) in tensors {
+        for (key, value) in transform(key, value)? {
+            if transformed.insert(key.clone(), value).is_some() {
+                return Err(Error::StrictLoadValidation {
+                    missing: Vec::new(),
+                    unused: vec![format!("duplicate transformed checkpoint key {key}")],
+                });
+            }
+        }
+    }
+    Ok(transformed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_additional_cached_ep(
+    topology: ParallelTopology,
+    kind: ModelKind,
+    assignment: ExpertAssignment,
+    architecture: ExpertArchitecture,
+    expert_cache: ExpertCache,
+    owned_expert_bytes: usize,
+    replicated_parameter_bytes: usize,
+    opened_checkpoint_shards: Vec<PathBuf>,
+) -> ExpertParallelModel {
+    ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: kind,
+            assignment,
+            local_parameter_bytes: replicated_parameter_bytes,
+            routed_expert_bytes: 0,
+            owned_expert_bytes,
+            replicated_parameter_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture,
+        expert_cache: Some(expert_cache),
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_additional_cached_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    kind: ModelKind,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if options.quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported with sparse expert-cached expert parallelism; use checkpoint-native weights"
+                .into(),
+        ));
+    }
+    let expert_options = match options.weight_residency {
+        WeightResidency::SparseExpertCache(options) => options,
+        _ => {
+            return Err(Error::Parallel(format!(
+                "{} expert-parallel execution requires WeightResidency::SparseExpertCache so remote experts are never materialized",
+                kind.model_type_name()
+            )))
+        }
+    };
+    let store = std::sync::Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        expert_options.non_expert.max_mapped_shards,
+    )?);
+    let mut plan = expert_cache_base_plan(store.as_ref(), topology, kind);
+    if kind == ModelKind::Inkling {
+        for key in store.keys() {
+            if key.starts_with("model.mtp.") {
+                plan.insert(key, TensorPlacement::Omit);
+            }
+        }
+    }
+    let partition = load_safetensors_partition_from_store_on_streams(
+        store.as_ref(),
+        &plan,
+        weights_stream,
+        stream,
+        &StrictLoadConfig::default(),
+    )?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let tensors = partition.into_tensors();
+
+    match kind {
+        ModelKind::GptOss => {
+            let args = gpt_oss::get_model_args(model_dir)?;
+            let assignment =
+                resolve_model_assignment(assignment, args.num_local_experts as usize, topology)?;
+            let mut model = gpt_oss::Model::new(args.clone(), stream)?;
+            let mut tensors = tensors;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".mlp.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::gpt_oss::gpt_oss_expert_catalog(&args, store.as_ref())?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".mlp.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::GptOss(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        ModelKind::Inkling => {
+            let args = inkling::get_model_args(model_dir)?;
+            let global_experts = usize::try_from(args.text_config.n_routed_experts)
+                .map_err(|_| Error::Parallel("Inkling routed expert count is negative".into()))?;
+            if global_experts == 0
+                || !(0..args.text_config.num_hidden_layers)
+                    .any(|layer| !args.text_config.is_dense(layer))
+            {
+                return Err(Error::UnsupportedArchitecture(
+                    "expert parallelism requires an Inkling checkpoint with routed MoE layers"
+                        .into(),
+                ));
+            }
+            let assignment = resolve_model_assignment(assignment, global_experts, topology)?;
+            let mut tensors = transform_partition_tensors(tensors, |key, value| {
+                inkling::transform_weight(key, value, stream)
+            })?;
+            let mut model = inkling::Model::new(args.clone(), stream)?;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".moe.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::inkling::inkling_expert_catalog(&args, store.as_ref())?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".moe.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::Inkling(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        ModelKind::Lfm2 => {
+            let args = lfm2::get_model_args(model_dir)?;
+            if !args.is_moe() {
+                return Err(Error::UnsupportedArchitecture(
+                    "expert parallelism requires an LFM2 MoE checkpoint".into(),
+                ));
+            }
+            let assignment =
+                resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
+            let mut model = lfm2::Model::new(args.clone(), stream)?;
+            let mut tensors = tensors;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".feed_forward.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::lfm2::lfm2_expert_catalog(&args, store.as_ref())?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".feed_forward.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::Lfm2(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        ModelKind::NemotronH => {
+            let args = nemotron_h::get_nemotron_h_model_args(model_dir)?;
+            if !args
+                .layer_block_types()?
+                .contains(&nemotron_h::LayerBlockType::Moe)
+            {
+                return Err(Error::UnsupportedArchitecture(
+                    "expert parallelism requires a Nemotron-H MoE checkpoint".into(),
+                ));
+            }
+            let assignment =
+                resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
+            let tensors = nemotron_h::transform_nemotron_h_weights(tensors, &args, stream)?;
+            let mut tensors = transform_partition_tensors(tensors, |key, value| {
+                let key = key
+                    .strip_prefix("backbone.")
+                    .map_or(key.clone(), |suffix| format!("model.{suffix}"));
+                Ok(vec![(key, value)])
+            })?;
+            let mut model = nemotron_h::Model::new(args.clone(), stream)?;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".moe.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::nemotron_h::nemotron_h_expert_catalog(&args, store.as_ref())?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".moe.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::NemotronH(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        ModelKind::Qwen3Next | ModelKind::Qwen35Moe => {
+            let (args, image_token_id, video_token_id, vision_config) =
+                if kind == ModelKind::Qwen3Next {
+                    (
+                        qwen3_next::get_qwen3_next_model_args(model_dir)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    qwen3_5_moe::get_qwen3_5_moe_model_args(model_dir)?
+                };
+            if !args.is_moe() {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "expert parallelism requires a {} MoE checkpoint",
+                    kind.model_type_name()
+                )));
+            }
+            if kind == ModelKind::Qwen3Next && args.uses_fp8() {
+                return Err(Error::UnsupportedArchitecture(
+                    "native FP8 Qwen3-Next checkpoints with fused qkvz/ba projections are unsupported"
+                        .into(),
+                ));
+            }
+            let assignment =
+                resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
+            let mut tensors = if kind == ModelKind::Qwen3Next {
+                transform_partition_tensors(tensors, |key, value| {
+                    qwen3_next::split_fused_projection(&key, value, &args, stream)
+                })?
+            } else {
+                tensors
+            };
+            let mut model = qwen3_5_moe::Model::new(
+                args.clone(),
+                image_token_id,
+                video_token_id,
+                vision_config,
+                stream,
+            )?;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".mlp.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::qwen_hybrid::qwen_hybrid_expert_catalog(&args, store.as_ref())?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".mlp.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::QwenHybrid(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        ModelKind::Qwen3VlMoe => {
+            let args = qwen3_vl::get_qwen3_vl_model_args(model_dir)?;
+            if !args.text_config.is_moe() {
+                return Err(Error::UnsupportedArchitecture(
+                    "expert parallelism requires a Qwen3-VL-MoE checkpoint".into(),
+                ));
+            }
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.text_config.num_experts as usize,
+                topology,
+            )?;
+            let mut model = qwen3_vl::Model::new(args.clone(), stream)?;
+            let mut tensors = tensors;
+            assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+                name.contains(".mlp.experts.")
+            })?;
+            ensure_no_unused_tensors(tensors)?;
+            let entries = crate::qwen3::qwen3_expert_catalog_at(
+                &args.text_config,
+                store.as_ref(),
+                "model.language_model.layers",
+            )?;
+            let (cache, owned) = rank_owned_expert_cache(
+                &store,
+                entries,
+                &assignment,
+                expert_options,
+                stream,
+                weights_stream,
+            )?;
+            let replicated = parameter_bytes_excluding(&model, ".mlp.experts.");
+            Ok(finish_additional_cached_ep(
+                topology,
+                kind,
+                assignment,
+                ExpertArchitecture::Qwen3Vl(model),
+                cache,
+                owned,
+                replicated,
+                opened_checkpoint_shards,
+            ))
+        }
+        _ => Err(Error::UnsupportedArchitecture(format!(
+            "{} is not an additional sparse expert-parallel architecture",
+            kind.model_type_name()
+        ))),
+    }
+}
+
+fn ensure_no_unused_tensors(
+    tensors: std::collections::HashMap<String, Array>,
+) -> Result<(), Error> {
+    if tensors.is_empty() {
+        return Ok(());
+    }
+    let mut unused = tensors.into_keys().collect::<Vec<_>>();
+    unused.sort();
+    Err(Error::StrictLoadValidation {
+        missing: Vec::new(),
+        unused,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn assert_rank_owned_sparse_ep_load(
+    model_dir: &Path,
+    expert_options: ExpertCacheLoadOptions,
+    expected_kind: ModelKind,
+    expected_owned_experts: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) {
+    use crate::parallel::DeviceAssignment;
+    use safemlx::DeviceType;
+
+    let topology =
+        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+            .unwrap();
+    let model = load_expert_parallel_model_with_options(
+        model_dir,
+        ModelLoadOptions {
+            quantization: None,
+            parallel: Some(topology),
+            weight_residency: WeightResidency::SparseExpertCache(expert_options),
+        },
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    assert_eq!(model.info().model_kind, expected_kind);
+    assert_eq!(model.info().expert_parallel_rank, 1);
+    assert_eq!(model.info().expert_parallel_size, 2);
+    assert_eq!(model.info().routed_expert_bytes, 0);
+    assert!(model.info().owned_expert_bytes > 0);
+    assert_eq!(
+        model.expert_cache_report().unwrap().unwrap().owned_experts,
+        expected_owned_experts
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2241,7 +3174,7 @@ fn load_deepseek_cached_ep(
         model_dir,
         expert_options.non_expert.max_mapped_shards,
     )?);
-    let plan = expert_cache_base_plan(store.as_ref(), topology);
+    let plan = expert_cache_base_plan(store.as_ref(), topology, ModelKind::DeepSeekV3);
     let mut strict = StrictLoadConfig::default();
     for index in 0..args.num_nextn_predict_layers {
         strict =
@@ -2330,7 +3263,7 @@ fn load_qwen3_cached_ep(
         model_dir,
         expert_options.non_expert.max_mapped_shards,
     )?);
-    let plan = expert_cache_base_plan(store.as_ref(), topology);
+    let plan = expert_cache_base_plan(store.as_ref(), topology, ModelKind::Qwen3);
     let partition = load_safetensors_partition_from_store_on_streams(
         store.as_ref(),
         &plan,

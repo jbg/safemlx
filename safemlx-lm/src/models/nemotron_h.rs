@@ -1655,6 +1655,16 @@ impl Cache {
     pub fn offset(&self) -> i32 {
         self.layers.iter().find_map(LayerCache::offset).unwrap_or(0)
     }
+
+    pub(crate) fn reset(&mut self) {
+        for layer in &mut self.layers {
+            match layer {
+                LayerCache::Mamba(cache) => *cache = Mamba2Cache::default(),
+                LayerCache::Attention(cache) => cache.clear(),
+                LayerCache::Mlp | LayerCache::Moe => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -1700,6 +1710,71 @@ impl NemotronHModel {
             layers,
             norm_f,
         })
+    }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        input: ModelInput<'_>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let ModelInput {
+            inputs,
+            mask,
+            mut cache,
+        } = input;
+        let mut h = self.embeddings.forward(inputs, stream)?;
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => {
+                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
+                if h.dim(1) > 1 {
+                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
+                        Some(AttentionMask::Array(mask)) => Some(mask),
+                        Some(AttentionMask::Causal) => {
+                            return Err(Exception::custom("Only `Array` mask is supported"));
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let cache = cache.as_mut().ok_or_else(|| {
+            Exception::custom("cached expert parallelism requires a Nemotron-H cache")
+        })?;
+        for (index, (layer, layer_cache)) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            h = if layer.block_type == LayerBlockType::Moe {
+                layer.forward_sparse_experts(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: Some(layer_cache),
+                    },
+                    stream,
+                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+                )?
+            } else {
+                layer.forward(
+                    BlockInput {
+                        x: &h,
+                        mask: mask.as_ref(),
+                        cache: Some(layer_cache),
+                    },
+                    stream,
+                )?
+            };
+        }
+        self.norm_f.forward(&h, stream)
     }
 }
 
@@ -1882,6 +1957,28 @@ impl Model {
             hidden_states
         };
         self.project_logits(&hidden_states, stream)
+    }
+
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let hidden = self.model.forward_with_expert_executor(
+            ModelInput {
+                inputs,
+                mask: None,
+                cache: Some(cache),
+            },
+            execute,
+            stream,
+        )?;
+        self.project_logits(&hidden, stream)
     }
 }
 

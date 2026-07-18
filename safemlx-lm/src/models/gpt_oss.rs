@@ -638,6 +638,21 @@ pub struct Cache {
     pub layers: Vec<LayerCache>,
 }
 
+impl Cache {
+    pub(crate) fn reset(&mut self) {
+        for layer in &mut self.layers {
+            match layer {
+                LayerCache::Full(cache) => cache.clear(),
+                LayerCache::Sliding(cache) => cache.clear(),
+            }
+        }
+    }
+
+    pub(crate) fn offset(&self) -> i32 {
+        self.layers.first().map_or(0, LayerCache::offset)
+    }
+}
+
 /// GPT-OSS transformer body.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct GptOssModel {
@@ -724,6 +739,52 @@ impl GptOssModel {
         }
         self.norm.forward(&hidden, stream)
     }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        if cache.layers.is_empty() {
+            *cache = self.new_cache();
+        }
+        let mut hidden = self.embed_tokens.forward(inputs, stream)?;
+        let length = hidden.dim(1);
+        for (index, (layer, layer_cache)) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            let offset = layer_cache.offset();
+            let window = layer_cache.max_size();
+            let needs_mask = length > 1 || window.is_some_and(|size| offset >= size);
+            let mask = needs_mask
+                .then(|| {
+                    create_causal_mask(
+                        length,
+                        Some(offset.min(window.unwrap_or(offset))),
+                        window.map(|size| size - 1),
+                        None,
+                        stream,
+                    )
+                })
+                .transpose()?;
+            hidden = layer.forward_with_expert_executor(
+                &hidden,
+                mask.as_ref(),
+                layer_cache,
+                stream,
+                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+            )?;
+        }
+        self.norm.forward(&hidden, stream)
+    }
 }
 
 /// GPT-OSS causal language model.
@@ -772,6 +833,22 @@ impl Model {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(inputs, cache, stream)?;
+        self.lm_head.forward(&hidden, stream)
+    }
+
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let hidden = self
+            .model
+            .forward_with_expert_executor(inputs, cache, execute, stream)?;
         self.lm_head.forward(&hidden, stream)
     }
 }

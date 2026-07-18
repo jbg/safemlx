@@ -1,12 +1,13 @@
-//! Minimal Ring expert-parallel generation probe for DeepSeek-V3/R1 or Qwen3 MoE.
+//! Minimal sparse-cache Ring expert-parallel generation probe for supported MoE models.
 
 use safemlx::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    expert_parallel::load_expert_parallel_model, sampler::DefaultSampler, DeviceAssignment,
-    ParallelTopology,
+    expert_cache::ExpertCacheLoadOptions, expert_parallel::load_expert_parallel_model_with_options,
+    models::ModelLoadOptions, sampler::DefaultSampler, DeviceAssignment, ParallelTopology,
+    WeightResidency,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +28,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let mut model = load_expert_parallel_model(&model_dir, topology, &stream, &weights_stream)?;
+    let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
+        WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default()),
+    );
+    let mut model =
+        load_expert_parallel_model_with_options(&model_dir, options, &stream, &weights_stream)?;
     if group.rank() == 0 {
         eprintln!(
             "EP={} assignment={:?} local experts by rank 0={:?}",

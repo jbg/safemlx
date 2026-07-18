@@ -1045,5 +1045,13 @@ mod tests {
         assert_eq!(report.owned_experts, 2);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
+        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+            dir.path(),
+            options,
+            crate::models::ModelKind::NemotronH,
+            report.owned_experts / 2,
+            gpu.stream(),
+            cpu.stream(),
+        );
     }
 }

@@ -23,7 +23,7 @@ use serde_json::Value;
 pub use super::qwen_vl::{QwenVisionTransformer, VisionConfig};
 
 use crate::{
-    cache::ConcatKeyValueCache,
+    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
@@ -433,6 +433,78 @@ impl Model {
                 )?;
                 hidden = hidden.add(aligned, stream)?;
             }
+        }
+        let hidden = self.model.language_model.norm.forward(&hidden, stream)?;
+        common::linear::project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.language_model.embed_tokens,
+            &hidden,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut hidden = self
+            .model
+            .language_model
+            .embed_tokens
+            .forward(tokens, stream)?;
+        let offset = cache
+            .kv
+            .first()
+            .and_then(Option::as_ref)
+            .map_or(0, KeyValueCache::offset)
+            + cache.rope_delta;
+        let mask = match create_attention_mask(&hidden, &cache.kv, Some(true), stream)? {
+            Some(AttentionMask::Array(mask)) => Some(mask),
+            Some(AttentionMask::Causal) => {
+                return Err(Exception::custom(
+                    "qwen3_vl requires an explicit causal mask",
+                ));
+            }
+            None => None,
+        };
+        if cache.kv.is_empty() {
+            cache.kv = (0..self.model.language_model.layers.len())
+                .map(|_| Some(ConcatKeyValueCache::default()))
+                .collect();
+        }
+        let positions = (offset..offset + tokens.dim(1)).collect::<Vec<_>>();
+        let position_ids = [positions.clone(), positions.clone(), positions];
+        let (cos, sin) = mrope_embeddings(
+            &position_ids,
+            self.args.text_config.head_dim,
+            self.args.text_config.rope_theta,
+            &self.args.mrope_section,
+        );
+        for (index, (layer, layer_cache)) in self
+            .model
+            .language_model
+            .layers
+            .iter_mut()
+            .zip(cache.kv.iter_mut())
+            .enumerate()
+        {
+            hidden = layer.forward_sparse_experts_with_rotary(
+                AttentionInput {
+                    x: &hidden,
+                    mask: mask.as_ref(),
+                    cache: layer_cache.as_mut(),
+                },
+                &cos,
+                &sin,
+                stream,
+                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+            )?;
         }
         let hidden = self.model.language_model.norm.forward(&hidden, stream)?;
         common::linear::project_logits_maybe_quantized(

@@ -105,7 +105,7 @@ fn load_qwen3_next_model_with_quantization(
     Ok(model)
 }
 
-fn split_fused_projection(
+pub(crate) fn split_fused_projection(
     key: &str,
     value: Array,
     args: &ModelArgs,

@@ -762,17 +762,21 @@ with MLX 0.31.2.
 
 ## Expert-parallel sparse MoE inference
 
-`expert_parallel` provides executable pure expert parallelism for official
-DeepSeek-V3/R1 safetensors and Qwen3 sparse-MoE safetensors. The initial model
-API requires `EP > 1`, `TP = 1`, and `PP = 1`; hybrid EP+TP and EP+PP are
-rejected before checkpoint payloads are opened. Dense models and GGUF are also
-rejected. Checkpoint `ep_size` describes a stored layout and is not the runtime
-EP degree.
+`expert_parallel` provides executable pure expert parallelism for the
+safetensors MoE families supported by sparse expert caching: DeepSeek-V3/R1,
+GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and
+Qwen3.5-MoE. GPT-OSS and the hybrid or multimodal families require
+`WeightResidency::SparseExpertCache`; DeepSeek and Qwen3 additionally retain
+their fully resident EP loaders. The model API requires `EP > 1`, `TP = 1`,
+and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
+are opened. Dense models and GGUF are also rejected. Checkpoint `ep_size`
+describes a stored layout and is not the runtime EP degree.
 
 `ExpertAssignment` supports balanced-contiguous (the model default),
 round-robin, and explicit owner maps. Pass a non-default assignment to
-`load_expert_parallel_model_with_assignment`, or combine it with quantization
-through `load_expert_parallel_model_with_options_and_assignment`. Packed
+`load_expert_parallel_model_with_assignment`, or use
+`load_expert_parallel_model_with_options_and_assignment` for sparse caching or
+the fully resident DeepSeek/Qwen3 quantization path. Packed
 checkpoints select the exact ordered expert rows for non-contiguous policies;
 they do not materialize the enclosing range. Routers and observations always
 use checkpoint-global expert ids. Only immediately before a grouped expert
@@ -780,13 +784,14 @@ kernel does the dispatcher translate them to dense owner-local ids, so
 non-contiguous policies do not depend on `global_id - range.start`.
 
 The pure-EP model path uses replicated-input dispatch. Attention, norms,
-routers, embeddings, dense MLPs, heads, and DeepSeek shared experts are
-replicated, so every rank already has the same hidden rows and router result.
+routers, embeddings, dense MLPs, heads, and architecture-specific shared
+experts are replicated, so every rank already has the same hidden rows and
+router result.
 Each rank compacts only locally owned routes, executes only its local expert
 bank, reduces those routes into a full zero-initialized token buffer, and uses
-one all-sum for the routed contribution. DeepSeek's replicated shared expert is
-computed once per rank and added *after* that all-sum; it is never multiplied
-by EP size. Exact compaction performs one scalar route-count synchronization
+one all-sum for the routed contribution. Replicated shared experts are computed
+once per rank and added *after* that all-sum; they are never multiplied by EP
+size. Exact compaction performs one scalar route-count synchronization
 per sparse layer, with no per-expert synchronization and no capacity dropping.
 
 For future token-sharded execution, `all_to_all_v` accepts destination-major
@@ -806,21 +811,24 @@ for measurement only: the inserted synchronization changes scheduling and can
 reduce production throughput. Use MLX device profiling when kernel-only timing
 is required.
 
+For fully resident DeepSeek and Qwen3,
 `ExpertParallelModel::forward_with_observer` preserves global router ids and
 weights while exposing the rank-local routed contribution, globally reduced
 routed contribution, replicated shared-expert contribution, and final combined
-MoE output as distinct fields. Qwen3 callers can select the standard growing
-cache with `new_cache()` or a bounded cache with
+MoE output as distinct fields. Detailed activation observation is currently
+unavailable on the sparse expert-cache EP path. Qwen3 callers can select the
+standard growing cache with `new_cache()` or a bounded cache with
 `new_qwen3_sliding_cache(window)`; both retain the same EP routing semantics.
 
-Packed Qwen3 expert axes and official split DeepSeek experts are selected by
-placement before payload materialization; remote-only indexed shards are not
-opened. Dense, affine/MXFP4, and DeepSeek block-FP8 banks retain their existing
-physical kernels behind `LocalExpertBank`. Routed-expert bytes should therefore
-scale approximately with `1 / EP`, while `replicated_parameter_bytes` remains
-constant. On-load affine/MXFP4 conversion also follows the placement plan:
-only this rank's local expert banks are materialized and quantized, while
-ordinary replicated matrices retain the existing tensor-at-a-time conversion.
+Every supported packed or split expert layout is selected by placement before
+payload materialization; remote-only indexed shards are not opened. Dense,
+affine/MXFP4, FP8, and ReLU2/SwiGLU banks retain their architecture-specific
+physical kernels behind the common replicated dispatch. With sparse caching,
+`routed_expert_bytes` is zero and `owned_expert_bytes` describes the rank's
+cold, warm, or hot catalog; with fully resident DeepSeek/Qwen3 it scales
+approximately with `1 / EP`. `replicated_parameter_bytes` remains constant.
+Load-time conversion is rejected for sparse-cache EP because it would require
+eager expert materialization.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:
@@ -874,7 +882,8 @@ keeps one rank completely route-empty while every collective is still entered.
 
 The model-parity Ring test uses tiny deterministic complete-model references
 and checks prefill, two cached decode steps, and three synchronized tokens for
-dense and affine-packed Qwen3/DeepSeek banks plus native DeepSeek block-FP8.
+dense and affine-packed Qwen3/DeepSeek banks, native DeepSeek block-FP8, and
+sparse expert-cache EP for every supported MoE family.
 It also runs packed Qwen with round-robin placement and split DeepSeek with an
 explicit non-contiguous owner map.
 Its DeepSeek fixture crosses a dense-to-MoE layer boundary, uses two router

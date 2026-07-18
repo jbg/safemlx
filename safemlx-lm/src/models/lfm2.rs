@@ -744,6 +744,15 @@ impl Cache {
     pub fn offset(&self) -> i32 {
         self.layers.first().map(LayerCache::offset).unwrap_or(0)
     }
+
+    pub(crate) fn reset(&mut self) {
+        for layer in &mut self.layers {
+            match layer {
+                LayerCache::Attention(cache) => cache.clear(),
+                LayerCache::Conv(cache) => *cache = CausalConv1dCache::default(),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -984,6 +993,50 @@ impl Lfm2Model {
         }
         self.embedding_norm.forward(&h, stream)
     }
+
+    fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut h = self.embed_tokens.forward(inputs, stream)?;
+        let offset = cache.offset();
+        let mask = if h.dim(1) > 1 {
+            match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("LFM2 requires an array causal mask"));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        for (index, (layer, layer_cache)) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            h = if layer.feed_forward.is_moe {
+                layer.forward_with_expert_executor(
+                    &h,
+                    mask.as_ref(),
+                    Some(layer_cache),
+                    stream,
+                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
+                )?
+            } else {
+                layer.forward(&h, mask.as_ref(), Some(layer_cache), stream)?
+            };
+        }
+        self.embedding_norm.forward(&h, stream)
+    }
 }
 
 fn offset_cache(offset: i32) -> Vec<Option<OffsetOnlyCache>> {
@@ -1073,6 +1126,27 @@ impl Model {
         } else {
             hidden
         };
+        project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &hidden,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_cached_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let hidden = self
+            .model
+            .forward_with_expert_executor(inputs, cache, execute, stream)?;
         project_logits_maybe_quantized(
             &mut self.lm_head,
             &mut self.model.embed_tokens,
