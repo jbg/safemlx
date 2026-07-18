@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid architecture-independent offload planning request.
+    #[error(transparent)]
+    Offload(#[from] crate::offload::OffloadError),
+
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]
     Parallel(String),

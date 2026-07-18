@@ -13,6 +13,34 @@ contributors.
 This fork adds model/runtime support including Gemma 4 loading, Gemma 4
 assistant drafting, expanded model dispatch, and related generation utilities.
 
+## Offload planning and observability
+
+Distributed placement decides which tensors a rank owns. Residency is a
+separate concern that decides where an owned logical unit lives and for how
+long. The public `safemlx_lm::offload` module provides architecture-independent
+configuration, explicit deterministic plans, tier byte totals, and reusable
+telemetry for a future residency manager.
+
+These APIs do **not** move, load, prefetch, or evict model weights and do not
+add CPU or disk offload support to model loading. Existing checkpoint and
+model-loading behavior is unchanged.
+
+On Apple silicon, CPU and GPU execution share the same physical unified-memory
+pool. Choosing CPU execution does not increase total model capacity, although
+it can change execution behavior, wired memory, and residency pressure. On a
+discrete CUDA system, a future implementation may use host-resident weights to
+extend effective capacity beyond VRAM, with transfer costs. Disk streaming is a
+not implemented; dense autoregressive decode would repeatedly wait on storage
+and is therefore expected to be slow rather than a general high-performance
+path.
+
+The `safemlx::memory` controls affect process-global MLX-managed allocations.
+They do not directly constrain process RSS, checkpoint mappings, or unrelated
+native allocations. The pinned MLX 0.32.0 C surface has whole-stream
+synchronization but no event/fence primitive, so initial residency execution
+will require conservative stream synchronization until an event-backed API is
+available.
+
 ## Linux and CUDA
 
 Enable the `cuda` feature to propagate MLX CUDA support through this crate:

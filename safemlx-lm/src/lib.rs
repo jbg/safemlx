@@ -5,6 +5,9 @@
 //! language models. The highest-level entry point is [`models::LoadedModel`],
 //! which loads a model directory containing a Hugging Face-style `config.json`,
 //! `tokenizer.json`, and safetensors weights.
+//!
+//! [`offload`] contains architecture-independent residency planning and
+//! observability contracts. It does not yet move or evict model weights.
 
 #![warn(missing_docs)]
 
@@ -19,6 +22,8 @@ pub mod gemma4_mtp;
 mod gguf_tokenizer;
 /// Lightweight activation inspection hooks.
 pub mod inspection;
+/// Planning contracts and telemetry for future weight residency management.
+pub mod offload;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;
