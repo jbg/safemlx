@@ -5,22 +5,41 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{
-    error::Exception, random::RandomState, transforms::async_eval, Array, Device, DeviceType,
-    ExecutionContext, Stream,
+    error::Exception,
+    ops::indexing::TryIndexOp,
+    random::RandomState,
+    transforms::{async_eval, eval},
+    Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
+    expert_cache::{ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics},
     layerwise::{LayerwiseLoadOptions, WeightResidency},
     models::{
         input::{InputPart, ModelInput},
         LoadedModel, ModelLoadOptions,
     },
-    offload::{MemoryTier, OffloadConfig, TransferDirection},
+    offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
     sampler::{DefaultSampler, GenerationSampler, Sampler},
 };
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExpertCacheEviction {
+    Lru,
+    Lfu,
+}
+
+impl From<ExpertCacheEviction> for CacheEvictionPolicy {
+    fn from(value: ExpertCacheEviction) -> Self {
+        match value {
+            ExpertCacheEviction::Lru => Self::LeastRecentlyUsed,
+            ExpertCacheEviction::Lfu => Self::LeastFrequentlyUsed,
+        }
+    }
+}
 
 enum CliSampler {
     Greedy(DefaultSampler),
@@ -110,6 +129,10 @@ struct Cli {
     #[arg(long)]
     layerwise_host: bool,
 
+    /// Cache routed DeepSeek or Qwen3 experts independently on host and device.
+    #[arg(long)]
+    expert_cache: bool,
+
     /// Maximum repeated layers resident on the execution device.
     #[arg(long, default_value_t = 1, value_name = "LAYERS")]
     device_layer_window: usize,
@@ -121,6 +144,26 @@ struct Cli {
     /// Optional logical host parameter budget in bytes.
     #[arg(long, value_name = "BYTES")]
     host_budget_bytes: Option<u64>,
+
+    /// Optional logical device budget for cached routed experts.
+    #[arg(long, value_name = "BYTES")]
+    expert_cache_device_budget_bytes: Option<u64>,
+
+    /// Optional logical host budget for cached routed experts; zero uses disk fallback.
+    #[arg(long, value_name = "BYTES")]
+    expert_cache_host_budget_bytes: Option<u64>,
+
+    /// Maximum temporary compact expert-bank allocation per routed block.
+    #[arg(long, default_value_t = 1_073_741_824, value_name = "BYTES")]
+    expert_cache_scratch_bytes: u64,
+
+    /// Deterministic expert cache eviction ordering.
+    #[arg(long, value_enum, default_value_t = ExpertCacheEviction::Lru)]
+    expert_cache_eviction: ExpertCacheEviction,
+
+    /// Measure cold prefill, repeated prefill, and one cached decode separately.
+    #[arg(long)]
+    expert_cache_benchmark: bool,
 
     /// Maximum simultaneously mapped safetensors payload shards.
     #[arg(long, default_value_t = 4, value_name = "SHARDS")]
@@ -161,7 +204,28 @@ fn main() -> Result<()> {
         )?),
         None => ModelLoadOptions::default(),
     };
-    if args.layerwise_host {
+    if args.expert_cache {
+        let non_expert = LayerwiseLoadOptions {
+            offload: OffloadConfig::new(
+                args.device_budget_bytes,
+                args.host_budget_bytes,
+                args.device_layer_window,
+            )?,
+            max_mapped_shards: args.mapped_shards,
+            sample_mlx_memory: args.verbose,
+            sample_process_memory: args.verbose,
+            ..LayerwiseLoadOptions::default()
+        };
+        let experts = OffloadConfig::new(
+            args.expert_cache_device_budget_bytes,
+            args.expert_cache_host_budget_bytes,
+            1,
+        )?
+        .with_eviction_policy(args.expert_cache_eviction.into());
+        load_options = load_options.with_weight_residency(WeightResidency::SparseExpertCache(
+            ExpertCacheLoadOptions::new(non_expert, experts, args.expert_cache_scratch_bytes)?,
+        ));
+    } else if args.layerwise_host {
         let offload = OffloadConfig::new(
             args.device_budget_bytes,
             args.host_budget_bytes,
@@ -202,6 +266,10 @@ fn main() -> Result<()> {
     let tokens = model.encode_to_array(&rendered_prompt, add_special_tokens, stream)?;
     if tokens.shape()[1] == 0 {
         bail!("the prompt produced no input tokens");
+    }
+
+    if args.expert_cache_benchmark {
+        run_expert_cache_benchmark(&mut model, &tokens, stream)?;
     }
 
     let eos_token_ids = model.eos_token_ids().to_vec();
@@ -344,6 +412,21 @@ fn main() -> Result<()> {
             }
             eprintln!("weight_store: {:?}", report.weight_store());
         }
+        if let Some(report) = model.expert_cache_report()? {
+            eprintln!(
+                "expert_cache_owned: {} experts, {} bytes",
+                report.owned_experts, report.owned_bytes
+            );
+            eprintln!(
+                "expert_cache_current_host_device: {} / {} experts, {} / {} bytes",
+                report.host_resident_experts,
+                report.device_resident_experts,
+                report.host_resident_bytes,
+                report.device_resident_bytes
+            );
+            eprintln!("expert_cache_prefill: {:?}", report.prefill);
+            eprintln!("expert_cache_decode: {:?}", report.decode);
+        }
         if eos_token_ids.is_empty() {
             eprintln!("warning: the model config contains no EOS token id");
         } else if !output_ids
@@ -373,6 +456,134 @@ fn format_bytes(bytes: usize) -> String {
         (bytes_float, "B")
     };
     format!("{value:.2} {unit} ({bytes} bytes)")
+}
+
+#[derive(Clone, Copy)]
+struct ExpertBenchmarkSnapshot {
+    prefill: ExpertPassStatistics,
+    decode: ExpertPassStatistics,
+    host_experts: usize,
+    device_experts: usize,
+    host_bytes: u64,
+    device_bytes: u64,
+}
+
+fn expert_benchmark_snapshot(model: &LoadedModel) -> Result<ExpertBenchmarkSnapshot> {
+    let report = model
+        .expert_cache_report()?
+        .context("sparse expert cache benchmark requires an expert-cache model")?;
+    Ok(ExpertBenchmarkSnapshot {
+        prefill: report.prefill,
+        decode: report.decode,
+        host_experts: report.host_resident_experts,
+        device_experts: report.device_resident_experts,
+        host_bytes: report.host_resident_bytes,
+        device_bytes: report.device_resident_bytes,
+    })
+}
+
+fn tier_delta(after: ExpertTierStatistics, before: ExpertTierStatistics) -> ExpertTierStatistics {
+    ExpertTierStatistics {
+        requests: after.requests.saturating_sub(before.requests),
+        hits: after.hits.saturating_sub(before.hits),
+        misses: after.misses.saturating_sub(before.misses),
+        evictions: after.evictions.saturating_sub(before.evictions),
+        eviction_bytes: after.eviction_bytes.saturating_sub(before.eviction_bytes),
+    }
+}
+
+fn print_expert_benchmark_result(
+    label: &str,
+    elapsed: std::time::Duration,
+    before: ExpertPassStatistics,
+    after: ExpertPassStatistics,
+    occupancy: ExpertBenchmarkSnapshot,
+) {
+    let host = tier_delta(after.host, before.host);
+    let device = tier_delta(after.device, before.device);
+    eprintln!(
+        "expert_cache_benchmark_{label}: latency={:.3}s routes={} distinct={} coalesced={} compact_banks={} compact_bytes={} host_hits={} host_misses={} host_evictions={} device_hits={} device_misses={} device_evictions={} host_resident={}({} bytes) device_resident={}({} bytes)",
+        elapsed.as_secs_f64(),
+        after.requested_routes.saturating_sub(before.requested_routes),
+        after.distinct_experts.saturating_sub(before.distinct_experts),
+        after
+            .coalesced_duplicates
+            .saturating_sub(before.coalesced_duplicates),
+        after.compact_banks.saturating_sub(before.compact_banks),
+        after
+            .compact_bank_bytes
+            .saturating_sub(before.compact_bank_bytes),
+        host.hits,
+        host.misses,
+        host.evictions,
+        device.hits,
+        device.misses,
+        device.evictions,
+        occupancy.host_experts,
+        occupancy.host_bytes,
+        occupancy.device_experts,
+        occupancy.device_bytes,
+    );
+}
+
+fn run_expert_cache_benchmark(
+    model: &mut LoadedModel,
+    tokens: &Array,
+    stream: &Stream,
+) -> Result<()> {
+    let parts = [InputPart::text_token_ids(tokens)];
+    let input = ModelInput::new(&parts);
+
+    let before_cold = expert_benchmark_snapshot(model)?;
+    let mut cold_cache = model.new_cache();
+    let started = Instant::now();
+    let logits = model.prefill_input_with_cache(input.clone(), &mut cold_cache, stream)?;
+    eval([&logits])?;
+    stream.synchronize()?;
+    let cold_elapsed = started.elapsed();
+    let after_cold = expert_benchmark_snapshot(model)?;
+    print_expert_benchmark_result(
+        "cold_prefill",
+        cold_elapsed,
+        before_cold.prefill,
+        after_cold.prefill,
+        after_cold,
+    );
+
+    let before_repeated = after_cold;
+    let mut repeated_cache = model.new_cache();
+    let started = Instant::now();
+    let logits = model.prefill_input_with_cache(input, &mut repeated_cache, stream)?;
+    eval([&logits])?;
+    stream.synchronize()?;
+    let repeated_elapsed = started.elapsed();
+    let after_repeated = expert_benchmark_snapshot(model)?;
+    print_expert_benchmark_result(
+        "repeated_prefill",
+        repeated_elapsed,
+        before_repeated.prefill,
+        after_repeated.prefill,
+        after_repeated,
+    );
+
+    let last = tokens.try_index_device((.., tokens.dim(1) - 1..), stream)?;
+    let decode_parts = [InputPart::text_token_ids(&last)];
+    let decode_input = ModelInput::new(&decode_parts);
+    let before_decode = after_repeated;
+    let started = Instant::now();
+    let logits = model.prefill_input_with_cache(decode_input, &mut repeated_cache, stream)?;
+    eval([&logits])?;
+    stream.synchronize()?;
+    let decode_elapsed = started.elapsed();
+    let after_decode = expert_benchmark_snapshot(model)?;
+    print_expert_benchmark_result(
+        "cached_decode",
+        decode_elapsed,
+        before_decode.decode,
+        after_decode.decode,
+        after_decode,
+    );
+    Ok(())
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
@@ -405,6 +616,18 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.layerwise_host && args.quantize.is_some() {
         bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
+    }
+    if args.expert_cache && args.quantize.is_some() {
+        bail!("--quantize is not supported with --expert-cache; use checkpoint-native weights");
+    }
+    if args.expert_cache && args.layerwise_host {
+        bail!("--expert-cache conflicts with --layerwise-host");
+    }
+    if args.expert_cache_benchmark && !args.expert_cache {
+        bail!("--expert-cache-benchmark requires --expert-cache");
+    }
+    if args.expert_cache_scratch_bytes == 0 {
+        bail!("--expert-cache-scratch-bytes must be greater than zero");
     }
     if args.device_layer_window == 0 {
         bail!("--device-layer-window must be greater than zero");

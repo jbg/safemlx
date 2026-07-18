@@ -39,9 +39,33 @@ tensors remain packed, while split expert banks are packed one layer at a time
 on the host. Transfers are
 synchronous because MLX does not expose stream events. On Metal this validates
 scheduling and logical residency within unified memory, not additional model
-capacity. GGUF layerwise residency, load-time conversion, individual expert
-caching, KV-cache offload, pinned host buffers, and asynchronous overlap are not
-supported.
+capacity. GGUF layerwise residency, KV-cache offload, pinned host buffers, and
+asynchronous overlap are not supported.
+
+DeepSeek-V3/R1 and sparse Qwen3 safetensors can instead use opt-in sparse expert
+caching through `WeightResidency::SparseExpertCache`. Attention, routers,
+normalization, dense MLPs, and DeepSeek shared experts continue through the
+layerwise host engine. Every routed expert is a separate cacheable unit: hot
+copies remain on the execution device, warm copies may remain on the host
+stream, and cold experts remain in the persistent checkpoint store. Packed
+expert-major checkpoints are sliced on axis zero before materialization;
+supported split experts use per-expert recipes. Checkpoint-native dense,
+affine/MXFP4, and DeepSeek block-FP8 representations remain packed. Load-time
+expert quantization is rejected because it cannot be performed lazily without
+changing the existing loading contract.
+
+Routes are synchronously inspected once per routed block because the vendored
+MLX C API has no event or fence primitive. Duplicate requests share one cache
+acquisition, then a temporary deterministic compact bank is evaluated before
+its source leases are released. Compact-bank bytes are governed by a separate
+scratch limit and are not claimed by the logical device-residency budget.
+Apple unified memory does not provide extra physical capacity for the logical
+host and device tiers. Disk-backed inference therefore depends heavily on
+routing locality and filesystem page-cache behavior. Storage diagnostics report
+mapped-shard activity and logical transfers, not exact physical disk reads.
+Pure expert parallelism uses the same cache and catalogs only each rank's owned
+global experts. Other MoE families and GGUF are rejected rather than silently
+falling back to eager expert banks.
 
 ## Crates
 
