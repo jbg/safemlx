@@ -7,7 +7,8 @@
 //! `tokenizer.json`, and safetensors weights.
 //!
 //! [`offload`] contains architecture-independent residency planning and
-//! observability contracts. It does not yet move or evict model weights.
+//! observability contracts. [`residency`] executes those plans for logical
+//! weight units without coupling them to a model family.
 //! [`weight_store`] catalogs safetensors checkpoints and safely materializes
 //! lazily acquired selections from bounded persistent mappings.
 
@@ -24,7 +25,7 @@ pub mod gemma4_mtp;
 mod gguf_tokenizer;
 /// Lightweight activation inspection hooks.
 pub mod inspection;
-/// Planning contracts and telemetry for future weight residency management.
+/// Planning contracts and telemetry for weight residency management.
 pub mod offload;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
@@ -40,6 +41,8 @@ pub mod processor;
 pub mod quantization;
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;
+/// Budgeted host and device residency for logical immutable weight units.
+pub mod residency;
 /// Token sampling strategies.
 pub mod sampler;
 /// Executable pure tensor-parallel model loading and inference.

@@ -36,9 +36,9 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-This is storage infrastructure, not executable CPU or disk offload. Models
-still retain their materialized arrays after loading. There is no layer
-scheduler, residency manager, background prefetch, or model-parameter eviction.
+Models still retain their materialized arrays after loading; no model adapter
+uses layerwise offload yet. Background prefetch and model execution through
+resident-unit leases are not implemented.
 
 ## Offload planning and observability
 
@@ -46,27 +46,52 @@ Distributed placement decides which tensors a rank owns. Residency is a
 separate concern that decides where an owned logical unit lives and for how
 long. The public `safemlx_lm::offload` module provides architecture-independent
 configuration, explicit deterministic plans, tier byte totals, and reusable
-telemetry for a future residency manager.
+telemetry. The public `safemlx_lm::residency` module executes those plans for
+caller-defined logical units. Each `OffloadUnit` groups one or more named
+checkpoint selections, including companion tensors that must become visible
+atomically.
 
-These APIs do **not** move, load, prefetch, or evict model weights and do not
-add CPU or disk offload support to model loading. Existing checkpoint and
-model-loading behavior is unchanged.
+`ResidencyManager` starts disk-planned units without arrays, materializes
+host-planned units on an explicit CPU stream, and materializes device-planned
+units on an explicit execution stream. A unit may hold both host and device
+copies. Dropping a host copy leaves the checkpoint as its canonical disk-backed
+source; dropping a device copy falls back to an existing host copy or the
+checkpoint. Host and device copies consume their finite logical budgets
+independently.
+
+Pinned units cannot be evicted. Windowed units are protected in the active
+execution window and preferred for eviction after departure. Cacheable units
+remain opportunistically and are evicted by deterministic LRU order, with unit
+identifiers breaking ties. RAII `ResidentUnitLease` values explicitly pin the
+requested tier while in use. Callers should not retain cloned MLX arrays beyond
+a lease when authoritative residency accounting is required.
+
+Prefetch and execution-window lookahead honor `OffloadConfig::prefetch_depth`,
+but run synchronously: they prepare residency ahead of demand without
+overlapping transfer and compute. Transfer, stall, eviction, current, and peak
+residency observations feed the existing offload telemetry, while mapped-shard
+diagnostics remain separate. Background workers and event-backed overlap are
+not implemented.
+
+This runtime is an executable residency primitive, not complete model offload.
+Existing checkpoint and model-loading behavior is unchanged, and no Llama,
+Qwen, DeepSeek, pipeline-, tensor-, or expert-parallel model code swaps weights
+through the manager. Distributed callers can construct units from only their
+rank-local ranges or indices; the manager has no rank or collective logic.
 
 On Apple silicon, CPU and GPU execution share the same physical unified-memory
-pool. Choosing CPU execution does not increase total model capacity, although
-it can change execution behavior, wired memory, and residency pressure. On a
-discrete CUDA system, a future implementation may use host-resident weights to
-extend effective capacity beyond VRAM, with transfer costs. Disk streaming is
-not implemented; dense autoregressive decode would repeatedly wait on storage
-and is therefore expected to be slow rather than a general high-performance
-path.
+pool. Logical host/device accounting is useful for residency policy, but does
+not imply additional physical capacity. Choosing CPU execution can change
+execution behavior, wired memory, and residency pressure. On a discrete CUDA
+system, host-resident weights may occupy separate physical memory, with transfer
+costs. Dense autoregressive model execution through this primitive is not
+implemented.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated
 native allocations. The pinned MLX 0.32.0 C surface has whole-stream
-synchronization but no event/fence primitive, so initial residency execution
-will require conservative stream synchronization until an event-backed API is
-available.
+synchronization but no event/fence primitive, so residency execution uses
+conservative stream synchronization until an event-backed API is available.
 
 ## Linux and CUDA
 

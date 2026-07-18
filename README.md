@@ -18,10 +18,17 @@ for structured messages and tools.
 Checkpoint keys can be cataloged without creating MLX arrays, selected tensors
 are safely materialized through mmap-pinning leases, and mapped payload shards
 are reused under a deterministic bound. Rank-aware loading resolves placement
-before materialization so remote-only indexed shards stay unopened. This does
-not add a layer scheduler, background prefetch, parameter eviction, or
-executable CPU/disk offload; loaded models continue to retain materialized
-arrays.
+before materialization so remote-only indexed shards stay unopened.
+
+The crate also provides a budgeted, architecture-independent residency manager
+for caller-defined multi-tensor units. It materializes evaluated host or device
+copies on explicit streams, applies pinned, windowed, and cacheable policies,
+evicts eligible units deterministically, and protects in-use arrays with RAII
+leases. Prefetch and execution windows are synchronous and feed existing
+offload telemetry. Apple CPU and GPU tiers share physical unified memory, so
+their logical budgets do not increase physical capacity. No model family uses
+layerwise offload yet, and background or event-backed prefetch is not
+implemented.
 
 ## Crates
 

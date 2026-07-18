@@ -1,13 +1,13 @@
-//! Architecture-independent contracts and telemetry for future weight offload.
+//! Architecture-independent contracts and telemetry for weight offload.
 //!
 //! Placement determines which tensors a rank owns. The types in this module
 //! describe a separate residency decision: the tier in which an owned logical
 //! unit is intended to reside and its lifetime policy. This module validates
-//! explicit plans and records observations; it does not move, load, prefetch,
-//! or evict model weights.
+//! explicit plans and records observations. The architecture-independent
+//! executor lives in [`crate::residency`].
 //!
-//! The vendored MLX C API does not expose stream events or fences. A future
-//! residency executor must therefore begin with conservative
+//! The vendored MLX C API does not expose stream events or fences. Residency
+//! execution therefore uses conservative
 //! [`safemlx::Stream::synchronize`] boundaries. The transfer telemetry is
 //! independent of that implementation so event-backed coordination can be
 //! introduced later without changing this public API.
@@ -107,7 +107,7 @@ impl OffloadConfig {
         self.host_budget_bytes
     }
 
-    /// Returns the number of logical units a future executor may prefetch ahead.
+    /// Returns the number of logical units the executor may prefetch ahead.
     pub const fn prefetch_depth(self) -> usize {
         self.prefetch_depth
     }

@@ -27,6 +27,10 @@ pub enum Error {
     #[error(transparent)]
     Offload(#[from] crate::offload::OffloadError),
 
+    /// Invalid or failed weight residency operation.
+    #[error(transparent)]
+    Residency(#[from] crate::residency::ResidencyError),
+
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]
     Parallel(String),

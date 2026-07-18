@@ -1,6 +1,7 @@
 //! Persistent, lazy checkpoint tensor storage.
 //!
-//! A [`WeightLease`] pins the bytes backing a safetensors view. Materialization
+//! A [`crate::weight_store::WeightLease`] pins the bytes backing a safetensors
+//! view. Materialization
 //! never exposes that view as an MLX array: selection, copying, evaluation, and
 //! conservative stream synchronization all finish before an owned array is
 //! returned to the caller.
@@ -628,11 +629,13 @@ impl WeightStore for SafetensorsWeightStore {
         let shard = self.acquire_shard(entry)?;
         let metadata = self.metadata_from_shard(key, entry, &shard)?;
         let output_shape = validate_selection(key, &metadata.shape, &selection)?;
+        let selected_byte_len = selected_byte_len(key, &metadata, &selection, &output_shape)?;
         Ok(WeightLease {
             key: key.to_string(),
             metadata,
             selection,
             output_shape,
+            selected_byte_len,
             shard,
         })
     }
@@ -659,6 +662,7 @@ pub struct WeightLease {
     metadata: WeightMetadata,
     selection: TensorSelection,
     output_shape: Vec<usize>,
+    selected_byte_len: usize,
     shard: Arc<MappedShard>,
 }
 
@@ -681,6 +685,15 @@ impl WeightLease {
     /// Returns the selected output shape.
     pub fn output_shape(&self) -> &[usize] {
         &self.output_shape
+    }
+
+    /// Returns the logical encoded byte length of the validated selection.
+    ///
+    /// This is the selected tensor's checkpoint payload size. For execution
+    /// dtypes supported by the store it also matches the materialized array's
+    /// `nbytes()` value.
+    pub const fn selected_byte_len(&self) -> usize {
+        self.selected_byte_len
     }
 
     /// Returns the path of the pinned payload shard.
@@ -1001,6 +1014,44 @@ fn validate_selection(
             })
     })?;
     Ok(output)
+}
+
+fn selected_byte_len(
+    key: &str,
+    metadata: &WeightMetadata,
+    selection: &TensorSelection,
+    output_shape: &[usize],
+) -> Result<usize, WeightStoreError> {
+    if matches!(selection, TensorSelection::Full) {
+        return Ok(metadata.logical_byte_len);
+    }
+    let full_elements = metadata.shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("element count for tensor {key:?}"),
+            })
+    })?;
+    let selected_elements = output_shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("selected element count for tensor {key:?}"),
+            })
+    })?;
+    let scaled = metadata
+        .logical_byte_len
+        .checked_mul(selected_elements)
+        .ok_or_else(|| WeightStoreError::Overflow {
+            context: format!("selected byte length for tensor {key:?}"),
+        })?;
+    if full_elements == 0 || scaled % full_elements != 0 {
+        return Err(WeightStoreError::InvalidSelection {
+            key: key.to_string(),
+            message: "selection does not have a whole-byte encoded length".into(),
+        });
+    }
+    Ok(scaled / full_elements)
 }
 
 fn materialize_range(
@@ -1448,6 +1499,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease.output_shape(), [2, 3]);
+        assert_eq!(lease.selected_byte_len(), 24);
+        assert_eq!(
+            store
+                .acquire("matrix", TensorSelection::Full)
+                .unwrap()
+                .selected_byte_len(),
+            16
+        );
         assert!(matches!(
             validate_selection("overflow", &[usize::MAX, 2], &TensorSelection::Full),
             Err(WeightStoreError::Overflow { .. })
