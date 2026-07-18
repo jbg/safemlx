@@ -2165,6 +2165,54 @@ mod tests {
         .unwrap();
     }
 
+    fn llama_pipeline_dense_requirements(
+        model_dir: &Path,
+        topology: ParallelTopology,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> (u64, u64, u64) {
+        let sizing = load_pipeline_model_with_options(
+            model_dir,
+            ModelLoadOptions::with_parallel(topology).with_weight_residency(
+                WeightResidency::DenseDiskStream(
+                    crate::dense_stream::DenseDiskStreamLoadOptions::new(
+                        u64::MAX,
+                        u64::MAX,
+                        1,
+                        1,
+                        1,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let report = sizing.dense_stream_report().unwrap().unwrap();
+        let static_bytes = report.pinned_static_device_bytes();
+        let layer_bytes = report.planned_layer_bytes();
+        let device_bytes = static_bytes.checked_add(layer_bytes).unwrap();
+        (device_bytes, layer_bytes, static_bytes)
+    }
+
+    fn sampled_dense_options(
+        device_budget_bytes: u64,
+        host_budget_bytes: u64,
+    ) -> crate::dense_stream::DenseDiskStreamLoadOptions {
+        let mut options = crate::dense_stream::DenseDiskStreamLoadOptions::new(
+            device_budget_bytes,
+            host_budget_bytes,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        options.sample_mlx_memory = true;
+        options.sample_process_memory = true;
+        options
+    }
+
     #[test]
     fn llama_pipeline_dense_stream_is_stage_local_cold_and_matches_decode() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -2174,23 +2222,30 @@ mod tests {
         initialize_parameters(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
         write_llama_fixture(dir.path(), &reference);
-        let mut dense =
-            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
-                .unwrap();
-        dense.sample_mlx_memory = true;
-        dense.sample_process_memory = true;
+        let first_requirements =
+            llama_pipeline_dense_requirements(dir.path(), gpu_topology(0), stream, cpu.stream());
+        let last_requirements =
+            llama_pipeline_dense_requirements(dir.path(), gpu_topology(1), stream, cpu.stream());
         let mut first = load_pipeline_model_with_options(
             dir.path(),
-            ModelLoadOptions::with_parallel(gpu_topology(0))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
+                WeightResidency::DenseDiskStream(sampled_dense_options(
+                    first_requirements.0,
+                    first_requirements.1,
+                )),
+            ),
             stream,
             cpu.stream(),
         )
         .unwrap();
         let mut last = load_pipeline_model_with_options(
             dir.path(),
-            ModelLoadOptions::with_parallel(gpu_topology(1))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            ModelLoadOptions::with_parallel(gpu_topology(1)).with_weight_residency(
+                WeightResidency::DenseDiskStream(sampled_dense_options(
+                    last_requirements.0,
+                    last_requirements.1,
+                )),
+            ),
             stream,
             cpu.stream(),
         )
@@ -2258,11 +2313,75 @@ mod tests {
             };
             assert_close(&actual, &expected);
         }
-        for model in [&first, &last] {
+        for (model, (device_budget, host_budget, static_bytes)) in
+            [(&first, first_requirements), (&last, last_requirements)]
+        {
             let report = model.dense_stream_report().unwrap().unwrap();
             assert!(report.residency().offload().mlx_memory().is_some());
             assert!(report.residency().offload().process_sampled());
+            assert_eq!(report.pinned_static_device_bytes(), static_bytes);
+            assert_eq!(report.planned_layer_bytes(), host_budget);
+            assert!(
+                report
+                    .device_layers()
+                    .peak_layer_bytes()
+                    .checked_add(static_bytes)
+                    .unwrap()
+                    <= device_budget
+            );
+            assert!(report.host_layers().peak_layer_bytes() <= host_budget);
         }
+    }
+
+    #[test]
+    fn llama_pipeline_dense_stream_rejects_undersized_local_budgets() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut reference = llama::ResidentModel::new(llama_args(true), stream).unwrap();
+        initialize_parameters(&mut reference, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_fixture(dir.path(), &reference);
+        let (device_bytes, layer_bytes, static_bytes) =
+            llama_pipeline_dense_requirements(dir.path(), gpu_topology(0), stream, cpu.stream());
+
+        let host_budget = layer_bytes.checked_sub(1).unwrap();
+        let host_error = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
+                WeightResidency::DenseDiskStream(sampled_dense_options(device_bytes, host_budget)),
+            ),
+            stream,
+            cpu.stream(),
+        )
+        .err()
+        .expect("an undersized local host budget must fail");
+        assert!(matches!(
+            host_error,
+            Error::Parallel(message)
+                if message == format!(
+                    "pipeline host budget {host_budget} cannot hold the largest protected local layer window ({layer_bytes} bytes)"
+                )
+        ));
+
+        let device_budget = device_bytes.checked_sub(1).unwrap();
+        let device_error = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
+                WeightResidency::DenseDiskStream(sampled_dense_options(device_budget, layer_bytes)),
+            ),
+            stream,
+            cpu.stream(),
+        )
+        .err()
+        .expect("an undersized local device budget must fail");
+        assert!(matches!(
+            device_error,
+            Error::Parallel(message)
+                if message == format!(
+                    "pipeline device budget {device_budget} cannot hold {static_bytes} pinned static bytes plus the largest local layer window ({layer_bytes} bytes, {device_bytes} total)"
+                )
+        ));
     }
 
     fn llama_pipeline_stages(
