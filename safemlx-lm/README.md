@@ -36,9 +36,9 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-The ordinary model loaders still retain their materialized arrays. Llama and
-Mistral safetensors additionally have an explicit layerwise host-offload path;
-other model families continue to use their existing loading behavior.
+The unified Llama/Mistral loader selects either the existing eager model engine
+or the generic layerwise engine from a weight-residency policy. Other model
+families continue to use their existing loading behavior.
 
 ## Offload planning and observability
 
@@ -74,11 +74,13 @@ diagnostics remain separate. Background workers and event-backed overlap are
 not implemented.
 
 `DeviceLayerWindow` adds deterministic ordered-unit preparation and explicit
-trimming even under an unlimited device budget. The Llama adapter uses it to
-execute temporary decoder blocks directly from resident leases. Qwen,
-DeepSeek, and the distributed adapters do not yet swap weights through the
-manager. Distributed callers can construct units from only their rank-local
-ranges or indices; the manager has no rank or collective logic.
+trimming even under an unlimited device budget. `LayerwiseModel<A>` owns the
+storage, plan, leases, synchronization, and telemetry for that execution loop.
+`LayerwiseModelAdapter` supplies model-family-specific static modules, decoder
+construction, mask and cache behavior, and logits projection. The Llama adapter
+is the first implementation; Qwen, DeepSeek, and distributed adapters do not
+yet use this engine. Distributed callers can construct units from only their
+rank-local ranges or indices; the manager has no rank or collective logic.
 
 On Apple silicon, CPU and GPU execution share the same physical unified-memory
 pool. Logical host/device accounting is useful for residency policy, but does
@@ -93,12 +95,28 @@ native allocations. The pinned MLX 0.32.0 C surface has whole-stream
 synchronization but no event/fence primitive, so residency execution uses
 conservative stream synchronization until an event-backed API is available.
 
-## Llama-compatible layerwise host offload
+## Llama-compatible weight residency
 
-`llama_host_offload::load_llama_host_offloaded_model` and
-`load_llama_host_offloaded_model_with_options` load dense or already-packed
-MLX affine/MXFP4 Llama and Mistral safetensors. They do not change the standard
-fully resident loader.
+`llama::load_llama_model` returns one `LlamaModel` inference facade. Choose
+`LlamaLoadOptions::fully_resident()` for the eager execution-device model or
+`LlamaLoadOptions::layerwise_host(...)` for the generic host-backed decoder
+engine. Both policies use the same `LlamaCache`, `forward`, `prefill`, `decode`,
+and `CausalLm` surface. Dense and already-packed MLX affine/MXFP4 Llama and
+Mistral safetensors are supported.
+
+```rust
+use safemlx_lm::{
+    load_llama_model, LayerwiseLoadOptions, LlamaLoadOptions,
+};
+
+let eager = LlamaLoadOptions::fully_resident();
+let bounded = LlamaLoadOptions::layerwise_host(
+    LayerwiseLoadOptions::new(offload_config),
+);
+let mut model = load_llama_model(model_dir, bounded, stream, cpu_stream)?;
+let mut cache = model.new_cache();
+let logits = model.prefill(&token_ids, &mut cache, stream)?;
+```
 
 The embedding, final normalization, untied output projection when present,
 activations, and KV cache remain on the execution device. Every decoder layer
@@ -120,8 +138,8 @@ increase model capacity. Discrete CUDA memory is the capacity-expanding target.
 Transfers are synchronous because the pinned MLX API exposes whole-stream
 synchronization but no events. GGUF, load-time quantization, other model
 families, pinned host buffers, KV-cache offload, and asynchronous transfer or
-compute overlap are not supported by this loader. The opt-in
-`llama_host_offload` example accepts a real checkpoint directory and reports
+compute overlap are not supported by this policy. The opt-in
+`llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
 

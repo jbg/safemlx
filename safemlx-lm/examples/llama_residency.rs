@@ -1,11 +1,12 @@
-//! Opt-in synchronous layerwise host-offload benchmark for local checkpoints.
+//! Compare Llama residency policies with an opt-in local checkpoint benchmark.
 
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    llama_host_offload::{load_llama_host_offloaded_model_with_options, LlamaHostOffloadOptions},
+    layerwise::LayerwiseLoadOptions,
+    llama::{load_llama_model, LlamaLoadOptions},
     models::llama,
     offload::{MemoryTier, OffloadConfig, TransferDirection},
 };
@@ -52,20 +53,23 @@ fn main() -> anyhow::Result<()> {
         args.host_budget_bytes,
         args.device_layer_window,
     )?;
-    let options = LlamaHostOffloadOptions {
+    let layerwise = LayerwiseLoadOptions {
         offload: config,
         max_mapped_shards: args.mapped_shards,
         sample_mlx_memory: true,
         sample_process_memory: true,
-        ..LlamaHostOffloadOptions::default()
+        ..LayerwiseLoadOptions::default()
     };
-    let mut model = load_llama_host_offloaded_model_with_options(
+    let mut model = load_llama_model(
         &args.model_dir,
-        options,
+        LlamaLoadOptions::layerwise_host(layerwise),
         stream,
         weights.stream(),
     )?;
-    let metadata = model.metadata().clone();
+    let metadata = model
+        .layerwise_metadata()
+        .expect("layerwise residency was selected")
+        .clone();
     let mut cache = model.new_cache();
 
     stream.synchronize()?;
@@ -85,7 +89,9 @@ fn main() -> anyhow::Result<()> {
         stream.synchronize()?;
     }
     let decode = decode_started.elapsed();
-    let report = model.residency_report()?;
+    let report = model
+        .residency_report()?
+        .expect("layerwise residency was selected");
     let offload = report.offload();
     let observed_window = report
         .units()

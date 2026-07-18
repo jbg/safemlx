@@ -1,31 +1,16 @@
-//! Explicit layerwise host offload for Llama-compatible safetensors models.
+//! Architecture-independent execution of decoder models from resident layers.
 //!
-//! Decoder weights remain evaluated on the configured CPU source stream and
-//! move synchronously through a bounded execution-device window. Embeddings,
-//! final normalization, an untied output head, activations, and KV caches stay
-//! on the execution device.
+//! [`LayerwiseModel`] owns checkpoint storage, residency, bounded device
+//! windows, and synchronization. Model-family behavior is supplied by a
+//! [`LayerwiseModelAdapter`].
 
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
-use safemlx::{
-    error::Exception, module::Module, nn, ops::indexing::TryIndexOp, quantization::MaybeQuantized,
-    transforms::eval, Array, Dtype, Stream,
-};
+use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::KeyValueCache,
     error::Error,
-    models::{
-        common::{
-            generation::CausalLm,
-            linear::{
-                build_unloaded_maybe_quantized_lm_head_with_quantization,
-                project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            },
-        },
-        input,
-        llama::{self, AttentionInput, ModelArgs, ModelInput, TransformerBlock},
-    },
     module_binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
     },
@@ -36,22 +21,17 @@ use crate::{
         DeviceLayerWindow, OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport,
         ResidentUnitLease,
     },
-    utils::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
     weight_store::{SafetensorsWeightStore, WeightStore},
 };
 
-const EMBEDDING_UNIT: &str = "llama.static.embedding";
-const NORM_UNIT: &str = "llama.static.norm";
-const HEAD_UNIT: &str = "llama.static.output";
-
-/// Loader controls consumed by the explicit Llama host-offload path.
+/// Loader controls for a host-backed layerwise execution engine.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct LlamaHostOffloadOptions {
+pub struct LayerwiseLoadOptions {
     /// Residency budgets and maximum device-layer window.
     pub offload: OffloadConfig,
     /// Maximum number of checkpoint payload shards retained as mappings.
     pub max_mapped_shards: usize,
-    /// Reject checkpoint tensors unrelated to the Llama parameter tree.
+    /// Reject checkpoint tensors unrelated to the adapter's parameter tree.
     pub strict_loading: bool,
     /// Sample MLX allocator memory when a forward pass completes.
     pub sample_mlx_memory: bool,
@@ -59,7 +39,7 @@ pub struct LlamaHostOffloadOptions {
     pub sample_process_memory: bool,
 }
 
-impl LlamaHostOffloadOptions {
+impl LayerwiseLoadOptions {
     /// Creates strict options with the default mapped-shard bound.
     pub fn new(offload: OffloadConfig) -> Self {
         Self {
@@ -69,7 +49,7 @@ impl LlamaHostOffloadOptions {
     }
 }
 
-impl Default for LlamaHostOffloadOptions {
+impl Default for LayerwiseLoadOptions {
     fn default() -> Self {
         Self {
             offload: OffloadConfig::default(),
@@ -81,9 +61,24 @@ impl Default for LlamaHostOffloadOptions {
     }
 }
 
-/// Inspectable parameter-residency metadata for an offloaded Llama model.
+/// Weight placement choices exposed by architecture-level model loaders.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum WeightResidency {
+    /// Construct every module once and keep all parameters on the execution device.
+    FullyResident,
+    /// Keep decoder weights on a host stream and execute through a bounded device window.
+    LayerwiseHost(LayerwiseLoadOptions),
+}
+
+impl Default for WeightResidency {
+    fn default() -> Self {
+        Self::FullyResident
+    }
+}
+
+/// Inspectable parameter-residency metadata for a layerwise model.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct OffloadedLlamaMetadata {
+pub struct LayerwiseModelMetadata {
     model_type: String,
     quantization: Option<crate::quantization::WeightQuantization>,
     layer_count: usize,
@@ -93,8 +88,8 @@ pub struct OffloadedLlamaMetadata {
     device_layer_window: usize,
 }
 
-impl OffloadedLlamaMetadata {
-    /// Returns `llama` or `mistral`.
+impl LayerwiseModelMetadata {
+    /// Returns the checkpoint model type supplied by the adapter.
     pub fn model_type(&self) -> &str {
         &self.model_type
     }
@@ -124,62 +119,95 @@ impl OffloadedLlamaMetadata {
     }
 }
 
-/// Model-aware standard or sliding per-layer KV cache.
-#[derive(Debug, Clone)]
-pub enum OffloadedLlamaCache {
-    /// Unbounded concatenating caches for ordinary causal attention.
-    Standard(Vec<Option<ConcatKeyValueCache>>),
-    /// Bounded caches for Mistral-style sliding-window attention.
-    Sliding(Vec<Option<SlidingKeyValueCache>>),
+/// One pinned static module and its checkpoint bindings.
+pub struct StaticUnitBindings {
+    id: OffloadUnitId,
+    bindings: Vec<crate::residency::WeightBinding>,
 }
 
-impl OffloadedLlamaCache {
-    /// Returns the common absolute token offset, or zero for an empty cache.
-    pub fn offset(&self) -> i32 {
-        match self {
-            Self::Standard(caches) => caches
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::Sliding(caches) => caches
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-        }
-    }
-
-    /// Clears retained arrays without changing cache type or window size.
-    pub fn clear(&mut self) {
-        match self {
-            Self::Standard(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
-            Self::Sliding(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
-        }
+impl StaticUnitBindings {
+    /// Creates a pinned static unit definition.
+    pub fn new(
+        id: impl Into<String>,
+        bindings: Vec<crate::residency::WeightBinding>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            id: OffloadUnitId::new(id.into())?,
+            bindings,
+        })
     }
 }
 
-/// Executable Llama/Mistral model whose decoder weights are host-offloaded.
-pub struct OffloadedLlamaModel {
-    args: ModelArgs,
+/// Architecture behavior required by the generic layerwise execution engine.
+pub trait LayerwiseModelAdapter: Sized {
+    /// Temporary unloaded decoder-block type.
+    type Layer: ModuleParameters;
+    /// Per-forward state shared by every decoder block.
+    type ForwardContext;
+
+    /// Returns the checkpoint model type.
+    fn model_type(&self) -> &str;
+    /// Returns checkpoint-native packed quantization metadata, if present.
+    fn quantization(&self) -> Option<crate::quantization::WeightQuantization>;
+    /// Returns the number of decoder blocks.
+    fn layer_count(&self) -> Result<usize, Error>;
+    /// Builds bindings for modules that remain pinned on the execution device.
+    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
+    /// Assigns pinned leases to the adapter's static modules.
+    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error>;
+    /// Creates one metadata-only decoder block.
+    fn new_layer(&self, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
+    /// Returns the checkpoint prefix for one decoder block.
+    fn layer_checkpoint_prefix(&self, index: usize) -> String;
+    /// Returns the stable residency unit name for one decoder block.
+    fn layer_unit_name(&self, index: usize) -> String;
+    /// Executes the architecture's input embedding.
+    fn embed(&mut self, inputs: &Array, stream: &Stream) -> Result<Array, Error>;
+    /// Prepares masks or other state shared by the decoder-block loop.
+    fn prepare_forward<C: KeyValueCache>(
+        &self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &[Option<C>],
+        stream: &Stream,
+    ) -> Result<Self::ForwardContext, Error>;
+    /// Executes one populated decoder block.
+    fn forward_layer<C: KeyValueCache>(
+        &self,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut C,
+        context: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+    /// Applies final normalization and logits projection.
+    fn finish(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Error>;
+    /// Returns whether a checkpoint key is intentionally ignored by strict loading.
+    fn ignores_checkpoint_key(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+/// Generic host-backed layerwise decoder execution engine.
+pub struct LayerwiseModel<A: LayerwiseModelAdapter> {
+    adapter: A,
     store: Arc<SafetensorsWeightStore>,
     residency: ResidencyManager,
     layer_window: DeviceLayerWindow,
-    embedding: MaybeQuantized<nn::Embedding>,
-    norm: nn::RmsNorm,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
     static_leases: Vec<ResidentUnitLease>,
-    metadata: OffloadedLlamaMetadata,
+    metadata: LayerwiseModelMetadata,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
 
-impl OffloadedLlamaModel {
-    /// Returns normalized model arguments.
-    pub const fn args(&self) -> &ModelArgs {
-        &self.args
+impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
+    /// Returns the architecture adapter.
+    pub const fn adapter(&self) -> &A {
+        &self.adapter
     }
 
     /// Returns parameter-residency metadata.
-    pub const fn metadata(&self) -> &OffloadedLlamaMetadata {
+    pub const fn metadata(&self) -> &LayerwiseModelMetadata {
         &self.metadata
     }
 
@@ -198,126 +226,38 @@ impl OffloadedLlamaModel {
         Ok(self.residency.report()?)
     }
 
-    /// Creates the cache type required by this model's attention configuration.
-    pub fn new_cache(&self) -> OffloadedLlamaCache {
-        match self.args.sliding_window {
-            Some(window) => OffloadedLlamaCache::Sliding(
-                (0..self.args.num_hidden_layers)
-                    .map(|_| Some(SlidingKeyValueCache::new(window)))
-                    .collect(),
-            ),
-            None => OffloadedLlamaCache::Standard(
-                (0..self.args.num_hidden_layers)
-                    .map(|_| Some(ConcatKeyValueCache::new()))
-                    .collect(),
-            ),
-        }
-    }
-
-    /// Creates bounded sliding caches, rejecting full-attention configurations.
-    pub fn new_sliding_cache(&self) -> Result<OffloadedLlamaCache, Error> {
-        let Some(window) = self.args.sliding_window else {
-            return Err(LlamaHostOffloadError::CacheTypeMismatch {
-                expected: "standard",
-                actual: "sliding",
-            }
-            .into());
-        };
-        Ok(OffloadedLlamaCache::Sliding(
-            (0..self.args.num_hidden_layers)
-                .map(|_| Some(SlidingKeyValueCache::new(window)))
-                .collect(),
-        ))
-    }
-
-    /// Runs embedding, decoder, normalization, and logits projection.
-    pub fn forward(
-        &mut self,
-        inputs: &Array,
-        cache: &mut OffloadedLlamaCache,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        match (&mut *cache, self.args.sliding_window) {
-            (OffloadedLlamaCache::Standard(caches), None) => self.forward_with_cache(
-                ModelInput {
-                    inputs,
-                    mask: None,
-                    cache: caches,
-                },
-                stream,
-            ),
-            (OffloadedLlamaCache::Sliding(caches), Some(_)) => self.forward_with_cache(
-                ModelInput {
-                    inputs,
-                    mask: None,
-                    cache: caches,
-                },
-                stream,
-            ),
-            (OffloadedLlamaCache::Standard(_), Some(_)) => {
-                Err(LlamaHostOffloadError::CacheTypeMismatch {
-                    expected: "sliding",
-                    actual: "standard",
-                }
-                .into())
-            }
-            (OffloadedLlamaCache::Sliding(_), None) => {
-                Err(LlamaHostOffloadError::CacheTypeMismatch {
-                    expected: "standard",
-                    actual: "sliding",
-                }
-                .into())
-            }
-        }
-    }
-
     /// Runs the model with a caller-selected compatible cache implementation.
     pub fn forward_with_cache<C>(
         &mut self,
-        input: ModelInput<'_, C>,
+        input: LayerwiseInput<'_, C>,
         stream: &Stream,
     ) -> Result<Array, Error>
     where
         C: KeyValueCache + Default,
     {
-        let ModelInput {
+        let LayerwiseInput {
             inputs,
             mask,
             cache,
         } = input;
         validate_cache(cache, self.metadata.layer_count)?;
 
-        let mut h = self.embedding.forward(inputs, stream)?;
-        let (mask, generated_sliding_window) = match mask {
-            Some(mask) => (Some(mask.clone()), None),
-            None if self.args.sliding_window.is_some() && h.shape()[1] > 1 => {
-                (None, self.args.sliding_window)
-            }
-            None => (
-                attention_mask(&h, cache, self.args.sliding_window, stream)?,
-                None,
-            ),
-        };
+        let mut h = self.adapter.embed(inputs, stream)?;
+        let context = self.adapter.prepare_forward(&h, mask, cache, stream)?;
 
         for index in 0..self.metadata.layer_count {
             self.layer_window.prepare(&self.residency, index)?;
             let id = &self.layer_window.units()[index];
             {
                 let lease = self.residency.acquire(id, MemoryTier::Device)?;
-                let mut layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
+                let mut layer = self.adapter.new_layer(index, stream)?;
                 populate_module_from_lease(&mut layer, &lease)?;
                 let layer_cache = cache[index]
                     .as_mut()
-                    .ok_or(LlamaHostOffloadError::MissingLayerCache { index })?;
-                h = layer.forward(
-                    AttentionInput {
-                        x: &h,
-                        mask: mask.as_ref(),
-                        cache: Some(layer_cache),
-                        generated_sliding_window,
-                    },
-                    stream,
-                )?;
+                    .ok_or(LayerwiseModelError::MissingLayerCache { index })?;
+                h = self
+                    .adapter
+                    .forward_layer(&mut layer, &h, layer_cache, &context, stream)?;
 
                 // MLX is lazy. Materialize both the activation and every cache
                 // handle updated by this block before its lease can be dropped.
@@ -328,40 +268,12 @@ impl OffloadedLlamaModel {
             self.layer_window.trim_to(&self.residency, desired)?;
         }
 
-        let hidden = self.norm.forward(&h, stream)?;
-        let logits = project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?;
+        let logits = self.adapter.finish(&h, stream)?;
         if self.sample_mlx_memory || self.sample_process_memory {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }
         Ok(logits)
-    }
-
-    /// Runs prompt prefill and returns last-token logits.
-    pub fn prefill(
-        &mut self,
-        inputs: &Array,
-        cache: &mut OffloadedLlamaCache,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.forward(inputs, cache, stream)?
-            .try_index_device((.., -1, ..), stream)
-            .map_err(Into::into)
-    }
-
-    /// Runs cached autoregressive decode and returns last-token logits.
-    pub fn decode(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut OffloadedLlamaCache,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.prefill(input_tokens, cache, stream)
     }
 
     /// Explicitly evicts all decoder copies from the execution device.
@@ -375,121 +287,52 @@ impl OffloadedLlamaModel {
     }
 }
 
-impl CausalLm<OffloadedLlamaCache> for OffloadedLlamaModel {
-    fn prefill_input_logits(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut OffloadedLlamaCache,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let tokens = input::text_token_ids(input, stream)?;
-        self.prefill(&tokens, cache, stream)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn decode_logits(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut OffloadedLlamaCache,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.decode(input_tokens, cache, stream)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
+/// Input shared by architecture adapters using the layerwise engine.
+pub struct LayerwiseInput<'a, C> {
+    /// Token ids with shape `[batch, sequence]`.
+    pub inputs: &'a Array,
+    /// Optional caller-provided attention mask.
+    pub mask: Option<&'a Array>,
+    /// Mutable per-layer caches.
+    pub cache: &'a mut Vec<Option<C>>,
 }
 
-/// Loads an explicit Llama/Mistral layerwise host-offloaded safetensors model.
-pub fn load_llama_host_offloaded_model(
+/// Builds a generic layerwise model from an architecture adapter and safetensors.
+pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
     model_dir: impl AsRef<Path>,
-    offload: OffloadConfig,
+    mut adapter: A,
+    options: LayerwiseLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<OffloadedLlamaModel, Error> {
-    load_llama_host_offloaded_model_with_options(
-        model_dir,
-        LlamaHostOffloadOptions::new(offload),
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads with explicit mapping, strictness, and diagnostics controls.
-pub fn load_llama_host_offloaded_model_with_options(
-    model_dir: impl AsRef<Path>,
-    options: LlamaHostOffloadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<OffloadedLlamaModel, Error> {
+) -> Result<LayerwiseModel<A>, Error> {
     let model_dir = model_dir.as_ref();
     if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
-        return Err(LlamaHostOffloadError::GgufUnsupported.into());
+        return Err(LayerwiseModelError::GgufUnsupported.into());
     }
-    let args = llama::get_llama_model_args(model_dir)?;
-    let layer_count = usize::try_from(args.num_hidden_layers).map_err(|_| {
-        LlamaHostOffloadError::ArithmeticOverflow {
-            context: "decoder layer count",
-        }
-    })?;
+    let layer_count = adapter.layer_count()?;
     let depth = options.offload.prefetch_depth();
     if depth > layer_count {
-        return Err(LlamaHostOffloadError::InvalidLayerWindow { depth, layer_count }.into());
+        return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
     }
     let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
         model_dir,
         options.max_mapped_shards,
     )?);
 
-    let mut embedding = unloaded_maybe_quantized_embedding(
-        args.vocab_size,
-        args.hidden_size,
-        args.affine_quantization_for("model.embed_tokens.weight"),
-        stream,
-    )?;
-    let mut norm =
-        nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
-    let mut lm_head = if args.tie_word_embeddings {
-        None
-    } else {
-        Some(build_unloaded_maybe_quantized_lm_head_with_quantization(
-            args.hidden_size,
-            args.vocab_size,
-            args.affine_quantization_for("lm_head.weight"),
-            stream,
-        )?)
-    };
-
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
     let mut static_device_bytes = 0u64;
+    let mut static_ids = Vec::new();
 
-    add_unit(
-        &mut definitions,
-        &mut specs,
-        &mut consumed,
-        EMBEDDING_UNIT,
-        build_module_bindings(&embedding, "model.embed_tokens", store.as_ref())?,
-        ResidencyPolicy::Pinned,
-        MemoryTier::Device,
-        &mut static_device_bytes,
-    )?;
-    add_unit(
-        &mut definitions,
-        &mut specs,
-        &mut consumed,
-        NORM_UNIT,
-        build_module_bindings(&norm, "model.norm", store.as_ref())?,
-        ResidencyPolicy::Pinned,
-        MemoryTier::Device,
-        &mut static_device_bytes,
-    )?;
-    if let Some(head) = &lm_head {
+    for unit in adapter.static_units(store.as_ref())? {
+        static_ids.push(unit.id.clone());
         add_unit(
             &mut definitions,
             &mut specs,
             &mut consumed,
-            HEAD_UNIT,
-            build_module_bindings(head, "lm_head", store.as_ref())?,
+            unit.id,
+            unit.bindings,
             ResidencyPolicy::Pinned,
             MemoryTier::Device,
             &mut static_device_bytes,
@@ -500,16 +343,20 @@ pub fn load_llama_host_offloaded_model_with_options(
     let mut layer_bytes = Vec::with_capacity(layer_count);
     let mut host_layer_bytes = 0u64;
     for index in 0..layer_count {
-        let layer = TransformerBlock::new_for_layer(&args, index as i32, stream)?;
-        let bindings =
-            build_module_bindings(&layer, &format!("model.layers.{index}"), store.as_ref())?;
-        let bytes = binding_bytes(&bindings)?;
-        host_layer_bytes = host_layer_bytes.checked_add(bytes).ok_or(
-            LlamaHostOffloadError::ArithmeticOverflow {
-                context: "host decoder byte total",
-            },
+        let layer = adapter.new_layer(index, stream)?;
+        let bindings = build_module_bindings(
+            &layer,
+            &adapter.layer_checkpoint_prefix(index),
+            store.as_ref(),
         )?;
-        let id = OffloadUnitId::new(format!("llama.layer.{index:05}"))?;
+        let bytes = binding_bytes(&bindings)?;
+        host_layer_bytes =
+            host_layer_bytes
+                .checked_add(bytes)
+                .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                    context: "host decoder byte total",
+                })?;
+        let id = OffloadUnitId::new(adapter.layer_unit_name(index))?;
         consumed.extend(
             bindings
                 .iter()
@@ -526,7 +373,9 @@ pub fn load_llama_host_offloaded_model_with_options(
         layer_bytes.push(bytes);
     }
 
-    validate_unused(store.as_ref(), &consumed, options.strict_loading)?;
+    validate_unused(store.as_ref(), &consumed, options.strict_loading, |key| {
+        adapter.ignores_checkpoint_key(key)
+    })?;
     validate_host_budget(options.offload, host_layer_bytes)?;
     let maximum_window_bytes = largest_window_bytes(&layer_bytes, depth)?;
     validate_device_budget(
@@ -546,37 +395,27 @@ pub fn load_llama_host_offloaded_model_with_options(
     )?;
     residency.initialize()?;
 
-    let mut static_leases = Vec::with_capacity(if lm_head.is_some() { 3 } else { 2 });
-    let embedding_lease = acquire_static(&residency, EMBEDDING_UNIT)?;
-    populate_module_from_lease(&mut embedding, &embedding_lease)?;
-    static_leases.push(embedding_lease);
-    let norm_lease = acquire_static(&residency, NORM_UNIT)?;
-    populate_module_from_lease(&mut norm, &norm_lease)?;
-    static_leases.push(norm_lease);
-    if let Some(head) = &mut lm_head {
-        let head_lease = acquire_static(&residency, HEAD_UNIT)?;
-        populate_module_from_lease(head, &head_lease)?;
-        static_leases.push(head_lease);
-    }
+    let static_leases = static_ids
+        .iter()
+        .map(|id| residency.acquire(id, MemoryTier::Device))
+        .collect::<Result<Vec<_>, _>>()?;
+    adapter.populate_static(&static_leases)?;
 
     let layer_window = DeviceLayerWindow::new(layer_ids, depth)?;
-    let metadata = OffloadedLlamaMetadata {
-        model_type: args.model_type.clone(),
-        quantization: args.weight_quantization(),
+    let metadata = LayerwiseModelMetadata {
+        model_type: adapter.model_type().to_string(),
+        quantization: adapter.quantization(),
         layer_count,
         static_device_bytes,
         host_layer_bytes,
         maximum_window_bytes,
         device_layer_window: depth,
     };
-    Ok(OffloadedLlamaModel {
-        args,
+    Ok(LayerwiseModel {
+        adapter,
         store,
         residency,
         layer_window,
-        embedding,
-        norm,
-        lm_head,
         static_leases,
         metadata,
         sample_mlx_memory: options.sample_mlx_memory,
@@ -588,39 +427,37 @@ fn add_unit(
     definitions: &mut Vec<OffloadUnit>,
     specs: &mut Vec<OffloadUnitSpec>,
     consumed: &mut BTreeSet<String>,
-    name: &str,
+    id: OffloadUnitId,
     bindings: Vec<crate::residency::WeightBinding>,
     policy: ResidencyPolicy,
     tier: MemoryTier,
     byte_total: &mut u64,
 ) -> Result<(), Error> {
     let bytes = binding_bytes(&bindings)?;
-    *byte_total =
-        byte_total
-            .checked_add(bytes)
-            .ok_or(LlamaHostOffloadError::ArithmeticOverflow {
-                context: "static device byte total",
-            })?;
+    *byte_total = byte_total
+        .checked_add(bytes)
+        .ok_or(LayerwiseModelError::ArithmeticOverflow {
+            context: "static device byte total",
+        })?;
     consumed.extend(
         bindings
             .iter()
             .map(|binding| binding.checkpoint_key().to_string()),
     );
-    let id = OffloadUnitId::new(name)?;
     definitions.push(OffloadUnit::new(id.clone(), bindings)?);
     specs.push(OffloadUnitSpec::new(id, bytes, policy, tier)?);
     Ok(())
 }
 
-fn acquire_static(residency: &ResidencyManager, name: &str) -> Result<ResidentUnitLease, Error> {
-    Ok(residency.acquire(&OffloadUnitId::new(name)?, MemoryTier::Device)?)
-}
-
-fn validate_unused(
+fn validate_unused<F>(
     store: &dyn WeightStore,
     consumed: &BTreeSet<String>,
     strict: bool,
-) -> Result<(), Error> {
+    ignored: F,
+) -> Result<(), Error>
+where
+    F: Fn(&str) -> bool,
+{
     if !strict {
         return Ok(());
     }
@@ -628,12 +465,12 @@ fn validate_unused(
         .keys()
         .into_iter()
         .filter(|key| !consumed.contains(key))
-        .filter(|key| !key.starts_with("rope_freqs.") && !key.ends_with(".rotary_emb.inv_freq"))
+        .filter(|key| !ignored(key))
         .collect::<Vec<_>>();
     if unused.is_empty() {
         Ok(())
     } else {
-        Err(LlamaHostOffloadError::UnexpectedCheckpointParameters { unused }.into())
+        Err(LayerwiseModelError::UnexpectedCheckpointParameters { unused }.into())
     }
 }
 
@@ -646,35 +483,16 @@ where
         return Ok(());
     }
     if cache.len() != layer_count {
-        return Err(LlamaHostOffloadError::CacheLengthMismatch {
+        return Err(LayerwiseModelError::CacheLengthMismatch {
             expected: layer_count,
             actual: cache.len(),
         }
         .into());
     }
     if let Some(index) = cache.iter().position(Option::is_none) {
-        return Err(LlamaHostOffloadError::MissingLayerCache { index }.into());
+        return Err(LayerwiseModelError::MissingLayerCache { index }.into());
     }
     Ok(())
-}
-
-fn attention_mask<C: KeyValueCache>(
-    h: &Array,
-    cache: &[Option<C>],
-    sliding_window: Option<i32>,
-    stream: &Stream,
-) -> Result<Option<Array>, Error> {
-    if let Some(window) = sliding_window {
-        return Ok(create_sliding_attention_mask(h, cache, window, stream)?);
-    }
-    match create_attention_mask(h, cache, Some(true), stream)? {
-        Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
-        Some(AttentionMask::Causal) => Err(Exception::custom(
-            "Llama-compatible decoders require an explicit attention mask",
-        )
-        .into()),
-        None => Ok(None),
-    }
 }
 
 fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {
@@ -685,7 +503,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
             current =
                 current
                     .checked_add(*bytes)
-                    .ok_or(LlamaHostOffloadError::ArithmeticOverflow {
+                    .ok_or(LayerwiseModelError::ArithmeticOverflow {
                         context: "device layer window byte total",
                     })?;
         }
@@ -697,7 +515,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
 fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
     if let Some(budget) = config.host_budget_bytes() {
         if required > budget {
-            return Err(LlamaHostOffloadError::HostBudgetTooSmall { required, budget }.into());
+            return Err(LayerwiseModelError::HostBudgetTooSmall { required, budget }.into());
         }
     }
     Ok(())
@@ -709,14 +527,15 @@ fn validate_device_budget(
     window_bytes: u64,
     depth: usize,
 ) -> Result<(), Error> {
-    let required = static_bytes.checked_add(window_bytes).ok_or(
-        LlamaHostOffloadError::ArithmeticOverflow {
-            context: "static plus device-window byte total",
-        },
-    )?;
+    let required =
+        static_bytes
+            .checked_add(window_bytes)
+            .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                context: "static plus device-window byte total",
+            })?;
     if let Some(budget) = config.device_budget_bytes() {
         if required > budget {
-            return Err(LlamaHostOffloadError::DeviceBudgetTooSmall {
+            return Err(LayerwiseModelError::DeviceBudgetTooSmall {
                 static_bytes,
                 window_bytes,
                 depth,
@@ -729,11 +548,11 @@ fn validate_device_budget(
     Ok(())
 }
 
-/// Structured failures specific to the explicit Llama host-offload adapter.
+/// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
-pub enum LlamaHostOffloadError {
+pub enum LayerwiseModelError {
     /// GGUF is intentionally outside this loader's safetensors contract.
-    #[error("Llama host offload requires safetensors; GGUF offload is unsupported")]
+    #[error("layerwise host residency requires safetensors; GGUF is unsupported")]
     GgufUnsupported,
     /// The configured ordered layer window was invalid.
     #[error("device layer window depth {depth} must be between 1 and layer count {layer_count}")]
@@ -744,9 +563,7 @@ pub enum LlamaHostOffloadError {
         layer_count: usize,
     },
     /// Strict loading found unrelated checkpoint tensors.
-    #[error(
-        "strict Llama host-offload loading found unexpected checkpoint parameters: {unused:?}"
-    )]
+    #[error("strict layerwise loading found unexpected checkpoint parameters: {unused:?}")]
     UnexpectedCheckpointParameters {
         /// Unexpected keys in stable order.
         unused: Vec<String>,
@@ -774,7 +591,7 @@ pub enum LlamaHostOffloadError {
         budget: u64,
     },
     /// A cache vector had the wrong number of layers.
-    #[error("Llama cache has {actual} layers, expected {expected}")]
+    #[error("layerwise cache has {actual} layers, expected {expected}")]
     CacheLengthMismatch {
         /// Model decoder count.
         expected: usize,
@@ -782,21 +599,13 @@ pub enum LlamaHostOffloadError {
         actual: usize,
     },
     /// A cache entry was absent.
-    #[error("Llama cache entry {index} is missing")]
+    #[error("layerwise cache entry {index} is missing")]
     MissingLayerCache {
         /// Missing decoder index.
         index: usize,
     },
-    /// The cache implementation did not match the model attention mode.
-    #[error("cache type mismatch: model requires {expected}, supplied {actual}")]
-    CacheTypeMismatch {
-        /// Required cache kind.
-        expected: &'static str,
-        /// Supplied cache kind.
-        actual: &'static str,
-    },
     /// Checked byte or index arithmetic overflowed.
-    #[error("Llama host-offload arithmetic overflow: {context}")]
+    #[error("layerwise model arithmetic overflow: {context}")]
     ArithmeticOverflow {
         /// Failed calculation.
         context: &'static str,
@@ -814,13 +623,30 @@ mod tests {
     use std::fs;
 
     use safemlx::{
-        module::{Module, ModuleParameters},
-        ops::ones_dtype,
-        Device, DeviceType, ExecutionContext,
+        module::ModuleParameters, ops::ones_dtype, Device, DeviceType, ExecutionContext,
     };
 
     use super::*;
-    use crate::{models::llama, offload::TransferDirection, residency::UnitResidencyReport};
+    use crate::{
+        llama::{load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel},
+        models::llama::{self, ModelArgs},
+        offload::TransferDirection,
+        residency::UnitResidencyReport,
+    };
+
+    fn load_layerwise_llama(
+        model_dir: impl AsRef<Path>,
+        offload: OffloadConfig,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<LlamaModel, Error> {
+        load_llama_model(
+            model_dir,
+            LlamaLoadOptions::layerwise_host(LayerwiseLoadOptions::new(offload)),
+            stream,
+            weights_stream,
+        )
+    }
 
     fn args(model_type: &str, tied: bool, sliding_window: Option<i32>) -> ModelArgs {
         ModelArgs {
@@ -872,7 +698,7 @@ mod tests {
         }
     }
 
-    fn write_fixture(dir: &Path, model: &llama::Model) {
+    fn write_fixture(dir: &Path, model: &llama::ResidentModel) {
         let params = model.parameters().flatten();
         let arrays = params
             .iter()
@@ -938,15 +764,24 @@ mod tests {
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = gpu.stream();
         let mut reference =
-            llama::Model::new(args(model_type, tied, sliding_window), stream).unwrap();
+            llama::ResidentModel::new(args(model_type, tied, sliding_window), stream).unwrap();
         initialize(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &reference);
 
+        let mut fully_resident = load_llama_model(
+            dir.path(),
+            LlamaLoadOptions::fully_resident(),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert!(fully_resident.is_fully_resident());
+        assert!(fully_resident.residency_report().unwrap().is_none());
         let config = OffloadConfig::new(None, None, depth).unwrap();
-        let mut offloaded =
-            load_llama_host_offloaded_model(dir.path(), config, stream, cpu.stream()).unwrap();
-        let initial = offloaded.residency_report().unwrap();
+        let mut offloaded = load_layerwise_llama(dir.path(), config, stream, cpu.stream()).unwrap();
+        assert!(!offloaded.is_fully_resident());
+        let initial = offloaded.residency_report().unwrap().unwrap();
         assert!(layer_reports(&initial)
             .iter()
             .all(|unit| unit.host_resident()));
@@ -954,12 +789,7 @@ mod tests {
             .iter()
             .all(|unit| !unit.device_resident()));
 
-        let mut reference_standard = Vec::<Option<ConcatKeyValueCache>>::new();
-        let mut reference_sliding = sliding_window.map(|window| {
-            (0..3)
-                .map(|_| Some(SlidingKeyValueCache::new(window)))
-                .collect::<Vec<_>>()
-        });
+        let mut resident_cache = fully_resident.new_cache();
         let mut cache = offloaded.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
@@ -967,32 +797,12 @@ mod tests {
             Array::from_slice(&[4u32], &[1, 1]),
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
-            let expected = if let Some(caches) = &mut reference_sliding {
-                reference
-                    .forward(
-                        llama::ModelInput {
-                            inputs: &tokens,
-                            mask: None,
-                            cache: caches,
-                        },
-                        stream,
-                    )
-                    .unwrap()
-            } else {
-                reference
-                    .forward(
-                        llama::ModelInput {
-                            inputs: &tokens,
-                            mask: None,
-                            cache: &mut reference_standard,
-                        },
-                        stream,
-                    )
-                    .unwrap()
-            };
+            let expected = fully_resident
+                .forward(&tokens, &mut resident_cache, stream)
+                .unwrap();
             let actual = offloaded.forward(&tokens, &mut cache, stream).unwrap();
             assert_close(&actual, &expected);
-            let report = offloaded.residency_report().unwrap();
+            let report = offloaded.residency_report().unwrap().unwrap();
             assert!(layer_reports(&report)
                 .iter()
                 .all(|unit| unit.host_resident()));
@@ -1005,7 +815,7 @@ mod tests {
             );
         }
 
-        let report = offloaded.residency_report().unwrap();
+        let report = offloaded.residency_report().unwrap().unwrap();
         assert!(
             report
                 .offload()
@@ -1013,9 +823,12 @@ mod tests {
                 .count()
                 >= 3
         );
-        assert_eq!(offloaded.static_lease_count(), if tied { 2 } else { 3 });
+        assert_eq!(
+            offloaded.layerwise_static_lease_count().unwrap(),
+            if tied { 2 } else { 3 }
+        );
         offloaded.clear_device_layer_window().unwrap();
-        let cleared = offloaded.residency_report().unwrap();
+        let cleared = offloaded.residency_report().unwrap().unwrap();
         assert!(layer_reports(&cleared)
             .iter()
             .all(|unit| !unit.device_resident()));
@@ -1027,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn host_offload_dense_prefill_decode_parity() {
+    fn llama_residency_dense_prefill_decode_parity() {
         run_parity("llama", true, None, 1);
         run_parity("llama", false, None, 2);
         run_parity("mistral", false, Some(4), 2);
@@ -1037,12 +850,13 @@ mod tests {
     fn budget_and_cache_validation_are_structured() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut reference = llama::Model::new(args("llama", true, None), gpu.stream()).unwrap();
+        let mut reference =
+            llama::ResidentModel::new(args("llama", true, None), gpu.stream()).unwrap();
         initialize(&mut reference, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &reference);
 
-        let host_error = load_llama_host_offloaded_model(
+        let host_error = load_layerwise_llama(
             dir.path(),
             OffloadConfig::new(None, Some(1), 1).unwrap(),
             gpu.stream(),
@@ -1052,7 +866,7 @@ mod tests {
         .unwrap();
         assert!(host_error.to_string().contains("host budget"));
 
-        let device_error = load_llama_host_offloaded_model(
+        let device_error = load_layerwise_llama(
             dir.path(),
             OffloadConfig::new(Some(1), None, 1).unwrap(),
             gpu.stream(),
@@ -1062,14 +876,14 @@ mod tests {
         .unwrap();
         assert!(device_error.to_string().contains("device budget"));
 
-        let mut model = load_llama_host_offloaded_model(
+        let mut model = load_layerwise_llama(
             dir.path(),
             OffloadConfig::new(None, None, 1).unwrap(),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        let mut bad_cache = OffloadedLlamaCache::Standard(vec![None]);
+        let mut bad_cache = LlamaCache::Standard(vec![None]);
         let error = model
             .forward(
                 &Array::from_slice(&[1u32], &[1, 1]),
@@ -1081,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn host_offload_packed_affine_parity() {
+    fn llama_residency_packed_affine_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut quant_args = args("llama", false, None);
@@ -1092,7 +906,7 @@ mod tests {
         quant_args.head_dim = 8;
         quant_args.vocab_size = 32;
         quant_args.num_hidden_layers = 2;
-        let mut dense = llama::Model::new(quant_args, gpu.stream()).unwrap();
+        let mut dense = llama::ResidentModel::new(quant_args, gpu.stream()).unwrap();
         initialize(&mut dense, gpu.stream());
         let source = tempfile::tempdir().unwrap();
         write_fixture(source.path(), &dense);
@@ -1108,16 +922,26 @@ mod tests {
         crate::quantization::quantize_checkpoint(source.path(), &converted, &options, gpu.stream())
             .unwrap();
 
-        let mut resident = llama::load_llama_model(&converted, gpu.stream(), cpu.stream()).unwrap();
-        let mut offloaded = load_llama_host_offloaded_model(
+        let mut resident = load_llama_model(
+            &converted,
+            LlamaLoadOptions::fully_resident(),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut offloaded = load_layerwise_llama(
             &converted,
             OffloadConfig::new(None, None, 1).unwrap(),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        assert!(offloaded.metadata().quantization().is_some());
-        let mut resident_cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        assert!(offloaded
+            .layerwise_metadata()
+            .unwrap()
+            .quantization()
+            .is_some());
+        let mut resident_cache = resident.new_cache();
         let mut offloaded_cache = offloaded.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
@@ -1125,14 +949,7 @@ mod tests {
             Array::from_slice(&[4u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward(
-                    llama::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = offloaded
                 .forward(&tokens, &mut offloaded_cache, gpu.stream())

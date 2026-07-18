@@ -600,7 +600,7 @@ where
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Llama transformer body without the language-model head.
-pub struct LlamaModel {
+pub struct ResidentDecoder {
     /// Token vocabulary size.
     pub vocab_size: i32,
     /// Number of decoder layers.
@@ -623,7 +623,7 @@ pub struct LlamaModel {
     pub norm: nn::RmsNorm,
 }
 
-impl LlamaModel {
+impl ResidentDecoder {
     /// Creates an unloaded Llama transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
@@ -737,7 +737,7 @@ pub struct ModelInput<'a, C> {
     pub cache: &'a mut Vec<Option<C>>,
 }
 
-impl<C> Module<ModelInput<'_, C>> for LlamaModel
+impl<C> Module<ModelInput<'_, C>> for ResidentDecoder
 where
     C: KeyValueCache + Default,
 {
@@ -794,14 +794,14 @@ where
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Llama causal language model.
-pub struct Model {
+pub struct ResidentModel {
     /// Model configuration.
     pub args: ModelArgs,
 
     #[quantizable]
     #[param]
     /// Transformer body.
-    pub model: LlamaModel,
+    pub model: ResidentDecoder,
 
     #[quantizable]
     #[param]
@@ -809,10 +809,10 @@ pub struct Model {
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
-impl Model {
+impl ResidentModel {
     /// Creates an unloaded Llama causal language model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let model = LlamaModel::new(&args, stream)?;
+        let model = ResidentDecoder::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(
                 common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
@@ -877,7 +877,7 @@ impl Model {
     }
 }
 
-impl<C> Module<ModelInput<'_, C>> for Model
+impl<C> Module<ModelInput<'_, C>> for ResidentModel
 where
     C: KeyValueCache + Default,
 {
@@ -900,7 +900,7 @@ where
     }
 
     fn training_mode(&mut self, mode: bool) {
-        <LlamaModel as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
+        <ResidentDecoder as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
         if let Some(lm_head) = &mut self.lm_head {
             lm_head.training_mode(mode);
         }
@@ -989,7 +989,7 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 pub(crate) struct LoadedLlamaGguf {
-    pub(crate) model: Model,
+    pub(crate) model: ResidentModel,
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
@@ -1002,7 +1002,7 @@ pub fn load_llama_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<ResidentModel, Error> {
     Ok(load_llama_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
@@ -1064,7 +1064,7 @@ pub(crate) fn load_llama_gguf_data_with_quantization(
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
 
-    let mut model = Model::new(args, stream)?;
+    let mut model = ResidentModel::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
     if let Some(quantization) = quantization {
@@ -1337,14 +1337,14 @@ pub struct WeightMap {
 }
 
 /// Loads a Llama model and safetensors weights from a model directory.
-pub fn load_llama_model(
+pub fn load_resident_llama_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_llama_model_args(model_dir)?;
-    let mut model = Model::new(model_args, stream)?;
+    let mut model = ResidentModel::new(model_args, stream)?;
 
     load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
     model.copy_to_stream(stream)?;
@@ -1353,12 +1353,12 @@ pub fn load_llama_model(
 }
 
 /// Loads a dense Llama checkpoint while quantizing matrices tensor-by-tensor.
-pub fn load_llama_model_quantized(
+pub fn load_resident_llama_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
     let mut model_args = get_llama_model_args(model_dir)?;
     if !crate::quantization::should_quantize_on_load(
@@ -1366,10 +1366,10 @@ pub fn load_llama_model_quantized(
         model_args.weight_quantization(),
         quantization,
     )? {
-        return load_llama_model(model_dir, stream, weights_stream);
+        return load_resident_llama_model(model_dir, stream, weights_stream);
     }
     model_args.quantization = Some(quantization);
-    let mut model = Model::new(model_args, stream)?;
+    let mut model = ResidentModel::new(model_args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
     load_safetensors_dir_quantized_strict(
@@ -1386,7 +1386,7 @@ pub fn load_llama_model_quantized(
     Ok(model)
 }
 
-impl<C> CausalLm<Vec<Option<C>>> for Model
+impl<C> CausalLm<Vec<Option<C>>> for ResidentModel
 where
     C: KeyValueCache + Default,
 {
@@ -1428,7 +1428,7 @@ where
 
 /// Llama token generation iterator.
 pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
-    common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
+    common::generation::Generate<'a, ResidentModel, Vec<Option<C>>, S>;
 
 #[cfg(test)]
 mod tests {
@@ -1448,7 +1448,7 @@ mod tests {
 
     use crate::{
         cache::ConcatKeyValueCache,
-        models::llama::{load_llama_model, load_llama_tokenizer},
+        models::llama::{load_llama_tokenizer, load_resident_llama_model},
         quantization::AffineQuantization,
     };
 
@@ -1528,7 +1528,7 @@ mod tests {
 
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let stream = ctx.stream();
-        let source = super::Model::new(
+        let source = super::ResidentModel::new(
             super::ModelArgs {
                 model_type: "mistral".into(),
                 hidden_size: 32,
@@ -1681,7 +1681,7 @@ mod tests {
             quantized_weights: Some(selected),
             quantized_weight_configs: None,
         };
-        let model = super::Model::new(args, ctx.stream()).unwrap();
+        let model = super::ResidentModel::new(args, ctx.stream()).unwrap();
         let params = model.parameters().flatten();
         assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
         assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
@@ -1737,7 +1737,7 @@ mod tests {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let model_args = super::get_llama_model_args(model_dir).unwrap();
-        let model = super::Model::new(model_args, stream).unwrap();
+        let model = super::ResidentModel::new(model_args, stream).unwrap();
 
         // Print some model parameter keys
         let params = model.parameters().flatten();
@@ -1802,7 +1802,8 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
         let mut model =
-            load_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream).unwrap();
+            load_resident_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream)
+                .unwrap();
 
         let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
         let encoding = tokenizer.encode(prompt, false).unwrap();

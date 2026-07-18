@@ -1709,7 +1709,7 @@ mod tests {
     }
 
     fn llama_pipeline_stages(
-        source: &llama::Model,
+        source: &llama::ResidentModel,
         stream: &Stream,
     ) -> (PipelineModel, PipelineModel) {
         let first_topology = gpu_topology(0);
@@ -1767,7 +1767,7 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         for tied in [false, true] {
-            let mut reference = llama::Model::new(llama_args(tied), stream).unwrap();
+            let mut reference = llama::ResidentModel::new(llama_args(tied), stream).unwrap();
             initialize_parameters(&mut reference, stream);
             let (mut first, mut last) = llama_pipeline_stages(&reference, stream);
             let mut reference_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();

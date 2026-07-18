@@ -364,7 +364,7 @@ pub enum Model {
     /// Thinking Machines Lab Inkling model.
     Inkling(inkling::Model),
     /// Llama-compatible dense model.
-    Llama(llama::Model),
+    Llama(llama::ResidentModel),
     /// Liquid AI LFM2/LFM2.5 model.
     Lfm2(lfm2::Model),
     /// Nemotron-H hybrid model.
@@ -1502,7 +1502,7 @@ fn load_model_for_kind(
             ModelKind::Inkling => Err(Error::Quantization(
                 "Inkling affine/MXFP4 on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without a matching quantized grouped-matmul implementation".into(),
             )),
-            ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model_quantized(
+            ModelKind::Llama => Ok(Model::Llama(llama::load_resident_llama_model_quantized(
                 model_dir,
                 quantization,
                 stream,
@@ -1582,7 +1582,7 @@ fn load_model_for_kind(
             stream,
             weights_stream,
         )?)),
-        ModelKind::Llama => Ok(Model::Llama(llama::load_llama_model(
+        ModelKind::Llama => Ok(Model::Llama(llama::load_resident_llama_model(
             model_dir,
             stream,
             weights_stream,
@@ -2104,7 +2104,7 @@ mod tests {
                 "llama" | "mistral" => {
                     let args = super::llama::get_llama_model_args(&dir).unwrap();
                     save_zero_checkpoint(
-                        &super::llama::Model::new(args, stream).unwrap(),
+                        &super::llama::ResidentModel::new(args, stream).unwrap(),
                         &dir,
                         stream,
                     );

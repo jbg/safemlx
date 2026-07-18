@@ -19,9 +19,13 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
-    /// Invalid or failed Llama-compatible layerwise host offload.
+    /// Invalid unified Llama model configuration or cache usage.
     #[error(transparent)]
-    LlamaHostOffload(#[from] crate::llama_host_offload::LlamaHostOffloadError),
+    LlamaModel(#[from] crate::llama::LlamaModelError),
+
+    /// Invalid or failed layerwise model execution.
+    #[error(transparent)]
+    LayerwiseModel(#[from] crate::layerwise::LayerwiseModelError),
 
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
