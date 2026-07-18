@@ -15,7 +15,7 @@ use crate::{
     error::Error,
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerwiseForwardState, StaticUnitBindings,
     },
     models::moshi::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
@@ -61,6 +61,13 @@ impl MoshiLayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
     }
 
     /// Returns residency attributed to the temporal and depth execution groups.
@@ -766,7 +773,7 @@ fn token_position(
 /// Loads a native MLX-layout Moshi checkpoint through bounded host residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -796,7 +803,7 @@ pub fn load_moshi_layerwise_model(
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded host residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -818,7 +825,7 @@ fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
     layout: CheckpointLayout,
-    options: LayerwiseLoadOptions,
+    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -1457,6 +1464,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        layerwise::LayerwiseLoadOptions,
         models::moshi as eager,
         offload::OffloadConfig,
         realtime::{generate_encoded_greedy, RealtimeSpeechModel},

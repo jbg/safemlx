@@ -32,7 +32,7 @@ use crate::sampler::{DefaultSampler, Sampler};
 use crate::{
     cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     error::Error,
-    layerwise::WeightResidency,
+    layerwise::{LayerExecutionLoadOptions, WeightResidency},
 };
 
 /// Shared building blocks used by multiple decoder-only model families.
@@ -451,6 +451,29 @@ impl Model {
             Self::Qwen3Layerwise(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
                 Ok(Some(model.residency_report()?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Returns experimental dense-stream telemetry when enabled.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        match self {
+            Self::DeepSeekV3Layerwise(model) => model.dense_stream_report(),
+            Self::Gemma4Layerwise(model) => model.dense_stream_report(),
+            Self::InklingLayerwise(model) => model.dense_stream_report(),
+            Self::LlamaLayerwise(model) => model.dense_stream_report(),
+            Self::GptOssLayerwise(model) => model.dense_stream_report(),
+            Self::Lfm2Layerwise(model) => model.dense_stream_report(),
+            Self::NemotronHLayerwise(model) => model.dense_stream_report(),
+            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
+                model.dense_stream_report()
+            }
+            Self::Qwen3Layerwise(model) => model.dense_stream_report(),
+            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
+                model.dense_stream_report()
             }
             _ => Ok(None),
         }
@@ -1170,6 +1193,13 @@ impl LoadedModel {
         self.model.residency_report()
     }
 
+    /// Returns experimental dense-stream telemetry when enabled.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.model.dense_stream_report()
+    }
+
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
@@ -1791,6 +1821,67 @@ fn load_model_for_kind(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     ensure_executable_load_options(options)?;
+    if let WeightResidency::SparseExpertCacheWithDenseLayers(combined) = options.weight_residency {
+        if options.quantization.is_some() {
+            return Err(Error::Quantization(format!(
+                "load-time quantization is unsupported for {} sparse expert caching with dense disk streaming; use a matching checkpoint-native packed format",
+                kind.model_type_name()
+            )));
+        }
+        let expert_cache = combined.expert_cache;
+        let non_expert = combined.non_expert;
+        return match kind {
+            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
+                crate::deepseek_v3::load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::GptOss => Ok(Model::GptOssLayerwise(
+                crate::gpt_oss::load_gpt_oss_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Inkling => Ok(Model::InklingLayerwise(
+                crate::inkling::load_inkling_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Lfm2 => Ok(Model::Lfm2Layerwise(
+                crate::lfm2::load_lfm2_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::NemotronH => Ok(Model::NemotronHLayerwise(
+                crate::nemotron_h::load_nemotron_h_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
+                crate::qwen3::load_qwen3_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3Next => Ok(Model::Qwen3NextLayerwise(
+                crate::qwen_hybrid::load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoeLayerwise(
+                crate::qwen3_vl::load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen35Moe => Ok(Model::Qwen35MoeLayerwise(
+                crate::qwen_hybrid::load_qwen35_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "sparse expert caching with dense disk streaming requires a supported safetensors MoE architecture, not {}",
+                kind.model_type_name()
+            ))),
+        };
+    }
     if let WeightResidency::SparseExpertCache(expert_cache) = options.weight_residency {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(
@@ -1877,10 +1968,15 @@ fn load_model_for_kind(
             ))),
         };
     }
-    if let WeightResidency::LayerwiseHost(layerwise) = options.weight_residency {
+    let layerwise: Option<LayerExecutionLoadOptions> = match options.weight_residency {
+        WeightResidency::LayerwiseHost(options) => Some(options.into()),
+        WeightResidency::DenseDiskStream(options) => Some(options.into()),
+        _ => None,
+    };
+    if let Some(layerwise) = layerwise {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} layerwise host residency; use a matching checkpoint-native packed format",
+                "load-time quantization is unsupported for {} layer streaming; use a matching checkpoint-native packed format",
                 kind.model_type_name()
             )));
         }
@@ -1911,7 +2007,16 @@ fn load_model_for_kind(
             )),
             ModelKind::Llama => Ok(Model::LlamaLayerwise(crate::llama::load_llama_model(
                 model_dir,
-                crate::llama::LlamaLoadOptions::layerwise_host(layerwise),
+                crate::llama::LlamaLoadOptions {
+                    weight_residency: match layerwise {
+                        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+                            WeightResidency::LayerwiseHost(options)
+                        }
+                        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+                            WeightResidency::DenseDiskStream(options)
+                        }
+                    },
+                },
                 stream,
                 weights_stream,
             )?)),

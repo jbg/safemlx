@@ -22,7 +22,7 @@ use crate::{
     expert_cache::{ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass},
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
     },
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
@@ -87,6 +87,12 @@ impl Qwen3VlLayerwiseModel {
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
     }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
+    }
 
     /// Returns the persistent checkpoint store.
     pub fn weight_store(&self) -> &SafetensorsWeightStore {
@@ -148,7 +154,7 @@ impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
 /// Loads either Qwen3-VL architecture through shared bounded residency.
 pub fn load_qwen3_vl_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -173,6 +179,39 @@ pub fn load_qwen3_vl_sparse_expert_cache_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
+    load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads Qwen3-VL-MoE with expert caching and disk-streamed non-expert units.
+pub fn load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3VlLayerwiseModel, Error> {
+    load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     if !args.text_config.is_moe() {
@@ -182,13 +221,8 @@ pub fn load_qwen3_vl_sparse_expert_cache_model(
     }
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model(
-        model_dir,
-        adapter,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = crate::qwen3::qwen3_expert_catalog_at(
         &args.text_config,
@@ -924,7 +958,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        expert_cache::ExpertCacheLoadOptions, models::qwen3_vl as eager, offload::OffloadConfig,
+        expert_cache::ExpertCacheLoadOptions, layerwise::LayerwiseLoadOptions,
+        models::qwen3_vl as eager, offload::OffloadConfig,
     };
 
     fn config(moe: bool) -> serde_json::Value {

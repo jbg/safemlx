@@ -21,7 +21,7 @@ use crate::{
     },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
     },
     models::{
         common::moe::PackedSwiGluExperts,
@@ -62,6 +62,12 @@ impl Lfm2LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
     }
 
     /// Returns sparse expert-cache telemetry when enabled.
@@ -124,7 +130,7 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
 /// Loads dense or MoE LFM2 through bounded host residency.
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -149,6 +155,39 @@ pub fn load_lfm2_sparse_expert_cache_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
+    load_lfm2_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads LFM2 with expert caching and disk-streamed non-expert units.
+pub fn load_lfm2_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Lfm2LayerwiseModel, Error> {
+    load_lfm2_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+fn load_lfm2_sparse_expert_cache_model_with_non_expert(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_model_args(model_dir)?;
     if !args.is_moe() {
@@ -158,13 +197,8 @@ pub fn load_lfm2_sparse_expert_cache_model(
     }
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model(
-        model_dir,
-        adapter,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = lfm2_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new(

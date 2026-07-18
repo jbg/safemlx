@@ -20,7 +20,7 @@ use crate::{
     },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
     },
     models::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
@@ -75,6 +75,12 @@ impl QwenHybridLayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
     }
 
     /// Returns sparse expert-cache telemetry when enabled.
@@ -138,7 +144,7 @@ impl CausalLm<Cache> for QwenHybridLayerwiseModel {
 /// Loads a text-only Qwen3-Next model through bounded host residency.
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -162,7 +168,7 @@ pub fn load_qwen3_next_layerwise_model(
 /// Loads a text-only or multimodal dense/MoE Qwen3.5 model through bounded residency.
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -204,6 +210,36 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
         None,
         None,
         options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads Qwen3-Next with expert caching and disk-streamed non-expert units.
+pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3-Next MoE checkpoint".into(),
+        ));
+    }
+    load_qwen_hybrid_sparse_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen3Next,
+        None,
+        None,
+        None,
+        options,
+        non_expert,
         stream,
         weights_stream,
     )
@@ -232,6 +268,37 @@ pub fn load_qwen35_sparse_expert_cache_model(
         video_token_id,
         vision,
         options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads Qwen3.5 MoE with expert caching and disk-streamed non-expert units.
+pub fn load_qwen35_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let (args, image_token_id, video_token_id, vision) =
+        resident::get_qwen3_5_moe_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3.5 MoE checkpoint".into(),
+        ));
+    }
+    load_qwen_hybrid_sparse_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen35,
+        image_token_id,
+        video_token_id,
+        vision,
+        options,
+        non_expert,
         stream,
         weights_stream,
     )
@@ -246,6 +313,7 @@ fn load_qwen_hybrid_sparse_model(
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
     options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -258,13 +326,8 @@ fn load_qwen_hybrid_sparse_model(
         stream,
     )?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model(
-        model_dir,
-        adapter,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new(
@@ -281,7 +344,7 @@ fn load_qwen_hybrid_layerwise_model(
     model_dir: &Path,
     args: ModelArgs,
     family: QwenHybridFamily,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -306,7 +369,7 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {

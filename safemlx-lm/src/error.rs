@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid dense disk streaming configuration or background work.
+    #[error(transparent)]
+    DenseStream(#[from] crate::dense_stream::DenseStreamError),
+
     /// Invalid unified Llama model configuration or cache usage.
     #[error(transparent)]
     LlamaModel(#[from] crate::llama::LlamaModelError),

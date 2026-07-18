@@ -916,7 +916,7 @@ impl ResidencyManager {
                     units: records,
                     source_stream,
                     device_stream,
-                    active_window: BTreeSet::new(),
+                    active_windows: BTreeMap::new(),
                     group_windows: BTreeMap::new(),
                     telemetry,
                     host_bytes: 0,
@@ -1135,18 +1135,21 @@ impl ResidencyManager {
                 return Err(ResidencyError::UnknownUnit { id: id.clone() });
             }
         }
+        let key = (group.to_string(), tier);
         if active.is_empty() {
-            state.group_windows.remove(group);
+            state.group_windows.remove(&key);
         } else {
             state
                 .group_windows
-                .insert(group.to_string(), active.iter().cloned().collect());
+                .insert(key, active.iter().cloned().collect());
         }
-        state.active_window = state
+        let active_window = state
             .group_windows
-            .values()
-            .flat_map(|window| window.iter().cloned())
+            .iter()
+            .filter(|((_, window_tier), _)| *window_tier == tier)
+            .flat_map(|(_, window)| window.iter().cloned())
             .collect();
+        state.active_windows.insert(tier, active_window);
         let depth = state.plan.config().prefetch_depth();
         let mut seen = BTreeSet::new();
         let selected = upcoming
@@ -1162,6 +1165,46 @@ impl ResidencyManager {
                     .map(|outcome| (id, outcome))
             })
             .collect()
+    }
+
+    /// Replaces one named protected window without materializing its units.
+    ///
+    /// This is used by schedulers that submit materialization through a
+    /// separate bounded service. Protection owned by other named windows is
+    /// preserved.
+    pub fn protect_group_window(
+        &self,
+        group: &str,
+        active: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<(), ResidencyError> {
+        if group.trim().is_empty() {
+            return Err(ResidencyError::InvalidGroupId);
+        }
+        let mut state = self.lock()?;
+        require_initialized(&state)?;
+        for id in active {
+            if !state.units.contains_key(id) {
+                return Err(ResidencyError::UnknownUnit { id: id.clone() });
+            }
+        }
+        validate_target(tier, "protect_group_window")?;
+        let key = (group.to_string(), tier);
+        if active.is_empty() {
+            state.group_windows.remove(&key);
+        } else {
+            state
+                .group_windows
+                .insert(key, active.iter().cloned().collect());
+        }
+        let active_window = state
+            .group_windows
+            .iter()
+            .filter(|((_, window_tier), _)| *window_tier == tier)
+            .flat_map(|(_, window)| window.iter().cloned())
+            .collect();
+        state.active_windows.insert(tier, active_window);
+        Ok(())
     }
 
     /// Explicitly evicts one host or device copy.
@@ -1233,14 +1276,23 @@ impl ResidencyManager {
                     device_resident: unit.device.is_some(),
                     host_pins: unit.host.as_ref().map_or(0, |copy| copy.pins),
                     device_pins: unit.device.as_ref().map_or(0, |copy| copy.pins),
-                    active_window: state.active_window.contains(unit.spec.id()),
+                    active_window: state
+                        .active_windows
+                        .values()
+                        .any(|window| window.contains(unit.spec.id())),
                 })
                 .collect();
             (
                 state.initialized,
                 state.telemetry.snapshot(),
                 units,
-                state.active_window.iter().cloned().collect(),
+                state
+                    .active_windows
+                    .values()
+                    .flat_map(|window| window.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             )
         };
         Ok(ResidencyReport {
@@ -1270,8 +1322,8 @@ struct ManagerState {
     units: BTreeMap<OffloadUnitId, UnitRecord>,
     source_stream: Stream,
     device_stream: Stream,
-    active_window: BTreeSet<OffloadUnitId>,
-    group_windows: BTreeMap<String, BTreeSet<OffloadUnitId>>,
+    active_windows: BTreeMap<MemoryTier, BTreeSet<OffloadUnitId>>,
+    group_windows: BTreeMap<(String, MemoryTier), BTreeSet<OffloadUnitId>>,
     telemetry: OffloadTelemetry,
     host_bytes: u64,
     device_bytes: u64,
@@ -1510,7 +1562,13 @@ fn ensure_many_resident(
 
     let temporary_protection = ids
         .iter()
-        .filter(|id| state.active_window.insert((*id).clone()))
+        .filter(|id| {
+            state
+                .active_windows
+                .entry(tier)
+                .or_default()
+                .insert((*id).clone())
+        })
         .cloned()
         .collect::<Vec<_>>();
     let started = Instant::now();
@@ -1675,7 +1733,9 @@ fn ensure_many_resident(
             .set_resident_bytes(tier, tier_bytes(state, tier));
     }
     for id in temporary_protection {
-        state.active_window.remove(&id);
+        if let Some(window) = state.active_windows.get_mut(&tier) {
+            window.remove(&id);
+        }
     }
     result
 }
@@ -1885,7 +1945,10 @@ fn eviction_candidate(state: &ManagerState, tier: MemoryTier) -> Option<OffloadU
             let copy = unit.copy(tier)?;
             if unit.spec.policy() == ResidencyPolicy::Pinned
                 || copy.pins != 0
-                || state.active_window.contains(unit.spec.id())
+                || state
+                    .active_windows
+                    .get(&tier)
+                    .is_some_and(|window| window.contains(unit.spec.id()))
             {
                 return None;
             }
@@ -1911,7 +1974,10 @@ fn blockers(state: &ManagerState, tier: MemoryTier) -> Vec<ResidencyBlocker> {
         .filter_map(|unit| {
             let copy = unit.copy(tier)?;
             let pinned = unit.spec.policy() == ResidencyPolicy::Pinned;
-            let active_window = state.active_window.contains(unit.spec.id());
+            let active_window = state
+                .active_windows
+                .get(&tier)
+                .is_some_and(|window| window.contains(unit.spec.id()));
             (pinned || copy.pins != 0 || active_window).then(|| ResidencyBlocker {
                 id: unit.spec.id().clone(),
                 pinned,

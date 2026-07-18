@@ -20,7 +20,7 @@ use crate::{
         ExpertPass,
     },
     layerwise::{
-        load_layerwise_model, LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel,
+        load_layerwise_model, LayerExecutionLoadOptions, LayerwiseInput, LayerwiseModel,
         LayerwiseModelAdapter, StaticUnitBindings,
     },
     models::{
@@ -70,6 +70,12 @@ impl Qwen3LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
     }
 
     /// Returns sparse expert-cache telemetry when that residency mode is active.
@@ -140,7 +146,7 @@ impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for Qwen3LayerwiseModel {
 /// Loads dense or sparse-MoE Qwen3 through the bounded host-residency engine.
 pub fn load_qwen3_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3LayerwiseModel, Error> {
@@ -159,6 +165,39 @@ pub fn load_qwen3_sparse_expert_cache_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3LayerwiseModel, Error> {
+    load_qwen3_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads sparse Qwen3 with expert caching and disk-streamed non-expert units.
+pub fn load_qwen3_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3LayerwiseModel, Error> {
+    load_qwen3_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+fn load_qwen3_sparse_expert_cache_model_with_non_expert(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_qwen3_model_args(model_dir)?;
     if !args.is_moe() {
@@ -167,13 +206,8 @@ pub fn load_qwen3_sparse_expert_cache_model(
         ));
     }
     let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_layerwise_model(
-        model_dir,
-        adapter,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = qwen3_expert_catalog(&args, store.as_ref())?;
     let cache = ExpertCache::new(
@@ -658,8 +692,9 @@ mod tests {
 
     use super::*;
     use crate::{
+        layerwise::LayerwiseLoadOptions,
         models::qwen3,
-        offload::{OffloadConfig, ResidencyPolicy},
+        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -858,6 +893,70 @@ mod tests {
     fn qwen3_sparse_expert_cache_prefill_and_decode_parity() {
         sparse_expert_cache_parity(false);
         sparse_expert_cache_parity(true);
+    }
+
+    #[test]
+    fn qwen3_sparse_expert_cache_streams_non_expert_layers() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = qwen3::Model::new(args(true), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, gpu.stream());
+
+        let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
+        let expert_options = ExpertCacheLoadOptions::new(
+            non_expert,
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let dense =
+            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
+                .unwrap();
+        let mut cached = load_qwen3_sparse_expert_cache_model_with_dense_layers(
+            dir.path(),
+            expert_options,
+            dense,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let initial = cached.dense_stream_report().unwrap().unwrap();
+        assert!(initial
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().starts_with("qwen3.layer."))
+            .all(|unit| {
+                unit.planned_tier() == MemoryTier::Disk
+                    && !unit.host_resident()
+                    && !unit.device_resident()
+            }));
+
+        let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cached_cache = cached.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(
+                    qwen3::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut resident_cache,
+                    },
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, None, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        assert!(cached.expert_cache_report().unwrap().is_some());
     }
 
     fn sparse_expert_cache_parity(split_experts: bool) {

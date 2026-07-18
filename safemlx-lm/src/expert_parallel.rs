@@ -2413,9 +2413,14 @@ fn load_deepseek_ep(
             weights_stream,
         );
     }
-    if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+    if matches!(
+        options.weight_residency,
+        WeightResidency::LayerwiseHost(_)
+            | WeightResidency::DenseDiskStream(_)
+            | WeightResidency::SparseExpertCacheWithDenseLayers(_)
+    ) {
         return Err(Error::Parallel(
-            "expert-parallel loading does not accept whole-block layerwise residency; select sparse expert caching or fully resident loading"
+            "expert-parallel loading accepts fully resident weights or SparseExpertCache; dense non-expert layer streaming is not supported"
                 .into(),
         ));
     }
@@ -2562,9 +2567,14 @@ fn load_qwen3_ep(
             weights_stream,
         );
     }
-    if matches!(options.weight_residency, WeightResidency::LayerwiseHost(_)) {
+    if matches!(
+        options.weight_residency,
+        WeightResidency::LayerwiseHost(_)
+            | WeightResidency::DenseDiskStream(_)
+            | WeightResidency::SparseExpertCacheWithDenseLayers(_)
+    ) {
         return Err(Error::Parallel(
-            "expert-parallel loading does not accept whole-block layerwise residency; select sparse expert caching or fully resident loading"
+            "expert-parallel loading accepts fully resident weights or SparseExpertCache; dense non-expert layer streaming is not supported"
                 .into(),
         ));
     }

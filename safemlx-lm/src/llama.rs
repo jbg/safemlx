@@ -11,8 +11,9 @@ use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
     error::Error,
     layerwise::{
-        load_layerwise_model, LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel,
-        LayerwiseModelAdapter, LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, DenseDiskStreamReport, LayerwiseInput, LayerwiseLoadOptions,
+        LayerwiseModel, LayerwiseModelAdapter, LayerwiseModelMetadata, StaticUnitBindings,
+        WeightResidency,
     },
     models::{
         common::{
@@ -54,6 +55,15 @@ impl LlamaLoadOptions {
     pub const fn layerwise_host(options: LayerwiseLoadOptions) -> Self {
         Self {
             weight_residency: WeightResidency::LayerwiseHost(options),
+        }
+    }
+
+    /// Selects experimental dense disk streaming with finite tier budgets.
+    pub const fn dense_disk_stream(
+        options: crate::dense_stream::DenseDiskStreamLoadOptions,
+    ) -> Self {
+        Self {
+            weight_residency: WeightResidency::DenseDiskStream(options),
         }
     }
 }
@@ -128,6 +138,14 @@ impl LlamaModel {
         match &self.execution {
             LlamaExecution::FullyResident(_) => Ok(None),
             LlamaExecution::LayerwiseHost(model) => Ok(Some(model.residency_report()?)),
+        }
+    }
+
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        match &self.execution {
+            LlamaExecution::FullyResident(_) => Ok(None),
+            LlamaExecution::LayerwiseHost(model) => model.dense_stream_report(),
         }
     }
 
@@ -327,7 +345,20 @@ pub fn load_llama_model(
                 weights_stream,
             )?)
         }
-        WeightResidency::SparseExpertCache(_) => {
+        WeightResidency::DenseDiskStream(options) => {
+            let model_dir = model_dir.as_ref();
+            let args = resident::get_llama_model_args(model_dir)?;
+            let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
+            LlamaExecution::LayerwiseHost(load_layerwise_model(
+                model_dir,
+                adapter,
+                options,
+                stream,
+                weights_stream,
+            )?)
+        }
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
             return Err(Error::UnsupportedArchitecture(
                 "sparse expert caching is not supported for Llama checkpoints".into(),
             ));

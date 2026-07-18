@@ -25,6 +25,8 @@
 pub mod cache;
 /// Layerwise-host execution for DeepSeek-V3 and DeepSeek-R1.
 pub mod deepseek_v3;
+/// Experimental bounded dense-layer streaming from safetensors checkpoints.
+pub mod dense_stream;
 /// Error types returned by the language-model runtime.
 pub mod error;
 /// Architecture-independent sparse routed-expert caching and telemetry.
@@ -91,10 +93,13 @@ pub mod weight_store;
 /// Strict safetensors loading and validation utilities.
 pub mod weights;
 
+pub use dense_stream::{BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError};
+pub use expert_cache::SparseExpertDenseStreamLoadOptions;
 pub use layerwise::{
-    load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-    LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter,
-    LayerwiseModelMetadata, WeightResidency,
+    load_general_layerwise_model, DenseDiskStreamReport, GeneralLayerwiseModel,
+    GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions, LayerwiseForwardState,
+    LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter, LayerwiseModelMetadata,
+    WeightResidency,
 };
 pub use llama::{load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel};
 pub use models::{

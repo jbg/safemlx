@@ -17,6 +17,7 @@ use safemlx::{
 };
 
 use crate::{
+    dense_stream::DenseDiskStreamLoadOptions,
     layerwise::LayerwiseLoadOptions,
     offload::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
@@ -34,6 +35,28 @@ pub struct ExpertIdentity {
     pub layer: usize,
     /// Global expert identity from the model router.
     pub global_expert: usize,
+}
+
+/// Sparse expert-cache controls with dense disk streaming for non-expert units.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SparseExpertDenseStreamLoadOptions {
+    /// Existing expert-granular budgets and compact-bank controls.
+    pub expert_cache: ExpertCacheLoadOptions,
+    /// Finite streaming controls for attention, routers, norms, and dense weights.
+    pub non_expert: DenseDiskStreamLoadOptions,
+}
+
+impl SparseExpertDenseStreamLoadOptions {
+    /// Combines existing expert controls with dense non-expert streaming.
+    pub const fn new(
+        expert_cache: ExpertCacheLoadOptions,
+        non_expert: DenseDiskStreamLoadOptions,
+    ) -> Self {
+        Self {
+            expert_cache,
+            non_expert,
+        }
+    }
 }
 
 impl ExpertIdentity {

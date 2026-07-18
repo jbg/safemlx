@@ -20,7 +20,7 @@ use crate::{
     },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
     },
     models::{
         common::{self, generation::CausalLm},
@@ -60,6 +60,12 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
     }
 
     /// Returns sparse expert-cache telemetry when that residency mode is active.
@@ -122,7 +128,7 @@ impl CausalLm<Cache> for DeepSeekV3LayerwiseModel {
 /// Loads DeepSeek-V3/R1 through the generalized host-residency engine.
 pub fn load_deepseek_v3_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -148,17 +154,45 @@ pub fn load_deepseek_v3_sparse_expert_cache_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads DeepSeek-V3/R1 with expert caching and disk-streamed non-expert units.
+pub fn load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
+        model_dir,
+        options,
+        non_expert,
+        stream,
+        weights_stream,
+    )
+}
+
+fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_general_layerwise_model(
-        model_dir,
-        adapter,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
     let cache = ExpertCache::new(
@@ -183,7 +217,7 @@ pub struct DeepSeekV3LayerwiseAdapter {
 }
 
 impl DeepSeekV3LayerwiseAdapter {
-    fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         Ok(Self {
             embedding: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,

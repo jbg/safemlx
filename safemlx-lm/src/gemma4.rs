@@ -16,7 +16,7 @@ use crate::{
     error::Error,
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
     },
     models::{
         common::generation::CausalLm,
@@ -74,6 +74,12 @@ impl Gemma4LayerwiseModel {
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
     }
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        self.execution.dense_stream_report()
+    }
 
     /// Returns the persistent checkpoint store.
     pub fn weight_store(&self) -> &SafetensorsWeightStore {
@@ -125,7 +131,7 @@ impl CausalLm<Cache> for Gemma4LayerwiseModel {
 /// Loads Gemma 4 text and configured media towers through bounded residency.
 pub fn load_gemma4_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: LayerwiseLoadOptions,
+    options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
@@ -1186,6 +1192,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
             gemma4::{self as resident, Model, ModelInput},

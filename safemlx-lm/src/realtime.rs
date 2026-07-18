@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::{
     error::Error,
-    layerwise::WeightResidency,
+    layerwise::{LayerExecutionLoadOptions, WeightResidency},
     models::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
     moshi::MoshiLayerwiseModel,
     sampler::{DefaultSampler, Sampler},
@@ -211,10 +211,15 @@ pub fn load_model_with_options(
 ) -> Result<LoadedRealtimeModel, Error> {
     ensure_executable_load_options(options)?;
     let kind = realtime_model_kind(&model_dir)?;
-    if let WeightResidency::LayerwiseHost(layerwise) = options.weight_residency {
+    let layerwise: Option<LayerExecutionLoadOptions> = match options.weight_residency {
+        WeightResidency::LayerwiseHost(options) => Some(options.into()),
+        WeightResidency::DenseDiskStream(options) => Some(options.into()),
+        _ => None,
+    };
+    if let Some(layerwise) = layerwise {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} layerwise host residency; use a matching checkpoint-native packed format",
+                "load-time quantization is unsupported for {} layer streaming; use a matching checkpoint-native packed format",
                 kind.model_type()
             )));
         }
@@ -344,6 +349,18 @@ impl LoadedRealtimeModel {
             Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
                 model.residency_report().map(Some)
             }
+        }
+    }
+
+    /// Returns dense-stream observations when that policy is active.
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+        match self {
+            Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
+                model.dense_stream_report()
+            }
+            Self::Moshi(_) | Self::PersonaPlex(_) => Ok(None),
         }
     }
 
