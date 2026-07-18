@@ -1464,9 +1464,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        layerwise::LayerwiseLoadOptions,
+        dense_stream::DenseDiskStreamLoadOptions,
+        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::moshi as eager,
-        offload::OffloadConfig,
+        offload::{MemoryTier, OffloadConfig},
         realtime::{generate_encoded_greedy, RealtimeSpeechModel},
     };
 
@@ -1777,6 +1778,116 @@ mod tests {
             crate::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
         ));
         assert_eq!(loaded.execution_group_reports().unwrap().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
+    fn dense_stream_teacher_forced_and_realtime_multigroup_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let dir = fixture(&gpu);
+        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let mut streamed = load_moshi_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(dense),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let initial = streamed.dense_stream_report().unwrap().unwrap();
+        assert!(initial
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| {
+                ["moshi.temporal.", "moshi.depth_slice."]
+                    .iter()
+                    .any(|prefix| unit.id().as_str().starts_with(prefix))
+            })
+            .all(|unit| {
+                unit.planned_tier() == MemoryTier::Disk
+                    && !unit.host_resident()
+                    && !unit.device_resident()
+            }));
+
+        let text = Array::from_slice(&[1i32], &[1, 1]);
+        let audio = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+        let depth = Array::from_slice(&[2i32, 3], &[1, 2]);
+        let mut resident_cache = resident.new_cache();
+        let mut streamed_cache = streamed.new_cache();
+        let expected = resident
+            .token_step(&text, &audio, &depth, &mut resident_cache, gpu.stream())
+            .unwrap();
+        let actual = streamed
+            .token_step(&text, &audio, &depth, &mut streamed_cache, gpu.stream())
+            .unwrap();
+        assert_close(&expected.text_logits, &actual.text_logits);
+        assert_close(&expected.temporal_output, &actual.temporal_output);
+        for (expected, actual) in expected.audio_logits.iter().zip(&actual.audio_logits) {
+            assert_close(expected, actual);
+        }
+
+        let mut resident_state = resident.new_realtime_state();
+        let mut streamed_state = streamed.new_realtime_state();
+        let input = Array::from_slice(&[4i32, 5], &[1, 2]);
+        let mut resident_text = crate::sampler::DefaultSampler;
+        let mut streamed_text = crate::sampler::DefaultSampler;
+        let mut resident_audio = (0..2)
+            .map(|_| crate::sampler::DefaultSampler)
+            .collect::<Vec<_>>();
+        let mut streamed_audio = (0..2)
+            .map(|_| crate::sampler::DefaultSampler)
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let expected = resident
+                .generate_step(
+                    &mut resident_state,
+                    &input,
+                    &mut resident_text,
+                    &mut resident_audio,
+                    0.0,
+                    0.0,
+                    None,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = streamed
+                .generate_step(
+                    &mut streamed_state,
+                    &input,
+                    &mut streamed_text,
+                    &mut streamed_audio,
+                    0.0,
+                    0.0,
+                    None,
+                    gpu.stream(),
+                )
+                .unwrap();
+            assert_tokens_equal(&expected.text_token, &actual.text_token, gpu.stream());
+            assert_tokens_equal(
+                &expected.sampled_audio_tokens,
+                &actual.sampled_audio_tokens,
+                gpu.stream(),
+            );
+        }
+        assert_eq!(resident_state.step(), streamed_state.step());
+        let report = streamed.dense_stream_report().unwrap().unwrap();
+        assert!(report.decode_forwards() >= 3);
+
+        let loaded = crate::realtime::load_model_with_options(
+            dir.path(),
+            crate::models::ModelLoadOptions::default()
+                .with_weight_residency(crate::layerwise::WeightResidency::DenseDiskStream(dense)),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &loaded,
+            crate::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
+        ));
+        assert!(loaded.dense_stream_report().unwrap().is_some());
     }
 
     #[test]

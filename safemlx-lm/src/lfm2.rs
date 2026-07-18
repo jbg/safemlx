@@ -781,10 +781,11 @@ mod tests {
 
     use super::{load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model};
     use crate::{
+        dense_stream::DenseDiskStreamLoadOptions,
         expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
+        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::lfm2::{self as resident, Cache, LayerCache, Model, ModelArgs},
-        offload::{OffloadConfig, ResidencyPolicy},
+        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -908,7 +909,7 @@ mod tests {
         }
     }
 
-    fn parity(moe: bool, depth: usize) {
+    fn parity(moe: bool, depth: usize, dense_stream: bool) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut fixture = Model::new(args(moe), gpu.stream()).unwrap();
@@ -917,13 +918,30 @@ mod tests {
         write_fixture(dir.path(), &fixture, gpu.stream());
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_lfm2_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
+        let options = if dense_stream {
+            LayerExecutionLoadOptions::DenseDiskStream(
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+            )
+        } else {
+            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, depth).unwrap(),
+            ))
+        };
+        let mut layerwise =
+            load_lfm2_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+        if dense_stream {
+            let report = layerwise.dense_stream_report().unwrap().unwrap();
+            assert!(report
+                .residency()
+                .units()
+                .iter()
+                .filter(|unit| unit.id().as_str().starts_with("lfm2.layer."))
+                .all(|unit| {
+                    unit.planned_tier() == MemoryTier::Disk
+                        && !unit.host_resident()
+                        && !unit.device_resident()
+                }));
+        }
         let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = Cache { layers: Vec::new() };
         for tokens in [
@@ -950,31 +968,38 @@ mod tests {
                 };
                 assert_eq!(expected_offset, actual_offset);
             }
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("lfm2.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
+            if !dense_stream {
+                let report = layerwise.residency_report().unwrap();
+                let layers = report
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.id().as_str().starts_with("lfm2.layer."))
+                    .collect::<Vec<_>>();
+                assert!(layers.iter().all(|unit| unit.host_resident()));
+                assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
+                assert!(report
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.device_resident() && !layers.contains(unit))
+                    .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
+            }
         }
     }
 
     #[test]
     fn lfm2_dense_hybrid_layerwise_prefill_and_cached_decode_parity() {
-        parity(false, 1);
-        parity(false, 2);
+        parity(false, 1, false);
+        parity(false, 2, false);
     }
 
     #[test]
     fn lfm2_split_moe_hybrid_layerwise_prefill_and_cached_decode_parity() {
-        parity(true, 1);
+        parity(true, 1, false);
+    }
+
+    #[test]
+    fn lfm2_dense_stream_hybrid_prefill_and_cached_decode_parity() {
+        parity(false, 1, true);
     }
 
     #[test]

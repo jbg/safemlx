@@ -958,8 +958,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        expert_cache::ExpertCacheLoadOptions, layerwise::LayerwiseLoadOptions,
-        models::qwen3_vl as eager, offload::OffloadConfig,
+        dense_stream::DenseDiskStreamLoadOptions,
+        expert_cache::ExpertCacheLoadOptions,
+        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        models::qwen3_vl as eager,
+        offload::{MemoryTier, OffloadConfig},
     };
 
     fn config(moe: bool) -> serde_json::Value {
@@ -1071,7 +1074,7 @@ mod tests {
         }
     }
 
-    fn parity(moe: bool, depth: usize) {
+    fn parity(moe: bool, depth: usize, dense_stream: bool) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let config_dir = tempfile::tempdir().unwrap();
@@ -1088,13 +1091,34 @@ mod tests {
 
         let mut resident =
             eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_qwen3_vl_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
+        let options = if dense_stream {
+            LayerExecutionLoadOptions::DenseDiskStream(
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+            )
+        } else {
+            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, depth).unwrap(),
+            ))
+        };
+        let mut layerwise =
+            load_qwen3_vl_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+        if dense_stream {
+            let report = layerwise.dense_stream_report().unwrap().unwrap();
+            assert!(report
+                .residency()
+                .units()
+                .iter()
+                .filter(|unit| {
+                    ["qwen3_vl.vision.", "qwen3_vl.text."]
+                        .iter()
+                        .any(|prefix| unit.id().as_str().starts_with(prefix))
+                })
+                .all(|unit| {
+                    unit.planned_tier() == MemoryTier::Disk
+                        && !unit.host_resident()
+                        && !unit.device_resident()
+                }));
+        }
         let before = Array::from_slice(&[1u32], &[1, 1]);
         let after = Array::from_slice(&[2u32], &[1, 1]);
         let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
@@ -1124,27 +1148,34 @@ mod tests {
                 .unwrap();
             assert_close(&actual, &expected);
         }
-        let report = layerwise.residency_report().unwrap();
-        for prefix in ["qwen3_vl.vision.", "qwen3_vl.text."] {
-            let resident = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with(prefix))
-                .filter(|unit| unit.device_resident())
-                .count();
-            assert!(resident <= depth);
+        if !dense_stream {
+            let report = layerwise.residency_report().unwrap();
+            for prefix in ["qwen3_vl.vision.", "qwen3_vl.text."] {
+                let resident = report
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.id().as_str().starts_with(prefix))
+                    .filter(|unit| unit.device_resident())
+                    .count();
+                assert!(resident <= depth);
+            }
         }
     }
 
     #[test]
     fn qwen3_vl_dense_multimodal_and_decode_parity() {
-        parity(false, 1);
-        parity(false, 2);
+        parity(false, 1, false);
+        parity(false, 2, false);
     }
 
     #[test]
     fn qwen3_vl_moe_multimodal_and_decode_parity() {
-        parity(true, 1);
+        parity(true, 1, false);
+    }
+
+    #[test]
+    fn qwen3_vl_dense_stream_multigroup_prefill_and_decode_parity() {
+        parity(false, 1, true);
     }
 
     #[test]

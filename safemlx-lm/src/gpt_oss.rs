@@ -620,10 +620,11 @@ mod tests {
     use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
         cache::KeyValueCache,
+        dense_stream::DenseDiskStreamLoadOptions,
         expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
+        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::gpt_oss::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
-        offload::{OffloadConfig, ResidencyPolicy},
+        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn tiny_args() -> ModelArgs {
@@ -718,7 +719,7 @@ mod tests {
         }
     }
 
-    fn parity(depth: usize) {
+    fn parity(depth: usize, dense_stream: bool) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut fixture = Model::new(tiny_args(), gpu.stream()).unwrap();
@@ -727,13 +728,30 @@ mod tests {
         write_fixture(dir.path(), &fixture);
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_gpt_oss_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
+        let options = if dense_stream {
+            LayerExecutionLoadOptions::DenseDiskStream(
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+            )
+        } else {
+            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, depth).unwrap(),
+            ))
+        };
+        let mut layerwise =
+            load_gpt_oss_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+        if dense_stream {
+            let report = layerwise.dense_stream_report().unwrap().unwrap();
+            assert!(report
+                .residency()
+                .units()
+                .iter()
+                .filter(|unit| unit.id().as_str().starts_with("gpt_oss.layer."))
+                .all(|unit| {
+                    unit.planned_tier() == MemoryTier::Disk
+                        && !unit.host_resident()
+                        && !unit.device_resident()
+                }));
+        }
         let mut resident_cache = Cache::default();
         let mut layerwise_cache = Cache::default();
         for tokens in [
@@ -754,26 +772,33 @@ mod tests {
                 assert_eq!(expected.offset(), actual.offset());
                 assert_eq!(expected.max_size(), actual.max_size());
             }
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("gpt_oss.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
+            if !dense_stream {
+                let report = layerwise.residency_report().unwrap();
+                let layers = report
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.id().as_str().starts_with("gpt_oss.layer."))
+                    .collect::<Vec<_>>();
+                assert!(layers.iter().all(|unit| unit.host_resident()));
+                assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
+                assert!(report
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.device_resident() && !layers.contains(unit))
+                    .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
+            }
         }
     }
 
     #[test]
     fn gpt_oss_native_mxfp4_layerwise_prefill_and_cached_decode_parity() {
-        parity(1);
-        parity(2);
+        parity(1, false);
+        parity(2, false);
+    }
+
+    #[test]
+    fn gpt_oss_native_mxfp4_dense_stream_prefill_and_cached_decode_parity() {
+        parity(1, true);
     }
 
     #[test]
