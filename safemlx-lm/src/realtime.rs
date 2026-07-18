@@ -271,11 +271,11 @@ pub fn load_model_with_options(
 pub enum LoadedRealtimeModel {
     /// Moshi-family model.
     Moshi(moshi::Model),
-    /// Moshi-family model using bounded host residency.
+    /// Moshi-family model using bounded layer residency.
     MoshiLayerwise(MoshiLayerwiseModel),
     /// PersonaPlex model.
     PersonaPlex(personaplex::Model),
-    /// PersonaPlex model using bounded host residency.
+    /// PersonaPlex model using bounded layer residency.
     PersonaPlexLayerwise(MoshiLayerwiseModel),
 }
 
@@ -301,7 +301,7 @@ impl LoadedRealtimeModel {
         }
     }
 
-    /// Returns the fully resident Moshi model when this load did not select host residency.
+    /// Returns the fully resident Moshi model when this load did not select bounded residency.
     pub fn try_as_moshi_model(&self) -> Option<&moshi::Model> {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => Some(model),
@@ -311,13 +311,13 @@ impl LoadedRealtimeModel {
 
     /// Returns the underlying fully resident Moshi-family token model.
     ///
-    /// Panics for a layerwise-host model; use [`Self::try_as_moshi_model`] or
+    /// Panics for a bounded-layer model; use [`Self::try_as_moshi_model`] or
     /// [`Self::args`] when either residency policy is accepted.
     pub fn as_moshi_model(&self) -> &moshi::Model {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
             Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
-                panic!("layerwise-host realtime models do not contain a fully resident Moshi model")
+                panic!("bounded-layer realtime models do not contain a fully resident Moshi model")
             }
         }
     }
@@ -327,7 +327,7 @@ impl LoadedRealtimeModel {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
             Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
-                panic!("layerwise-host realtime models do not contain a fully resident Moshi model")
+                panic!("bounded-layer realtime models do not contain a fully resident Moshi model")
             }
         }
     }
@@ -337,7 +337,7 @@ impl LoadedRealtimeModel {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
             Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
-                panic!("a layerwise-host realtime model cannot be converted into a fully resident Moshi model")
+                panic!("a bounded-layer realtime model cannot be converted into a fully resident Moshi model")
             }
         }
     }

@@ -2133,7 +2133,7 @@ pub enum LayerwiseModelError {
     #[error("unknown resident execution group {0:?}")]
     UnknownExecutionGroup(String),
     /// GGUF is intentionally outside this loader's safetensors contract.
-    #[error("layerwise host residency requires safetensors; GGUF is unsupported")]
+    #[error("bounded layer residency requires safetensors; GGUF is unsupported")]
     GgufUnsupported,
     /// The configured ordered layer window was invalid.
     #[error("device layer window depth {depth} must be between 1 and layer count {layer_count}")]

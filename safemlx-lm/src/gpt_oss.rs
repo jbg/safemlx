@@ -1,4 +1,4 @@
-//! Unified fully resident and layerwise-host GPT-OSS execution.
+//! Unified fully resident and bounded layer execution for GPT-OSS.
 
 use std::{path::Path, time::Instant};
 
@@ -41,7 +41,7 @@ const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
 const NORM_UNIT: &str = "gpt_oss.static.norm";
 const HEAD_UNIT: &str = "gpt_oss.static.output";
 
-/// GPT-OSS causal LM using bounded host residency for complete decoder blocks.
+/// GPT-OSS causal LM using bounded residency for complete decoder blocks.
 pub struct GptOssLayerwiseModel {
     execution: GeneralLayerwiseModel<GptOssLayerwiseAdapter>,
 }
@@ -603,7 +603,7 @@ pub(crate) fn gpt_oss_expert_catalog(
     Ok(entries)
 }
 
-/// GPT-OSS token generation iterator using layerwise-host execution.
+/// GPT-OSS token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, GptOssLayerwiseModel, Cache, S>;
 

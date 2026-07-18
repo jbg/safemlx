@@ -185,7 +185,7 @@ impl ModelLoadOptions {
         Self::default().with_parallel_topology(topology)
     }
 
-    /// Selects fully resident or layerwise-host safetensors execution.
+    /// Selects fully resident or bounded layer execution for safetensors.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
         self
@@ -386,56 +386,56 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
 pub enum Model {
     /// DeepSeek-V3/R1 model.
     DeepSeekV3(deepseek_v3::Model),
-    /// DeepSeek-V3/R1 model using layerwise-host execution.
+    /// DeepSeek-V3/R1 model using bounded layer execution.
     DeepSeekV3Layerwise(crate::deepseek_v3::DeepSeekV3LayerwiseModel),
     /// Gemma 4 text model.
     Gemma4(gemma4::Model),
-    /// Gemma 4 multimodal model using layerwise-host execution.
+    /// Gemma 4 multimodal model using bounded layer execution.
     Gemma4Layerwise(crate::gemma4::Gemma4LayerwiseModel),
     /// OpenAI GPT-OSS model.
     GptOss(gpt_oss::Model),
-    /// OpenAI GPT-OSS model using layerwise-host execution.
+    /// OpenAI GPT-OSS model using bounded layer execution.
     GptOssLayerwise(crate::gpt_oss::GptOssLayerwiseModel),
     /// Thinking Machines Lab Inkling model.
     Inkling(inkling::Model),
-    /// Inkling multimodal model using layerwise-host execution.
+    /// Inkling multimodal model using bounded layer execution.
     InklingLayerwise(crate::inkling::InklingLayerwiseModel),
     /// Llama-compatible dense model.
     Llama(llama::ResidentModel),
-    /// Llama-compatible model using the unified layerwise-host API.
+    /// Llama-compatible model using the unified bounded layer API.
     LlamaLayerwise(crate::llama::LlamaModel),
     /// Liquid AI LFM2/LFM2.5 model.
     Lfm2(lfm2::Model),
-    /// Liquid AI LFM2/LFM2.5 model using layerwise-host execution.
+    /// Liquid AI LFM2/LFM2.5 model using bounded layer execution.
     Lfm2Layerwise(crate::lfm2::Lfm2LayerwiseModel),
     /// Nemotron-H hybrid model.
     NemotronH(nemotron_h::Model),
-    /// Nemotron-H hybrid model using layerwise-host execution.
+    /// Nemotron-H hybrid model using bounded layer execution.
     NemotronHLayerwise(crate::nemotron_h::NemotronHLayerwiseModel),
     /// Qwen3 model.
     Qwen3(qwen3::Model),
-    /// Qwen3 dense or sparse-MoE model using layerwise-host execution.
+    /// Qwen3 dense or sparse-MoE model using bounded layer execution.
     Qwen3Layerwise(crate::qwen3::Qwen3LayerwiseModel),
     /// Qwen3-Next model.
     Qwen3Next(qwen3_next::Model),
-    /// Qwen3-Next model using shared hybrid layerwise-host execution.
+    /// Qwen3-Next model using shared hybrid bounded layer execution.
     Qwen3NextLayerwise(crate::qwen_hybrid::QwenHybridLayerwiseModel),
     /// Qwen3-VL multimodal model.
     Qwen3Vl(qwen3_vl::Model),
-    /// Qwen3-VL multimodal model using vision/text layerwise-host execution.
+    /// Qwen3-VL multimodal model using vision/text bounded layer execution.
     Qwen3VlLayerwise(crate::qwen3_vl::Qwen3VlLayerwiseModel),
     /// Qwen3-VL-MoE multimodal model.
     Qwen3VlMoe(qwen3_vl_moe::Model),
-    /// Qwen3-VL-MoE multimodal model using vision/text layerwise-host execution.
+    /// Qwen3-VL-MoE multimodal model using vision/text bounded layer execution.
     Qwen3VlMoeLayerwise(crate::qwen3_vl::Qwen3VlLayerwiseModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
     Qwen35Moe(qwen3_5_moe::Model),
-    /// Qwen3.5 model using shared vision/hybrid layerwise-host execution.
+    /// Qwen3.5 model using shared vision/hybrid bounded layer execution.
     Qwen35MoeLayerwise(crate::qwen_hybrid::QwenHybridLayerwiseModel),
 }
 
 impl Model {
-    /// Returns residency telemetry when this model uses layerwise-host execution.
+    /// Returns residency telemetry when this model uses bounded layer execution.
     pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => Ok(Some(model.residency_report()?)),
@@ -553,7 +553,7 @@ impl Model {
                     observer,
                 ),
             (Self::DeepSeekV3Layerwise(_), ModelCache::DeepSeekV3(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host DeepSeek-V3 execution",
+                "detailed activation inspection is unavailable for bounded-layer DeepSeek-V3 execution",
             )),
             (Self::Llama(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
                 llama::ModelInput {
@@ -575,7 +575,7 @@ impl Model {
                     observer,
                 ),
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Llama execution",
+                "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
                 qwen3::ModelInput {
@@ -587,7 +587,7 @@ impl Model {
                 observer,
             ),
             (Self::Qwen3Layerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3 execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3 execution",
             )),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => model.forward_with_observer(
                 qwen3_5_moe::ModelInput {
@@ -600,7 +600,7 @@ impl Model {
                 observer,
             ),
             (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3.5 execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3.5 execution",
             )),
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => model.forward_with_observer(
                 qwen3_next::ModelInput {
@@ -613,7 +613,7 @@ impl Model {
                 observer,
             ),
             (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3-Next execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3-Next execution",
             )),
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => model.forward_with_observer(
                 gemma4::ModelInput {
@@ -628,7 +628,7 @@ impl Model {
                 observer,
             ),
             (Self::Gemma4Layerwise(_), ModelCache::Gemma4(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Gemma 4 execution",
+                "detailed activation inspection is unavailable for bounded-layer Gemma 4 execution",
             )),
             (Self::NemotronH(_) | Self::NemotronHLayerwise(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
@@ -686,7 +686,7 @@ impl Model {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
             (Self::Gemma4Layerwise(_), ModelCache::Gemma4(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Gemma 4 execution",
+                "detailed activation inspection is unavailable for bounded-layer Gemma 4 execution",
             )),
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
                 let prompt_tokens = input::text_token_ids(input, stream)?;
@@ -715,7 +715,7 @@ impl Model {
                 final_token_logits(&logits, stream)
             }
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Llama execution",
+                "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
             (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
                 let prompt_tokens = input::text_token_ids(input, stream)?;
@@ -731,19 +731,19 @@ impl Model {
                 final_token_logits(&logits, stream)
             }
             (Self::Qwen3Layerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3 execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3 execution",
             )),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
             (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3.5 execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3.5 execution",
             )),
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
             (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for layerwise-host Qwen3-Next execution",
+                "detailed activation inspection is unavailable for bounded-layer Qwen3-Next execution",
             )),
             (Self::NemotronH(_) | Self::NemotronHLayerwise(_), _) => Err(Exception::custom(
                 "detailed activation inspection is not implemented for nemotron_h yet",
@@ -1051,7 +1051,7 @@ pub enum ModelCache {
     Inkling(inkling::Cache),
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
-    /// Unified Llama cache used by layerwise-host execution.
+    /// Unified Llama cache used by bounded layer execution.
     LlamaLayerwise(crate::llama::LlamaCache),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
@@ -1076,31 +1076,31 @@ where
 {
     /// DeepSeek-V3/R1 generation iterator.
     DeepSeekV3(deepseek_v3::Generate<'a, S>),
-    /// DeepSeek-V3/R1 generation using layerwise-host execution.
+    /// DeepSeek-V3/R1 generation using bounded layer execution.
     DeepSeekV3Layerwise(crate::deepseek_v3::Generate<'a, S>),
     /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, S>),
-    /// Gemma 4 multimodal-prefill generation using layerwise-host execution.
+    /// Gemma 4 multimodal-prefill generation using bounded layer execution.
     Gemma4Layerwise(crate::gemma4::Generate<'a, S>),
     /// GPT-OSS generation iterator.
     GptOss(gpt_oss::Generate<'a, S>),
-    /// GPT-OSS generation using layerwise-host execution.
+    /// GPT-OSS generation using bounded layer execution.
     GptOssLayerwise(crate::gpt_oss::Generate<'a, S>),
     /// Inkling generation iterator.
     Inkling(inkling::Generate<'a, S>),
-    /// Inkling multimodal-prefill generation using layerwise-host execution.
+    /// Inkling multimodal-prefill generation using bounded layer execution.
     InklingLayerwise(crate::inkling::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
     LlamaSliding(llama::Generate<'a, SlidingKeyValueCache, S>),
-    /// Llama-compatible generation using layerwise-host execution.
+    /// Llama-compatible generation using bounded layer execution.
     LlamaLayerwise(
         common::generation::Generate<'a, crate::llama::LlamaModel, crate::llama::LlamaCache, S>,
     ),
     /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
-    /// Qwen3 generation using layerwise-host execution.
+    /// Qwen3 generation using bounded layer execution.
     Qwen3Layerwise(
         common::generation::Generate<
             'a,
@@ -1111,27 +1111,27 @@ where
     ),
     /// Qwen3-VL generation iterator.
     Qwen3Vl(qwen3_vl::Generate<'a, S>),
-    /// Qwen3-VL generation using vision/text layerwise-host execution.
+    /// Qwen3-VL generation using vision/text bounded layer execution.
     Qwen3VlLayerwise(crate::qwen3_vl::Generate<'a, S>),
     /// Qwen3-VL-MoE generation iterator.
     Qwen3VlMoe(qwen3_vl_moe::Generate<'a, S>),
-    /// Qwen3-VL-MoE generation using vision/text layerwise-host execution.
+    /// Qwen3-VL-MoE generation using vision/text bounded layer execution.
     Qwen3VlMoeLayerwise(crate::qwen3_vl::Generate<'a, S>),
     /// Nemotron-H generation iterator.
     NemotronH(nemotron_h::Generate<'a, S>),
-    /// Nemotron-H generation using layerwise-host execution.
+    /// Nemotron-H generation using bounded layer execution.
     NemotronHLayerwise(crate::nemotron_h::Generate<'a, S>),
     /// LFM2 generation iterator.
     Lfm2(lfm2::Generate<'a, S>),
-    /// LFM2 generation using layerwise-host execution.
+    /// LFM2 generation using bounded layer execution.
     Lfm2Layerwise(crate::lfm2::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
-    /// Qwen3.5 multimodal-prefill generation using shared layerwise-host execution.
+    /// Qwen3.5 multimodal-prefill generation using shared bounded layer execution.
     Qwen35MoeLayerwise(crate::qwen_hybrid::Generate<'a, S>),
     /// Qwen3-Next generation iterator.
     Qwen3Next(qwen3_next::Generate<'a, S>),
-    /// Qwen3-Next generation using shared hybrid layerwise-host execution.
+    /// Qwen3-Next generation using shared hybrid bounded layer execution.
     Qwen3NextLayerwise(crate::qwen_hybrid::Generate<'a, S>),
 }
 
@@ -1188,7 +1188,7 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// Returns residency telemetry when layerwise-host execution was selected.
+    /// Returns residency telemetry when bounded layer execution was selected.
     pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
         self.model.residency_report()
     }
@@ -2085,7 +2085,7 @@ fn load_model_for_kind(
                 )?,
             )),
             ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-                "PersonaPlex layerwise host residency is selected through the realtime loader"
+                "PersonaPlex bounded layer residency is selected through the realtime loader"
                     .into(),
             )),
         };

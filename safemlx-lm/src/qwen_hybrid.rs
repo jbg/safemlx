@@ -1,4 +1,4 @@
-//! Shared layerwise-host execution for Qwen3-Next and Qwen3.5 text models.
+//! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -141,7 +141,7 @@ impl CausalLm<Cache> for QwenHybridLayerwiseModel {
     }
 }
 
-/// Loads a text-only Qwen3-Next model through bounded host residency.
+/// Loads a text-only Qwen3-Next model through bounded layer residency.
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -1586,7 +1586,7 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
     }
 }
 
-/// Shared Qwen hybrid token generation iterator using layerwise-host execution.
+/// Shared Qwen hybrid token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, QwenHybridLayerwiseModel, Cache, S>;
 

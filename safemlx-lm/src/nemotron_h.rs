@@ -1,4 +1,4 @@
-//! Unified fully resident and layerwise-host Nemotron-H execution.
+//! Unified fully resident and bounded layer execution for Nemotron-H.
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -45,7 +45,7 @@ const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
 const NORM_UNIT: &str = "nemotron_h.static.norm";
 const HEAD_UNIT: &str = "nemotron_h.static.output";
 
-/// Nemotron-H causal LM using bounded host residency for hybrid blocks.
+/// Nemotron-H causal LM using bounded residency for hybrid blocks.
 pub struct NemotronHLayerwiseModel {
     execution: GeneralLayerwiseModel<NemotronHLayerwiseAdapter>,
 }
@@ -811,7 +811,7 @@ fn nemotron_recipe_binding(
     Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
 }
 
-/// Nemotron-H token generation iterator using layerwise-host execution.
+/// Nemotron-H token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, NemotronHLayerwiseModel, Cache, S>;
 

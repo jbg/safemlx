@@ -13,7 +13,7 @@
 //! lazily acquired selections from bounded persistent mappings.
 //! [`layerwise`] provides a model-family adapter contract and a reusable
 //! host-backed decoder engine. [`llama`] exposes one Llama/Mistral model API
-//! across fully resident and layerwise-host residency policies.
+//! across fully resident and bounded layer-execution residency policies.
 //! [`expert_cache`] adds opt-in expert-granular hot-device, warm-host, and
 //! cold-checkpoint residency for every supported safetensors MoE family,
 //! including rank-owned expert-parallel catalogs and separate prefill/decode
@@ -23,7 +23,7 @@
 
 /// Attention key/value cache implementations.
 pub mod cache;
-/// Layerwise-host execution for DeepSeek-V3 and DeepSeek-R1.
+/// Bounded layer execution for DeepSeek-V3 and DeepSeek-R1.
 pub mod deepseek_v3;
 /// Experimental bounded dense-layer streaming from safetensors checkpoints.
 pub mod dense_stream;
@@ -33,28 +33,28 @@ pub mod error;
 pub mod expert_cache;
 /// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
 pub mod expert_parallel;
-/// Multimodal layerwise-host execution for Gemma 4.
+/// Multimodal bounded layer execution for Gemma 4.
 pub mod gemma4;
 /// Gemma 4 multi-token prediction generation helpers.
 pub mod gemma4_mtp;
 mod gguf_tokenizer;
-/// Unified fully resident and layerwise-host GPT-OSS execution.
+/// Unified fully resident and bounded layer execution for GPT-OSS.
 pub mod gpt_oss;
-/// Multimodal layerwise-host execution for Thinking Machines Lab Inkling.
+/// Multimodal bounded layer execution for Thinking Machines Lab Inkling.
 pub mod inkling;
 /// Lightweight activation inspection hooks.
 pub mod inspection;
 /// Generic model-family adapters and host-backed layerwise execution.
 pub mod layerwise;
-/// Unified fully resident and layerwise-host LFM2/LFM2.5 execution.
+/// Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 pub mod lfm2;
 /// Unified Llama/Mistral loading across weight-residency policies.
 pub mod llama;
 /// Canonical unloaded-module checkpoint binding and resident assignment helpers.
 pub mod module_binding;
-/// Layerwise-host execution for Moshi and PersonaPlex realtime token models.
+/// Bounded layer execution for Moshi and PersonaPlex realtime token models.
 pub mod moshi;
-/// Unified fully resident and layerwise-host Nemotron-H execution.
+/// Unified fully resident and bounded layer execution for Nemotron-H.
 pub mod nemotron_h;
 /// Planning contracts and telemetry for weight residency management.
 pub mod offload;
@@ -70,11 +70,11 @@ pub mod pipeline;
 pub mod processor;
 /// Generic affine checkpoint quantization and conversion utilities.
 pub mod quantization;
-/// Unified dense and sparse-MoE Qwen3 layerwise-host execution.
+/// Unified dense and sparse-MoE Qwen3 bounded layer execution.
 pub mod qwen3;
-/// Shared multimodal layerwise-host execution for dense and MoE Qwen3-VL.
+/// Shared multimodal bounded layer execution for dense and MoE Qwen3-VL.
 pub mod qwen3_vl;
-/// Shared layerwise-host execution for Qwen3-Next and multimodal Qwen3.5 models.
+/// Shared bounded layer execution for Qwen3-Next and multimodal Qwen3.5 models.
 pub mod qwen_hybrid;
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;

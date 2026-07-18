@@ -1,4 +1,4 @@
-//! Layerwise-host execution for Moshi and PersonaPlex realtime token models.
+//! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -770,7 +770,7 @@ fn token_position(
         })
 }
 
-/// Loads a native MLX-layout Moshi checkpoint through bounded host residency.
+/// Loads a native MLX-layout Moshi checkpoint through bounded layer residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
@@ -800,7 +800,7 @@ pub fn load_moshi_layerwise_model(
     )
 }
 
-/// Loads the released PersonaPlex PyTorch checkpoint through bounded host residency.
+/// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,

@@ -1,4 +1,4 @@
-//! Unified fully resident and layerwise-host LFM2/LFM2.5 execution.
+//! Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -127,7 +127,7 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
     }
 }
 
-/// Loads dense or MoE LFM2 through bounded host residency.
+/// Loads dense or MoE LFM2 through bounded layer residency.
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -765,7 +765,7 @@ pub(crate) fn lfm2_expert_catalog(
     Ok(entries)
 }
 
-/// LFM2 token generation iterator using layerwise-host execution.
+/// LFM2 token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, Lfm2LayerwiseModel, Cache, S>;
 

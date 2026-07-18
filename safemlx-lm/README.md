@@ -145,12 +145,8 @@ validated from metadata, keep all source leases alive through evaluation, and
 materialize the transformed runtime representation on the host before device
 promotion. Direct `WeightBinding` construction remains compatible.
 
-On Apple silicon, CPU and GPU execution share the same physical unified-memory
-pool. Logical host/device accounting is useful for residency policy, but does
-not imply additional physical capacity. Choosing CPU execution can change
-execution behavior, wired memory, and residency pressure. CUDA behavior is
-verified by CI; local verification in this workspace does not make discrete
-memory capacity or performance claims.
+CUDA behavior is verified by CI; local verification in this workspace does not
+make discrete-memory capacity or performance claims.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated
@@ -194,9 +190,7 @@ not dequantized or repacked.
 Host budgets must contain all decoder weights. Device budgets must contain
 pinned static weights plus the largest permitted consecutive layer window.
 Residency reports account for parameter copies only; activations, KV state,
-kernels, and allocator cache can make MLX peak memory larger. On Apple silicon,
-logical CPU/GPU totals refer to one unified physical memory pool and do not
-increase model capacity.
+kernels, and allocator cache can make MLX peak memory larger.
 
 Transfers are synchronous because the pinned MLX API exposes whole-stream
 synchronization but no events. GGUF, load-time quantization, pinned host

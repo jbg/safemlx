@@ -1,4 +1,4 @@
-//! Layerwise-host execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
+//! Bounded layer execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -41,7 +41,7 @@ const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";
 const NORM_UNIT: &str = "deepseek_v3.static.norm";
 const HEAD_UNIT: &str = "deepseek_v3.static.output";
 
-/// DeepSeek-V3/R1 causal LM using bounded host residency for decoder blocks.
+/// DeepSeek-V3/R1 causal LM using bounded residency for decoder blocks.
 pub struct DeepSeekV3LayerwiseModel {
     execution: GeneralLayerwiseModel<DeepSeekV3LayerwiseAdapter>,
 }
@@ -782,7 +782,7 @@ fn deepseek_recipe_binding(
     Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
 }
 
-/// DeepSeek token generation using layerwise-host execution.
+/// DeepSeek token generation using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, DeepSeekV3LayerwiseModel, Cache, S>;
 

@@ -1,4 +1,4 @@
-//! Text-decoder layerwise-host execution for Gemma 4 checkpoints.
+//! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
 use std::{collections::BTreeMap, collections::HashMap, path::Path};
 
@@ -54,7 +54,7 @@ const VISION_EMBED_UNIT: &str = "gemma4.static.vision_embed";
 const AUDIO_STATIC_UNIT: &str = "gemma4.static.audio";
 const AUDIO_EMBED_UNIT: &str = "gemma4.static.audio_embed";
 
-/// Gemma 4 multimodal model using bounded host residency for media and text blocks.
+/// Gemma 4 multimodal model using bounded residency for media and text blocks.
 pub struct Gemma4LayerwiseModel {
     execution: GeneralLayerwiseModel<Gemma4LayerwiseAdapter>,
 }
@@ -1177,7 +1177,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
     }
 }
 
-/// Gemma 4 token generation using layerwise-host text execution.
+/// Gemma 4 token generation using bounded text-layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     crate::models::common::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
 

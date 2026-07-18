@@ -25,21 +25,21 @@ for caller-defined multi-tensor units. It materializes evaluated host or device
 copies on explicit streams, applies pinned, windowed, and cacheable policies,
 evicts eligible units deterministically, and protects in-use arrays with RAII
 leases. Prefetch and execution windows are synchronous and feed existing
-offload telemetry. Apple CPU and GPU tiers share physical unified memory, so
-their logical budgets do not increase physical capacity. The normal model-load
-options select fully resident or layerwise host execution for DeepSeek-V3/R1,
+offload telemetry. On Apple silicon, CPU and GPU tiers share physical unified
+memory; all host/device budgets and residency telemetry described below are
+logical and do not increase physical capacity. The normal model-load options
+select fully resident, layerwise host, or dense disk-streaming execution for DeepSeek-V3/R1,
 Gemma 4, Inkling, Llama, Mistral, GPT-OSS, LFM2/LFM2.5,
 Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and Qwen3.5
 language-model safetensors, plus Moshi and PersonaPlex realtime checkpoints,
-including dense and MoE variants. Layerwise execution keeps complete decoder
-blocks on a CPU stream and moves a bounded window to the execution device;
+including dense and MoE variants. Host-backed layerwise execution keeps complete
+decoder blocks on a CPU stream and moves a bounded window to the execution device.
+Dense disk streaming instead leaves ordinary layers array-free until requested;
 embeddings, final normalization, output heads, and architecture-owned cache or
 recurrent state stay pinned on the device. Existing checkpoint-native packed
 tensors remain packed, while split expert banks are packed one layer at a time
-on the host. Transfers are
-synchronous because MLX does not expose stream events. On Metal this validates
-scheduling and logical residency within unified memory, not additional model
-capacity. GGUF layerwise residency, KV-cache offload, pinned host buffers, and
+on the host. Transfers are synchronous because MLX does not expose stream
+events. GGUF bounded layer residency, KV-cache offload, pinned host buffers, and
 asynchronous overlap are not supported.
 
 Supported safetensors MoE models can instead use opt-in sparse expert caching
@@ -58,8 +58,8 @@ by each loader:
 | Qwen3 and Qwen3-VL-MoE | packed dense/affine banks or supported split SwiGLU experts |
 | Qwen3-Next and Qwen3.5-MoE | packed dense/affine/FP8 banks or supported split dense/FP8 experts |
 
-Attention, routers, normalization, dense MLPs, and shared experts continue
-through the layerwise host engine. Every routed expert is a separate cacheable
+Attention, routers, normalization, dense MLPs, and shared experts use the
+configured bounded non-expert layer policy. Every routed expert is a separate cacheable
 unit: hot copies remain on the execution device, warm copies may remain on the host
 stream, and cold experts remain in the persistent checkpoint store. Packed
 expert-major checkpoints are sliced on axis zero before materialization;
@@ -73,9 +73,8 @@ MLX C API has no event or fence primitive. Duplicate requests share one cache
 acquisition, then a temporary deterministic compact bank is evaluated before
 its source leases are released. Compact-bank bytes are governed by a separate
 scratch limit and are not claimed by the logical device-residency budget.
-Apple unified memory does not provide extra physical capacity for the logical
-host and device tiers. Disk-backed inference therefore depends heavily on
-routing locality and filesystem page-cache behavior. Storage diagnostics report
+Disk-backed inference depends heavily on routing locality and filesystem
+page-cache behavior. Storage diagnostics report
 mapped-shard activity and logical transfers, not exact physical disk reads.
 Pure expert parallelism can combine the same sparse cache with DeepSeek-V3/R1,
 GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and

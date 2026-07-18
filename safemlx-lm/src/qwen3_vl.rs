@@ -1,4 +1,4 @@
-//! Shared layerwise-host execution for dense and MoE Qwen3-VL models.
+//! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
 use std::{path::Path, time::Instant};
 
@@ -942,7 +942,7 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
     }
 }
 
-/// Qwen3-VL generation using shared vision/text layerwise-host execution.
+/// Qwen3-VL generation using shared vision/text bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, Qwen3VlLayerwiseModel, Cache, S>;
 

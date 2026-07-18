@@ -1,4 +1,4 @@
-//! Text-decoder layerwise-host execution for Thinking Machines Lab Inkling.
+//! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -45,7 +45,7 @@ const HEAD_UNIT: &str = "inkling.static.output";
 const AUDIO_UNIT: &str = "inkling.static.audio";
 const VISION_NORM_UNIT: &str = "inkling.static.vision_norm";
 
-/// Inkling multimodal model using bounded host residency for hMLP and decoder blocks.
+/// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
     execution: GeneralLayerwiseModel<InklingLayerwiseAdapter>,
 }
@@ -1204,7 +1204,7 @@ pub(crate) fn inkling_expert_catalog(
     Ok(entries)
 }
 
-/// Inkling text token generation using layerwise-host execution.
+/// Inkling text token generation using bounded layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
 

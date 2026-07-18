@@ -1,4 +1,4 @@
-//! Unified fully resident and layerwise-host Qwen3 execution.
+//! Unified fully resident and bounded layer execution for Qwen3.
 
 use std::{collections::BTreeSet, path::Path, time::Instant};
 
