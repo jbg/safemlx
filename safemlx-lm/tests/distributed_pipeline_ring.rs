@@ -13,14 +13,16 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    pipeline::{load_pipeline_model, PipelineStep},
+    pipeline::{load_pipeline_model, load_pipeline_model_with_options, PipelineStep},
     sampler::DefaultSampler,
-    DeviceAssignment, ParallelTopology,
+    DenseDiskStreamLoadOptions, DeviceAssignment, ModelLoadOptions, ParallelTopology,
+    WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "SAFEMLX_LM_PIPELINE_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_PIPELINE_CHECKPOINT";
+const DENSE_STREAM: &str = "SAFEMLX_LM_PIPELINE_DENSE_STREAM";
 
 #[test]
 fn pipeline_ring_worker() {
@@ -35,13 +37,28 @@ fn pipeline_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let mut model = load_pipeline_model(&checkpoint, topology, &stream, &stream).unwrap();
+    let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
+    let mut model = if dense_stream {
+        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        load_pipeline_model_with_options(
+            &checkpoint,
+            ModelLoadOptions::with_parallel(topology)
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            &stream,
+            &stream,
+        )
+        .unwrap()
+    } else {
+        load_pipeline_model(&checkpoint, topology, &stream, &stream).unwrap()
+    };
     let info = model.stage_info();
     assert_eq!(info.global_layer_range, expected_rank..expected_rank + 1);
-    assert!(info
-        .owned_tensors
-        .iter()
-        .any(|name| name.starts_with(&format!("model.layers.{expected_rank}."))));
+    assert_eq!(
+        info.owned_tensors
+            .iter()
+            .any(|name| name.starts_with(&format!("model.layers.{expected_rank}."))),
+        !dense_stream
+    );
     assert!(!info
         .owned_tensors
         .iter()
@@ -64,12 +81,24 @@ fn pipeline_ring_worker() {
         .iter()
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(opened.contains(&format!("layer-{expected_rank}.safetensors")));
+    assert_eq!(
+        opened.contains(&format!("layer-{expected_rank}.safetensors")),
+        !dense_stream
+    );
     assert!(!opened.contains(&format!("layer-{}.safetensors", 1 - expected_rank)));
     assert_eq!(
         opened.contains(&"input.safetensors".into()),
         expected_rank == 0
     );
+    if dense_stream {
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert_eq!(report.planned_layer_count(), 1);
+        assert!(report
+            .residency()
+            .units()
+            .iter()
+            .all(|unit| !unit.host_resident() && !unit.device_resident()));
+    }
     assert_eq!(
         opened.contains(&"output.safetensors".into()),
         expected_rank == 1
@@ -121,6 +150,11 @@ fn pipeline_ring_worker() {
                 &stream,
             )
             .unwrap();
+    }
+    if dense_stream {
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert!(report.prefill_forwards() >= 1);
+        assert!(report.decode_forwards() >= 2);
     }
 }
 
@@ -308,6 +342,18 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_pipeline() {
+    run_ring_pipeline(false);
+}
+
+/// Run with:
+/// `cargo test -p safemlx-lm --test distributed_pipeline_ring ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_dense_stream_pipeline() {
+    run_ring_pipeline(true);
+}
+
+fn run_ring_pipeline(dense_stream: bool) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
     write_fixture(checkpoint.path());
@@ -327,19 +373,20 @@ fn ring_two_process_pipeline() {
         children: Vec::with_capacity(2),
     };
     for rank in 0..2 {
-        children.children.push(
-            Command::new(&executable)
-                .args(["--exact", "pipeline_ring_worker", "--nocapture"])
-                .env(WORKER_RANK, rank.to_string())
-                .env(CHECKPOINT_DIR, checkpoint.path())
-                .env("MLX_RANK", rank.to_string())
-                .env("MLX_HOSTFILE", &hostfile)
-                .env_remove("MLX_RING_VERBOSE")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
+        let mut command = Command::new(&executable);
+        command
+            .args(["--exact", "pipeline_ring_worker", "--nocapture"])
+            .env(WORKER_RANK, rank.to_string())
+            .env(CHECKPOINT_DIR, checkpoint.path())
+            .env("MLX_RANK", rank.to_string())
+            .env("MLX_HOSTFILE", &hostfile)
+            .env_remove("MLX_RING_VERBOSE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if dense_stream {
+            command.env(DENSE_STREAM, "1");
+        }
+        children.children.push(command.spawn().unwrap());
     }
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut timed_out = false;

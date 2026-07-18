@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use safemlx::{
@@ -26,17 +27,26 @@ use crate::{
     cache::{CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
     error::Error,
     inspection::ActivationObserver,
+    layerwise::{
+        DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
+    },
     models::{
         common::{linear, linear::project_logits_maybe_quantized},
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
+    },
+    module_binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
+    offload::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
     parallel::{
         load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
         TensorPlacement,
     },
     quantization::{quantize_tensor, WeightQuantization},
+    residency::{OffloadUnit, ResidencyManager},
     sampler::Sampler,
     utils::create_causal_mask,
+    weight_store::{SafetensorsWeightStore, WeightStore},
     weights::StrictLoadConfig,
 };
 
@@ -67,8 +77,13 @@ pub struct PipelineStageInfo {
     pub activation_dtype: Dtype,
     /// Checkpoint tensors selected for this rank.
     pub owned_tensors: Vec<String>,
-    /// Total uncompressed bytes of locally selected checkpoint tensors.
+    /// Parameter bytes materialized while loading this stage.
+    ///
+    /// For dense disk streaming this contains only pinned static weights;
+    /// cold layer bytes are included in `planned_owned_parameter_bytes`.
     pub local_parameter_bytes: usize,
+    /// Total logical bytes owned by this stage, including cold streamed layers.
+    pub planned_owned_parameter_bytes: u64,
     /// Payload shards actually opened for this rank.
     pub opened_checkpoint_shards: Vec<PathBuf>,
 }
@@ -206,6 +221,7 @@ struct LlamaStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<llama::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
@@ -215,6 +231,7 @@ struct DeepSeekStage {
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<deepseek_v3::DecoderLayer>,
+    dense_layers: Option<PipelineDenseLayers>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
@@ -222,6 +239,32 @@ struct DeepSeekStage {
 enum ArchitectureStage {
     Llama(LlamaStage),
     DeepSeek(DeepSeekStage),
+}
+
+struct PipelineDenseLayers {
+    residency: ResidencyManager,
+    controller: DenseStreamController,
+    units: Vec<OffloadUnitId>,
+}
+
+impl PipelineDenseLayers {
+    fn prepare(
+        &self,
+        local_index: usize,
+    ) -> Result<
+        (
+            Option<crate::residency::ResidentUnitLease>,
+            crate::residency::ResidentUnitLease,
+        ),
+        Error,
+    > {
+        self.controller
+            .prepare(&self.residency, "pipeline_stage", &self.units, local_index)
+    }
+
+    fn report(&self) -> Result<DenseDiskStreamReport, Error> {
+        self.controller.report(&self.residency)
+    }
 }
 
 /// An executable, rank-local piece of a pipeline-parallel model.
@@ -244,6 +287,22 @@ impl PipelineModel {
     /// Returns the immutable stage description.
     pub fn stage_info(&self) -> &PipelineStageInfo {
         &self.info
+    }
+
+    /// Returns stage-local dense-stream observations when enabled.
+    pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        match &self.stage {
+            ArchitectureStage::Llama(stage) => stage
+                .dense_layers
+                .as_ref()
+                .map(PipelineDenseLayers::report)
+                .transpose(),
+            ArchitectureStage::DeepSeek(stage) => stage
+                .dense_layers
+                .as_ref()
+                .map(PipelineDenseLayers::report)
+                .transpose(),
+        }
     }
 
     /// Allocates cache entries only for locally owned decoder layers.
@@ -509,6 +568,7 @@ fn base_info(
         activation_dtype: Dtype::Float32,
         owned_tensors: Vec::new(),
         local_parameter_bytes: 0,
+        planned_owned_parameter_bytes: 0,
         opened_checkpoint_shards: Vec::new(),
     }
 }
@@ -737,6 +797,126 @@ fn load_partition(
     load_safetensors_partition_on_streams(model_dir, plan, weights_stream, stream, config)
 }
 
+fn build_pipeline_dense_layers<L, F, B>(
+    model_dir: &Path,
+    range: Range<usize>,
+    options: crate::dense_stream::DenseDiskStreamLoadOptions,
+    static_device_bytes: u64,
+    stream: &Stream,
+    weights_stream: &Stream,
+    mut make_layer: F,
+    mut make_bindings: B,
+) -> Result<PipelineDenseLayers, Error>
+where
+    L: ModuleParameters,
+    F: FnMut(usize, &Stream) -> Result<L, Error>,
+    B: FnMut(usize, &L, &dyn WeightStore) -> Result<Vec<crate::residency::WeightBinding>, Error>,
+{
+    options.validate()?;
+    let layer_count = range.len();
+    if options.device_lookahead == 0 || options.device_lookahead > layer_count {
+        return Err(Error::Parallel(format!(
+            "pipeline device lookahead {} cannot fit the {layer_count} local layers",
+            options.device_lookahead
+        )));
+    }
+    if options.host_budget_bytes > 0
+        && (options.host_lookahead == 0 || options.host_lookahead > layer_count)
+    {
+        return Err(Error::Parallel(format!(
+            "pipeline host lookahead {} cannot fit the {layer_count} local layers",
+            options.host_lookahead
+        )));
+    }
+    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        options.max_mapped_shards,
+    )?);
+    let mut definitions = Vec::with_capacity(layer_count);
+    let mut specs = Vec::with_capacity(layer_count);
+    let mut units = Vec::with_capacity(layer_count);
+    let mut bytes = Vec::with_capacity(layer_count);
+    let mut planned_layer_bytes = 0u64;
+    for global_layer in range {
+        let layer = make_layer(global_layer, stream)?;
+        let bindings = make_bindings(global_layer, &layer, store.as_ref())?;
+        let layer_bytes = binding_bytes(&bindings)?;
+        planned_layer_bytes = planned_layer_bytes
+            .checked_add(layer_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("pipeline streamed-layer byte total overflowed".into())
+            })?;
+        let id = OffloadUnitId::new(format!("pipeline.layer.{global_layer:05}"))?;
+        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
+        specs.push(OffloadUnitSpec::new(
+            id.clone(),
+            layer_bytes,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )?);
+        units.push(id);
+        bytes.push(layer_bytes);
+    }
+    let largest = |depth: usize| -> Result<u64, Error> {
+        bytes
+            .windows(depth)
+            .try_fold(0u64, |largest, window| {
+                window
+                    .iter()
+                    .try_fold(0u64, |total, value| total.checked_add(*value))
+                    .map(|total| largest.max(total))
+            })
+            .ok_or_else(|| Error::Parallel("pipeline layer-window byte total overflowed".into()))
+    };
+    let device_window_bytes = largest(options.device_lookahead)?;
+    let required_device = static_device_bytes
+        .checked_add(device_window_bytes)
+        .ok_or_else(|| Error::Parallel("pipeline device parameter total overflowed".into()))?;
+    if required_device > options.device_budget_bytes {
+        return Err(Error::Parallel(format!(
+            "pipeline device budget {} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)",
+            options.device_budget_bytes
+        )));
+    }
+    let device_layer_budget = options.device_budget_bytes - static_device_bytes;
+    if options.host_budget_bytes > 0 {
+        let host_window_bytes = largest(options.host_lookahead)?;
+        if host_window_bytes > options.host_budget_bytes {
+            return Err(Error::Parallel(format!(
+                "pipeline host budget {} cannot hold the largest protected local layer window ({host_window_bytes} bytes)",
+                options.host_budget_bytes
+            )));
+        }
+    }
+    let config = OffloadConfig::new(
+        Some(device_layer_budget),
+        Some(options.host_budget_bytes),
+        options.host_lookahead.max(options.device_lookahead),
+    )?
+    .with_eviction_policy(options.eviction_policy);
+    let plan = OffloadPlan::new(config, specs)?;
+    let residency = ResidencyManager::new(
+        store,
+        plan,
+        definitions,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    residency.initialize()?;
+    let controller = DenseStreamController::new(
+        &residency,
+        options,
+        units.len(),
+        planned_layer_bytes,
+        static_device_bytes,
+    )?;
+    Ok(PipelineDenseLayers {
+        residency,
+        controller,
+        units,
+    })
+}
+
 /// Loads a pure-PP model using default non-quantizing options.
 pub fn load_pipeline_model(
     model_dir: impl AsRef<Path>,
@@ -774,6 +954,22 @@ pub fn load_pipeline_model_with_options(
     })?;
     validate_pure_pipeline(topology)?;
     topology.validate_execution_stream(stream)?;
+    let dense_stream = match options.weight_residency {
+        WeightResidency::FullyResident => None,
+        WeightResidency::DenseDiskStream(options) => Some(options),
+        WeightResidency::LayerwiseHost(_) => {
+            return Err(Error::Parallel(
+                "pipeline loading does not support eager host-layer residency; select fully resident or dense disk streaming"
+                    .into(),
+            ));
+        }
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
+            return Err(Error::Parallel(
+                "pipeline loading does not combine with sparse expert caching".into(),
+            ));
+        }
+    };
 
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
@@ -782,6 +978,7 @@ pub fn load_pipeline_model_with_options(
             model_dir,
             topology,
             options.quantization,
+            dense_stream,
             stream,
             weights_stream,
         ),
@@ -789,6 +986,7 @@ pub fn load_pipeline_model_with_options(
             model_dir,
             topology,
             options.quantization,
+            dense_stream,
             stream,
             weights_stream,
         ),
@@ -805,9 +1003,16 @@ fn load_llama_pipeline(
     model_dir: &Path,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    if dense_stream.is_some() && requested_quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
     let source_args = llama::get_llama_model_args(model_dir)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
@@ -854,7 +1059,7 @@ fn load_llama_pipeline(
             &mut plan,
             &layer,
             &format!("model.layers.{global_layer}"),
-            range.contains(&global_layer),
+            range.contains(&global_layer) && dense_stream.is_none(),
         );
     }
     let norm = nn::RmsNorm::unloaded(
@@ -882,6 +1087,8 @@ fn load_llama_pipeline(
     )?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
+    let static_device_bytes = u64::try_from(info.local_parameter_bytes)
+        .map_err(|_| Error::Parallel("pipeline static parameter byte total overflowed".into()))?;
     info.opened_checkpoint_shards = partition.opened_shards().to_vec();
     info.owned_tensors = partition
         .tensors()
@@ -891,7 +1098,44 @@ fn load_llama_pipeline(
     let mut tensors = partition.into_tensors();
 
     let mut stage = LlamaStage::new(target_args, range, &info, stream)?;
-    stage.load(&mut tensors, quantize_on_load, stream)?;
+    stage.load(
+        &mut tensors,
+        quantize_on_load,
+        dense_stream.is_none(),
+        stream,
+    )?;
+    if let Some(dense_stream) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            model_dir,
+            stage.range.clone(),
+            dense_stream,
+            static_device_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                Ok(llama::TransformerBlock::new_for_layer(
+                    &source_args,
+                    global_layer as i32,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, store| {
+                Ok(build_module_bindings(
+                    layer,
+                    &format!("model.layers.{global_layer}"),
+                    store,
+                )?)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_device_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("pipeline planned-owned byte total overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_device_bytes;
+    }
     if !tensors.is_empty() {
         let mut unused = tensors.into_keys().collect::<Vec<_>>();
         unused.sort();
@@ -953,6 +1197,7 @@ impl LlamaStage {
             embedding,
             output_embedding,
             layers,
+            dense_layers: None,
             norm,
             lm_head,
         })
@@ -962,6 +1207,7 @@ impl LlamaStage {
         &mut self,
         tensors: &mut HashMap<String, Array>,
         quantization: Option<WeightQuantization>,
+        load_layers: bool,
         stream: &Stream,
     ) -> Result<(), Error> {
         if let Some(embedding) = &mut self.embedding {
@@ -982,14 +1228,16 @@ impl LlamaStage {
                 stream,
             )?;
         }
-        for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
-            assign_module(
-                layer,
-                &format!("model.layers.{global_layer}"),
-                tensors,
-                quantization,
-                stream,
-            )?;
+        if load_layers {
+            for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
+                assign_module(
+                    layer,
+                    &format!("model.layers.{global_layer}"),
+                    tensors,
+                    quantization,
+                    stream,
+                )?;
+            }
         }
         if let Some(norm) = &mut self.norm {
             assign_module(norm, "model.norm", tensors, None, stream)?;
@@ -1052,45 +1300,104 @@ impl LlamaStage {
                 .transpose()?
         };
         let mask = explicit_mask.or(generated_mask.as_ref());
-        for ((global_layer, layer), cache) in self
-            .range
-            .clone()
-            .zip(&mut self.layers)
-            .zip(caches.iter_mut())
-        {
-            match cache {
-                PipelineLlamaLayerCache::Standard {
-                    global_layer: cached_layer,
-                    cache,
-                } if *cached_layer == global_layer => {
-                    hidden = layer.forward(
-                        llama::AttentionInput {
-                            x: &hidden,
-                            mask,
-                            cache: Some(cache),
-                            generated_sliding_window,
-                        },
-                        stream,
-                    )?;
+        if let Some(dense_layers) = &self.dense_layers {
+            let dense_guard = dense_layers
+                .controller
+                .group_guard(&dense_layers.residency, "pipeline_stage");
+            for (local_index, (global_layer, cache)) in
+                self.range.clone().zip(caches.iter_mut()).enumerate()
+            {
+                let (_host_lease, lease) = dense_layers.prepare(local_index)?;
+                let mut layer = llama::TransformerBlock::new_for_layer(
+                    &self.args,
+                    global_layer as i32,
+                    stream,
+                )?;
+                populate_module_from_lease(&mut layer, &lease)?;
+                match cache {
+                    PipelineLlamaLayerCache::Standard {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
+                    }
+                    PipelineLlamaLayerCache::Sliding {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
+                    }
+                    _ => {
+                        return Err(Error::Parallel(format!(
+                            "Llama stage cache does not match global layer {global_layer}"
+                        )))
+                    }
                 }
-                PipelineLlamaLayerCache::Sliding {
-                    global_layer: cached_layer,
-                    cache,
-                } if *cached_layer == global_layer => {
-                    hidden = layer.forward(
-                        llama::AttentionInput {
-                            x: &hidden,
-                            mask,
-                            cache: Some(cache),
-                            generated_sliding_window,
-                        },
-                        stream,
-                    )?;
-                }
-                _ => {
-                    return Err(Error::Parallel(format!(
-                        "Llama stage cache does not match global layer {global_layer}"
-                    )))
+                stream.synchronize()?;
+            }
+            dense_guard.complete()?;
+            dense_layers
+                .controller
+                .record_forward(step.sequence_length > 1);
+        } else {
+            for ((global_layer, layer), cache) in self
+                .range
+                .clone()
+                .zip(&mut self.layers)
+                .zip(caches.iter_mut())
+            {
+                match cache {
+                    PipelineLlamaLayerCache::Standard {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                    }
+                    PipelineLlamaLayerCache::Sliding {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                    }
+                    _ => {
+                        return Err(Error::Parallel(format!(
+                            "Llama stage cache does not match global layer {global_layer}"
+                        )))
+                    }
                 }
             }
         }
@@ -1119,9 +1426,16 @@ fn load_deepseek_pipeline(
     model_dir: &Path,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    if dense_stream.is_some() && requested_quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
     let source_args = deepseek_v3::get_model_args(model_dir)?;
     if requested_quantization.is_some() && source_args.native_fp8_config().is_some() {
         return Err(Error::Quantization(
@@ -1161,7 +1475,7 @@ fn load_deepseek_pipeline(
     insert_module_plan(&mut plan, &embedding, "model.embed_tokens", info.is_first);
     for global_layer in 0..source_args.num_hidden_layers as usize {
         let layer = deepseek_v3::DecoderLayer::new(&source_args, global_layer as i32, stream)?;
-        let local = range.contains(&global_layer);
+        let local = range.contains(&global_layer) && dense_stream.is_none();
         insert_module_plan(
             &mut plan,
             &layer,
@@ -1203,6 +1517,8 @@ fn load_deepseek_pipeline(
     let partition = load_partition(model_dir, &plan, weights_stream, stream, &strict)?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
+    let static_device_bytes = u64::try_from(info.local_parameter_bytes)
+        .map_err(|_| Error::Parallel("pipeline static parameter byte total overflowed".into()))?;
     info.opened_checkpoint_shards = partition.opened_shards().to_vec();
     info.owned_tensors = partition
         .tensors()
@@ -1211,7 +1527,42 @@ fn load_deepseek_pipeline(
     info.owned_tensors.sort();
     let mut tensors = partition.into_tensors();
     let mut stage = DeepSeekStage::new(target_args, range, &info, stream)?;
-    stage.load(&mut tensors, quantize_on_load, stream)?;
+    stage.load(
+        &mut tensors,
+        quantize_on_load,
+        dense_stream.is_none(),
+        stream,
+    )?;
+    if let Some(dense_stream) = dense_stream {
+        let binding_adapter =
+            crate::deepseek_v3::DeepSeekV3LayerwiseAdapter::new(source_args.clone(), stream)?;
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            model_dir,
+            stage.range.clone(),
+            dense_stream,
+            static_device_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                Ok(deepseek_v3::DecoderLayer::new(
+                    &source_args,
+                    global_layer as i32,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_device_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("pipeline planned-owned byte total overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_device_bytes;
+    }
     if !tensors.is_empty() {
         let mut unused = tensors.into_keys().collect::<Vec<_>>();
         unused.sort();
@@ -1312,6 +1663,7 @@ impl DeepSeekStage {
             range,
             embedding,
             layers,
+            dense_layers: None,
             norm,
             lm_head,
         })
@@ -1321,6 +1673,7 @@ impl DeepSeekStage {
         &mut self,
         tensors: &mut HashMap<String, Array>,
         quantization: Option<WeightQuantization>,
+        load_layers: bool,
         stream: &Stream,
     ) -> Result<(), Error> {
         if let Some(embedding) = &mut self.embedding {
@@ -1332,27 +1685,29 @@ impl DeepSeekStage {
                 stream,
             )?;
         }
-        for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
-            assign_module(
-                layer,
-                &format!("model.layers.{global_layer}"),
-                tensors,
-                quantization,
-                stream,
-            )?;
-            if let Some(moe) = layer.mlp.moe_mut() {
-                load_deepseek_experts(
-                    moe,
-                    global_layer,
-                    (
-                        self.args.n_routed_experts,
-                        self.args.hidden_size,
-                        self.args.moe_intermediate_size,
-                    ),
+        if load_layers {
+            for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
+                assign_module(
+                    layer,
+                    &format!("model.layers.{global_layer}"),
                     tensors,
                     quantization,
                     stream,
                 )?;
+                if let Some(moe) = layer.mlp.moe_mut() {
+                    load_deepseek_experts(
+                        moe,
+                        global_layer,
+                        (
+                            self.args.n_routed_experts,
+                            self.args.hidden_size,
+                            self.args.moe_intermediate_size,
+                        ),
+                        tensors,
+                        quantization,
+                        stream,
+                    )?;
+                }
             }
         }
         if let Some(norm) = &mut self.norm {
@@ -1392,18 +1747,49 @@ impl DeepSeekStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
-        for ((global_layer, layer), cache) in self
-            .range
-            .clone()
-            .zip(&mut self.layers)
-            .zip(caches.iter_mut())
-        {
-            if cache.global_layer != global_layer {
-                return Err(Error::Parallel(format!(
-                    "DeepSeek stage cache does not match global layer {global_layer}"
-                )));
+        if let Some(dense_layers) = &self.dense_layers {
+            let dense_guard = dense_layers
+                .controller
+                .group_guard(&dense_layers.residency, "pipeline_stage");
+            for (local_index, (global_layer, cache)) in
+                self.range.clone().zip(caches.iter_mut()).enumerate()
+            {
+                if cache.global_layer != global_layer {
+                    return Err(Error::Parallel(format!(
+                        "DeepSeek stage cache does not match global layer {global_layer}"
+                    )));
+                }
+                let (_host_lease, lease) = dense_layers.prepare(local_index)?;
+                let mut layer =
+                    deepseek_v3::DecoderLayer::new(&self.args, global_layer as i32, stream)?;
+                populate_module_from_lease(&mut layer, &lease)?;
+                hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
+                let retained = cache
+                    .cache
+                    .arrays()
+                    .into_iter()
+                    .flat_map(|(latent, rotary)| [latent, rotary]);
+                eval(std::iter::once(&hidden).chain(retained))?;
+                stream.synchronize()?;
             }
-            hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
+            dense_guard.complete()?;
+            dense_layers
+                .controller
+                .record_forward(step.sequence_length > 1);
+        } else {
+            for ((global_layer, layer), cache) in self
+                .range
+                .clone()
+                .zip(&mut self.layers)
+                .zip(caches.iter_mut())
+            {
+                if cache.global_layer != global_layer {
+                    return Err(Error::Parallel(format!(
+                        "DeepSeek stage cache does not match global layer {global_layer}"
+                    )));
+                }
+                hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
+            }
         }
         if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
@@ -1591,6 +1977,7 @@ mod tests {
     use super::*;
     use crate::parallel::DeviceAssignment;
     use safemlx::{module::Param, ops::ones_dtype, Device, DeviceType, ExecutionContext};
+    use std::fs;
 
     fn topology(world: usize, rank: usize, pp: usize) -> ParallelTopology {
         ParallelTopology::from_rank(
@@ -1725,6 +2112,138 @@ mod tests {
         }
     }
 
+    fn write_llama_fixture(dir: &Path, model: &llama::ResidentModel) {
+        let params = model.parameters().flatten();
+        let arrays = params
+            .iter()
+            .map(|(name, value)| {
+                (
+                    crate::module_binding::canonical_checkpoint_name(name),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "llama",
+                "hidden_size": 8,
+                "num_hidden_layers": 2,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 16,
+                "max_position_embeddings": 64,
+                "rope_theta": 10000.0,
+                "rope_traditional": false,
+                "head_dim": 4,
+                "tie_word_embeddings": true,
+                "attention_bias": false,
+                "mlp_bias": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn llama_pipeline_dense_stream_is_stage_local_cold_and_matches_decode() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut reference = llama::ResidentModel::new(llama_args(true), stream).unwrap();
+        initialize_parameters(&mut reference, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_fixture(dir.path(), &reference);
+        let dense =
+            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
+                .unwrap();
+        let mut first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        for (model, expected_id) in [
+            (&first, "pipeline.layer.00000"),
+            (&last, "pipeline.layer.00001"),
+        ] {
+            let report = model.dense_stream_report().unwrap().unwrap();
+            let layers = report.residency().units();
+            assert_eq!(layers.len(), 1);
+            assert_eq!(layers[0].id().as_str(), expected_id);
+            assert_eq!(layers[0].planned_tier(), MemoryTier::Disk);
+            assert!(!layers[0].host_resident());
+            assert!(!layers[0].device_resident());
+        }
+
+        let mut reference_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut first_cache = first.new_cache();
+        let mut last_cache = last.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let sequence = tokens.shape()[1];
+            let expected = reference
+                .forward(
+                    llama::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut reference_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            let step = PipelineStep::new(1, sequence).unwrap();
+            let hidden = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(hidden) => hidden,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            let actual = match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&hidden),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            };
+            assert_close(&actual, &expected);
+        }
+    }
+
     fn llama_pipeline_stages(
         source: &llama::ResidentModel,
         stream: &Stream,
@@ -1749,6 +2268,7 @@ mod tests {
             embedding: Some(source.model.embed_tokens.clone()),
             output_embedding: None,
             layers: vec![source.model.layers[0].clone()],
+            dense_layers: None,
             norm: None,
             lm_head: None,
         };
@@ -1761,6 +2281,7 @@ mod tests {
                 .tie_word_embeddings
                 .then(|| source.model.embed_tokens.clone()),
             layers: vec![source.model.layers[1].clone()],
+            dense_layers: None,
             norm: Some(source.model.norm.clone()),
             lm_head: source.lm_head.clone(),
         };
@@ -1917,6 +2438,7 @@ mod tests {
                 range: 0..1,
                 embedding: Some(reference.model.embed_tokens.clone()),
                 layers: vec![reference.model.layers[0].clone()],
+                dense_layers: None,
                 norm: None,
                 lm_head: None,
             }),
@@ -1929,6 +2451,7 @@ mod tests {
                 range: 1..2,
                 embedding: None,
                 layers: vec![reference.model.layers[1].clone()],
+                dense_layers: None,
                 norm: Some(reference.model.norm.clone()),
                 lm_head: Some(reference.lm_head.clone()),
             }),
