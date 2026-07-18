@@ -1544,7 +1544,7 @@ fn load_deepseek_pipeline(
             stream,
             weights_stream,
             |global_layer, stream| {
-                Ok(deepseek_v3::DecoderLayer::new(
+                Ok(deepseek_v3::DecoderLayer::new_layerwise(
                     &source_args,
                     global_layer as i32,
                     stream,
@@ -1760,8 +1760,11 @@ impl DeepSeekStage {
                     )));
                 }
                 let (_host_lease, lease) = dense_layers.prepare(local_index)?;
-                let mut layer =
-                    deepseek_v3::DecoderLayer::new(&self.args, global_layer as i32, stream)?;
+                let mut layer = deepseek_v3::DecoderLayer::new_layerwise(
+                    &self.args,
+                    global_layer as i32,
+                    stream,
+                )?;
                 populate_module_from_lease(&mut layer, &lease)?;
                 hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
                 let retained = cache
@@ -2397,15 +2400,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sequential_deepseek_pipeline_matches_local_moe_prefill_decode() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let mut reference = deepseek_v3::Model::new(deepseek_args(), stream).unwrap();
-        if let deepseek_v3::FeedForward::Moe(moe) = &mut reference.model.layers[1].mlp {
-            let experts = reference.args.n_routed_experts;
-            let hidden = reference.args.hidden_size;
-            let intermediate = reference.args.moe_intermediate_size;
+    fn initialized_deepseek(stream: &Stream) -> deepseek_v3::Model {
+        let mut model = deepseek_v3::Model::new(deepseek_args(), stream).unwrap();
+        if let deepseek_v3::FeedForward::Moe(moe) = &mut model.model.layers[1].mlp {
+            let experts = model.args.n_routed_experts;
+            let hidden = model.args.hidden_size;
+            let intermediate = model.args.moe_intermediate_size;
             moe.experts.gate_proj = Param::new(Some(
                 Array::full::<f32>(
                     &[experts, intermediate, hidden],
@@ -2426,7 +2426,177 @@ mod tests {
         } else {
             panic!("second tiny DeepSeek layer must be MoE");
         }
-        initialize_parameters(&mut reference, stream);
+        initialize_parameters(&mut model, stream);
+        model
+    }
+
+    fn write_deepseek_fixture(dir: &Path, model: &deepseek_v3::Model, stream: &Stream) {
+        let mut arrays = Vec::<(String, Array)>::new();
+        for (name, value) in model.parameters().flatten() {
+            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            let packed_projection = ["gate_proj", "up_proj", "down_proj"]
+                .into_iter()
+                .find(|projection| name.ends_with(&format!(".mlp.experts.{projection}")));
+            if let Some(projection) = packed_projection {
+                let suffix = format!(".experts.{projection}");
+                let prefix = name.strip_suffix(&suffix).unwrap();
+                for expert in 0..model.args.n_routed_experts {
+                    arrays.push((
+                        format!("{prefix}.experts.{expert}.{projection}.weight"),
+                        value.try_index_device(expert, stream).unwrap(),
+                    ));
+                }
+            } else {
+                arrays.push((name, value.clone()));
+            }
+        }
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "deepseek_v3",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "moe_intermediate_size": 4,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "vocab_size": 16,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 64,
+                "rope_theta": 10000.0,
+                "q_lora_rank": 4,
+                "kv_lora_rank": 4,
+                "qk_nope_head_dim": 2,
+                "qk_rope_head_dim": 2,
+                "v_head_dim": 2,
+                "first_k_dense_replace": 1,
+                "moe_layer_freq": 1,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "n_group": 2,
+                "topk_group": 1,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": true,
+                "routed_scaling_factor": 1.5,
+                "num_nextn_predict_layers": 0,
+                "split_kv_b": false,
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deepseek_pipeline_dense_stream_crosses_dense_to_moe_boundary() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut reference = initialized_deepseek(stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_deepseek_fixture(dir.path(), &reference, stream);
+        let dense =
+            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
+                .unwrap();
+        let mut first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .dense_stream_report()
+                .unwrap()
+                .unwrap()
+                .residency()
+                .units()[0]
+                .id()
+                .as_str(),
+            "pipeline.layer.00000"
+        );
+        assert_eq!(
+            last.dense_stream_report()
+                .unwrap()
+                .unwrap()
+                .residency()
+                .units()[0]
+                .id()
+                .as_str(),
+            "pipeline.layer.00001"
+        );
+
+        let mut reference_cache = reference.new_cache();
+        let mut first_cache = first.new_cache();
+        let mut last_cache = last.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
+            let expected = reference
+                .forward(
+                    deepseek_v3::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut reference_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            let hidden = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(hidden) => hidden,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            let actual = match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&hidden),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            };
+            assert_close(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn sequential_deepseek_pipeline_matches_local_moe_prefill_decode() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut reference = initialized_deepseek(stream);
 
         let first_topology = gpu_topology(0);
         let last_topology = gpu_topology(1);
