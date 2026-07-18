@@ -213,6 +213,23 @@ fn main() -> anyhow::Result<()> {
     println!("weight-store diagnostics: {:?}", report.weight_store());
     if let Some(dense) = model.dense_stream_report()? {
         println!("background host-prefetch: {:?}", dense.background());
+        println!(
+            "streamed host layers current/peak: {}/{} ({} peak bytes)",
+            dense.host_layers().current_layer_count(),
+            dense.host_layers().peak_layer_count(),
+            dense.host_layers().peak_layer_bytes()
+        );
+        println!(
+            "streamed device layers current/peak: {}/{} ({} peak bytes)",
+            dense.device_layers().current_layer_count(),
+            dense.device_layers().peak_layer_count(),
+            dense.device_layers().peak_layer_bytes()
+        );
+        println!("host cache: {:?}", dense.host_layers().cache());
+        println!("device cache: {:?}", dense.device_layers().cache());
+        println!("execution groups: {:?}", dense.execution_groups());
+        println!("prefill dense activity: {:?}", dense.prefill());
+        println!("decode dense activity: {:?}", dense.decode());
         println!("exact physical disk I/O is not inferred from mmap or page-fault observations");
     }
     println!("KV cache and activations are not included in logical parameter residency totals.");

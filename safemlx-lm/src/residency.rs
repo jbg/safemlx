@@ -1262,39 +1262,7 @@ impl ResidencyManager {
 
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
-        let (initialized, offload, units, active_window) = {
-            let state = self.lock()?;
-            let units = state
-                .units
-                .values()
-                .map(|unit| UnitResidencyReport {
-                    id: unit.spec.id().clone(),
-                    planned_tier: unit.spec.tier(),
-                    policy: unit.spec.policy(),
-                    expected_bytes: unit.spec.bytes(),
-                    host_resident: unit.host.is_some(),
-                    device_resident: unit.device.is_some(),
-                    host_pins: unit.host.as_ref().map_or(0, |copy| copy.pins),
-                    device_pins: unit.device.as_ref().map_or(0, |copy| copy.pins),
-                    active_window: state
-                        .active_windows
-                        .values()
-                        .any(|window| window.contains(unit.spec.id())),
-                })
-                .collect();
-            (
-                state.initialized,
-                state.telemetry.snapshot(),
-                units,
-                state
-                    .active_windows
-                    .values()
-                    .flat_map(|window| window.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-            )
-        };
+        let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
         Ok(ResidencyReport {
             initialized,
             offload,
@@ -1302,6 +1270,46 @@ impl ResidencyManager {
             active_window,
             weight_store: self.inner.store.diagnostics()?,
         })
+    }
+
+    pub(crate) fn telemetry_snapshot(
+        &self,
+    ) -> Result<
+        (
+            bool,
+            OffloadReport,
+            Vec<UnitResidencyReport>,
+            Vec<OffloadUnitId>,
+        ),
+        ResidencyError,
+    > {
+        let state = self.lock()?;
+        let active = state
+            .active_windows
+            .values()
+            .flat_map(|window| window.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let units = state
+            .units
+            .values()
+            .map(|unit| UnitResidencyReport {
+                id: unit.spec.id().clone(),
+                planned_tier: unit.spec.tier(),
+                policy: unit.spec.policy(),
+                expected_bytes: unit.spec.bytes(),
+                host_resident: unit.host.is_some(),
+                device_resident: unit.device.is_some(),
+                host_pins: unit.host.as_ref().map_or(0, |copy| copy.pins),
+                device_pins: unit.device.as_ref().map_or(0, |copy| copy.pins),
+                active_window: active.contains(unit.spec.id()),
+            })
+            .collect();
+        Ok((
+            state.initialized,
+            state.telemetry.snapshot(),
+            units,
+            active.into_iter().collect(),
+        ))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ManagerState>, ResidencyError> {
@@ -1507,7 +1515,7 @@ fn prefetch_locked(
     } else {
         PrefetchOutcome::Miss
     };
-    state.telemetry.record_prefetch(outcome);
+    state.telemetry.record_tier_prefetch(tier, outcome);
     ensure_resident(state, store, id, tier)?;
     Ok(outcome)
 }
@@ -1719,18 +1727,14 @@ fn ensure_many_resident(
                     .last_used = tick;
             }
         }
-        state
-            .telemetry
-            .set_resident_bytes(tier, tier_bytes(state, tier));
+        update_resident_telemetry(state, tier);
         Ok(created.clone())
     })();
 
     if result.is_err() && reserved > 0 {
         let current = tier_bytes(state, tier);
         set_tier_bytes(state, tier, current.saturating_sub(reserved));
-        state
-            .telemetry
-            .set_resident_bytes(tier, tier_bytes(state, tier));
+        update_resident_telemetry(state, tier);
     }
     for id in temporary_protection {
         if let Some(window) = state.active_windows.get_mut(&tier) {
@@ -2010,9 +2014,20 @@ fn remove_copy(
     .ok_or(ResidencyError::StatePoisoned)?;
     debug_assert_eq!(copy.bytes, bytes);
     set_tier_bytes(state, tier, total);
-    state.telemetry.set_resident_bytes(tier, total);
-    state.telemetry.record_eviction(copy.bytes);
+    update_resident_telemetry(state, tier);
+    state.telemetry.record_tier_eviction(tier, copy.bytes);
     Ok(())
+}
+
+fn update_resident_telemetry(state: &mut ManagerState, tier: MemoryTier) {
+    let bytes = tier_bytes(state, tier);
+    let units = state
+        .units
+        .values()
+        .filter(|unit| unit.is_resident(tier))
+        .count();
+    state.telemetry.set_resident_bytes(tier, bytes);
+    state.telemetry.set_resident_units(tier, units);
 }
 
 fn tier_bytes(state: &ManagerState, tier: MemoryTier) -> u64 {

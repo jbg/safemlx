@@ -251,6 +251,7 @@ impl PipelineDenseLayers {
     fn prepare(
         &self,
         local_index: usize,
+        prefill: bool,
     ) -> Result<
         (
             Option<crate::residency::ResidentUnitLease>,
@@ -258,8 +259,13 @@ impl PipelineDenseLayers {
         ),
         Error,
     > {
-        self.controller
-            .prepare(&self.residency, "pipeline_stage", &self.units, local_index)
+        self.controller.prepare(
+            &self.residency,
+            "pipeline_stage",
+            &self.units,
+            local_index,
+            prefill,
+        )
     }
 
     fn report(&self) -> Result<DenseDiskStreamReport, Error> {
@@ -909,6 +915,7 @@ where
         units.len(),
         planned_layer_bytes,
         static_device_bytes,
+        [("pipeline_stage".to_string(), units.clone())],
     )?;
     Ok(PipelineDenseLayers {
         residency,
@@ -1307,7 +1314,8 @@ impl LlamaStage {
             for (local_index, (global_layer, cache)) in
                 self.range.clone().zip(caches.iter_mut()).enumerate()
             {
-                let (_host_lease, lease) = dense_layers.prepare(local_index)?;
+                let (_host_lease, lease) =
+                    dense_layers.prepare(local_index, step.sequence_length > 1)?;
                 let mut layer = llama::TransformerBlock::new_for_layer(
                     &self.args,
                     global_layer as i32,
@@ -1356,7 +1364,7 @@ impl LlamaStage {
             dense_guard.complete()?;
             dense_layers
                 .controller
-                .record_forward(step.sequence_length > 1);
+                .record_forward(step.sequence_length > 1, &dense_layers.residency)?;
         } else {
             for ((global_layer, layer), cache) in self
                 .range
@@ -1759,7 +1767,8 @@ impl DeepSeekStage {
                         "DeepSeek stage cache does not match global layer {global_layer}"
                     )));
                 }
-                let (_host_lease, lease) = dense_layers.prepare(local_index)?;
+                let (_host_lease, lease) =
+                    dense_layers.prepare(local_index, step.sequence_length > 1)?;
                 let mut layer = deepseek_v3::DecoderLayer::new_layerwise(
                     &self.args,
                     global_layer as i32,
@@ -1778,7 +1787,7 @@ impl DeepSeekStage {
             dense_guard.complete()?;
             dense_layers
                 .controller
-                .record_forward(step.sequence_length > 1);
+                .record_forward(step.sequence_length > 1, &dense_layers.residency)?;
         } else {
             for ((global_layer, layer), cache) in self
                 .range

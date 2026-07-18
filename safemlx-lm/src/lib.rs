@@ -96,7 +96,8 @@ pub mod weights;
 pub use dense_stream::{BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError};
 pub use expert_cache::SparseExpertDenseStreamLoadOptions;
 pub use layerwise::{
-    load_general_layerwise_model, DenseDiskStreamReport, GeneralLayerwiseModel,
+    load_general_layerwise_model, DenseCacheMetrics, DenseDiskStreamReport,
+    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, GeneralLayerwiseModel,
     GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions, LayerwiseForwardState,
     LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter, LayerwiseModelMetadata,
     WeightResidency,

@@ -1159,6 +1159,25 @@ mod tests {
                     .count();
                 assert!(resident <= depth);
             }
+        } else {
+            let report = layerwise.dense_stream_report().unwrap().unwrap();
+            assert_eq!(report.prefill().forwards(), 1);
+            assert_eq!(report.decode().forwards(), 2);
+            assert!(report.prefill().peak_host_layers() > 0);
+            assert!(report.prefill().peak_device_layers() > 0);
+            assert!(report.decode().peak_host_layers() > 0);
+            assert!(report.decode().peak_device_layers() > 0);
+            let groups = report
+                .execution_groups()
+                .iter()
+                .map(|group| (group.id(), group))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let vision = groups["vision_encoder"];
+            let text = groups["text_decoder"];
+            assert_eq!(vision.completed_executions(), 1);
+            assert_eq!(text.completed_executions(), 3);
+            assert!(vision.peak_device_layers() > 0);
+            assert!(text.peak_device_layers() > 0);
         }
     }
 

@@ -25,6 +25,16 @@ pub enum MemoryTier {
     Disk,
 }
 
+impl MemoryTier {
+    const fn index(self) -> usize {
+        match self {
+            Self::Device => 0,
+            Self::Host => 1,
+            Self::Disk => 2,
+        }
+    }
+}
+
 /// The intended lifetime behavior of an offload unit within a tier.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResidencyPolicy {
@@ -210,6 +220,38 @@ pub struct TierByteTotals {
     device: u64,
     host: u64,
     disk: u64,
+}
+
+/// Current or peak logical resident-unit counts by tier.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct TierUnitTotals {
+    device: usize,
+    host: usize,
+    disk: usize,
+}
+
+impl TierUnitTotals {
+    /// Creates explicit device, host, and disk unit totals.
+    pub const fn new(device: usize, host: usize, disk: usize) -> Self {
+        Self { device, host, disk }
+    }
+
+    /// Returns the unit total for `tier`.
+    pub const fn get(self, tier: MemoryTier) -> usize {
+        match tier {
+            MemoryTier::Device => self.device,
+            MemoryTier::Host => self.host,
+            MemoryTier::Disk => self.disk,
+        }
+    }
+
+    fn set(&mut self, tier: MemoryTier, units: usize) {
+        match tier {
+            MemoryTier::Device => self.device = units,
+            MemoryTier::Host => self.host = units,
+            MemoryTier::Disk => self.disk = units,
+        }
+    }
 }
 
 impl TierByteTotals {
@@ -667,9 +709,13 @@ pub struct OffloadTelemetry {
     planned_bytes: TierByteTotals,
     resident_bytes: TierByteTotals,
     peak_resident_bytes: TierByteTotals,
+    resident_units: TierUnitTotals,
+    peak_resident_units: TierUnitTotals,
     transfers: [TransferMetrics; 6],
     prefetch: PrefetchMetrics,
+    tier_prefetch: [PrefetchMetrics; 3],
     evictions: EvictionMetrics,
+    tier_evictions: [EvictionMetrics; 3],
     mlx_memory: Option<MlxMemoryMetrics>,
     process: ProcessMetrics,
 }
@@ -696,6 +742,14 @@ impl OffloadTelemetry {
         }
     }
 
+    /// Sets current resident units and updates the peak for `tier`.
+    pub fn set_resident_units(&mut self, tier: MemoryTier, units: usize) {
+        self.resident_units.set(tier, units);
+        if units > self.peak_resident_units.get(tier) {
+            self.peak_resident_units.set(tier, units);
+        }
+    }
+
     /// Records one completed transfer using saturating counter updates.
     pub fn record_transfer(
         &mut self,
@@ -719,6 +773,17 @@ impl OffloadTelemetry {
         }
     }
 
+    /// Records a cache request both globally and for its target tier.
+    pub fn record_tier_prefetch(&mut self, tier: MemoryTier, outcome: PrefetchOutcome) {
+        self.record_prefetch(outcome);
+        let metrics = &mut self.tier_prefetch[tier.index()];
+        metrics.requests = metrics.requests.saturating_add(1);
+        match outcome {
+            PrefetchOutcome::Hit => metrics.hits = metrics.hits.saturating_add(1),
+            PrefetchOutcome::Miss => metrics.misses = metrics.misses.saturating_add(1),
+        }
+    }
+
     /// Records a demand stall while waiting for a prefetched unit.
     pub fn record_prefetch_stall(&mut self, duration: Duration) {
         self.prefetch.stalls = self.prefetch.stalls.saturating_add(1);
@@ -729,6 +794,14 @@ impl OffloadTelemetry {
     pub fn record_eviction(&mut self, bytes: u64) {
         self.evictions.count = self.evictions.count.saturating_add(1);
         self.evictions.bytes = self.evictions.bytes.saturating_add(bytes);
+    }
+
+    /// Records an eviction both globally and for its source tier.
+    pub fn record_tier_eviction(&mut self, tier: MemoryTier, bytes: u64) {
+        self.record_eviction(bytes);
+        let metrics = &mut self.tier_evictions[tier.index()];
+        metrics.count = metrics.count.saturating_add(1);
+        metrics.bytes = metrics.bytes.saturating_add(bytes);
     }
 
     /// Records an externally obtained MLX allocator sample.
@@ -765,9 +838,13 @@ impl OffloadTelemetry {
             planned_bytes: self.planned_bytes,
             resident_bytes: self.resident_bytes,
             peak_resident_bytes: self.peak_resident_bytes,
+            resident_units: self.resident_units,
+            peak_resident_units: self.peak_resident_units,
             transfers: self.transfers,
             prefetch: self.prefetch,
+            tier_prefetch: self.tier_prefetch,
             evictions: self.evictions,
+            tier_evictions: self.tier_evictions,
             mlx_memory: self.mlx_memory,
             process: self.process,
         }
@@ -785,9 +862,13 @@ pub struct OffloadReport {
     planned_bytes: TierByteTotals,
     resident_bytes: TierByteTotals,
     peak_resident_bytes: TierByteTotals,
+    resident_units: TierUnitTotals,
+    peak_resident_units: TierUnitTotals,
     transfers: [TransferMetrics; 6],
     prefetch: PrefetchMetrics,
+    tier_prefetch: [PrefetchMetrics; 3],
     evictions: EvictionMetrics,
+    tier_evictions: [EvictionMetrics; 3],
     mlx_memory: Option<MlxMemoryMetrics>,
     process: ProcessMetrics,
 }
@@ -808,6 +889,16 @@ impl OffloadReport {
         self.peak_resident_bytes
     }
 
+    /// Returns current resident-unit counts per tier.
+    pub const fn resident_units(&self) -> TierUnitTotals {
+        self.resident_units
+    }
+
+    /// Returns peak resident-unit counts per tier.
+    pub const fn peak_resident_units(&self) -> TierUnitTotals {
+        self.peak_resident_units
+    }
+
     /// Returns accumulated metrics for one transfer direction.
     pub const fn transfer(&self, direction: TransferDirection) -> TransferMetrics {
         self.transfers[direction.index()]
@@ -818,9 +909,19 @@ impl OffloadReport {
         self.prefetch
     }
 
+    /// Returns cache request metrics for one target tier.
+    pub const fn tier_prefetch(&self, tier: MemoryTier) -> PrefetchMetrics {
+        self.tier_prefetch[tier.index()]
+    }
+
     /// Returns accumulated eviction metrics.
     pub const fn evictions(&self) -> EvictionMetrics {
         self.evictions
+    }
+
+    /// Returns eviction metrics for one source tier.
+    pub const fn tier_evictions(&self, tier: MemoryTier) -> EvictionMetrics {
+        self.tier_evictions[tier.index()]
     }
 
     /// Returns the latest MLX allocator sample, if one was recorded.
@@ -964,13 +1065,16 @@ mod tests {
         telemetry.set_resident_bytes(MemoryTier::Device, 8);
         telemetry.set_resident_bytes(MemoryTier::Device, 12);
         telemetry.set_resident_bytes(MemoryTier::Device, 6);
+        telemetry.set_resident_units(MemoryTier::Device, 1);
+        telemetry.set_resident_units(MemoryTier::Device, 2);
+        telemetry.set_resident_units(MemoryTier::Device, 1);
         telemetry.record_transfer(TransferDirection::HostToDevice, 5, Duration::from_millis(2));
         telemetry.record_transfer(TransferDirection::HostToDevice, 7, Duration::from_millis(3));
-        telemetry.record_prefetch(PrefetchOutcome::Hit);
-        telemetry.record_prefetch(PrefetchOutcome::Miss);
+        telemetry.record_tier_prefetch(MemoryTier::Device, PrefetchOutcome::Hit);
+        telemetry.record_tier_prefetch(MemoryTier::Host, PrefetchOutcome::Miss);
         telemetry.record_prefetch_stall(Duration::from_millis(4));
-        telemetry.record_eviction(3);
-        telemetry.record_eviction(4);
+        telemetry.record_tier_eviction(MemoryTier::Device, 3);
+        telemetry.record_tier_eviction(MemoryTier::Host, 4);
         telemetry.record_mlx_memory(MlxMemoryMetrics::new(11, 12, 13));
         telemetry.record_process_metrics(ProcessMetrics::new(Some(14), Some(15), Some(16)));
 
@@ -978,6 +1082,8 @@ mod tests {
         assert_eq!(report.planned_bytes().get(MemoryTier::Device), 10);
         assert_eq!(report.resident_bytes().get(MemoryTier::Device), 6);
         assert_eq!(report.peak_resident_bytes().get(MemoryTier::Device), 12);
+        assert_eq!(report.resident_units().get(MemoryTier::Device), 1);
+        assert_eq!(report.peak_resident_units().get(MemoryTier::Device), 2);
         assert_eq!(report.transfer(TransferDirection::HostToDevice).count(), 2);
         assert_eq!(report.transfer(TransferDirection::HostToDevice).bytes(), 12);
         assert_eq!(
@@ -991,6 +1097,10 @@ mod tests {
         assert_eq!(report.prefetch().stall_duration(), Duration::from_millis(4));
         assert_eq!(report.evictions().count(), 2);
         assert_eq!(report.evictions().bytes(), 7);
+        assert_eq!(report.tier_prefetch(MemoryTier::Device).hits(), 1);
+        assert_eq!(report.tier_prefetch(MemoryTier::Host).misses(), 1);
+        assert_eq!(report.tier_evictions(MemoryTier::Device).bytes(), 3);
+        assert_eq!(report.tier_evictions(MemoryTier::Host).bytes(), 4);
         assert_eq!(report.mlx_memory().unwrap().peak_bytes(), 13);
         assert_eq!(report.process_metrics().rss_bytes(), Some(14));
     }
@@ -1000,11 +1110,13 @@ mod tests {
         let mut telemetry = OffloadTelemetry::default();
         telemetry.set_planned_bytes(TierByteTotals::new(1, 2, 3));
         telemetry.set_resident_bytes(MemoryTier::Host, 4);
+        telemetry.set_resident_units(MemoryTier::Host, 1);
         let snapshot = telemetry.snapshot();
 
         telemetry.set_resident_bytes(MemoryTier::Host, 9);
         telemetry.record_eviction(5);
         assert_eq!(snapshot.resident_bytes().get(MemoryTier::Host), 4);
+        assert_eq!(snapshot.resident_units().get(MemoryTier::Host), 1);
         assert_eq!(snapshot.evictions(), EvictionMetrics::default());
 
         telemetry.reset();
