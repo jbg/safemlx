@@ -30,7 +30,11 @@ use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, Proce
 use crate::quantization::WeightQuantization;
 use crate::sampler::{DefaultSampler, Sampler};
 use crate::{
-    cache::{ConcatKeyValueCache, SlidingKeyValueCache},
+    cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
+    cache_residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+    },
     error::Error,
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
 };
@@ -574,6 +578,9 @@ impl Model {
                     stream,
                     observer,
                 ),
+            (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
+                "detailed attention inspection is unavailable for paged key/value caches",
+            )),
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
                 "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
@@ -714,6 +721,9 @@ impl Model {
                 )?;
                 final_token_logits(&logits, stream)
             }
+            (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
+                "detailed attention inspection is unavailable for paged key/value caches",
+            )),
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
                 "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
@@ -799,6 +809,114 @@ impl Model {
         }
     }
 
+    /// Creates ordinary cache state or an explicitly bounded paged cache.
+    ///
+    /// Paged construction is currently supported for Llama-compatible text
+    /// attention, DeepSeek compressed-latent attention, and the corresponding
+    /// bounded weight-execution wrappers. Other cache representations return a
+    /// precise unsupported error and retain their device-resident defaults.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<ModelCache, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => match self {
+                Self::Llama(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let layer_count = usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
+                    let caches = (0..layer_count)
+                        .map(|layer| {
+                            PagedKeyValueCache::new(manager.clone(), layer, model.sliding_window())
+                                .map(Some)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(ModelCache::PagedKeyValue(caches))
+                }
+                Self::LlamaLayerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::LlamaLayerwise)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::DeepSeekV3(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::DeepSeekV3),
+                Self::DeepSeekV3Layerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::DeepSeekV3)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::GptOss(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::GptOss),
+                Self::GptOssLayerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::GptOss)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                _ => Err(Exception::custom(format!(
+                    "paged cache residency is unsupported for model type {}",
+                    self.model_type()
+                ))),
+            },
+        }
+    }
+
+    /// Lazily catalogs a compatible persisted text prefix for a fresh cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
+        match self {
+            Self::Llama(model) => {
+                let (manager, manifest) =
+                    open_prompt_cache(directory, expected, prefix_token_ids, options)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                let layer_count = usize::try_from(model.args.num_hidden_layers)
+                    .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
+                let caches = (0..layer_count)
+                    .map(|layer| {
+                        PagedKeyValueCache::new(
+                            manager.clone(),
+                            layer,
+                            model.sliding_window(),
+                        )
+                        .map(Some)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((ModelCache::PagedKeyValue(caches), manifest))
+            }
+            Self::LlamaLayerwise(model) => model
+                .load_prompt_cache(
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                )
+                .map(|(cache, manifest)| (ModelCache::LlamaLayerwise(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::DeepSeekV3(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest)),
+            Self::DeepSeekV3Layerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::GptOss(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest)),
+            Self::GptOssLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "prompt-cache loading is unsupported for this model cache representation; multimodal and recurrent prefixes require additional identity state",
+            )),
+        }
+    }
+
     /// Computes logits for an initial typed input using a cache returned by [`Model::new_cache`].
     pub fn prefill_input_with_cache(
         &mut self,
@@ -829,6 +947,9 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
@@ -960,6 +1081,9 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
+            (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => ModelGenerate::LlamaPaged(
+                llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+            ),
             (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
                 ModelGenerate::LlamaLayerwise(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
@@ -1059,6 +1183,8 @@ pub enum ModelCache {
     Qwen3VlMoe(qwen3_vl_moe::Cache),
     /// Homogeneous bounded cache for sliding-window attention.
     SlidingKeyValue(Vec<Option<SlidingKeyValueCache>>),
+    /// Homogeneous block-addressable key/value cache under one global budget.
+    PagedKeyValue(Vec<Option<PagedKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
     NemotronH(nemotron_h::Cache),
     /// Heterogeneous LFM2 attention/convolution cache.
@@ -1067,6 +1193,63 @@ pub enum ModelCache {
     Qwen35Moe(qwen3_5_moe::Cache),
     /// Heterogeneous Qwen3-Next cache.
     Qwen3Next(qwen3_next::Cache),
+}
+
+impl ModelCache {
+    /// Returns aggregate cache-residency telemetry when paging is active.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        match self {
+            Self::PagedKeyValue(caches) => caches
+                .iter()
+                .flatten()
+                .next()
+                .map(PagedKeyValueCache::report)
+                .transpose(),
+            Self::LlamaLayerwise(cache) => cache
+                .residency_report()
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::DeepSeekV3(cache) => cache.residency_report(),
+            Self::GptOss(cache) => cache.residency_report(),
+            _ => Ok(None),
+        }
+    }
+
+    /// Finalizes and atomically saves a completed immutable text prefix.
+    pub fn save_prompt_cache(
+        &mut self,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Exception> {
+        match self {
+            Self::PagedKeyValue(caches) => {
+                for cache in caches.iter_mut().flatten() {
+                    cache.finalize()?;
+                }
+                caches
+                    .iter()
+                    .flatten()
+                    .next()
+                    .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
+                    .manager()
+                    .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+                    .map_err(|error| Exception::custom(error.to_string()))
+            }
+            Self::LlamaLayerwise(cache) => cache
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::DeepSeekV3(cache) => {
+                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            }
+            Self::GptOss(cache) => {
+                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            }
+            _ => Err(Exception::custom(
+                "prompt-cache persistence is unsupported for this model cache representation",
+            )),
+        }
+    }
 }
 
 /// Token iterator for any supported model variant.
@@ -1094,6 +1277,8 @@ where
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
     LlamaSliding(llama::Generate<'a, SlidingKeyValueCache, S>),
+    /// Llama-compatible generation with block-addressable cache residency.
+    LlamaPaged(llama::Generate<'a, PagedKeyValueCache, S>),
     /// Llama-compatible generation using bounded layer execution.
     LlamaLayerwise(
         common::generation::Generate<'a, crate::llama::LlamaModel, crate::llama::LlamaCache, S>,
@@ -1153,6 +1338,7 @@ where
             Self::InklingLayerwise(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::LlamaSliding(generate) => generate.next(),
+            Self::LlamaPaged(generate) => generate.next(),
             Self::LlamaLayerwise(generate) => generate.next(),
             Self::Lfm2(generate) => generate.next(),
             Self::Lfm2Layerwise(generate) => generate.next(),
@@ -1484,6 +1670,26 @@ impl LoadedModel {
     /// Creates an empty cache value appropriate for the loaded model.
     pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
+    }
+
+    /// Creates cache state under an explicit cache-residency policy.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<ModelCache, Exception> {
+        self.model.new_cache_with_options(policy)
+    }
+
+    /// Lazily catalogs a compatible reusable text prefix for this loaded model.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
+        self.model
+            .load_prompt_cache(directory, expected, prefix_token_ids, options)
     }
 
     /// Computes logits for an initial typed input using a cache returned by [`LoadedModel::new_cache`].

@@ -13,6 +13,9 @@ use safemlx::{
 };
 
 use crate::{
+    cache_residency::{
+        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+    },
     error::Error,
     expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -55,6 +58,29 @@ impl DeepSeekV3LayerwiseModel {
     /// Creates one compressed MLA cache per decoder block.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Creates ordinary or paged compressed attention state independently of weight residency.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        Cache::new_with_options(self.args().num_hidden_layers, policy).map_err(Into::into)
+    }
+
+    /// Lazily catalogs a compatible persisted compressed prefix.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        Cache::load_prompt_cache(
+            self.args().num_hidden_layers,
+            directory,
+            expected,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(Into::into)
     }
 
     /// Returns current logical residency and transfer telemetry.

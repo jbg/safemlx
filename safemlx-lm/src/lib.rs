@@ -23,6 +23,8 @@
 
 /// Attention key/value cache implementations.
 pub mod cache;
+/// Block-addressable attention-cache residency and prompt-cache persistence.
+pub mod cache_residency;
 /// Bounded layer execution for DeepSeek-V3 and DeepSeek-R1.
 pub mod deepseek_v3;
 /// Experimental bounded dense-layer streaming from safetensors checkpoints.
@@ -95,6 +97,13 @@ pub mod weight_store;
 /// Strict safetensors loading and validation utilities.
 pub mod weights;
 
+pub use cache::PagedKeyValueCache;
+pub use cache_residency::{
+    inspect_prompt_cache, open_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheRankIdentity,
+    CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheResidencyPolicy,
+    CacheResidencyReport, CacheTier, LiveCacheDiskPolicy, PagedCacheOptions, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
+};
 pub use dense_stream::{BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError};
 pub use expert_cache::SparseExpertDenseStreamLoadOptions;
 pub use layerwise::{
