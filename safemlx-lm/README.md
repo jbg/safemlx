@@ -944,3 +944,8 @@ uses the slower dequantized FP8 reference path.
 ## License
 
 Licensed under either Apache-2.0 or MIT.
+Paged attention-cache residency and reusable prompt-cache persistence are
+opt-in. Device-resident caches remain the default. See
+[`CACHE_RESIDENCY.md`](CACHE_RESIDENCY.md) for configuration, compatibility,
+cost, and safety details, and run `paged_prompt_cache` for a deterministic
+save/drop/reopen parity check.
