@@ -486,7 +486,7 @@ fn ceil_div(lhs: i32, rhs: i32) -> i32 {
 }
 
 impl ModelArgs {
-    fn uses_fp8(&self) -> bool {
+    pub(crate) fn uses_fp8(&self) -> bool {
         self.quantization_config.is_some()
     }
 
@@ -496,11 +496,11 @@ impl ModelArgs {
             .and_then(|configs| configs.get(weight_name).copied())
     }
 
-    fn is_moe(&self) -> bool {
+    pub(crate) fn is_moe(&self) -> bool {
         self.num_experts > 0
     }
 
-    fn layer_type(&self, index: usize) -> LayerType {
+    pub(crate) fn layer_type(&self, index: usize) -> LayerType {
         self.layer_types
             .get(index)
             .copied()
@@ -738,7 +738,7 @@ impl Cache {
         }
     }
 
-    fn offset(&self) -> i32 {
+    pub(crate) fn offset(&self) -> i32 {
         self.layers
             .iter()
             .map(|layer| match layer {
@@ -793,6 +793,19 @@ pub enum LayerCache {
     FullAttention(ConcatKeyValueCache),
     /// Linear-attention convolution and recurrent cache.
     LinearAttention(LinearAttentionCache),
+}
+
+impl LayerCache {
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::FullAttention(cache) => cache.retained_arrays(),
+            Self::LinearAttention(cache) => cache
+                .conv_state
+                .iter()
+                .chain(cache.recurrent_state.iter())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3393,7 +3406,7 @@ impl Model {
         Ok(logits)
     }
 
-    fn forward_logits(
+    pub(crate) fn forward_logits(
         &mut self,
         input: ModelInput<'_>,
         last_token_only: bool,

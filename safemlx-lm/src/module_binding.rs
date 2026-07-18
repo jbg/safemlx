@@ -9,6 +9,7 @@ use safemlx::module::ModuleParameters;
 
 use crate::{
     residency::{ResidentUnitLease, WeightBinding},
+    weight_recipe::{DerivedWeightRecipe, RecipeDtype},
     weight_store::{TensorSelection, WeightStore},
 };
 
@@ -47,6 +48,20 @@ pub fn build_module_bindings(
     prefix: &str,
     store: &dyn WeightStore,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+    build_module_bindings_with_recipes(module, prefix, store, BTreeMap::new())
+}
+
+/// Builds module bindings while replacing selected local parameters with recipes.
+///
+/// Recipe keys use the module-local flattened parameter names. Every override
+/// is shape- and dtype-checked against the unloaded runtime parameter before
+/// residency initialization.
+pub fn build_module_bindings_with_recipes(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<Vec<WeightBinding>, ModuleBindingError> {
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut local_names = params.keys().map(ToString::to_string).collect::<Vec<_>>();
@@ -58,6 +73,39 @@ pub fn build_module_bindings(
         let parameter = params
             .get(local_name.as_str())
             .expect("parameter name came from the same flattened tree");
+        if let Some(recipe) = recipes.remove(&local_name) {
+            let metadata = recipe.infer(store)?;
+            let expected_shape = parameter
+                .shape()
+                .iter()
+                .map(|&dimension| usize::try_from(dimension))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ModuleBindingError::InvalidModuleShape {
+                    parameter: qualify(prefix, &local_name),
+                    shape: parameter.shape().to_vec(),
+                })?;
+            if metadata.shape() != expected_shape {
+                return Err(ModuleBindingError::RecipeShapeMismatch {
+                    parameter: qualify(prefix, &local_name),
+                    expected: expected_shape,
+                    actual: metadata.shape().to_vec(),
+                });
+            }
+            let expected_dtype = RecipeDtype::from(parameter.dtype());
+            if metadata.dtype() != &expected_dtype {
+                return Err(ModuleBindingError::RecipeDtypeMismatch {
+                    parameter: qualify(prefix, &local_name),
+                    expected: expected_dtype,
+                    actual: metadata.dtype().clone(),
+                });
+            }
+            bindings.push(WeightBinding::from_recipe(
+                local_name,
+                recipe,
+                metadata.byte_len(),
+            )?);
+            continue;
+        }
         let destination = qualify(prefix, &local_name);
         let canonical = canonical_checkpoint_name(&destination);
         let checkpoint_key = if keys.contains(&destination) {
@@ -105,6 +153,12 @@ pub fn build_module_bindings(
             TensorSelection::Full,
             expected_bytes,
         )?);
+    }
+
+    if !recipes.is_empty() {
+        return Err(ModuleBindingError::UnknownRecipeParameters {
+            parameters: recipes.into_keys().collect(),
+        });
     }
 
     Ok(bindings)
@@ -181,6 +235,32 @@ fn qualify(prefix: &str, name: &str) -> String {
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
+    /// A recipe override did not name a runtime parameter.
+    #[error("derived-weight recipes name unknown local parameters: {parameters:?}")]
+    UnknownRecipeParameters {
+        /// Unknown local parameter names.
+        parameters: Vec<String>,
+    },
+    /// A recipe output shape differed from its runtime placeholder.
+    #[error("derived weight for {parameter:?} has shape {actual:?}, expected {expected:?}")]
+    RecipeShapeMismatch {
+        /// Fully qualified runtime parameter.
+        parameter: String,
+        /// Runtime placeholder shape.
+        expected: Vec<usize>,
+        /// Recipe output shape.
+        actual: Vec<usize>,
+    },
+    /// A recipe output dtype differed from its runtime placeholder.
+    #[error("derived weight for {parameter:?} has dtype {actual:?}, expected {expected:?}")]
+    RecipeDtypeMismatch {
+        /// Fully qualified runtime parameter.
+        parameter: String,
+        /// Runtime placeholder dtype.
+        expected: RecipeDtype,
+        /// Recipe output dtype.
+        actual: RecipeDtype,
+    },
     /// A module parameter had no matching checkpoint tensor.
     #[error("checkpoint is missing module parameter {destination:?}")]
     MissingParameter {
@@ -250,6 +330,9 @@ pub enum ModuleBindingError {
     /// Persistent checkpoint inspection failed.
     #[error(transparent)]
     WeightStore(#[from] crate::weight_store::WeightStoreError),
+    /// Derived-weight metadata validation failed.
+    #[error(transparent)]
+    WeightRecipe(#[from] crate::weight_recipe::WeightRecipeError),
     /// Residency binding or lookup failed.
     #[error(transparent)]
     Residency(#[from] crate::residency::ResidencyError),

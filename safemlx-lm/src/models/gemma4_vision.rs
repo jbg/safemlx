@@ -37,7 +37,7 @@ fn default_hidden_activation() -> String {
 }
 
 impl Gemma4VisionConfig {
-    fn rope_theta(&self) -> f32 {
+    pub(crate) fn rope_theta(&self) -> f32 {
         self.rope_parameters
             .as_ref()
             .and_then(|parameters| parameters.get("rope_theta"))
@@ -59,7 +59,7 @@ pub(crate) struct VisionPatchEmbedder {
 }
 
 impl VisionPatchEmbedder {
-    fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             input_proj: nn::Linear::unloaded(
                 3 * config.patch_size * config.patch_size,
@@ -76,7 +76,7 @@ impl VisionPatchEmbedder {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         pixel_values: &Array,
         position_ids: &Array,
@@ -288,23 +288,24 @@ impl VisionMlp {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-pub(crate) struct VisionLayer {
+/// One Gemma 4 vision transformer block.
+pub struct VisionLayer {
     #[param]
-    pub self_attn: VisionAttention,
+    pub(crate) self_attn: VisionAttention,
     #[param]
-    pub mlp: VisionMlp,
+    pub(crate) mlp: VisionMlp,
     #[param]
-    pub input_layernorm: nn::RmsNorm,
+    pub(crate) input_layernorm: nn::RmsNorm,
     #[param]
-    pub post_attention_layernorm: nn::RmsNorm,
+    pub(crate) post_attention_layernorm: nn::RmsNorm,
     #[param]
-    pub pre_feedforward_layernorm: nn::RmsNorm,
+    pub(crate) pre_feedforward_layernorm: nn::RmsNorm,
     #[param]
-    pub post_feedforward_layernorm: nn::RmsNorm,
+    pub(crate) post_feedforward_layernorm: nn::RmsNorm,
 }
 
 impl VisionLayer {
-    fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         let norm = || {
             nn::RmsNorm::unloaded(
                 config.hidden_size,
@@ -323,7 +324,7 @@ impl VisionLayer {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         hidden: &Array,
         padding: &Array,
@@ -354,6 +355,95 @@ impl VisionLayer {
     }
 }
 
+/// Pinned vision modules surrounding layerwise transformer blocks.
+#[derive(Debug, Clone, ModuleParameters)]
+pub(crate) struct Gemma4VisionLayerwiseStatic {
+    pub(crate) config: Gemma4VisionConfig,
+    #[param]
+    pub(crate) patch_embedder: VisionPatchEmbedder,
+    #[param]
+    pub(crate) std_bias: Param<Option<Array>>,
+    #[param]
+    pub(crate) std_scale: Param<Option<Array>>,
+}
+
+/// Per-image padding and rotary state retained across vision blocks.
+pub(crate) struct Gemma4VisionLayerwiseState {
+    pub(crate) position_ids: Array,
+    pub(crate) padding: Array,
+    pub(crate) cos: Array,
+    pub(crate) sin: Array,
+    pub(crate) working_dtype: Dtype,
+}
+
+impl Gemma4VisionLayerwiseState {
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        vec![&self.position_ids, &self.padding, &self.cos, &self.sin]
+    }
+}
+
+impl Gemma4VisionLayerwiseStatic {
+    pub(crate) fn from_tower(tower: Gemma4VisionTower) -> Self {
+        Self {
+            config: tower.config,
+            patch_embedder: tower.patch_embedder,
+            std_bias: tower.std_bias,
+            std_scale: tower.std_scale,
+        }
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        pixel_values: &Array,
+        position_ids: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Gemma4VisionLayerwiseState), Exception> {
+        let (hidden, padding) = self
+            .patch_embedder
+            .forward(pixel_values, position_ids, stream)?;
+        let working_dtype = hidden.dtype();
+        let (cos, sin) = vision_rope(
+            position_ids,
+            self.config.head_dim,
+            self.config.rope_theta(),
+            stream,
+        )?;
+        Ok((
+            hidden,
+            Gemma4VisionLayerwiseState {
+                position_ids: position_ids.clone(),
+                padding,
+                cos,
+                sin,
+                working_dtype,
+            },
+        ))
+    }
+
+    pub(crate) fn finish(
+        &self,
+        hidden: &Array,
+        state: &Gemma4VisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut hidden = pool_hidden(
+            hidden,
+            &state.position_ids,
+            self.config.pooling_kernel_size,
+            stream,
+        )?
+        .as_dtype(Dtype::Float32, stream)?
+        .multiply(
+            Array::from_f32((self.config.hidden_size as f32).sqrt()),
+            stream,
+        )?;
+        if let (Some(bias), Some(scale)) = (self.std_bias.as_ref(), self.std_scale.as_ref()) {
+            hidden = hidden.subtract(bias, stream)?.multiply(scale, stream)?;
+        }
+        hidden.as_dtype(state.working_dtype, stream)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct VisionEncoder {
     #[param]
@@ -374,7 +464,7 @@ pub(crate) struct Gemma4VisionTower {
 }
 
 impl Gemma4VisionTower {
-    pub(super) fn new(config: Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         let patch_embedder = VisionPatchEmbedder::new(&config, stream)?;
         let layers = (0..config.num_hidden_layers)
             .map(|_| VisionLayer::new(&config, stream))

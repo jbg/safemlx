@@ -201,7 +201,7 @@ pub struct Fp8QuantizationConfig {
 }
 
 impl Fp8QuantizationConfig {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.quant_method != "fp8"
             || self.fmt != "e4m3"
             || self.activation_scheme != "dynamic"
@@ -315,7 +315,7 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.model_type != "deepseek_v3" {
             return Err(Error::UnsupportedModelType(self.model_type.clone()));
         }
@@ -477,7 +477,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn new(num_layers: i32) -> Self {
+    pub(crate) fn new(num_layers: i32) -> Self {
         Self {
             layers: (0..num_layers)
                 .map(|_| CompressedLatentCache::new())
@@ -1273,6 +1273,119 @@ impl RoutedExperts {
         })
     }
 
+    fn initialize_unloaded_banks(
+        &mut self,
+        args: &ModelArgs,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let expert_weight = |output: i32,
+                             input: i32,
+                             affine: Option<WeightQuantization>|
+         -> Result<Param<Option<Array>>, Exception> {
+            let packed_input = affine.map_or(input, |quantization| {
+                quantized_packed_dimension(input, quantization.bits())
+            });
+            Param::<Option<Array>>::unloaded_some(
+                &[args.n_routed_experts, output, packed_input],
+                if args.native_fp8_config().is_some() {
+                    Dtype::Uint8
+                } else if affine.is_some() {
+                    Dtype::Uint32
+                } else {
+                    Dtype::Float32
+                },
+                stream,
+            )
+        };
+        let fp8_scale = |output: i32, input: i32| {
+            if args.native_fp8_config().is_some() {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.n_routed_experts,
+                        (output + 127) / 128,
+                        (input + 127) / 128,
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )
+            } else {
+                Ok(Param::new(None))
+            }
+        };
+        let affine_component = |output: i32,
+                                input: i32,
+                                affine: Option<WeightQuantization>,
+                                biases: bool|
+         -> Result<Param<Option<Array>>, Exception> {
+            if let Some(quantization) =
+                affine.filter(|quantization| !biases || quantization.has_biases())
+            {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        args.n_routed_experts,
+                        output,
+                        input / quantization.group_size(),
+                    ],
+                    Dtype::Float32,
+                    stream,
+                )
+            } else {
+                Ok(Param::new(None))
+            }
+        };
+        self.gate_proj = expert_weight(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.gate_affine,
+        )?;
+        self.gate_proj_scale_inv = fp8_scale(args.moe_intermediate_size, args.hidden_size)?;
+        self.gate_proj_scales = affine_component(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.gate_affine,
+            false,
+        )?;
+        self.gate_proj_biases = affine_component(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.gate_affine,
+            true,
+        )?;
+        self.up_proj = expert_weight(args.moe_intermediate_size, args.hidden_size, self.up_affine)?;
+        self.up_proj_scale_inv = fp8_scale(args.moe_intermediate_size, args.hidden_size)?;
+        self.up_proj_scales = affine_component(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.up_affine,
+            false,
+        )?;
+        self.up_proj_biases = affine_component(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.up_affine,
+            true,
+        )?;
+        self.down_proj = expert_weight(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            self.down_affine,
+        )?;
+        self.down_proj_scale_inv = fp8_scale(args.hidden_size, args.moe_intermediate_size)?;
+        self.down_proj_scales = affine_component(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            self.down_affine,
+            false,
+        )?;
+        self.down_proj_biases = affine_component(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            self.down_affine,
+            true,
+        )?;
+        Ok(())
+    }
+
     fn projection(
         input: &Array,
         weight: &Array,
@@ -1760,6 +1873,18 @@ impl DecoderLayer {
         })
     }
 
+    pub(crate) fn new_layerwise(
+        args: &ModelArgs,
+        layer: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut block = Self::new(args, layer, stream)?;
+        if let FeedForward::Moe(moe) = &mut block.mlp {
+            moe.experts.initialize_unloaded_banks(args, stream)?;
+        }
+        Ok(block)
+    }
+
     fn forward_impl(
         &mut self,
         x: &Array,
@@ -2069,7 +2194,7 @@ impl Model {
         &self.args.model_type
     }
 
-    fn forward_logits(
+    pub(crate) fn forward_logits(
         &mut self,
         input: ModelInput<'_>,
         last_token_only: bool,

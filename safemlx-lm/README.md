@@ -36,9 +36,13 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-The unified Llama/Mistral loader selects either the existing eager model engine
-or the generic layerwise engine from a weight-residency policy. Other model
-families continue to use their existing loading behavior.
+`ModelLoadOptions` selects either existing eager execution or the generic
+layerwise engine. DeepSeek-V3/R1, Gemma 4, Inkling, Llama,
+Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL,
+Qwen3-VL-MoE, and Qwen3.5 safetensors have registered adapters,
+including dense and MoE variants. Moshi and PersonaPlex use the same engine with
+independent temporal-layer and depth-codebook-slice windows. A requested family without a registered adapter returns
+a specific error and never silently falls back to fully resident execution.
 
 ## Offload planning and observability
 
@@ -73,21 +77,26 @@ residency observations feed the existing offload telemetry, while mapped-shard
 diagnostics remain separate. Background workers and event-backed overlap are
 not implemented.
 
-`DeviceLayerWindow` adds deterministic ordered-unit preparation and explicit
-trimming even under an unlimited device budget. `LayerwiseModel<A>` owns the
-storage, plan, leases, synchronization, and telemetry for that execution loop.
-`LayerwiseModelAdapter` supplies model-family-specific static modules, decoder
-construction, mask and cache behavior, and logits projection. The Llama adapter
-is the first implementation; Qwen, DeepSeek, and distributed adapters do not
-yet use this engine. Distributed callers can construct units from only their
-rank-local ranges or indices; the manager has no rank or collective logic.
+`ResidentLayerGroup` adds named, deterministic ordered-unit preparation and
+explicit trimming even under an unlimited device budget. Independent groups
+can represent text, vision, audio, temporal, or depth-transformer stacks and
+can be cleared without disturbing each other. `LayerwiseModel<A>` preserves the
+compatible homogeneous-KV path. `GeneralLayerwiseModel<A>` adds associated
+input and cache types, heterogeneous runtime units, full-cache access, and
+central retained-state evaluation for recurrent and multimodal adapters.
+
+`DerivedWeightRecipe` composes checkpoint selection and renaming,
+concatenation, stacking, reshape, axis permutation, and dtype cast. Recipes are
+validated from metadata, keep all source leases alive through evaluation, and
+materialize the transformed runtime representation on the host before device
+promotion. Direct `WeightBinding` construction remains compatible.
 
 On Apple silicon, CPU and GPU execution share the same physical unified-memory
 pool. Logical host/device accounting is useful for residency policy, but does
 not imply additional physical capacity. Choosing CPU execution can change
-execution behavior, wired memory, and residency pressure. On a discrete CUDA
-system, host-resident weights occupy separate physical memory, making this a
-capacity-expanding option at the cost of synchronous layer transfers.
+execution behavior, wired memory, and residency pressure. CUDA behavior is
+verified by CI; local verification in this workspace does not make discrete
+memory capacity or performance claims.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated
@@ -133,15 +142,96 @@ pinned static weights plus the largest permitted consecutive layer window.
 Residency reports account for parameter copies only; activations, KV state,
 kernels, and allocator cache can make MLX peak memory larger. On Apple silicon,
 logical CPU/GPU totals refer to one unified physical memory pool and do not
-increase model capacity. Discrete CUDA memory is the capacity-expanding target.
+increase model capacity.
 
 Transfers are synchronous because the pinned MLX API exposes whole-stream
-synchronization but no events. GGUF, load-time quantization, other model
-families, pinned host buffers, KV-cache offload, and asynchronous transfer or
+synchronization but no events. GGUF, load-time quantization, pinned host
+buffers, KV-cache offload, and asynchronous transfer or
 compute overlap are not supported by this policy. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
+
+## Qwen3 weight residency
+
+Dense and sparse-MoE Qwen3 use one adapter. Token embeddings, final norm, and
+the tied or untied output projection stay pinned. Each complete transformer
+block, including its routed expert bank, is one `text_decoder` execution unit.
+Standard KV caches remain device resident. Matching checkpoint-native affine
+and MXFP4 parameter trees load directly; load-time conversion in the layerwise
+path is rejected.
+
+## GPT-OSS weight residency
+
+GPT-OSS keeps embeddings, final norm, and the output head pinned while complete
+sparse decoder blocks move through the `text_decoder` window. The adapter owns
+the alternating full/sliding cache schedule, sink-token mask behavior, and RoPE
+state. Checkpoint-native MXFP4 expert blocks and scales remain packed.
+
+## LFM2/LFM2.5 weight residency
+
+Dense and MoE LFM2 variants share one hybrid adapter for full-attention and
+short-convolution layers. KV arrays and bounded convolution state are evaluated
+before a block lease is released. Public per-expert `w1`/`w2`/`w3` tensors are
+concatenated and stacked into runtime expert banks one layer at a time on the
+host; already-packed checkpoint representations load directly.
+
+## DeepSeek-V3/R1 weight residency
+
+DeepSeek keeps embeddings, final normalization, and the output head pinned while
+complete MLA blocks move through the `text_decoder` window. Compressed latent and
+rotary-key cache arrays are evaluated before each block lease is released. The
+dense prefix and routed-plus-shared MoE suffix use the same adapter; official
+per-expert tensors are stacked per layer for dense, affine, and native 128-by-128
+block-FP8 checkpoints. Appended multi-token-prediction weights remain explicitly
+ignored just as they are by the eager text-model loader.
+
+## Inkling weight residency
+
+Inkling local and global attention blocks share one text-decoder window. Global
+and sliding KV arrays plus all four short-convolution states per block are
+evaluated before lease release. Released `model.llm` names are rewritten, short
+convolution weights are cast to the runtime dtype, and interleaved dense, routed,
+and shared `w13` tensors are selected into runtime gate/up order on the host.
+The dMel encoder is a pinned static unit, while the four released hMLP
+projection/fold layers use an independent vision window. Typed prompts may
+interleave text, discrete audio, precomputed media embeddings, and image patches.
+
+## Nemotron-H weight residency
+
+One hybrid adapter handles Mamba2, attention, dense MLP, and sparse MoE blocks.
+Mamba convolution and SSM arrays plus attention KV arrays are evaluated before
+lease release. Public `backbone`/`mixer` names are resolved through the same key
+rewrite used by eager loading, and split ReLU2 experts are stacked per layer.
+
+## Qwen hybrid weight residency
+
+Qwen3-Next and Qwen3.5 share one adapter for recurrent linear attention
+and full attention. Qwen3-Next fused QKVZ/BA tensors are selected into runtime
+projections without materializing the complete checkpoint, and public split
+SwiGLU experts are packed per layer. Qwen3.5 dense and packed-MoE checkpoints use
+the same block loop. Multimodal checkpoints add an independent Qwen vision-block
+group and reuse the resident patch, position, and merger math around that group.
+
+## Layerwise safetensors coverage
+
+The table records the architecture inventory used by the normal and realtime
+dispatch surfaces. “Precise error” means a layerwise request is rejected and is
+never replaced by eager loading.
+
+| Family | Eager loader | Layerwise loader | Cache/state | Pinned static modules | Windowed unit | Checkpoint transform / native packing | Parity coverage |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Llama / Mistral | yes | yes | growing or sliding KV | embedding, norm, head | decoder block | direct affine/MXFP4 | prefill and multi-step decode |
+| Qwen3 dense / MoE | yes | yes | growing KV | embedding, norm, head | decoder block with local experts | direct affine/MXFP4 | dense and MoE prefill/decode |
+| GPT-OSS | yes | yes | alternating full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | both attention modes and multi-step decode |
+| LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
+| DeepSeek-V3/R1 | yes | yes | compressed MLA latent and rotary-key state | embedding, norm, head | MLA decoder block with dense or routed/shared experts | official split experts stacked per layer; direct dense/affine and native block-FP8 banks | dense-to-MoE prefill/decode at two depths; native block-FP8 prefill/decode |
+| Gemma 4 multimodal | yes | yes | alternating KV plus transient shared-KV and media state | patch embedding/pooling, audio subsampling/output, modality projections, token/per-layer embeddings, norm, head | independent vision, audio, and sliding/full text groups | public prefix rewrite; direct affine/MXFP4 text and modality projections | vision/audio/text typed prefill parity; per-layer inputs, shared KV, prefill/decode at two depths |
+| Inkling multimodal | yes | yes | global/local KV, four convolution states per layer, transient hMLP activations | dMel embedding/norm, hMLP final norm, text embedding/norm/head | independent hMLP and local/global dense-or-MoE text groups | released-name rewrite, convolution cast, dense/routed/shared w13 deinterleave | audio/text typed prefill parity; local/global and dense/MoE prefill/decode at two depths |
+| Nemotron-H | yes | yes | attention KV and Mamba convolution/SSM state | embedding, norm, tied/untied head | hybrid block | public key rewrite and split ReLU2 expert packing | all four block kinds, split MoE, prefill/decode |
+| Qwen3-Next / Qwen3.5 | yes | yes | full-attention KV, recurrent linear-attention state, transient vision state | Qwen vision patch/position/merger modules, embedding, norm, tied/untied head | optional vision group plus shared hybrid text group | fused QKVZ/BA selection; split SwiGLU and FP8 expert recipes | Qwen3.5 image/text prefill parity; Qwen3-Next dense/split-MoE and Qwen3.5 dense/MoE prefill/decode |
+| Qwen3-VL / Qwen3-VL-MoE | yes | yes | text KV plus multimodal RoPE delta and transient DeepStack state | patch/position embeddings, vision mergers, text embedding/norm/head | independent vision block and dense/MoE text-block groups | direct public DeepStack vision and packed Qwen3 expert trees | image prefill plus multi-step decode for dense/MoE; two depths for dense |
+| PersonaPlex / Moshi realtime | yes, realtime API | yes, realtime API | temporal KV plus reset-per-frame depth KV and delayed-stream state | text/audio embeddings, temporal norm and heads | independent temporal layers and per-codebook depth slices | native Moshi layout; released PersonaPlex PyTorch norms, packed attention, embeddings, and projections derived lazily | teacher-forced logits, consecutive realtime frames, offline encoded sequence, forced prompt/cache continuity |
 
 ## Linux and CUDA
 
@@ -547,6 +637,14 @@ if let Some(codec_tokens) = output.output_audio_tokens {
     // Decode [batch, config.generated_audio_codebooks] with your codec.
 }
 ```
+
+Pass `ModelLoadOptions::default().with_weight_residency(WeightResidency::LayerwiseHost(...))`
+to `load_realtime_model_with_options` to keep temporal layers and Moshi-family
+depth-codebook slices on the host. Text/audio embeddings and temporal output
+modules remain pinned, and `residency_report()` exposes the two execution groups.
+PersonaPlex system-prompt helpers accept either the fully resident model or
+`MoshiLayerwiseModel`, so forced voice/text prefill continues into ordinary
+realtime generation with the same delayed-stream and transformer caches.
 
 The `models::moshi` module implements Moshi's temporal and depth language
 models over pre-tokenized Mimi streams. `GenerationState` accepts one

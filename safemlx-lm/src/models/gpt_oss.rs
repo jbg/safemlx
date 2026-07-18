@@ -107,7 +107,7 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.model_type != "gpt_oss" {
             return Err(Error::UnsupportedArchitecture(format!(
                 "GPT-OSS loader requires model_type gpt_oss, got {:?}",
@@ -157,7 +157,7 @@ impl ModelArgs {
         Ok(())
     }
 
-    fn effective_layer_types(&self) -> Vec<String> {
+    pub(crate) fn effective_layer_types(&self) -> Vec<String> {
         if !self.layer_types.is_empty() {
             return self.layer_types.clone();
         }
@@ -511,7 +511,7 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             self_attn: Attention::new(args, stream)?,
             mlp: Mlp::new(args, stream)?,
@@ -530,7 +530,7 @@ impl TransformerBlock {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
@@ -568,6 +568,13 @@ impl KeyValueCache for LayerCache {
         match self {
             Self::Full(cache) => cache.max_size(),
             Self::Sliding(cache) => cache.max_size(),
+        }
+    }
+
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Full(cache) => cache.retained_arrays(),
+            Self::Sliding(cache) => cache.retained_arrays(),
         }
     }
 
@@ -646,7 +653,7 @@ impl GptOssModel {
         }
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
@@ -718,7 +725,7 @@ impl Model {
         self.model.new_cache()
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,

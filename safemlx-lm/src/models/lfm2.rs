@@ -193,7 +193,7 @@ impl ModelArgs {
         self.model_type == "lfm2_moe"
     }
 
-    fn layer_type(&self, index: usize) -> Result<LayerType, Error> {
+    pub(crate) fn layer_type(&self, index: usize) -> Result<LayerType, Error> {
         self.layer_types
             .get(index)
             .ok_or_else(|| {
@@ -231,7 +231,7 @@ impl ModelArgs {
         self.quantization.or(self.quantization_config)
     }
 
-    fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
@@ -678,7 +678,7 @@ pub enum LayerCache {
 }
 
 impl LayerCache {
-    fn new(layer_type: LayerType) -> Self {
+    pub(crate) fn new(layer_type: LayerType) -> Self {
         match layer_type {
             LayerType::Conv => Self::Conv(CausalConv1dCache::default()),
             // Match mlx-lm's KVCache growth policy. Chunked backing arrays
@@ -687,10 +687,17 @@ impl LayerCache {
         }
     }
 
-    fn offset(&self) -> i32 {
+    pub(crate) fn offset(&self) -> i32 {
         match self {
             Self::Attention(cache) => cache.offset(),
             Self::Conv(cache) => cache.offset,
+        }
+    }
+
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Attention(cache) => cache.retained_arrays(),
+            Self::Conv(cache) => cache.state.iter().collect(),
         }
     }
 }
@@ -703,7 +710,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn new(args: &ModelArgs) -> Result<Self, Error> {
+    pub(crate) fn new(args: &ModelArgs) -> Result<Self, Error> {
         Ok(Self {
             layers: (0..args.num_hidden_layers)
                 .map(|index| args.layer_type(index as usize).map(LayerCache::new))
@@ -743,7 +750,7 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &ModelArgs, index: i32, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(args: &ModelArgs, index: i32, stream: &Stream) -> Result<Self, Error> {
         let layer_type = args.layer_type(index as usize)?;
         Ok(Self {
             layer_type,
@@ -786,7 +793,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
@@ -978,7 +985,7 @@ impl Model {
         Cache::new(&self.args).expect("validated LFM2 layer schedule")
     }
 
-    fn forward_logits(
+    pub(crate) fn forward_logits(
         &mut self,
         inputs: &Array,
         cache: Option<&mut Cache>,

@@ -26,17 +26,22 @@ copies on explicit streams, applies pinned, windowed, and cacheable policies,
 evicts eligible units deterministically, and protects in-use arrays with RAII
 leases. Prefetch and execution windows are synchronous and feed existing
 offload telemetry. Apple CPU and GPU tiers share physical unified memory, so
-their logical budgets do not increase physical capacity. The unified Llama and
-Mistral loader accepts a weight-residency policy: fully resident uses the eager
-model engine, while layerwise host residency keeps decoder weights on a CPU
-stream and moves a bounded layer window to the execution device. Static weights
-and KV caches stay on the device, and existing packed affine or MXFP4 tensors
-remain packed. Transfers are synchronous because MLX does not expose stream
-events. This expands capacity on discrete CUDA systems; on Metal it validates
-scheduling and logical residency within unified memory. The reusable layerwise
-engine is model-family independent; Llama/Mistral is currently its only adapter.
-GGUF, load-time conversion, pinned host buffers, and asynchronous overlap are
-not supported by the layerwise-host policy.
+their logical budgets do not increase physical capacity. The normal model-load
+options select fully resident or layerwise host execution for DeepSeek-V3/R1,
+Gemma 4, Inkling, Llama, Mistral, GPT-OSS, LFM2/LFM2.5,
+Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and Qwen3.5
+language-model safetensors, plus Moshi and PersonaPlex realtime checkpoints,
+including dense and MoE variants. Layerwise execution keeps complete decoder
+blocks on a CPU stream and moves a bounded window to the execution device;
+embeddings, final normalization, output heads, and architecture-owned cache or
+recurrent state stay pinned on the device. Existing checkpoint-native packed
+tensors remain packed, while split expert banks are packed one layer at a time
+on the host. Transfers are
+synchronous because MLX does not expose stream events. On Metal this validates
+scheduling and logical residency within unified memory, not additional model
+capacity. GGUF layerwise residency, load-time conversion, individual expert
+caching, KV-cache offload, pinned host buffers, and asynchronous overlap are not
+supported.
 
 ## Crates
 

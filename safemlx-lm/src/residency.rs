@@ -20,6 +20,7 @@ use crate::{
         MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
         PrefetchOutcome, ResidencyPolicy, TransferDirection,
     },
+    weight_recipe::{DerivedWeightRecipe, WeightRecipeError},
     weight_store::{TensorSelection, WeightStore, WeightStoreDiagnostics, WeightStoreError},
 };
 
@@ -29,6 +30,7 @@ pub struct WeightBinding {
     name: String,
     checkpoint_key: String,
     selection: TensorSelection,
+    recipe: Option<DerivedWeightRecipe>,
     expected_bytes: u64,
 }
 
@@ -55,6 +57,41 @@ impl WeightBinding {
             name,
             checkpoint_key,
             selection,
+            recipe: None,
+            expected_bytes,
+        })
+    }
+
+    /// Creates a binding backed by a composable derived-weight recipe.
+    ///
+    /// The recipe is validated against checkpoint metadata when the residency
+    /// manager is constructed and materialized once on the host during
+    /// initialization. Device promotion copies that transformed representation.
+    pub fn from_recipe(
+        name: impl Into<String>,
+        recipe: DerivedWeightRecipe,
+        expected_bytes: u64,
+    ) -> Result<Self, ResidencyError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(ResidencyError::InvalidBindingName);
+        }
+        let checkpoint_key = recipe
+            .source_keys()
+            .first()
+            .map(|key| (*key).to_string())
+            .ok_or_else(|| ResidencyError::Recipe {
+                binding: name.clone(),
+                source: WeightRecipeError::EmptyInputs,
+            })?;
+        if expected_bytes == 0 {
+            return Err(ResidencyError::ZeroSizedBinding { name });
+        }
+        Ok(Self {
+            name,
+            checkpoint_key,
+            selection: TensorSelection::Full,
+            recipe: Some(recipe),
             expected_bytes,
         })
     }
@@ -72,6 +109,19 @@ impl WeightBinding {
     /// Returns the checkpoint selection delegated to the weight store.
     pub fn selection(&self) -> &TensorSelection {
         &self.selection
+    }
+
+    /// Returns the derived recipe when this is not a direct binding.
+    pub const fn recipe(&self) -> Option<&DerivedWeightRecipe> {
+        self.recipe.as_ref()
+    }
+
+    /// Returns every checkpoint key consumed by this binding.
+    pub fn checkpoint_keys(&self) -> Vec<&str> {
+        match &self.recipe {
+            Some(recipe) => recipe.source_keys(),
+            None => vec![self.checkpoint_key.as_str()],
+        }
     }
 
     /// Returns the expected logical and materialized byte length.
@@ -194,6 +244,9 @@ pub struct ResidencyBlocker {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// A named execution group had an empty identifier.
+    #[error("resident execution group id must not be empty")]
+    InvalidGroupId,
     /// An ordered layer window had no units.
     #[error("device layer window requires at least one ordered unit")]
     EmptyLayerWindow,
@@ -283,6 +336,15 @@ pub enum ResidencyError {
         expected_bytes: u64,
         /// Store-validated size.
         actual_bytes: u64,
+    },
+    /// A derived-weight recipe was invalid or could not be materialized.
+    #[error("derived-weight recipe for binding {binding:?} failed: {source}")]
+    Recipe {
+        /// Local binding name.
+        binding: String,
+        /// Recipe failure.
+        #[source]
+        source: WeightRecipeError,
     },
     /// A caller requested disk as an MLX array target.
     #[error("{operation} requires Host or Device residency, not Disk")]
@@ -481,6 +543,153 @@ pub struct DeviceLayerWindow {
     depth: usize,
 }
 
+/// A named sequential execution stack with an independent device window.
+///
+/// Models with text, vision, audio, temporal, or depth-transformer stacks can
+/// use one group per ordered stack without imposing a checkpoint naming scheme
+/// on the residency core.
+#[derive(Debug, Clone)]
+pub struct ResidentLayerGroup {
+    id: String,
+    window: DeviceLayerWindow,
+}
+
+impl ResidentLayerGroup {
+    /// Creates a named group over ordered residency units.
+    pub fn new(
+        id: impl Into<String>,
+        units: impl IntoIterator<Item = OffloadUnitId>,
+        depth: usize,
+    ) -> Result<Self, ResidencyError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(ResidencyError::InvalidGroupId);
+        }
+        Ok(Self {
+            id,
+            window: DeviceLayerWindow::new(units, depth)?,
+        })
+    }
+
+    /// Returns the stable group identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns ordered units in this group.
+    pub fn units(&self) -> &[OffloadUnitId] {
+        self.window.units()
+    }
+
+    /// Returns the configured device-unit bound.
+    pub const fn depth(&self) -> usize {
+        self.window.depth()
+    }
+
+    /// Synchronously prepares this group's window without replacing another group's window.
+    pub fn prepare(
+        &self,
+        manager: &ResidencyManager,
+        current: usize,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
+        let desired = self.window.desired(current)?;
+        let outcomes =
+            manager.prepare_group_window(&self.id, desired, desired, MemoryTier::Device)?;
+        self.window.trim_to(manager, desired)?;
+        Ok(outcomes)
+    }
+
+    /// Trims this group to the desired window.
+    pub fn trim_to(
+        &self,
+        manager: &ResidencyManager,
+        desired: &[OffloadUnitId],
+    ) -> Result<(), ResidencyError> {
+        self.window.trim_to(manager, desired)
+    }
+
+    /// Clears only this group's protection and device copies.
+    pub fn clear(&self, manager: &ResidencyManager) -> Result<(), ResidencyError> {
+        manager.prepare_group_window(&self.id, &[], &[], MemoryTier::Device)?;
+        self.window.trim_to(manager, &[])
+    }
+
+    /// Returns current logical residency attributed to this group's units.
+    pub fn report(
+        &self,
+        manager: &ResidencyManager,
+    ) -> Result<ResidentLayerGroupReport, ResidencyError> {
+        let report = manager.report()?;
+        let ids = self.units().iter().collect::<BTreeSet<_>>();
+        let mut host_bytes = 0u64;
+        let mut device_bytes = 0u64;
+        let mut device_units = 0usize;
+        for unit in report.units().iter().filter(|unit| ids.contains(unit.id())) {
+            if unit.host_resident() {
+                host_bytes = host_bytes.checked_add(unit.expected_bytes()).ok_or(
+                    ResidencyError::ArithmeticOverflow {
+                        context: "execution group host bytes",
+                    },
+                )?;
+            }
+            if unit.device_resident() {
+                device_bytes = device_bytes.checked_add(unit.expected_bytes()).ok_or(
+                    ResidencyError::ArithmeticOverflow {
+                        context: "execution group device bytes",
+                    },
+                )?;
+                device_units += 1;
+            }
+        }
+        Ok(ResidentLayerGroupReport {
+            id: self.id.clone(),
+            ordered_units: self.units().len(),
+            window_depth: self.depth(),
+            host_bytes,
+            device_bytes,
+            device_units,
+        })
+    }
+}
+
+/// Logical residency attributed to one named execution group.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidentLayerGroupReport {
+    id: String,
+    ordered_units: usize,
+    window_depth: usize,
+    host_bytes: u64,
+    device_bytes: u64,
+    device_units: usize,
+}
+
+impl ResidentLayerGroupReport {
+    /// Returns the group identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Returns the number of ordered units.
+    pub const fn ordered_units(&self) -> usize {
+        self.ordered_units
+    }
+    /// Returns the configured maximum device-unit count.
+    pub const fn window_depth(&self) -> usize {
+        self.window_depth
+    }
+    /// Returns current host-resident bytes for group units.
+    pub const fn host_bytes(&self) -> u64 {
+        self.host_bytes
+    }
+    /// Returns current device-resident bytes for group units.
+    pub const fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
+    /// Returns current device-resident group units.
+    pub const fn device_units(&self) -> usize {
+        self.device_units
+    }
+}
+
 impl DeviceLayerWindow {
     /// Creates a controller for a non-empty ordered unit sequence.
     pub fn new(
@@ -648,6 +857,7 @@ impl ResidencyManager {
                     source_stream,
                     device_stream,
                     active_window: BTreeSet::new(),
+                    group_windows: BTreeMap::new(),
                     telemetry,
                     host_bytes: 0,
                     device_bytes: 0,
@@ -749,7 +959,24 @@ impl ResidencyManager {
         upcoming: &[OffloadUnitId],
         tier: MemoryTier,
     ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
-        validate_target(tier, "prepare_window")?;
+        self.prepare_group_window("default", active, upcoming, tier)
+    }
+
+    /// Replaces one named group's protected window and prepares bounded lookahead.
+    ///
+    /// Protection owned by other groups remains active. This permits independent
+    /// text, vision, audio, temporal, and depth stack scheduling.
+    pub fn prepare_group_window(
+        &self,
+        group: &str,
+        active: &[OffloadUnitId],
+        upcoming: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
+        if group.trim().is_empty() {
+            return Err(ResidencyError::InvalidGroupId);
+        }
+        validate_target(tier, "prepare_group_window")?;
         let mut state = self.lock()?;
         require_initialized(&state)?;
         for id in active.iter().chain(upcoming) {
@@ -757,7 +984,18 @@ impl ResidencyManager {
                 return Err(ResidencyError::UnknownUnit { id: id.clone() });
             }
         }
-        state.active_window = active.iter().cloned().collect();
+        if active.is_empty() {
+            state.group_windows.remove(group);
+        } else {
+            state
+                .group_windows
+                .insert(group.to_string(), active.iter().cloned().collect());
+        }
+        state.active_window = state
+            .group_windows
+            .values()
+            .flat_map(|window| window.iter().cloned())
+            .collect();
         let depth = state.plan.config().prefetch_depth();
         let mut seen = BTreeSet::new();
         let selected = upcoming
@@ -882,6 +1120,7 @@ struct ManagerState {
     source_stream: Stream,
     device_stream: Stream,
     active_window: BTreeSet<OffloadUnitId>,
+    group_windows: BTreeMap<String, BTreeSet<OffloadUnitId>>,
     telemetry: OffloadTelemetry,
     host_bytes: u64,
     device_bytes: u64,
@@ -946,12 +1185,23 @@ fn validate_unit_bytes(
                 context: "unit binding byte total",
             },
         )?;
-        let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
-        let actual = u64::try_from(lease.selected_byte_len()).map_err(|_| {
-            ResidencyError::ArithmeticOverflow {
-                context: "selected binding byte conversion",
+        let actual = match &binding.recipe {
+            Some(recipe) => recipe
+                .infer(store)
+                .map_err(|source| ResidencyError::Recipe {
+                    binding: binding.name.clone(),
+                    source,
+                })?
+                .byte_len(),
+            None => {
+                let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
+                u64::try_from(lease.selected_byte_len()).map_err(|_| {
+                    ResidencyError::ArithmeticOverflow {
+                        context: "selected binding byte conversion",
+                    }
+                })?
             }
-        })?;
+        };
         if actual != binding.expected_bytes {
             return Err(ResidencyError::BindingByteMismatch {
                 id: unit.id.clone(),
@@ -1120,8 +1370,41 @@ fn materialize_from_disk(
 ) -> Result<BTreeMap<String, Array>, ResidencyError> {
     let mut arrays = BTreeMap::new();
     for binding in bindings {
-        let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
-        let array = lease.materialize(source_stream, execution_stream)?;
+        let array = match &binding.recipe {
+            Some(recipe) => {
+                let host = recipe.materialize(store, source_stream).map_err(|source| {
+                    ResidencyError::Recipe {
+                        binding: binding.name.clone(),
+                        source,
+                    }
+                })?;
+                if execution_stream == source_stream {
+                    host
+                } else {
+                    let output =
+                        host.copy(execution_stream)
+                            .map_err(|source| ResidencyError::Recipe {
+                                binding: binding.name.clone(),
+                                source: WeightRecipeError::Mlx(source),
+                            })?;
+                    eval([&output]).map_err(|source| ResidencyError::Recipe {
+                        binding: binding.name.clone(),
+                        source: WeightRecipeError::Mlx(source),
+                    })?;
+                    execution_stream
+                        .synchronize()
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: binding.name.clone(),
+                            source: WeightRecipeError::Mlx(source),
+                        })?;
+                    output
+                }
+            }
+            None => {
+                let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
+                lease.materialize(source_stream, execution_stream)?
+            }
+        };
         arrays.insert(binding.name.clone(), array);
     }
     Ok(arrays)
@@ -1399,6 +1682,44 @@ mod tests {
 
     fn single(name: &str, key: &str) -> OffloadUnit {
         unit(name, [binding("weight", key, TensorSelection::Full, 8)])
+    }
+
+    #[test]
+    fn named_execution_groups_keep_independent_windows_and_clear_in_isolation() {
+        let (_dir, store) = fixture_store();
+        let manager = manager(
+            store,
+            OffloadConfig::new(None, None, 1).unwrap(),
+            [
+                spec("text.0", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+                spec("text.1", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+                spec("vision.0", 8, ResidencyPolicy::Windowed, MemoryTier::Host),
+            ],
+            [
+                single("text.0", "a"),
+                single("text.1", "b"),
+                single("vision.0", "c"),
+            ],
+        );
+        manager.initialize().unwrap();
+        let text = ResidentLayerGroup::new("text", [id("text.0"), id("text.1")], 1).unwrap();
+        let vision = ResidentLayerGroup::new("vision", [id("vision.0")], 1).unwrap();
+
+        text.prepare(&manager, 0).unwrap();
+        vision.prepare(&manager, 0).unwrap();
+        let report = manager.report().unwrap();
+        assert_eq!(report.active_window(), &[id("text.0"), id("vision.0")]);
+        assert!(state(&report, "text.0").device_resident());
+        assert!(state(&report, "vision.0").device_resident());
+
+        text.clear(&manager).unwrap();
+        let report = manager.report().unwrap();
+        assert!(!state(&report, "text.0").device_resident());
+        assert!(state(&report, "vision.0").device_resident());
+        assert_eq!(report.active_window(), &[id("vision.0")]);
+        let vision_report = vision.report(&manager).unwrap();
+        assert_eq!(vision_report.device_units(), 1);
+        assert_eq!(vision_report.device_bytes(), 8);
     }
 
     fn state<'a>(report: &'a ResidencyReport, name: &str) -> &'a UnitResidencyReport {

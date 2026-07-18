@@ -100,7 +100,7 @@ pub(crate) struct AudioSubsampleConvProjection {
 }
 
 impl AudioSubsampleConvProjection {
-    fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
         if config.attention_context_right != 0 {
             return Err(Exception::custom(
                 "Gemma 4 audio currently requires zero right attention context",
@@ -131,7 +131,7 @@ impl AudioSubsampleConvProjection {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         features: &Array,
         valid_frames: i32,
@@ -468,25 +468,26 @@ impl AudioAttention {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-pub(crate) struct AudioLayer {
+/// One Gemma 4 audio encoder block.
+pub struct AudioLayer {
     #[param]
-    pub feed_forward1: AudioFeedForward,
+    pub(crate) feed_forward1: AudioFeedForward,
     #[param]
-    pub norm_pre_attn: nn::RmsNorm,
+    pub(crate) norm_pre_attn: nn::RmsNorm,
     #[param]
-    pub self_attn: AudioAttention,
+    pub(crate) self_attn: AudioAttention,
     #[param]
-    pub norm_post_attn: nn::RmsNorm,
+    pub(crate) norm_post_attn: nn::RmsNorm,
     #[param]
-    pub lconv1d: AudioLightConv1d,
+    pub(crate) lconv1d: AudioLightConv1d,
     #[param]
-    pub feed_forward2: AudioFeedForward,
+    pub(crate) feed_forward2: AudioFeedForward,
     #[param]
-    pub norm_out: nn::RmsNorm,
+    pub(crate) norm_out: nn::RmsNorm,
 }
 
 impl AudioLayer {
-    fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
         let norm = || {
             nn::RmsNorm::unloaded(
                 config.hidden_size,
@@ -506,7 +507,12 @@ impl AudioLayer {
         })
     }
 
-    fn forward(&mut self, x: &Array, valid: i32, stream: &Stream) -> Result<Array, Exception> {
+    pub(crate) fn forward(
+        &mut self,
+        x: &Array,
+        valid: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
         let x = self.feed_forward1.forward(x, stream)?;
         let residual = x.clone();
         let attended =
@@ -516,6 +522,59 @@ impl AudioLayer {
         let x = self.lconv1d.forward(&x, stream)?;
         let x = self.feed_forward2.forward(&x, stream)?;
         self.norm_out.forward(&x, stream)
+    }
+}
+
+/// Pinned audio preprocessing and output projection around layerwise blocks.
+#[derive(Debug, Clone, ModuleParameters)]
+pub(crate) struct Gemma4AudioLayerwiseStatic {
+    #[param]
+    pub(crate) subsample_conv_projection: AudioSubsampleConvProjection,
+    #[param]
+    pub(crate) output_proj: nn::Linear,
+}
+
+impl Gemma4AudioLayerwiseStatic {
+    pub(crate) fn from_tower(tower: Gemma4AudioTower) -> Self {
+        Self {
+            subsample_conv_projection: tower.subsample_conv_projection,
+            output_proj: tower.output_proj,
+        }
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        features: &Array,
+        mask: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, i32), Exception> {
+        if mask.shape().len() != 2
+            || mask.dim(0) != features.dim(0)
+            || mask.dim(1) != features.dim(1)
+        {
+            return Err(Exception::custom(format!(
+                "Gemma 4 audio mask must be [batch, frames], got {:?} for {:?}",
+                mask.shape(),
+                features.shape()
+            )));
+        }
+        let valid_frames = mask.sum(None, stream)?.item::<i32>(stream);
+        let valid = (valid_frames + 3) / 4;
+        Ok((
+            self.subsample_conv_projection
+                .forward(features, valid_frames, stream)?,
+            valid,
+        ))
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        hidden: &Array,
+        valid: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.output_proj
+            .forward(&hidden.try_index_device((.., ..valid, ..), stream)?, stream)
     }
 }
 

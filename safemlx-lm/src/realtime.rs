@@ -16,7 +16,9 @@ use std::path::Path;
 
 use crate::{
     error::Error,
+    layerwise::WeightResidency,
     models::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
+    moshi::MoshiLayerwiseModel,
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -208,7 +210,34 @@ pub fn load_model_with_options(
     weights_stream: &Stream,
 ) -> Result<LoadedRealtimeModel, Error> {
     ensure_executable_load_options(options)?;
-    match realtime_model_kind(&model_dir)? {
+    let kind = realtime_model_kind(&model_dir)?;
+    if let WeightResidency::LayerwiseHost(layerwise) = options.weight_residency {
+        if options.quantization.is_some() {
+            return Err(Error::Quantization(format!(
+                "load-time quantization is unsupported for {} layerwise host residency; use a matching checkpoint-native packed format",
+                kind.model_type()
+            )));
+        }
+        return match kind {
+            RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::MoshiLayerwise(
+                crate::moshi::load_moshi_layerwise_model(
+                    model_dir,
+                    layerwise,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            RealtimeModelKind::PersonaPlex => Ok(LoadedRealtimeModel::PersonaPlexLayerwise(
+                crate::moshi::load_personaplex_layerwise_model(
+                    model_dir,
+                    layerwise,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+        };
+    }
+    match kind {
         RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::Moshi(match options.quantization {
             Some(quantization) => {
                 moshi::load_model_quantized(model_dir, quantization, stream, weights_stream)?
@@ -237,16 +266,20 @@ pub fn load_model_with_options(
 pub enum LoadedRealtimeModel {
     /// Moshi-family model.
     Moshi(moshi::Model),
+    /// Moshi-family model using bounded host residency.
+    MoshiLayerwise(MoshiLayerwiseModel),
     /// PersonaPlex model.
     PersonaPlex(personaplex::Model),
+    /// PersonaPlex model using bounded host residency.
+    PersonaPlexLayerwise(MoshiLayerwiseModel),
 }
 
 impl LoadedRealtimeModel {
     /// Returns the loaded realtime model family.
     pub fn kind(&self) -> RealtimeModelKind {
         match self {
-            Self::Moshi(_) => RealtimeModelKind::Moshi,
-            Self::PersonaPlex(_) => RealtimeModelKind::PersonaPlex,
+            Self::Moshi(_) | Self::MoshiLayerwise(_) => RealtimeModelKind::Moshi,
+            Self::PersonaPlex(_) | Self::PersonaPlexLayerwise(_) => RealtimeModelKind::PersonaPlex,
         }
     }
 
@@ -255,10 +288,32 @@ impl LoadedRealtimeModel {
         self.kind().model_type()
     }
 
-    /// Returns the underlying Moshi-family token model.
+    /// Returns the parsed Moshi-family token-model configuration.
+    pub fn args(&self) -> &moshi::ModelArgs {
+        match self {
+            Self::Moshi(model) | Self::PersonaPlex(model) => &model.args,
+            Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => model.args(),
+        }
+    }
+
+    /// Returns the fully resident Moshi model when this load did not select host residency.
+    pub fn try_as_moshi_model(&self) -> Option<&moshi::Model> {
+        match self {
+            Self::Moshi(model) | Self::PersonaPlex(model) => Some(model),
+            Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => None,
+        }
+    }
+
+    /// Returns the underlying fully resident Moshi-family token model.
+    ///
+    /// Panics for a layerwise-host model; use [`Self::try_as_moshi_model`] or
+    /// [`Self::args`] when either residency policy is accepted.
     pub fn as_moshi_model(&self) -> &moshi::Model {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
+            Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
+                panic!("layerwise-host realtime models do not contain a fully resident Moshi model")
+            }
         }
     }
 
@@ -266,6 +321,9 @@ impl LoadedRealtimeModel {
     pub fn as_moshi_model_mut(&mut self) -> &mut moshi::Model {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
+            Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
+                panic!("layerwise-host realtime models do not contain a fully resident Moshi model")
+            }
         }
     }
 
@@ -273,6 +331,31 @@ impl LoadedRealtimeModel {
     pub fn into_moshi_model(self) -> moshi::Model {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model,
+            Self::MoshiLayerwise(_) | Self::PersonaPlexLayerwise(_) => {
+                panic!("a layerwise-host realtime model cannot be converted into a fully resident Moshi model")
+            }
+        }
+    }
+
+    /// Returns current layerwise residency telemetry, or `None` for fully resident models.
+    pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
+        match self {
+            Self::Moshi(_) | Self::PersonaPlex(_) => Ok(None),
+            Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
+                model.residency_report().map(Some)
+            }
+        }
+    }
+
+    /// Returns per-group residency for layerwise models, or `None` when fully resident.
+    pub fn execution_group_reports(
+        &self,
+    ) -> Result<Option<Vec<crate::residency::ResidentLayerGroupReport>>, Error> {
+        match self {
+            Self::Moshi(_) | Self::PersonaPlex(_) => Ok(None),
+            Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
+                model.execution_group_reports().map(Some)
+            }
         }
     }
 }
@@ -281,13 +364,24 @@ impl RealtimeSpeechModel for LoadedRealtimeModel {
     type State = RealtimeState;
 
     fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        self.as_moshi_model().realtime_config()
+        match self {
+            Self::Moshi(model) | Self::PersonaPlex(model) => model.realtime_config(),
+            Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
+                model.realtime_config()
+            }
+        }
     }
 
     fn new_realtime_state(&self) -> Self::State {
         match self {
             Self::Moshi(model) => RealtimeState::Moshi(model.new_realtime_state()),
+            Self::MoshiLayerwise(model) => {
+                RealtimeState::MoshiLayerwise(model.new_realtime_state())
+            }
             Self::PersonaPlex(model) => RealtimeState::PersonaPlex(model.new_realtime_state()),
+            Self::PersonaPlexLayerwise(model) => {
+                RealtimeState::PersonaPlexLayerwise(model.new_realtime_state())
+            }
         }
     }
 
@@ -306,7 +400,13 @@ impl RealtimeSpeechModel for LoadedRealtimeModel {
             (Self::Moshi(model), RealtimeState::Moshi(state)) => {
                 model.step_realtime(state, input, sampling, stream)
             }
+            (Self::MoshiLayerwise(model), RealtimeState::MoshiLayerwise(state)) => {
+                model.step_realtime(state, input, sampling, stream)
+            }
             (Self::PersonaPlex(model), RealtimeState::PersonaPlex(state)) => {
+                model.step_realtime(state, input, sampling, stream)
+            }
+            (Self::PersonaPlexLayerwise(model), RealtimeState::PersonaPlexLayerwise(state)) => {
                 model.step_realtime(state, input, sampling, stream)
             }
             _ => Err(Exception::custom(
@@ -320,16 +420,20 @@ impl RealtimeSpeechModel for LoadedRealtimeModel {
 pub enum RealtimeState {
     /// Moshi-family generation state.
     Moshi(moshi::GenerationState),
+    /// Moshi-family layerwise generation state.
+    MoshiLayerwise(moshi::GenerationState),
     /// PersonaPlex generation state.
     PersonaPlex(personaplex::GenerationState),
+    /// PersonaPlex layerwise generation state.
+    PersonaPlexLayerwise(personaplex::GenerationState),
 }
 
 impl RealtimeState {
     /// Returns the model family this state belongs to.
     pub fn kind(&self) -> RealtimeModelKind {
         match self {
-            Self::Moshi(_) => RealtimeModelKind::Moshi,
-            Self::PersonaPlex(_) => RealtimeModelKind::PersonaPlex,
+            Self::Moshi(_) | Self::MoshiLayerwise(_) => RealtimeModelKind::Moshi,
+            Self::PersonaPlex(_) | Self::PersonaPlexLayerwise(_) => RealtimeModelKind::PersonaPlex,
         }
     }
 }

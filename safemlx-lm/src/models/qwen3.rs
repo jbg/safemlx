@@ -188,7 +188,7 @@ impl Attention {
         Self::new_with_prefix(args, None, stream)
     }
 
-    fn new_for_layer(
+    pub(crate) fn new_for_layer(
         args: &ModelArgs,
         layer_index: i32,
         stream: &Stream,
@@ -811,7 +811,7 @@ impl TransformerBlock {
         Self::new_for_layer(args, 0, stream)
     }
 
-    fn new_for_layer(
+    pub(crate) fn new_for_layer(
         args: &ModelArgs,
         layer_index: i32,
         stream: &Stream,

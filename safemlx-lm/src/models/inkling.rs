@@ -321,6 +321,13 @@ impl KeyValueCache for InklingKvCache {
         }
     }
 
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Global(cache) => cache.retained_arrays(),
+            Self::Sliding(cache) => cache.retained_arrays(),
+        }
+    }
+
     fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -361,7 +368,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn new(args: &TextArgs) -> Self {
+    pub(crate) fn new(args: &TextArgs) -> Self {
         Self {
             layers: (0..args.num_hidden_layers)
                 .map(|layer| LayerCache::new(args.is_local(layer), args.sliding_window_size))
@@ -838,7 +845,7 @@ impl InklingMoe {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct DecoderLayer {
+pub(crate) struct DecoderLayer {
     #[param]
     input_layernorm: nn::RmsNorm,
     #[param]
@@ -858,7 +865,7 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &TextArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &TextArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
         let dense = args.is_dense(layer);
         Ok(Self {
             input_layernorm: nn::RmsNorm::unloaded(
@@ -909,7 +916,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         hidden: &Array,
         cache: Option<&mut LayerCache>,
@@ -1033,7 +1040,7 @@ impl TextModel {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct AudioModel {
+pub(crate) struct AudioModel {
     num_codebooks: i32,
     codebook_size: i32,
     #[param]
@@ -1043,7 +1050,7 @@ struct AudioModel {
 }
 
 impl AudioModel {
-    fn new(args: &AudioArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &AudioArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             num_codebooks: args.num_codebooks,
             codebook_size: args.codebook_size,
@@ -1062,7 +1069,7 @@ impl AudioModel {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
@@ -1115,7 +1122,7 @@ impl AudioModel {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct VisionLayer {
+pub(crate) struct VisionLayer {
     t_fold: i32,
     hw_fold: i32,
     #[param]
@@ -1125,7 +1132,7 @@ struct VisionLayer {
 }
 
 impl VisionLayer {
-    fn new(
+    pub(crate) fn new(
         input_dim: i32,
         output_dim: i32,
         t_fold: i32,
@@ -1144,7 +1151,7 @@ impl VisionLayer {
         })
     }
 
-    fn forward(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
+    pub(crate) fn forward(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
         let mut hidden = if self.t_fold > 1 || self.hw_fold > 1 {
             let shape = hidden.shape();
             if shape.len() != 5
@@ -1197,16 +1204,16 @@ impl VisionLayer {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct VisionModel {
-    text_hidden_size: i32,
+pub(crate) struct VisionModel {
+    pub(crate) text_hidden_size: i32,
     #[param]
-    layers: Vec<VisionLayer>,
+    pub(crate) layers: Vec<VisionLayer>,
     #[param]
-    final_norm: nn::RmsNorm,
+    pub(crate) final_norm: nn::RmsNorm,
 }
 
 impl VisionModel {
-    fn new(args: &VisionArgs, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(args: &VisionArgs, stream: &Stream) -> Result<Self, Error> {
         if (
             args.temporal_patch_size,
             args.patch_size,
@@ -1317,7 +1324,7 @@ impl Model {
         Cache::new(&self.args.text_config)
     }
 
-    fn forward_logits(
+    pub(crate) fn forward_logits(
         &mut self,
         tokens: &Array,
         inputs_embeds: Option<&Array>,

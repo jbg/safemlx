@@ -61,6 +61,94 @@ pub type GenerationStepOutput = moshi::GenerationStepOutput;
 /// Offline encoded-audio output.
 pub type EncodedAudioOutput = moshi::EncodedAudioOutput;
 
+/// PersonaPlex model operations needed by forced system-prompt prefill.
+pub trait PromptModel {
+    /// Number of within-frame depth codebooks.
+    fn depth_codebooks(&self) -> i32;
+
+    /// Advances one prompt frame with forced agent audio and text.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepOutput, Exception>;
+}
+
+impl PromptModel for Model {
+    fn depth_codebooks(&self) -> i32 {
+        self.args.dep_q
+    }
+
+    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepOutput, Exception> {
+        self.generate_step_forced(
+            state,
+            input_audio_tokens,
+            forced_generated_audio_tokens,
+            forced_text_token,
+            text_sampler,
+            audio_samplers,
+            text_temperature,
+            audio_temperature,
+            prng_state,
+            stream,
+        )
+    }
+}
+
+impl PromptModel for crate::moshi::MoshiLayerwiseModel {
+    fn depth_codebooks(&self) -> i32 {
+        self.args().dep_q
+    }
+
+    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepOutput, Exception> {
+        self.generate_step_forced(
+            state,
+            input_audio_tokens,
+            forced_generated_audio_tokens,
+            forced_text_token,
+            text_sampler,
+            audio_samplers,
+            text_temperature,
+            audio_temperature,
+            prng_state,
+            stream,
+        )
+    }
+}
+
 /// Returns the published PersonaPlex 7B v1 language-model defaults.
 pub fn model_args_7b_v1() -> moshi::ModelArgs {
     moshi::ModelArgs {
@@ -324,8 +412,8 @@ fn repeated_frame(tokens: &[i32; 8], batch: i32, stream: &Stream) -> Result<Arra
 
 /// Runs one forced PersonaPlex prompt frame.
 #[allow(clippy::too_many_arguments)]
-pub fn step_prompt_frame<TS: Sampler, AS: Sampler>(
-    model: &mut Model,
+pub fn step_prompt_frame<M: PromptModel, TS: Sampler, AS: Sampler>(
+    model: &mut M,
     state: &mut GenerationState,
     frame: PromptFrame<'_>,
     text_sampler: &mut TS,
@@ -335,7 +423,7 @@ pub fn step_prompt_frame<TS: Sampler, AS: Sampler>(
     prng_state: Option<&mut RandomState>,
     stream: &Stream,
 ) -> Result<GenerationStepOutput, Exception> {
-    model.generate_step_forced(
+    model.generate_prompt_step(
         state,
         frame.user_audio_tokens,
         Some(frame.agent_audio_tokens),
@@ -350,14 +438,14 @@ pub fn step_prompt_frame<TS: Sampler, AS: Sampler>(
 }
 
 /// Greedily runs one forced PersonaPlex prompt frame.
-pub fn step_prompt_frame_greedy(
-    model: &mut Model,
+pub fn step_prompt_frame_greedy<M: PromptModel>(
+    model: &mut M,
     state: &mut GenerationState,
     frame: PromptFrame<'_>,
     stream: &Stream,
 ) -> Result<GenerationStepOutput, Exception> {
     let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.depth_codebooks())
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
     step_prompt_frame(
@@ -378,8 +466,8 @@ pub fn step_prompt_frame_greedy(
 /// `voice_prompt_tokens` uses codec layout `[batch, 8, frames]`; the user side
 /// is filled with PersonaPlex's sine-conditioning token frame and text is
 /// forced to the existing text pad id.
-pub fn prefill_voice_prompt_greedy(
-    model: &mut Model,
+pub fn prefill_voice_prompt_greedy<M: PromptModel>(
+    model: &mut M,
     state: &mut GenerationState,
     voice_prompt_tokens: &Array,
     stream: &Stream,
@@ -417,8 +505,8 @@ pub fn prefill_voice_prompt_greedy(
 /// from the caller's PersonaPlex-compatible text tokenizer. The generated audio
 /// side is forced to PersonaPlex silence while the user side is filled with the
 /// sine-conditioning frame.
-pub fn prefill_text_prompt_greedy(
-    model: &mut Model,
+pub fn prefill_text_prompt_greedy<M: PromptModel>(
+    model: &mut M,
     state: &mut GenerationState,
     text_prompt_tokens: &Array,
     stream: &Stream,
@@ -457,8 +545,8 @@ pub fn prefill_text_prompt_greedy(
 /// and tokenization stay outside this crate; callers can use
 /// [`wrap_system_prompt`] before tokenizing with a compatible SentencePiece
 /// tokenizer.
-pub fn prefill_system_prompt_greedy(
-    model: &mut Model,
+pub fn prefill_system_prompt_greedy<M: PromptModel>(
+    model: &mut M,
     state: &mut GenerationState,
     voice_prompt_tokens: Option<&Array>,
     text_prompt_tokens: &Array,

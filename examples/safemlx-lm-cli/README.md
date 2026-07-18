@@ -46,6 +46,23 @@ The default quantization group size is 64 weights; change it with
 so use a checkpoint already carrying matching quantization metadata when
 startup time is important.
 
+For a safetensors family with a registered host-residency adapter, select a
+bounded device window through the same architecture-detecting loader:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/model --layerwise-host \
+  --device-layer-window 1 --mapped-shards 4 \
+  --host-budget-bytes 24000000000 --device-budget-bytes 8000000000 \
+  "Summarize bounded weight residency."
+```
+
+`--verbose` also prints logical current/peak host and device parameter bytes,
+synchronous transfer counts, and mapped-shard diagnostics. Apple CPU and GPU
+tiers share unified physical memory, so these logical tiers do not increase
+total capacity. GGUF, load-time conversion, individual expert caching, and KV
+cache offload are not supported by this path.
+
 When the positional prompt is omitted, the binary reads it from stdin. Only
 the generated text is written to stdout, making it convenient to pipe or
 capture; `--verbose` writes model details, separate load and generation times,

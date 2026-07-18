@@ -18,7 +18,7 @@ use crate::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
     residency::{
-        DeviceLayerWindow, OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport,
+        OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentLayerGroup,
         ResidentUnitLease,
     },
     weight_store::{SafetensorsWeightStore, WeightStore},
@@ -188,12 +188,467 @@ pub trait LayerwiseModelAdapter: Sized {
     }
 }
 
+/// Forward state returned by a generalized architecture adapter.
+pub struct LayerwiseForwardState<C> {
+    /// Activation consumed by the first sequential execution group.
+    pub hidden: Array,
+    /// Architecture-owned masks, positions, and auxiliary per-forward state.
+    pub context: C,
+}
+
+/// General adapter contract for heterogeneous caches and architecture-specific input.
+///
+/// The original [`LayerwiseModelAdapter`] remains available for Llama-compatible
+/// callers. New hybrid, multimodal, and realtime adapters can use this companion
+/// contract without pretending recurrent or convolution state is a KV cache.
+pub trait GeneralLayerwiseModelAdapter: Sized {
+    /// Borrowed family-specific forward input.
+    type Input<'a>;
+    /// Complete architecture-owned cache and recurrent state.
+    type Cache;
+    /// Runtime execution unit. Families with heterogeneous blocks may use an enum.
+    type Layer: ModuleParameters;
+    /// Masks, positions, prepared media, or other per-forward state.
+    type ForwardContext;
+
+    /// Builds bindings for modules that remain pinned on the execution device.
+    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
+
+    /// Assigns pinned leases to the adapter's static modules.
+    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error>;
+
+    /// Validates or initializes the complete cache before any weight lease is acquired.
+    fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error>;
+
+    /// Embeds or prepares the input and creates family-owned forward context.
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error>;
+
+    /// Returns the number of named sequential groups used by this adapter.
+    fn execution_group_count(&self) -> usize;
+
+    /// Returns the stable name of one sequential execution group.
+    fn execution_group_id(&self, group: usize) -> Result<String, Error>;
+
+    /// Returns whether a group is needed for this particular forward pass.
+    ///
+    /// This lets multimodal adapters skip vision groups during text-only decode.
+    fn should_execute_group(&self, _group: usize, _context: &Self::ForwardContext) -> bool {
+        true
+    }
+
+    /// Returns the number of ordered units in one group.
+    fn layer_count(&self, group: usize) -> Result<usize, Error>;
+
+    /// Creates a metadata-only runtime unit for one group position.
+    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
+
+    /// Returns the checkpoint prefix for one runtime unit.
+    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String;
+
+    /// Returns the stable residency unit name for one runtime unit.
+    fn layer_unit_name(&self, group: usize, index: usize) -> String;
+
+    /// Builds direct or derived bindings for one runtime unit.
+    fn layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<crate::residency::WeightBinding>, Error> {
+        Ok(build_module_bindings(
+            layer,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+        )?)
+    }
+
+    /// Executes one populated unit while inspecting and mutating the complete cache.
+    fn forward_layer(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+
+    /// Returns every cache/state array that must be evaluated before lease release.
+    fn retained_arrays<'a>(
+        &self,
+        cache: &'a Self::Cache,
+        group: usize,
+        index: usize,
+    ) -> Vec<&'a Array>;
+
+    /// Returns transient forward-context arrays that must be evaluated before lease release.
+    fn retained_context_arrays<'a>(
+        &self,
+        _context: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Vec<&'a Array> {
+        Vec::new()
+    }
+
+    /// Converts one group's output into the activation consumed by the next group.
+    ///
+    /// Multimodal adapters use this hook to merge encoded media before entering
+    /// a text decoder. Homogeneous adapters keep the activation unchanged.
+    fn finish_execution_group(
+        &mut self,
+        _group: usize,
+        hidden: &Array,
+        _cache: &mut Self::Cache,
+        _context: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        Ok(hidden.clone())
+    }
+
+    /// Applies final normalization, projections, or family-specific output assembly.
+    fn finish(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+
+    /// Returns whether a checkpoint key is intentionally ignored by strict loading.
+    fn ignores_checkpoint_key(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+/// Residency-owned execution engine for generalized adapters.
+///
+/// Group windows, lease lifetime, retained-state evaluation, stream
+/// synchronization, and telemetry stay centralized here. Adapter code owns only
+/// architecture math, cache validation, and runtime-unit construction.
+pub struct GeneralLayerwiseModel<A: GeneralLayerwiseModelAdapter> {
+    adapter: A,
+    store: Arc<SafetensorsWeightStore>,
+    residency: ResidencyManager,
+    groups: Vec<ResidentLayerGroup>,
+    static_leases: Vec<ResidentUnitLease>,
+    sample_mlx_memory: bool,
+    sample_process_memory: bool,
+}
+
+impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
+    /// Creates an engine from a validated residency manager and execution groups.
+    pub fn new(
+        adapter: A,
+        store: Arc<SafetensorsWeightStore>,
+        residency: ResidencyManager,
+        groups: Vec<ResidentLayerGroup>,
+        static_leases: Vec<ResidentUnitLease>,
+    ) -> Result<Self, Error> {
+        if groups.len() != adapter.execution_group_count() {
+            return Err(LayerwiseModelError::ExecutionGroupCount {
+                adapter: adapter.execution_group_count(),
+                configured: groups.len(),
+            }
+            .into());
+        }
+        for (group_index, group) in groups.iter().enumerate() {
+            let expected = adapter.layer_count(group_index)?;
+            if expected != group.units().len() {
+                return Err(LayerwiseModelError::ExecutionGroupLength {
+                    group: group.id().to_string(),
+                    adapter: expected,
+                    configured: group.units().len(),
+                }
+                .into());
+            }
+        }
+        Ok(Self {
+            adapter,
+            store,
+            residency,
+            groups,
+            static_leases,
+            sample_mlx_memory: false,
+            sample_process_memory: false,
+        })
+    }
+
+    /// Enables optional allocator and process-memory samples after forward.
+    pub fn with_memory_sampling(mut self, mlx: bool, process: bool) -> Self {
+        self.sample_mlx_memory = mlx;
+        self.sample_process_memory = process;
+        self
+    }
+
+    /// Returns the architecture adapter.
+    pub const fn adapter(&self) -> &A {
+        &self.adapter
+    }
+
+    /// Returns the persistent checkpoint store.
+    pub fn weight_store(&self) -> &SafetensorsWeightStore {
+        &self.store
+    }
+
+    /// Returns named execution groups in deterministic order.
+    pub fn execution_groups(&self) -> &[ResidentLayerGroup] {
+        &self.groups
+    }
+
+    /// Returns the reusable residency manager.
+    pub const fn residency_manager(&self) -> &ResidencyManager {
+        &self.residency
+    }
+
+    /// Returns a current residency and transfer report.
+    pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        Ok(self.residency.report()?)
+    }
+
+    /// Runs every sequential group while centrally enforcing lease safety.
+    pub fn forward<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward_with_context_hook(input, cache, stream, |_, _, _| Ok(()))
+            .map(|(output, _)| output)
+    }
+
+    /// Runs a generalized forward pass and invokes `hook` after each execution unit.
+    ///
+    /// Realtime autoregressive subgroups use this to turn one unit's logits into
+    /// the token consumed by the next unit without moving lease ownership out of
+    /// the shared residency engine.
+    pub(crate) fn forward_with_context_hook<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+        mut hook: F,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        F: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
+    {
+        self.adapter.validate_cache(cache)?;
+        let LayerwiseForwardState {
+            mut hidden,
+            mut context,
+        } = self.adapter.begin_forward(input, cache, stream)?;
+
+        for (group_index, group) in self.groups.iter().enumerate() {
+            if self.adapter.should_execute_group(group_index, &context) {
+                for index in 0..group.units().len() {
+                    group.prepare(&self.residency, index)?;
+                    let id = &group.units()[index];
+                    {
+                        let lease = self.residency.acquire(id, MemoryTier::Device)?;
+                        let mut layer = self.adapter.new_layer(group_index, index, stream)?;
+                        populate_module_from_lease(&mut layer, &lease)?;
+                        hidden = self.adapter.forward_layer(
+                            group_index,
+                            index,
+                            &mut layer,
+                            &hidden,
+                            cache,
+                            &mut context,
+                            stream,
+                        )?;
+                        let hook_result = hook(group_index, index, &mut context);
+                        let retained = self.adapter.retained_arrays(cache, group_index, index);
+                        let retained_context =
+                            self.adapter
+                                .retained_context_arrays(&context, group_index, index);
+                        eval(
+                            std::iter::once(&hidden)
+                                .chain(retained.into_iter())
+                                .chain(retained_context.into_iter()),
+                        )?;
+                        stream.synchronize()?;
+                        hook_result?;
+                    }
+                    let end = index.saturating_add(group.depth()).min(group.units().len());
+                    group.trim_to(&self.residency, &group.units()[index..end])?;
+                }
+            }
+            hidden = self.adapter.finish_execution_group(
+                group_index,
+                &hidden,
+                cache,
+                &mut context,
+                stream,
+            )?;
+            let retained_context =
+                self.adapter
+                    .retained_context_arrays(&context, group_index, group.units().len());
+            eval(std::iter::once(&hidden).chain(retained_context))?;
+            stream.synchronize()?;
+        }
+
+        let output = self.adapter.finish(&hidden, cache, &context, stream)?;
+        eval([&output])?;
+        stream.synchronize()?;
+        if self.sample_mlx_memory || self.sample_process_memory {
+            self.residency
+                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
+        }
+        Ok((output, context))
+    }
+
+    /// Clears one named execution group without affecting other groups.
+    pub fn clear_device_group(&self, id: &str) -> Result<(), Error> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.id() == id)
+            .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(id.to_string()))?;
+        Ok(group.clear(&self.residency)?)
+    }
+
+    /// Clears every temporary device execution group.
+    pub fn clear_all_device_groups(&self) -> Result<(), Error> {
+        for group in &self.groups {
+            group.clear(&self.residency)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the number of pinned static leases held by the engine.
+    pub fn static_lease_count(&self) -> usize {
+        self.static_leases.len()
+    }
+}
+
+/// Builds a generalized host-backed model with independently bounded groups.
+pub fn load_general_layerwise_model<A: GeneralLayerwiseModelAdapter>(
+    model_dir: impl AsRef<Path>,
+    mut adapter: A,
+    options: LayerwiseLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GeneralLayerwiseModel<A>, Error> {
+    let model_dir = model_dir.as_ref();
+    if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
+        return Err(LayerwiseModelError::GgufUnsupported.into());
+    }
+    let depth = options.offload.prefetch_depth();
+    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        options.max_mapped_shards,
+    )?);
+
+    let mut definitions = Vec::new();
+    let mut specs = Vec::new();
+    let mut consumed = BTreeSet::new();
+    let mut static_device_bytes = 0u64;
+    let mut static_ids = Vec::new();
+    for unit in adapter.static_units(store.as_ref())? {
+        static_ids.push(unit.id.clone());
+        add_unit(
+            &mut definitions,
+            &mut specs,
+            &mut consumed,
+            unit.id,
+            unit.bindings,
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+            &mut static_device_bytes,
+        )?;
+    }
+
+    let mut groups = Vec::with_capacity(adapter.execution_group_count());
+    let mut host_layer_bytes = 0u64;
+    let mut combined_window_bytes = 0u64;
+    for group_index in 0..adapter.execution_group_count() {
+        let layer_count = adapter.layer_count(group_index)?;
+        if depth > layer_count {
+            return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
+        }
+        let mut layer_ids = Vec::with_capacity(layer_count);
+        let mut layer_bytes = Vec::with_capacity(layer_count);
+        for index in 0..layer_count {
+            let layer = adapter.new_layer(group_index, index, stream)?;
+            let bindings = adapter.layer_bindings(group_index, index, &layer, store.as_ref())?;
+            let bytes = binding_bytes(&bindings)?;
+            host_layer_bytes = host_layer_bytes.checked_add(bytes).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "host execution-unit byte total",
+                },
+            )?;
+            let id = OffloadUnitId::new(adapter.layer_unit_name(group_index, index))?;
+            consumed.extend(
+                bindings
+                    .iter()
+                    .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
+            );
+            definitions.push(OffloadUnit::new(id.clone(), bindings)?);
+            specs.push(OffloadUnitSpec::new(
+                id.clone(),
+                bytes,
+                ResidencyPolicy::Windowed,
+                MemoryTier::Host,
+            )?);
+            layer_ids.push(id);
+            layer_bytes.push(bytes);
+        }
+        combined_window_bytes = combined_window_bytes
+            .checked_add(largest_window_bytes(&layer_bytes, depth)?)
+            .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                context: "combined device execution-window byte total",
+            })?;
+        groups.push(ResidentLayerGroup::new(
+            adapter.execution_group_id(group_index)?,
+            layer_ids,
+            depth,
+        )?);
+    }
+
+    validate_unused(store.as_ref(), &consumed, options.strict_loading, |key| {
+        adapter.ignores_checkpoint_key(key)
+    })?;
+    validate_host_budget(options.offload, host_layer_bytes)?;
+    validate_device_budget(
+        options.offload,
+        static_device_bytes,
+        combined_window_bytes,
+        depth,
+    )?;
+
+    let plan = OffloadPlan::new(options.offload, specs)?;
+    let residency = ResidencyManager::new(
+        Arc::clone(&store),
+        plan,
+        definitions,
+        weights_stream.clone(),
+        stream.clone(),
+    )?;
+    residency.initialize()?;
+    let static_leases = static_ids
+        .iter()
+        .map(|id| residency.acquire(id, MemoryTier::Device))
+        .collect::<Result<Vec<_>, _>>()?;
+    adapter.populate_static(&static_leases)?;
+
+    GeneralLayerwiseModel::new(adapter, store, residency, groups, static_leases).map(|model| {
+        model.with_memory_sampling(options.sample_mlx_memory, options.sample_process_memory)
+    })
+}
+
 /// Generic host-backed layerwise decoder execution engine.
 pub struct LayerwiseModel<A: LayerwiseModelAdapter> {
     adapter: A,
     store: Arc<SafetensorsWeightStore>,
     residency: ResidencyManager,
-    layer_window: DeviceLayerWindow,
+    layer_group: ResidentLayerGroup,
     static_leases: Vec<ResidentUnitLease>,
     metadata: LayerwiseModelMetadata,
     sample_mlx_memory: bool,
@@ -246,8 +701,8 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         let context = self.adapter.prepare_forward(&h, mask, cache, stream)?;
 
         for index in 0..self.metadata.layer_count {
-            self.layer_window.prepare(&self.residency, index)?;
-            let id = &self.layer_window.units()[index];
+            self.layer_group.prepare(&self.residency, index)?;
+            let id = &self.layer_group.units()[index];
             {
                 let lease = self.residency.acquire(id, MemoryTier::Device)?;
                 let mut layer = self.adapter.new_layer(index, stream)?;
@@ -264,8 +719,11 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
                 eval(std::iter::once(&h).chain(layer_cache.retained_arrays()))?;
                 stream.synchronize()?;
             }
-            let desired = self.layer_window.desired(index)?;
-            self.layer_window.trim_to(&self.residency, desired)?;
+            let end = index
+                .saturating_add(self.layer_group.depth())
+                .min(self.layer_group.units().len());
+            let desired = &self.layer_group.units()[index..end];
+            self.layer_group.trim_to(&self.residency, desired)?;
         }
 
         let logits = self.adapter.finish(&h, stream)?;
@@ -278,7 +736,7 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
 
     /// Explicitly evicts all decoder copies from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        Ok(self.layer_window.clear(&self.residency)?)
+        Ok(self.layer_group.clear(&self.residency)?)
     }
 
     /// Returns the number of long-lived pinned static leases.
@@ -360,7 +818,7 @@ pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
         consumed.extend(
             bindings
                 .iter()
-                .map(|binding| binding.checkpoint_key().to_string()),
+                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
         );
         definitions.push(OffloadUnit::new(id.clone(), bindings)?);
         specs.push(OffloadUnitSpec::new(
@@ -401,7 +859,7 @@ pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
         .collect::<Result<Vec<_>, _>>()?;
     adapter.populate_static(&static_leases)?;
 
-    let layer_window = DeviceLayerWindow::new(layer_ids, depth)?;
+    let layer_group = ResidentLayerGroup::new("text_decoder", layer_ids, depth)?;
     let metadata = LayerwiseModelMetadata {
         model_type: adapter.model_type().to_string(),
         quantization: adapter.quantization(),
@@ -415,7 +873,7 @@ pub fn load_layerwise_model<A: LayerwiseModelAdapter>(
         adapter,
         store,
         residency,
-        layer_window,
+        layer_group,
         static_leases,
         metadata,
         sample_mlx_memory: options.sample_mlx_memory,
@@ -442,7 +900,7 @@ fn add_unit(
     consumed.extend(
         bindings
             .iter()
-            .map(|binding| binding.checkpoint_key().to_string()),
+            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
     );
     definitions.push(OffloadUnit::new(id.clone(), bindings)?);
     specs.push(OffloadUnitSpec::new(id, bytes, policy, tier)?);
@@ -551,6 +1009,27 @@ fn validate_device_budget(
 /// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwiseModelError {
+    /// Adapter and configured execution-group counts differ.
+    #[error("adapter declares {adapter} execution groups but {configured} were configured")]
+    ExecutionGroupCount {
+        /// Adapter-declared count.
+        adapter: usize,
+        /// Configured count.
+        configured: usize,
+    },
+    /// Adapter and configured unit counts differ for one execution group.
+    #[error("execution group {group:?} has {configured} configured units but adapter declares {adapter}")]
+    ExecutionGroupLength {
+        /// Group id.
+        group: String,
+        /// Adapter-declared count.
+        adapter: usize,
+        /// Configured count.
+        configured: usize,
+    },
+    /// A requested execution group does not exist.
+    #[error("unknown resident execution group {0:?}")]
+    UnknownExecutionGroup(String),
     /// GGUF is intentionally outside this loader's safetensors contract.
     #[error("layerwise host residency requires safetensors; GGUF is unsupported")]
     GgufUnsupported,

@@ -403,13 +403,13 @@ struct Gemma4Config {
 }
 
 impl ModelArgs {
-    fn weight_quantization(&self) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.weight_quantization.or_else(|| {
-            self.quantized.then_some(
+            self.quantized.then(|| {
                 AffineQuantization::new(self.quantization_group_size, self.quantization_bits)
                     .expect("validated affine quantization")
-                    .into(),
-            )
+                    .into()
+            })
         })
     }
 
@@ -2173,7 +2173,7 @@ impl Gemma4ForConditionalGeneration {
         })
     }
 
-    fn new_with_modalities(
+    pub(crate) fn new_with_modalities(
         args: &ModelArgs,
         vision_config: Option<Gemma4VisionConfig>,
         audio_config: Option<Gemma4AudioConfig>,
@@ -2321,7 +2321,7 @@ impl Model {
         logits.try_index_device((.., -1, ..), stream)
     }
 
-    fn forward_logits<C>(
+    pub(crate) fn forward_logits<C>(
         &mut self,
         input: ModelInput<'_, C>,
         last_token_only: bool,
@@ -2362,7 +2362,7 @@ impl Model {
         })
     }
 
-    fn new_with_modalities(
+    pub(crate) fn new_with_modalities(
         args: ModelArgs,
         image_token_id: Option<i32>,
         vision_config: Option<Gemma4VisionConfig>,
@@ -3138,7 +3138,7 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
     Ok(get_gemma4_model_config(model_dir.as_ref())?.0)
 }
 
-type Gemma4ModelConfigParts = (
+pub(crate) type Gemma4ModelConfigParts = (
     ModelArgs,
     Option<Gemma4VisionConfig>,
     Option<i32>,
@@ -3147,7 +3147,7 @@ type Gemma4ModelConfigParts = (
     Option<i32>,
 );
 
-fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, Error> {
+pub(crate) fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
     if config.text_config.enable_moe_block {
@@ -3467,12 +3467,12 @@ fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exc
         .map_err(Into::into)
 }
 
-struct Gemma4AttentionMasks {
-    full: Array,
-    sliding: Array,
+pub(crate) struct Gemma4AttentionMasks {
+    pub(crate) full: Array,
+    pub(crate) sliding: Array,
 }
 
-fn multimodal_attention_masks(
+pub(crate) fn multimodal_attention_masks(
     token_ids: &[u32],
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,

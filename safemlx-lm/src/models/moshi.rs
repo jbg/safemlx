@@ -128,7 +128,7 @@ pub struct ModelArgs {
     /// Optional checkpoint filename relative to the model directory.
     #[serde(default)]
     pub moshi_name: Option<String>,
-    /// Conditioner definitions. Token-only milestone 1 supports empty maps.
+    /// Conditioner definitions. The token-only runtime supports empty maps.
     #[serde(default)]
     pub conditioners: HashMap<String, Value>,
     /// Whether temporal layers include cross attention.
@@ -275,7 +275,7 @@ impl ModelArgs {
         }
         if self.cross_attention || !self.conditioners.is_empty() {
             return Err(Error::UnsupportedArchitecture(
-                "Moshi conditioners and cross attention are outside token-only milestone 1".into(),
+                "Moshi conditioners and cross attention are outside the token-only runtime".into(),
             ));
         }
         if self.demux_second_stream || self.depformer_low_rank_embeddings.is_some() {
@@ -762,7 +762,7 @@ fn moshi_mlp(x: &Array, captures: &[Array], stream: &Stream) -> Result<Array, Ex
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct MoshiTransformerLayer {
+pub(crate) struct MoshiTransformerLayer {
     #[param]
     norm1: nn::RmsNorm,
     #[param]
@@ -793,6 +793,10 @@ impl MoshiTransformerLayer {
                 false,
             ),
         })
+    }
+
+    pub(crate) fn new_temporal(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        Self::unloaded(temporal_transformer_config(args), stream)
     }
 
     fn forward(
@@ -828,6 +832,15 @@ impl MoshiTransformerLayer {
         let qkv = self.compiled_pre.call(&x, stream)?;
         let attended = self.self_attn.attend_projected(qkv, cache, stream)?;
         self.compiled_post.call(&x, &attended, stream)
+    }
+
+    pub(crate) fn forward_layerwise(
+        &mut self,
+        x: Array,
+        cache: &mut ConcatKeyValueCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.forward(x, cache, stream)
     }
 
     fn forward_traced(
@@ -930,7 +943,7 @@ impl MoshiTransformer {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct DepFormerSlice {
+pub(crate) struct DepFormerSlice {
     #[param]
     emb: ScaledEmbedding,
     #[param]
@@ -970,6 +983,46 @@ impl DepFormerSlice {
             transformer: MoshiTransformer::unloaded(cfg, stream)?,
         })
     }
+
+    pub(crate) fn new_for_index(
+        args: &ModelArgs,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let input_vocab = if index == 0 {
+            args.text_card + 1
+        } else {
+            args.card + 1
+        };
+        Self::unloaded(
+            input_vocab,
+            args.dim,
+            depth_transformer_config(args),
+            args.card + 1,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_layerwise(
+        &mut self,
+        temporal_output: &Array,
+        previous: &Array,
+        nonnegative: bool,
+        cache: &mut [ConcatKeyValueCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embedded = if nonnegative {
+            self.emb.forward_nonnegative(previous, stream)?
+        } else {
+            self.emb.forward(previous, stream)?
+        };
+        let x = self
+            .linear_in
+            .forward(temporal_output, stream)?
+            .add(embedded, stream)?;
+        let x = self.transformer.forward(x, cache, stream)?;
+        self.linear_out.forward(&x, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -981,8 +1034,8 @@ struct DepFormer {
 /// Stateful caches for temporal and within-frame depth inference.
 #[derive(Debug, Clone)]
 pub struct MoshiCache {
-    temporal: Vec<ConcatKeyValueCache>,
-    depth: Vec<ConcatKeyValueCache>,
+    pub(crate) temporal: Vec<ConcatKeyValueCache>,
+    pub(crate) depth: Vec<ConcatKeyValueCache>,
 }
 
 impl MoshiCache {
@@ -992,7 +1045,7 @@ impl MoshiCache {
         self.depth.iter_mut().for_each(|cache| cache.clear());
     }
 
-    fn reset_depth(&mut self) {
+    pub(crate) fn reset_depth(&mut self) {
         self.depth.iter_mut().for_each(|cache| cache.clear());
     }
 }
@@ -1047,10 +1100,10 @@ pub struct GenerationStepWithLogits {
 /// generated side, temporal/depth caches, text feedback, and per-codebook
 /// delays remain internal to this state.
 pub struct GenerationState {
-    cache: MoshiCache,
-    frames: Vec<Vec<Option<Array>>>,
-    previous_text: Option<Array>,
-    step: usize,
+    pub(crate) cache: MoshiCache,
+    pub(crate) frames: Vec<Vec<Option<Array>>>,
+    pub(crate) previous_text: Option<Array>,
+    pub(crate) step: usize,
 }
 
 impl GenerationState {
@@ -1116,6 +1169,116 @@ pub struct Model {
     text_linear: MoshiLinear,
     #[param]
     audio_embs: Vec<ScaledEmbedding>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+pub(crate) struct MoshiLayerwiseStatic {
+    #[param]
+    text_emb: ScaledEmbedding,
+    #[param]
+    out_norm: nn::RmsNorm,
+    #[param]
+    text_linear: MoshiLinear,
+    #[param]
+    audio_embs: Vec<ScaledEmbedding>,
+}
+
+impl MoshiLayerwiseStatic {
+    pub(crate) fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        let audio_embs = (0..args.n_q)
+            .map(|_| ScaledEmbedding::unloaded(args.card + 1, args.dim, args.quantization, stream))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            text_emb: ScaledEmbedding::unloaded(
+                args.text_card + 1,
+                args.dim,
+                args.quantization,
+                stream,
+            )?,
+            out_norm: nn::RmsNorm::unloaded(args.dim, RMS_NORM_EPS, Dtype::Float32, stream)?,
+            text_linear: MoshiLinear::unloaded(
+                args.dim,
+                args.text_card,
+                false,
+                Dtype::Float32,
+                args.quantization,
+                stream,
+            )?,
+            audio_embs,
+        })
+    }
+
+    pub(crate) fn temporal_input(
+        &mut self,
+        args: &ModelArgs,
+        text_token: &Array,
+        audio_tokens: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if text_token.shape().len() != 2 || text_token.dim(1) != 1 {
+            return Err(Exception::custom(
+                "Moshi text input must have shape [batch, 1]",
+            ));
+        }
+        if audio_tokens.shape().len() != 2
+            || audio_tokens.dim(0) != text_token.dim(0)
+            || audio_tokens.dim(1) != args.n_q
+        {
+            return Err(Exception::custom(format!(
+                "Moshi audio input must have shape [batch, {}]",
+                args.n_q
+            )));
+        }
+        let mut x = self.text_emb.forward_nonnegative(text_token, stream)?;
+        for codebook in 0..args.n_q {
+            let token = audio_tokens
+                .try_index_device((.., codebook), stream)?
+                .expand_dims(1, stream)?;
+            x = x.add(
+                self.audio_embs[codebook as usize].forward_nonnegative(&token, stream)?,
+                stream,
+            )?;
+        }
+        Ok(x)
+    }
+
+    pub(crate) fn finish_temporal(
+        &mut self,
+        hidden: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let output = self.out_norm.forward(hidden, stream)?;
+        let logits = self.text_linear.forward(&output, stream)?;
+        Ok((output, logits))
+    }
+}
+
+fn temporal_transformer_config(args: &ModelArgs) -> TransformerConfig {
+    TransformerConfig {
+        dim: args.dim,
+        num_heads: args.num_heads,
+        num_layers: args.num_layers,
+        feed_forward: args.dim_feedforward.unwrap_or(4 * args.dim),
+        context: args.context,
+        max_period: args.max_period,
+        rope: true,
+        quantization: args.quantization,
+    }
+}
+
+fn depth_transformer_config(args: &ModelArgs) -> TransformerConfig {
+    TransformerConfig {
+        dim: args.depformer_dim,
+        num_heads: args.depformer_num_heads,
+        num_layers: args.depformer_num_layers,
+        feed_forward: args
+            .depformer_dim_feedforward
+            .unwrap_or(4 * args.depformer_dim),
+        context: args.depformer_context.unwrap_or(args.dep_q),
+        max_period: args.depformer_max_period.unwrap_or(8.0),
+        rope: false,
+        quantization: args.quantization,
+    }
 }
 
 impl Model {

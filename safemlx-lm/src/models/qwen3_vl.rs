@@ -195,7 +195,7 @@ pub struct Model {
 pub struct Cache {
     /// Per-layer key/value caches.
     pub kv: Vec<Option<ConcatKeyValueCache>>,
-    rope_delta: i32,
+    pub(crate) rope_delta: i32,
 }
 
 struct PreparedPrefill {
@@ -444,7 +444,7 @@ impl Model {
     }
 }
 
-fn multimodal_position_ids(
+pub(crate) fn multimodal_position_ids(
     input: runtime_input::ModelInput<'_>,
     spatial_merge_size: i32,
     expected_len: i32,
@@ -504,7 +504,7 @@ fn multimodal_position_ids(
     Ok((positions, max_position + 1 - expected_len))
 }
 
-fn mrope_embeddings(
+pub(crate) fn mrope_embeddings(
     position_ids: &[Vec<i32>; 3],
     head_dim: i32,
     theta: f32,

@@ -222,7 +222,7 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    pub(crate) fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
         if let Some(configs) = &self.quantized_weight_configs {
             return configs.get(weight_name).copied();
         }
@@ -241,7 +241,7 @@ impl ModelArgs {
             .collect()
     }
 
-    fn layer_block_type(&self, index: usize) -> Result<LayerBlockType, Error> {
+    pub(crate) fn layer_block_type(&self, index: usize) -> Result<LayerBlockType, Error> {
         self.hybrid_override_pattern
             .chars()
             .nth(index)
@@ -1523,7 +1523,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
 }
 
 impl LayerCache {
-    fn new(block_type: LayerBlockType) -> Self {
+    pub(crate) fn new(block_type: LayerBlockType) -> Self {
         match block_type {
             LayerBlockType::Mamba => Self::Mamba(Mamba2Cache::default()),
             LayerBlockType::Attention => Self::Attention(ConcatKeyValueCache::new()),
@@ -1532,11 +1532,23 @@ impl LayerCache {
         }
     }
 
-    fn offset(&self) -> Option<i32> {
+    pub(crate) fn offset(&self) -> Option<i32> {
         match self {
             Self::Mamba(cache) => Some(cache.offset),
             Self::Attention(cache) => Some(cache.offset()),
             Self::Mlp | Self::Moe => None,
+        }
+    }
+
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Mamba(cache) => cache
+                .conv_state
+                .iter()
+                .chain(cache.ssm_state.iter())
+                .collect(),
+            Self::Attention(cache) => cache.retained_arrays(),
+            Self::Mlp | Self::Moe => Vec::new(),
         }
     }
 }
@@ -1778,7 +1790,7 @@ impl Model {
         )
     }
 
-    fn forward_logits(
+    pub(crate) fn forward_logits(
         &mut self,
         input: ModelInput<'_>,
         last_token_only: bool,
@@ -2473,7 +2485,7 @@ pub fn transform_nemotron_h_weights(
     transform_split_relu2_experts(rewritten, args.n_routed_experts, stream)
 }
 
-fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Result<String, Error> {
+pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Result<String, Error> {
     let Some(rest) = key.strip_prefix("backbone.layers.") else {
         return Ok(key.to_string());
     };

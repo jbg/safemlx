@@ -414,7 +414,7 @@ pub struct QwenVisionBlock {
 }
 
 impl QwenVisionBlock {
-    fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             norm1: QwenVisionRmsNorm::new(config.hidden_size, 1e-6, stream)?,
             attn: QwenVisionAttention::new(config, stream)?,
@@ -555,6 +555,161 @@ enum VisionMode {
 pub(crate) struct VisionOutput {
     pub embeddings: Array,
     pub deepstack_features: Vec<Array>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Pinned Qwen3-VL vision modules surrounding the windowed transformer blocks.
+pub(crate) struct QwenVisionLayerwiseStatic {
+    pub(crate) config: VisionConfig,
+    #[param]
+    pub(crate) pos_embed: nn::Embedding,
+    #[param]
+    pub(crate) patch_embed: QwenVisionPatchEmbed,
+    #[param]
+    pub(crate) merger: QwenVisionPatchMerger,
+    #[param]
+    pub(crate) deepstack_merger_list: Vec<QwenVisionPatchMerger>,
+}
+
+/// Per-input rotary, window, and DeepStack state for layerwise vision execution.
+pub(crate) struct QwenVisionLayerwiseState {
+    full_chunk_lengths: Vec<i32>,
+    window_chunk_lengths: Vec<i32>,
+    window_index: Vec<i32>,
+    cos: Array,
+    sin: Array,
+    deepstack_features: Vec<Array>,
+}
+
+impl QwenVisionLayerwiseState {
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        self.deepstack_features.iter().collect()
+    }
+}
+
+impl QwenVisionLayerwiseStatic {
+    pub(crate) fn from_transformer(transformer: QwenVisionTransformer) -> Self {
+        Self {
+            config: transformer.config,
+            pos_embed: transformer.pos_embed,
+            patch_embed: transformer.patch_embed,
+            merger: transformer.merger,
+            deepstack_merger_list: transformer.deepstack_merger_list,
+        }
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, QwenVisionLayerwiseState), Exception> {
+        let grid = grid_thw_from_array(grid_thw, stream)?;
+        validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
+        let mut hidden = self.patch_embed.forward(pixel_values, stream)?;
+        let seq_len = hidden.dim(0);
+        let positions = vision_interpolated_position_embeddings(
+            &mut self.pos_embed,
+            &grid,
+            self.config.num_position_embeddings,
+            self.config.spatial_merge_size,
+            stream,
+        )?;
+        hidden = hidden.add(positions.as_dtype(hidden.dtype(), stream)?, stream)?;
+        let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
+        let total: i32 = full_chunk_lengths.iter().sum();
+        if total != seq_len {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision grid describes {total} patches but image tensor has {seq_len}"
+            )));
+        }
+        let merge_unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let window_index = (0..seq_len / merge_unit).collect::<Vec<_>>();
+        let window_chunk_lengths = full_chunk_lengths.clone();
+        let window_index_array = Array::from_slice(&window_index, &[window_index.len() as i32]);
+        hidden = hidden.reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?;
+        hidden = hidden.try_index_device((&window_index_array, .., ..), stream)?;
+        hidden = hidden.reshape(&[seq_len, -1], stream)?;
+
+        let (cos, sin) = vision_rotary_embeddings(
+            &grid,
+            self.config.spatial_merge_size,
+            self.config.hidden_size / self.config.num_heads,
+        );
+        let reorder = |array: Array| -> Result<Array, Exception> {
+            Ok(array
+                .reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?
+                .try_index_device((&window_index_array, .., ..), stream)?
+                .reshape(&[seq_len, -1], stream)?)
+        };
+        Ok((
+            hidden,
+            QwenVisionLayerwiseState {
+                full_chunk_lengths,
+                window_chunk_lengths,
+                window_index,
+                cos: reorder(cos)?,
+                sin: reorder(sin)?,
+                deepstack_features: Vec::new(),
+            },
+        ))
+    }
+
+    pub(crate) fn forward_block(
+        &self,
+        block: &mut QwenVisionBlock,
+        index: usize,
+        hidden: Array,
+        state: &QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let chunks = if self.config.fullatt_block_indexes.contains(&(index as i32)) {
+            &state.full_chunk_lengths
+        } else {
+            &state.window_chunk_lengths
+        };
+        block.forward(hidden, chunks, &state.cos, &state.sin, stream)
+    }
+
+    pub(crate) fn capture_deepstack(
+        &mut self,
+        index: usize,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if let Some(merger_index) = self
+            .config
+            .deepstack_visual_indexes
+            .iter()
+            .position(|&layer| layer == index as i32)
+        {
+            state.deepstack_features.push(
+                self.deepstack_merger_list[merger_index]
+                    .forward(hidden, stream)?
+                    .try_index_device((NewAxis, .., ..), stream)?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<VisionOutput, Exception> {
+        let hidden = self.merger.forward(hidden, stream)?;
+        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
+        let embeddings = hidden
+            .try_index_device((&reverse_index_array, ..), stream)?
+            .try_index_device((NewAxis, .., ..), stream)?;
+        Ok(VisionOutput {
+            embeddings,
+            deepstack_features: std::mem::take(&mut state.deepstack_features),
+        })
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]

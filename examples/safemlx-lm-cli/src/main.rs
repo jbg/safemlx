@@ -12,10 +12,12 @@ use safemlx::{
     ExecutionContext, Stream,
 };
 use safemlx_lm::{
+    layerwise::{LayerwiseLoadOptions, WeightResidency},
     models::{
         input::{InputPart, ModelInput},
         LoadedModel, ModelLoadOptions,
     },
+    offload::{MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
     sampler::{DefaultSampler, GenerationSampler, Sampler},
 };
@@ -104,6 +106,26 @@ struct Cli {
     #[arg(long, default_value_t = 64, value_name = "WEIGHTS")]
     quantization_group_size: i32,
 
+    /// Keep repeated model layers on the host and use a bounded device window.
+    #[arg(long)]
+    layerwise_host: bool,
+
+    /// Maximum repeated layers resident on the execution device.
+    #[arg(long, default_value_t = 1, value_name = "LAYERS")]
+    device_layer_window: usize,
+
+    /// Optional logical device parameter budget in bytes.
+    #[arg(long, value_name = "BYTES")]
+    device_budget_bytes: Option<u64>,
+
+    /// Optional logical host parameter budget in bytes.
+    #[arg(long, value_name = "BYTES")]
+    host_budget_bytes: Option<u64>,
+
+    /// Maximum simultaneously mapped safetensors payload shards.
+    #[arg(long, default_value_t = 4, value_name = "SHARDS")]
+    mapped_shards: usize,
+
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
     raw: bool,
@@ -132,13 +154,29 @@ fn main() -> Result<()> {
         safemlx::memory::reset_peak_memory()?;
     }
     let load_started = Instant::now();
-    let load_options = match args.quantize {
+    let mut load_options = match args.quantize {
         Some(bits) => ModelLoadOptions::with_quantization(AffineQuantization::new(
             args.quantization_group_size,
             bits,
         )?),
         None => ModelLoadOptions::default(),
     };
+    if args.layerwise_host {
+        let offload = OffloadConfig::new(
+            args.device_budget_bytes,
+            args.host_budget_bytes,
+            args.device_layer_window,
+        )?;
+        load_options = load_options.with_weight_residency(WeightResidency::LayerwiseHost(
+            LayerwiseLoadOptions {
+                offload,
+                max_mapped_shards: args.mapped_shards,
+                sample_mlx_memory: args.verbose,
+                sample_process_memory: args.verbose,
+                ..LayerwiseLoadOptions::default()
+            },
+        ));
+    }
     let mut model =
         LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
             .with_context(|| format!("failed to load model from {}", model_path.display()))?;
@@ -282,6 +320,30 @@ fn main() -> Result<()> {
         eprintln!("mlx_peak_memory: {}", format_bytes(peak_memory));
         eprintln!("mlx_active_memory: {}", format_bytes(active_memory));
         eprintln!("mlx_cache_memory: {}", format_bytes(cache_memory));
+        if let Some(report) = model.residency_report()? {
+            let offload = report.offload();
+            eprintln!(
+                "residency_current_host_device: {} / {} bytes",
+                offload.resident_bytes().get(MemoryTier::Host),
+                offload.resident_bytes().get(MemoryTier::Device)
+            );
+            eprintln!(
+                "residency_peak_host_device: {} / {} bytes",
+                offload.peak_resident_bytes().get(MemoryTier::Host),
+                offload.peak_resident_bytes().get(MemoryTier::Device)
+            );
+            for direction in TransferDirection::ALL {
+                let transfer = offload.transfer(direction);
+                if transfer.count() > 0 {
+                    eprintln!(
+                        "residency_{direction:?}: {} transfers, {} bytes",
+                        transfer.count(),
+                        transfer.bytes()
+                    );
+                }
+            }
+            eprintln!("weight_store: {:?}", report.weight_store());
+        }
         if eos_token_ids.is_empty() {
             eprintln!("warning: the model config contains no EOS token id");
         } else if !output_ids
@@ -340,6 +402,15 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if let Some(bits) = args.quantize {
         AffineQuantization::new(args.quantization_group_size, bits)?;
+    }
+    if args.layerwise_host && args.quantize.is_some() {
+        bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
+    }
+    if args.device_layer_window == 0 {
+        bail!("--device-layer-window must be greater than zero");
+    }
+    if args.mapped_shards == 0 {
+        bail!("--mapped-shards must be greater than zero");
     }
     if args.revision.is_some() && Path::new(&args.model).exists() {
         bail!("--revision can only be used with a Hugging Face model identifier");
