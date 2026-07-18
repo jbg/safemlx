@@ -3,9 +3,10 @@
 //! Checkpoints store E4M3 bytes together with one inverse scale per 128x128
 //! weight block. Conventional dense and routed-expert projections dynamically
 //! quantize each 128-value activation block to E4M3 using the checkpoint's
-//! declared DeepSeek/Qwen FP8 execution scheme. These operations consume both
+//! declared DeepSeek/Qwen FP8 execution scheme. GPU operations consume both
 //! packed representations directly, including rank-3 expert banks, without
-//! expanding a complete weight bank.
+//! expanding a complete weight bank. CPU execution uses a deliberately slow
+//! dequantized reference path for correctness tests and functional fallback.
 
 use std::cell::RefCell;
 
@@ -14,7 +15,12 @@ use safemlx::fast::CudaKernel;
 #[cfg(not(feature = "cuda"))]
 use safemlx::fast::MetalKernel;
 use safemlx::fast::MetalKernelConfig;
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Dtype, Stream};
+use safemlx::{
+    error::Exception,
+    ops::{concatenate_axis, grouped_matmul, indexing::TryIndexOp, matmul},
+    transforms::eval,
+    Array, DeviceType, Dtype, Stream,
+};
 
 #[cfg(not(feature = "cuda"))]
 thread_local! {
@@ -91,6 +97,53 @@ fn restore_activation_dtype(
     } else {
         output.as_dtype(dtype, stream)
     }
+}
+
+fn is_cpu_stream(stream: &Stream) -> Result<bool, Exception> {
+    Ok(stream.get_device()?.get_type()? == DeviceType::Cpu)
+}
+
+fn dequantize_grouped(weight: &Array, scale: &Array, stream: &Stream) -> Result<Array, Exception> {
+    let experts = weight.dim(0);
+    let out_dim = weight.dim(1);
+    let in_dim = weight.dim(2);
+    let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 1, stream)?;
+    let scale = Array::repeat_axis::<f32>(scale, 128, 2, stream)?;
+    weight.from_fp8(Dtype::Float32, stream)?.multiply(
+        scale.try_index_device((..experts, ..out_dim, ..in_dim), stream)?,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn segmented_reference(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    group_ids: &Array,
+    group_stride: i32,
+    row_offset: i32,
+    output_dims: i32,
+    transpose: bool,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let weight = dequantize(weight, scale, stream)?;
+    let group_ids = group_ids.as_dtype(Dtype::Uint32, stream)?;
+    eval([&group_ids])?;
+    let evaluated = group_ids.evaluated()?;
+    let mut outputs = Vec::with_capacity(input.dim(0) as usize);
+    for (route, group) in evaluated.as_slice::<u32>().iter().copied().enumerate() {
+        let start = group as i32 * group_stride + row_offset;
+        let input_row = input.try_index_device(route as i32..route as i32 + 1, stream)?;
+        let segment = weight.try_index_device(start..start + output_dims, stream)?;
+        outputs.push(if transpose {
+            matmul(&input_row, &segment, stream)?
+        } else {
+            matmul(&input_row, &segment.transpose(stream)?, stream)?
+        });
+    }
+    let refs = outputs.iter().collect::<Vec<_>>();
+    concatenate_axis(&refs, 0, stream)
 }
 
 struct QuantizedActivations {
@@ -265,6 +318,11 @@ pub fn linear(
         ));
     }
     let rows = (input.size() as i32) / in_dim;
+    if is_cpu_stream(stream)? {
+        let weight = dequantize(weight, scale, stream)?;
+        let output = matmul(input, &weight.transpose(stream)?, stream)?;
+        return restore_activation_dtype(output, output_dtype, stream);
+    }
     let input = input.reshape(&[rows, in_dim], stream)?;
     let input = quantize_activations(&input, rows, in_dim, stream)?;
     let scale_cols = scale.dim(1);
@@ -533,6 +591,17 @@ pub fn grouped_linear(
         ));
     }
     let scale_cols = scale.dim(2);
+    if is_cpu_stream(stream)? {
+        let weight = dequantize_grouped(weight, scale, stream)?;
+        let output = grouped_matmul(
+            input,
+            &weight.swap_axes(-1, -2, stream)?,
+            group_ids,
+            true,
+            stream,
+        )?;
+        return restore_activation_dtype(output, output_dtype, stream);
+    }
     let input = quantize_activations(input, routes, in_dim, stream)?;
 
     #[cfg(feature = "cuda")]
@@ -820,6 +889,19 @@ pub fn segmented_linear(
             "invalid segmented block-FP8 linear dimensions",
         ));
     }
+    if is_cpu_stream(stream)? {
+        return segmented_reference(
+            input,
+            weight,
+            scale,
+            group_ids,
+            group_stride,
+            row_offset,
+            output_dims,
+            false,
+            stream,
+        );
+    }
     let routes = input.dim(0);
     SEGMENTED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
@@ -873,6 +955,19 @@ pub fn segmented_transposed_linear(
         return Err(Exception::custom(
             "invalid segmented transposed block-FP8 linear dimensions",
         ));
+    }
+    if is_cpu_stream(stream)? {
+        return segmented_reference(
+            input,
+            weight,
+            scale,
+            group_ids,
+            group_stride,
+            row_offset,
+            input.dim(1),
+            true,
+            stream,
+        );
     }
     let routes = input.dim(0);
     let output_dims = weight.dim(1);
@@ -1087,9 +1182,8 @@ mod tests {
     };
     use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype, ExecutionContext};
 
-    #[test]
-    fn block_fp8_dense_and_grouped_projections() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    fn assert_block_fp8_dense_and_grouped_projections(device_type: DeviceType) {
+        let context = ExecutionContext::new(Device::new(device_type, 0));
         let stream = context.stream();
         // E4M3 0x38 represents 1.0; inverse block scale 2.0 makes
         // every effective weight 2.0.
@@ -1200,6 +1294,16 @@ mod tests {
                 .item::<f32>(stream),
             512.0
         );
+    }
+
+    #[test]
+    fn block_fp8_dense_and_grouped_projections() {
+        assert_block_fp8_dense_and_grouped_projections(DeviceType::Gpu);
+    }
+
+    #[test]
+    fn block_fp8_cpu_reference_projections() {
+        assert_block_fp8_dense_and_grouped_projections(DeviceType::Cpu);
     }
 
     #[test]

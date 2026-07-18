@@ -156,8 +156,8 @@ pub struct ModelLoadOptions {
     /// Optional validated runtime topology and process-local device assignment.
     ///
     /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must be loaded through the explicit [`crate::pipeline`] or
-    /// [`crate::tensor_parallel`] APIs.
+    /// topologies must be loaded through the explicit [`crate::pipeline`],
+    /// [`crate::tensor_parallel`], or [`crate::expert_parallel`] APIs.
     pub parallel: Option<ParallelTopology>,
 }
 
@@ -200,8 +200,14 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
             {
                 "non-replicated pure pipeline loading cannot return the complete Model type; use pipeline::load_pipeline_model_with_options"
                     .into()
+            } else if topology.expert_parallel_size > 1
+                && topology.tensor_parallel_size == 1
+                && topology.pipeline_parallel_size == 1
+            {
+                "non-replicated pure expert-parallel loading cannot return the complete Model type; use expert_parallel::load_expert_parallel_model_with_options"
+                    .into()
             } else {
-                "hybrid TP+PP, TP+EP, and PP+EP model loading is unsupported; use a pure tensor- or pipeline-parallel topology"
+                "hybrid TP+PP, TP+EP, and PP+EP model loading is unsupported; use a pure tensor-, pipeline-, or expert-parallel topology"
                     .into()
             },
         ))

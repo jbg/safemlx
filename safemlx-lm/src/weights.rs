@@ -789,6 +789,45 @@ fn pack_split_swiglu_expert_prefix(
     ]))
 }
 
+/// Packs a map of split SwiGLU experts into local expert-major banks.
+///
+/// Expert ids in `loaded` must already be dense local ids `0..num_experts`.
+pub fn transform_split_swiglu_experts(
+    loaded: HashMap<String, Array>,
+    num_experts: i32,
+    stream: &Stream,
+) -> Result<HashMap<String, Array>, Error> {
+    let mut transformed = HashMap::with_capacity(loaded.len());
+    let mut expert_parts: HashMap<(String, i32), SwiGluExpertParts> = HashMap::new();
+    for (key, value) in loaded {
+        if let Some((prefix, expert, projection)) = parse_split_swiglu_expert_projection_key(&key) {
+            let parts = expert_parts.entry((prefix, expert)).or_default();
+            match projection {
+                SwiGluExpertProjection::Gate => parts.gate = Some(value),
+                SwiGluExpertProjection::Down => parts.down = Some(value),
+                SwiGluExpertProjection::Up => parts.up = Some(value),
+            }
+        } else {
+            transformed.insert(key, value);
+        }
+    }
+    let mut prefixes = expert_parts
+        .keys()
+        .map(|(prefix, _)| prefix.clone())
+        .collect::<Vec<_>>();
+    prefixes.sort();
+    prefixes.dedup();
+    for prefix in prefixes {
+        transformed.extend(pack_split_swiglu_expert_prefix(
+            &mut expert_parts,
+            &prefix,
+            num_experts,
+            stream,
+        )?);
+    }
+    Ok(transformed)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Projection kind in a split ReLU2 expert checkpoint.
 pub enum Relu2ExpertProjection {

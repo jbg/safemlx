@@ -532,6 +532,128 @@ Moshi projections preserve their checkpoint dtype. MLX 0.32.0 fixes the
 locally built NAX metallib behavior that previously required FP32 promotion
 with MLX 0.31.2.
 
+## Expert-parallel sparse MoE inference
+
+`expert_parallel` provides executable pure expert parallelism for official
+DeepSeek-V3/R1 safetensors and Qwen3 sparse-MoE safetensors. The initial model
+API requires `EP > 1`, `TP = 1`, and `PP = 1`; hybrid EP+TP and EP+PP are
+rejected before checkpoint payloads are opened. Dense models and GGUF are also
+rejected. Checkpoint `ep_size` describes a stored layout and is not the runtime
+EP degree.
+
+`ExpertAssignment` supports balanced-contiguous (the model default),
+round-robin, and explicit owner maps. Pass a non-default assignment to
+`load_expert_parallel_model_with_assignment`, or combine it with quantization
+through `load_expert_parallel_model_with_options_and_assignment`. Packed
+checkpoints select the exact ordered expert rows for non-contiguous policies;
+they do not materialize the enclosing range. Routers and observations always
+use checkpoint-global expert ids. Only immediately before a grouped expert
+kernel does the dispatcher translate them to dense owner-local ids, so
+non-contiguous policies do not depend on `global_id - range.start`.
+
+The pure-EP model path uses replicated-input dispatch. Attention, norms,
+routers, embeddings, dense MLPs, heads, and DeepSeek shared experts are
+replicated, so every rank already has the same hidden rows and router result.
+Each rank compacts only locally owned routes, executes only its local expert
+bank, reduces those routes into a full zero-initialized token buffer, and uses
+one all-sum for the routed contribution. DeepSeek's replicated shared expert is
+computed once per rank and added *after* that all-sum; it is never multiplied
+by EP size. Exact compaction performs one scalar route-count synchronization
+per sparse layer, with no per-expert synchronization and no capacity dropping.
+
+For future token-sharded execution, `all_to_all_v` accepts destination-major
+activation or metadata blocks and returns received rows in source-rank order.
+Because MLX 0.32 has no native all-to-all C API, it gathers counts, pads all
+blocks to the global maximum, all-gathers the destination matrix, extracts the
+current destination, and removes padding. This is a real Ring-compatible
+fallback, but its transfer and temporary storage replicate `O(world_size)`
+data. `RoutingStatistics` exposes route counts, padding, synchronization,
+logical exchanged bytes, and router/compaction/exchange/expert/reduction/shared
+expert/total MoE wall times so probes can report imbalance and phase overhead;
+`model_time` separately records the complete model forward. Normal inference
+keeps MLX's lazy scheduling, so those fields primarily measure host submission
+apart from explicit waits. The opt-in `profile_expert_parallel_timings` guard
+materializes each phase and the final logits before its timer stops. It is meant
+for measurement only: the inserted synchronization changes scheduling and can
+reduce production throughput. Use MLX device profiling when kernel-only timing
+is required.
+
+`ExpertParallelModel::forward_with_observer` preserves global router ids and
+weights while exposing the rank-local routed contribution, globally reduced
+routed contribution, replicated shared-expert contribution, and final combined
+MoE output as distinct fields. Qwen3 callers can select the standard growing
+cache with `new_cache()` or a bounded cache with
+`new_qwen3_sliding_cache(window)`; both retain the same EP routing semantics.
+
+Packed Qwen3 expert axes and official split DeepSeek experts are selected by
+placement before payload materialization; remote-only indexed shards are not
+opened. Dense, affine/MXFP4, and DeepSeek block-FP8 banks retain their existing
+physical kernels behind `LocalExpertBank`. Routed-expert bytes should therefore
+scale approximately with `1 / EP`, while `replicated_parameter_bytes` remains
+constant. On-load affine/MXFP4 conversion also follows the placement plan:
+only this rank's local expert banks are materialized and quantized, while
+ordinary replicated matrices retain the existing tensor-at-a-time conversion.
+
+Run a two-process Ring generation probe with the usual MLX Ring host file and
+rank environment:
+
+```sh
+cargo run --release -p safemlx-lm --example expert_parallel_generate -- /path/to/model
+```
+
+The example prints assignment metadata, performs prefill and multiple decode
+steps, samples only on rank zero, synchronizes token/stop state, and reports
+routing counters. Ring is intended for correctness and functional testing.
+JACCL or NCCL is expected for practical low-latency EP. Small-batch decode is
+often dominated by expert imbalance, and the all-gather all-to-all fallback has
+substantial memory/bandwidth overhead. Replicated-input EP avoids token exchange
+entirely and is usually preferable until a native all-to-all is available. No
+speedup is implied without measurements on the target checkpoint and backend.
+
+For a device-complete performance probe comparing a complete model on rank
+zero, replicated-input EP on every rank, and a variable-count synthetic
+sharded-input exchange, run:
+
+```sh
+cargo run --release -p safemlx-lm --example expert_parallel_benchmark -- \
+  /path/to/model --backend jaccl --device gpu --warmup 1 --iterations 3
+```
+
+The CSV reports prefill and fixed-token decode latency/throughput, every MoE
+phase, summed MoE and whole-model time, routes-per-rank imbalance, logical
+bytes, padding, synchronization, peak MLX memory, and complete-versus-EP logit
+error. The synthetic case deliberately uses uneven destination counts to expose
+fallback padding. Ring can be used with `--backend ring --device cpu` for a
+functional comparison; MLX Ring collectives do not currently execute on GPU.
+Results include the synchronization introduced by phase profiling and should
+not be presented as unprofiled production throughput or as an automatic EP
+speedup.
+
+Useful verification and opt-in probe commands are:
+
+```sh
+cargo test -p safemlx-lm expert_parallel --lib
+cargo test -p safemlx-lm --test distributed_expert_exchange_ring -- --ignored --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_two_process_model_parity -- --ignored --exact --nocapture
+cargo run --release -p safemlx-lm --example expert_parallel_generate -- /path/to/model
+cargo run --release -p safemlx-lm --example expert_parallel_benchmark -- /path/to/model --backend jaccl
+```
+
+The exchange Ring test covers variable-count transport plus complete two-rank
+forward and reverse sharded dispatch. Its non-monotonic route metadata runs
+through packed ReLU2 and native block-FP8 local banks, and a separate case
+keeps one rank completely route-empty while every collective is still entered.
+
+The model-parity Ring test uses tiny deterministic complete-model references
+and checks prefill, two cached decode steps, and three synchronized tokens for
+dense and affine-packed Qwen3/DeepSeek banks plus native DeepSeek block-FP8.
+It also runs packed Qwen with round-robin placement and split DeepSeek with an
+explicit non-contiguous owner map.
+Its DeepSeek fixture crosses a dense-to-MoE layer boundary, uses two router
+groups, and deliberately gives one rank zero routes to exercise imbalance and
+empty-local-work behavior. GPU FP8 keeps the packed Metal kernels; CPU Ring
+uses the slower dequantized FP8 reference path.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.

@@ -23,7 +23,7 @@ pub use super::common::generation::sample;
 use crate::{
     cache::KeyValueCache,
     error::Error,
-    inspection::ActivationObserver,
+    inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
         common::{
             self,
@@ -114,7 +114,7 @@ impl ModelArgs {
         self.quantization.or(self.quantization_config)
     }
 
-    fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
@@ -485,7 +485,95 @@ impl SparseMoeBlock {
             .experts
             .forward(&flat, &routing.indices, &routing.weights, stream)?;
         observer.observe(&format!("{prefix}.experts.output"), &output)?;
+        observer.observe_moe_routing(MoeRoutingObservation {
+            prefix,
+            selected_experts: &routing.indices,
+            selected_scores: &routing.scores,
+            routing_weights: &routing.weights,
+            routed_output: &output,
+            local_routed_output: None,
+            reduced_routed_output: Some(&output),
+            shared_output: None,
+            combined_output: Some(&output),
+            num_experts: self.gate.num_experts,
+        })?;
         output.reshape(shape, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        hidden_states: &Array,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        mut observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        crate::expert_parallel::materialize_timing_phase([&flat])?;
+        let moe_started = std::time::Instant::now();
+        let previous_moe_time = statistics.total_time;
+        let router_started = std::time::Instant::now();
+        let (indices, selected_scores, weights) = if let Some(observer) = observer.as_deref_mut() {
+            let routing = self.gate.forward_with_observer(
+                &flat,
+                stream,
+                &format!("{prefix}.gate"),
+                observer,
+            )?;
+            (routing.indices, Some(routing.scores), routing.weights)
+        } else {
+            let (indices, weights) = self.gate.forward(&flat, stream)?;
+            (indices, None, weights)
+        };
+        let mut router_outputs = vec![&indices, &weights];
+        if let Some(scores) = selected_scores.as_ref() {
+            router_outputs.push(scores);
+        }
+        crate::expert_parallel::materialize_timing_phase(router_outputs)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::expert_parallel::dispatch_replicated(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            &mut self.experts,
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        if let Some(observer) = observer {
+            observer.observe(
+                &format!("{prefix}.experts.local_output"),
+                &returned.local_output,
+            )?;
+            observer.observe(
+                &format!("{prefix}.experts.reduced_output"),
+                &returned.reduced_output,
+            )?;
+            observer.observe_moe_routing(MoeRoutingObservation {
+                prefix,
+                selected_experts: &indices,
+                selected_scores: selected_scores
+                    .as_ref()
+                    .expect("observed EP routing scores initialized"),
+                routing_weights: &weights,
+                routed_output: &returned.reduced_output,
+                local_routed_output: Some(&returned.local_output),
+                reduced_routed_output: Some(&returned.reduced_output),
+                shared_output: None,
+                combined_output: Some(&returned.reduced_output),
+                num_experts: self.gate.num_experts,
+            })?;
+        }
+        let output = returned.reduced_output.reshape(shape, stream)?;
+        crate::expert_parallel::materialize_timing_phase([&output])?;
+        statistics.total_time = previous_moe_time + moe_started.elapsed();
+        Ok(output)
     }
 }
 
@@ -563,6 +651,31 @@ impl FeedForward {
         match self {
             Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
             Self::Moe(moe) => moe.forward_with_observer(input, stream, prefix, observer),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        hidden_states: &Array,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(hidden_states, stream),
+            Self::Moe(moe) => moe.forward_expert_parallel(
+                hidden_states,
+                assignment,
+                group,
+                statistics,
+                prefix,
+                observer,
+                stream,
+            ),
         }
     }
 }
@@ -809,6 +922,44 @@ impl TransformerBlock {
         let mlp = self.mlp.forward(&normed, stream)?;
         hidden.add(mlp, stream)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, cache } = input;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let attention = self.self_attn.forward(
+            AttentionInput {
+                x: &normed,
+                mask,
+                cache,
+            },
+            stream,
+        )?;
+        let hidden = x.add(attention, stream)?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = self.mlp.forward_expert_parallel(
+            &normed,
+            assignment,
+            group,
+            statistics,
+            &format!("{prefix}.mlp"),
+            observer,
+            stream,
+        )?;
+        hidden.add(mlp, stream)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for TransformerBlock
@@ -955,6 +1106,56 @@ impl Qwen3Model {
         observer.observe("model.norm", &output)?;
         Ok(output)
     }
+
+    pub(crate) fn forward_expert_parallel<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        mut observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let ModelInput {
+            inputs,
+            mask,
+            cache,
+        } = input;
+        let mut hidden = self.embed_tokens.forward(inputs, stream)?;
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => match create_attention_mask(&hidden, cache, Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => unreachable!("array mask requested"),
+                None => None,
+            },
+        };
+        if cache.is_empty() {
+            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
+        }
+        for (index, (layer, cache)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+            let layer_observer = observer
+                .as_mut()
+                .map(|observer| &mut **observer as &mut dyn ActivationObserver);
+            hidden = layer.forward_expert_parallel(
+                AttentionInput {
+                    x: &hidden,
+                    mask: mask.as_ref(),
+                    cache: cache.as_mut(),
+                },
+                assignment,
+                group,
+                statistics,
+                &format!("model.layers.{index}"),
+                layer_observer,
+                stream,
+            )?;
+        }
+        self.norm.forward(&hidden, stream)
+    }
 }
 
 /// Input for a Qwen3 forward pass.
@@ -1090,6 +1291,29 @@ impl Model {
         )?;
         observer.observe("lm_head.logits", &logits)?;
         Ok(logits)
+    }
+
+    pub(crate) fn forward_expert_parallel<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let hidden = self
+            .model
+            .forward_expert_parallel(input, assignment, group, statistics, observer, stream)?;
+        project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.model.embed_tokens,
+            &hidden,
+            stream,
+        )
     }
 }
 

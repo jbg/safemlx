@@ -1,0 +1,2316 @@
+//! Reusable expert-parallel assignment, routing, and exchange infrastructure.
+//!
+//! Pure expert parallelism keeps ordinary model state replicated and partitions
+//! only routed expert banks.  [`dispatch_replicated`] exploits the replicated
+//! token layout: ranks compact only routes owned by their experts and all-sum
+//! the resulting token buffer.  [`all_to_all_v`] is the general sharded-token
+//! transport.  It is intentionally an all-gather fallback and therefore uses
+//! `O(group_size)` temporary replication until MLX exposes native all-to-all.
+
+use std::{
+    cell::Cell,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use memmap2::MmapOptions;
+use safetensors::SafeTensors;
+
+use safemlx::{
+    distributed::{self, Group},
+    module::{ModuleParameters, Param},
+    ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum_by_index, zeros_dtype},
+    transforms::eval,
+    Array, Dtype, Stream,
+};
+
+use crate::{
+    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    error::Error,
+    inspection::ActivationObserver,
+    models::{deepseek_v3, qwen3, ModelKind, ModelLoadOptions},
+    parallel::{
+        load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
+    },
+    pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
+    quantization::{should_quantize_on_load, WeightQuantization},
+    sampler::Sampler,
+    weights::{transform_split_swiglu_experts, StrictLoadConfig, WeightMap},
+};
+
+use crate::models::{
+    common::moe::{quantize_expert_bank, PackedRelu2Experts, PackedSwiGluExperts},
+    deepseek_v3::RoutedExperts,
+};
+
+thread_local! {
+    static EAGER_TIMING_PROFILING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Scoped opt-in profiling mode for expert-parallel phase timings.
+///
+/// MLX executes lazily, so ordinary phase timings primarily describe graph
+/// submission. While this guard is alive, expert-parallel code materializes
+/// phase outputs before stopping each timer. This makes the measurements useful
+/// for benchmarks, at the cost of extra synchronization and changed scheduling.
+#[must_use]
+pub struct ExpertParallelTimingGuard {
+    previous: bool,
+}
+
+impl Drop for ExpertParallelTimingGuard {
+    fn drop(&mut self) {
+        EAGER_TIMING_PROFILING.with(|enabled| enabled.set(self.previous));
+    }
+}
+
+/// Enables device-complete expert-parallel phase timings for the current thread.
+pub fn profile_expert_parallel_timings() -> ExpertParallelTimingGuard {
+    let previous = EAGER_TIMING_PROFILING.with(|enabled| {
+        let previous = enabled.get();
+        enabled.set(true);
+        previous
+    });
+    ExpertParallelTimingGuard { previous }
+}
+
+pub(crate) fn timing_profiling_enabled() -> bool {
+    EAGER_TIMING_PROFILING.with(Cell::get)
+}
+
+pub(crate) fn materialize_timing_phase<'a>(
+    outputs: impl IntoIterator<Item = &'a Array>,
+) -> safemlx::error::Result<()> {
+    if timing_profiling_enabled() {
+        eval(outputs)?;
+    }
+    Ok(())
+}
+
+/// Policy used to assign global routed experts to ranks.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ExpertAssignmentPolicy {
+    /// Balanced contiguous ranges, with lower ranks receiving any remainder.
+    BalancedContiguous,
+    /// Expert `e` is owned by rank `e % group_size`.
+    RoundRobin,
+    /// Explicit global-expert-to-owner-rank table.
+    Explicit(Vec<usize>),
+}
+
+/// Validated bidirectional mapping between checkpoint-global and owner-local ids.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExpertAssignment {
+    global_expert_count: usize,
+    group_size: usize,
+    rank: usize,
+    policy: ExpertAssignmentPolicy,
+    owners: Vec<usize>,
+    owner_local: Vec<usize>,
+    local_global: Vec<usize>,
+}
+
+impl ExpertAssignment {
+    /// Creates the default balanced contiguous assignment.
+    pub fn balanced(global_experts: usize, group_size: usize, rank: usize) -> Result<Self, Error> {
+        Self::balanced_with_empty(global_experts, group_size, rank, false)
+    }
+
+    /// Creates a balanced assignment and optionally permits empty ranks.
+    pub fn balanced_with_empty(
+        global_experts: usize,
+        group_size: usize,
+        rank: usize,
+        allow_empty: bool,
+    ) -> Result<Self, Error> {
+        validate_dimensions(global_experts, group_size, rank, allow_empty)?;
+        let base = global_experts / group_size;
+        let extra = global_experts % group_size;
+        let mut owners = Vec::with_capacity(global_experts);
+        for owner in 0..group_size {
+            owners.extend(std::iter::repeat_n(
+                owner,
+                base + usize::from(owner < extra),
+            ));
+        }
+        Self::from_owners_impl(
+            owners,
+            group_size,
+            rank,
+            ExpertAssignmentPolicy::BalancedContiguous,
+            allow_empty,
+        )
+    }
+
+    /// Creates a deterministic round-robin assignment.
+    pub fn round_robin(
+        global_experts: usize,
+        group_size: usize,
+        rank: usize,
+    ) -> Result<Self, Error> {
+        validate_dimensions(global_experts, group_size, rank, false)?;
+        let owners = (0..global_experts)
+            .map(|expert| expert % group_size)
+            .collect();
+        Self::from_owners_impl(
+            owners,
+            group_size,
+            rank,
+            ExpertAssignmentPolicy::RoundRobin,
+            false,
+        )
+    }
+
+    /// Creates an assignment from one owner rank per global expert.
+    pub fn explicit(owners: Vec<usize>, group_size: usize, rank: usize) -> Result<Self, Error> {
+        let policy = ExpertAssignmentPolicy::Explicit(owners.clone());
+        Self::from_owners_impl(owners, group_size, rank, policy, false)
+    }
+
+    /// Creates an explicit assignment and optionally permits empty ranks.
+    pub fn explicit_with_empty(
+        owners: Vec<usize>,
+        group_size: usize,
+        rank: usize,
+        allow_empty: bool,
+    ) -> Result<Self, Error> {
+        let policy = ExpertAssignmentPolicy::Explicit(owners.clone());
+        Self::from_owners_impl(owners, group_size, rank, policy, allow_empty)
+    }
+
+    fn from_owners_impl(
+        owners: Vec<usize>,
+        group_size: usize,
+        rank: usize,
+        policy: ExpertAssignmentPolicy,
+        allow_empty: bool,
+    ) -> Result<Self, Error> {
+        validate_dimensions(owners.len(), group_size, rank, allow_empty)?;
+        if let Some((expert, owner)) = owners
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, owner)| *owner >= group_size)
+        {
+            return Err(Error::Parallel(format!(
+                "global expert {expert} has invalid owner rank {owner} for EP size {group_size}"
+            )));
+        }
+        let mut next_local = vec![0usize; group_size];
+        let mut owner_local = Vec::with_capacity(owners.len());
+        let mut local_global = Vec::new();
+        for (global, owner) in owners.iter().copied().enumerate() {
+            owner_local.push(next_local[owner]);
+            next_local[owner] = next_local[owner].checked_add(1).ok_or_else(|| {
+                Error::Parallel("owner-local expert index overflowed usize".into())
+            })?;
+            if owner == rank {
+                local_global.push(global);
+            }
+        }
+        if !allow_empty && next_local.contains(&0) {
+            return Err(Error::Parallel(format!(
+                "expert assignment creates an empty rank: counts {next_local:?}"
+            )));
+        }
+        if owners.len() > i32::MAX as usize
+            || next_local.iter().any(|count| *count > i32::MAX as usize)
+        {
+            return Err(Error::Parallel(
+                "expert assignment exceeds MLX i32 indexing limits".into(),
+            ));
+        }
+        Ok(Self {
+            global_expert_count: owners.len(),
+            group_size,
+            rank,
+            policy,
+            owners,
+            owner_local,
+            local_global,
+        })
+    }
+
+    /// Total checkpoint-global routed expert count.
+    pub const fn global_expert_count(&self) -> usize {
+        self.global_expert_count
+    }
+    /// EP group size.
+    pub const fn group_size(&self) -> usize {
+        self.group_size
+    }
+    /// Current rank within the EP group.
+    pub const fn rank(&self) -> usize {
+        self.rank
+    }
+    /// Assignment policy.
+    pub fn policy(&self) -> &ExpertAssignmentPolicy {
+        &self.policy
+    }
+    /// Global expert ids owned by this rank, in owner-local order.
+    pub fn local_global_expert_ids(&self) -> &[usize] {
+        &self.local_global
+    }
+    /// Number of experts owned by this rank.
+    pub fn local_expert_count(&self) -> usize {
+        self.local_global.len()
+    }
+    /// Returns the owner rank of a global expert.
+    pub fn owner(&self, global: usize) -> Option<usize> {
+        self.owners.get(global).copied()
+    }
+    /// Returns the owner-local id of a global expert.
+    pub fn owner_local_id(&self, global: usize) -> Option<usize> {
+        self.owner_local.get(global).copied()
+    }
+    /// Returns the global id corresponding to a local id on this rank.
+    pub fn global_id(&self, local: usize) -> Option<usize> {
+        self.local_global.get(local).copied()
+    }
+    /// Complete global-to-owner mapping.
+    pub fn owners(&self) -> &[usize] {
+        &self.owners
+    }
+    /// Complete global-to-owner-local mapping.
+    pub fn owner_local_ids(&self) -> &[usize] {
+        &self.owner_local
+    }
+}
+
+fn validate_dimensions(
+    global_experts: usize,
+    group_size: usize,
+    rank: usize,
+    allow_empty: bool,
+) -> Result<(), Error> {
+    if global_experts == 0 || group_size == 0 {
+        return Err(Error::Parallel(
+            "expert count and EP size must be nonzero".into(),
+        ));
+    }
+    if rank >= group_size {
+        return Err(Error::Parallel(format!(
+            "EP rank {rank} is outside size {group_size}"
+        )));
+    }
+    if !allow_empty && global_experts < group_size {
+        return Err(Error::Parallel(format!(
+            "cannot assign {global_experts} experts to {group_size} non-empty ranks"
+        )));
+    }
+    Ok(())
+}
+
+/// Token ownership layout used by expert dispatch.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TokenLayout {
+    /// Every EP rank has identical hidden rows and router results.
+    Replicated,
+    /// Each source rank owns disjoint hidden rows and exchanges routes.
+    Sharded,
+}
+
+/// Transport selected for expert routes.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExpertExchangeStrategy {
+    /// Compact local routes, execute local experts, and all-sum token outputs.
+    ReplicatedInputAllSum,
+    /// Variable-count all-to-all emulated with padded all-gather.
+    AllGatherAllToAllV,
+}
+
+/// Per-dispatch counters used by diagnostics and benchmark probes.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct RoutingStatistics {
+    /// Total selected routes visible to the source rank.
+    pub total_routes: usize,
+    /// Selected routes owned and executed by this rank.
+    pub local_routes: usize,
+    /// Routes sent by a sharded-input exchange.
+    pub sent_routes: usize,
+    /// Routes received by a sharded-input exchange.
+    pub received_routes: usize,
+    /// Padding rows introduced by the fallback transport.
+    pub padding_routes: usize,
+    /// Explicit host-visible synchronization points.
+    pub synchronization_count: usize,
+    /// Payload bytes transferred logically, excluding backend internals.
+    pub exchanged_bytes: usize,
+    /// Time spent waiting for explicit route metadata synchronization.
+    pub synchronization_time: Duration,
+    /// Wall time spent computing router decisions.
+    pub router_time: Duration,
+    /// Wall time spent validating and compacting owner-local routes.
+    pub compaction_time: Duration,
+    /// Wall time spent in route transport collectives.
+    pub exchange_time: Duration,
+    /// Wall time spent in local expert computation.
+    pub expert_time: Duration,
+    /// Wall time spent reducing or recombining routed outputs.
+    pub reduction_time: Duration,
+    /// Wall time spent computing replicated shared experts.
+    pub shared_expert_time: Duration,
+    /// End-to-end wall time summed across represented MoE blocks or one dispatch.
+    pub total_time: Duration,
+    /// End-to-end wall time for the complete model forward containing those blocks.
+    pub model_time: Duration,
+}
+
+impl RoutingStatistics {
+    /// Adds counters and measured synchronization time from another dispatch.
+    pub fn accumulate(&mut self, other: &Self) {
+        self.total_routes += other.total_routes;
+        self.local_routes += other.local_routes;
+        self.sent_routes += other.sent_routes;
+        self.received_routes += other.received_routes;
+        self.padding_routes += other.padding_routes;
+        self.synchronization_count += other.synchronization_count;
+        self.exchanged_bytes += other.exchanged_bytes;
+        self.synchronization_time += other.synchronization_time;
+        self.router_time += other.router_time;
+        self.compaction_time += other.compaction_time;
+        self.exchange_time += other.exchange_time;
+        self.expert_time += other.expert_time;
+        self.reduction_time += other.reduction_time;
+        self.shared_expert_time += other.shared_expert_time;
+        self.total_time += other.total_time;
+        self.model_time += other.model_time;
+    }
+}
+
+/// Compact device-side routes owned by the current rank.
+pub struct DispatchedRoutes {
+    /// Hidden rows in stable original route order.
+    pub hidden: Array,
+    /// Checkpoint-global expert ids.
+    pub global_expert_ids: Array,
+    /// Dense owner-local ids passed to grouped kernels.
+    pub local_expert_ids: Array,
+    /// Original flattened route positions.
+    pub original_route_indices: Array,
+    /// Source token indices.
+    pub token_indices: Array,
+    /// Top-k slot indices.
+    pub slot_indices: Array,
+    /// Route weights, not yet applied.
+    pub weights: Array,
+}
+
+/// Result of a replicated-input expert dispatch.
+pub struct ReturnedRoutes {
+    /// Rank-local weighted token buffer before the collective.
+    pub local_output: Array,
+    /// Exact routed output after all-sum.
+    pub reduced_output: Array,
+    /// Dispatch counters.
+    pub statistics: RoutingStatistics,
+}
+
+/// Architecture-specific execution behind the common route dispatcher.
+pub trait LocalExpertBank {
+    /// Executes compact hidden rows using dense owner-local expert ids.
+    /// Returned route rows must be unweighted and retain input order.
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+}
+
+fn unit_route_weights(routes: i32, dtype: Dtype, stream: &Stream) -> Result<Array, Error> {
+    Ok(safemlx::ops::ones_dtype(&[routes, 1], dtype, stream)?)
+}
+
+impl LocalExpertBank for PackedSwiGluExperts {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        Ok(self.forward(hidden, &ids, &weights, stream)?)
+    }
+}
+
+impl LocalExpertBank for PackedRelu2Experts {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        Ok(self.forward(hidden, &ids, &weights, stream)?)
+    }
+}
+
+impl LocalExpertBank for RoutedExperts {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        Ok(self.forward_local(hidden, &ids, &weights, stream)?)
+    }
+}
+
+/// Compacts routes owned by this rank with exactly one scalar synchronization.
+pub fn compact_local_routes(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<(DispatchedRoutes, RoutingStatistics), Error> {
+    if expert_ids.ndim() != 2 || weights.shape() != expert_ids.shape() {
+        return Err(Error::Parallel(format!(
+            "expert ids and weights must have matching [tokens, top_k] shapes, got {:?} and {:?}",
+            expert_ids.shape(),
+            weights.shape()
+        )));
+    }
+    if hidden_states.ndim() != 2 || hidden_states.dim(0) != expert_ids.dim(0) {
+        return Err(Error::Parallel(format!(
+            "hidden states must be [tokens, hidden] matching route tokens, got {:?}",
+            hidden_states.shape()
+        )));
+    }
+    if !matches!(
+        expert_ids.dtype(),
+        Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
+    ) {
+        return Err(Error::Parallel(format!(
+            "expert ids must use an integer dtype, got {:?}",
+            expert_ids.dtype()
+        )));
+    }
+    if !weights.dtype().is_float() || !hidden_states.dtype().is_float() {
+        return Err(Error::Parallel(
+            "route weights and hidden states must be floating point".into(),
+        ));
+    }
+    let flat_ids = expert_ids
+        .reshape(&[-1], stream)?
+        .as_dtype(Dtype::Int32, stream)?;
+    let valid = flat_ids.ge(Array::from_int(0), stream)?.logical_and(
+        flat_ids.lt(
+            Array::from_int(assignment.global_expert_count as i32),
+            stream,
+        )?,
+        stream,
+    )?;
+    let invalid = valid.logical_not(stream)?.count_nonzero(stream)?;
+    // Use a safe placeholder for invalid ids so validation and the compact
+    // count can share the same single host synchronization below.
+    let safe_ids = r#where(
+        &valid,
+        flat_ids.clone(),
+        Array::zeros::<i32>(&[flat_ids.size() as i32], stream)?,
+        stream,
+    )?;
+    let owners = Array::from_slice(
+        &assignment
+            .owners
+            .iter()
+            .map(|value| *value as i32)
+            .collect::<Vec<_>>(),
+        &[assignment.global_expert_count as i32],
+    );
+    let owner_local = Array::from_slice(
+        &assignment
+            .owner_local
+            .iter()
+            .map(|value| *value as i32)
+            .collect::<Vec<_>>(),
+        &[assignment.global_expert_count as i32],
+    );
+    let route_owners = owners.take(&safe_ids, stream)?;
+    let mask = route_owners
+        .eq(Array::from_int(assignment.rank as i32), stream)?
+        .logical_and(valid, stream)?;
+    let compact = mask.compact_indices(stream)?;
+    eval([&invalid, &compact.count])?;
+    let started = std::time::Instant::now();
+    stream.synchronize()?;
+    if invalid.clone().try_item::<i32>(stream)? != 0 {
+        return Err(Error::Parallel(
+            "route contains a globally invalid expert id".into(),
+        ));
+    }
+    let local_routes = compact.count.clone().try_item::<i32>(stream)? as usize;
+    let synchronization_time = started.elapsed();
+    let positions = compact
+        .indices
+        .try_index_device(..local_routes as i32, stream)?;
+    let global_expert_ids = flat_ids.take(&positions, stream)?;
+    let local_expert_ids = owner_local.take(&global_expert_ids, stream)?;
+    let top_k = expert_ids.dim(1);
+    let token_indices = positions.floor_divide(Array::from_int(top_k), stream)?;
+    let slot_indices = positions.remainder(Array::from_int(top_k), stream)?;
+    let hidden = hidden_states.take_axis(&token_indices, 0, stream)?;
+    let route_weights = weights.reshape(&[-1], stream)?.take(&positions, stream)?;
+    Ok((
+        DispatchedRoutes {
+            hidden,
+            global_expert_ids,
+            local_expert_ids,
+            original_route_indices: positions,
+            token_indices,
+            slot_indices,
+            weights: route_weights,
+        },
+        RoutingStatistics {
+            total_routes: expert_ids.size(),
+            local_routes,
+            synchronization_count: 1,
+            synchronization_time,
+            ..RoutingStatistics::default()
+        },
+    ))
+}
+
+/// Executes compact local routes and exactly recombines them across EP ranks.
+pub fn dispatch_replicated(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    bank: &mut impl LocalExpertBank,
+    group: &Group,
+    stream: &Stream,
+) -> Result<ReturnedRoutes, Error> {
+    let total_started = Instant::now();
+    if group.rank() != assignment.rank || group.size() != assignment.group_size {
+        return Err(Error::Parallel(
+            "expert assignment does not match the supplied group".into(),
+        ));
+    }
+    let compaction_started = Instant::now();
+    let (routes, mut statistics) =
+        compact_local_routes(hidden_states, expert_ids, weights, assignment, stream)?;
+    materialize_timing_phase([
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.local_expert_ids,
+        &routes.original_route_indices,
+        &routes.token_indices,
+        &routes.slot_indices,
+        &routes.weights,
+    ])?;
+    statistics.compaction_time += compaction_started.elapsed();
+    let expert_started = Instant::now();
+    let local_output = if statistics.local_routes == 0 {
+        zeros_dtype(hidden_states.shape(), hidden_states.dtype(), stream)?
+    } else {
+        let output = bank.execute_local_routes(&routes.hidden, &routes.local_expert_ids, stream)?;
+        if output.ndim() != 2 || output.dim(0) != statistics.local_routes as i32 {
+            return Err(Error::Parallel(format!(
+                "local expert bank returned invalid shape {:?}",
+                output.shape()
+            )));
+        }
+        let weighted = output.multiply(routes.weights.expand_dims(1, stream)?, stream)?;
+        segment_sum_by_index(
+            weighted,
+            &routes.token_indices,
+            hidden_states.dim(0),
+            stream,
+        )?
+    };
+    materialize_timing_phase([&local_output])?;
+    statistics.expert_time += expert_started.elapsed();
+    let reduction_started = Instant::now();
+    let reduced_output = distributed::all_sum(&local_output, group, stream)?;
+    materialize_timing_phase([&reduced_output])?;
+    statistics.reduction_time += reduction_started.elapsed();
+    statistics.total_time = total_started.elapsed();
+    Ok(ReturnedRoutes {
+        local_output,
+        reduced_output,
+        statistics,
+    })
+}
+
+/// Result of one variable-count all-to-all fallback.
+pub struct ExchangeResult {
+    /// Received rows concatenated in source-rank order.
+    pub received: Array,
+    /// Number of logical rows received from every source rank.
+    pub source_counts: Vec<usize>,
+    /// Transport counters.
+    pub statistics: RoutingStatistics,
+}
+
+/// Destination-major route blocks for sharded-token expert dispatch.
+///
+/// Every vector has exactly one block per destination EP rank and matching
+/// leading row counts. Global expert ids and original flattened route indices
+/// remain visible at this transport boundary.
+pub struct ShardedRouteBlocks {
+    /// Hidden activation rows addressed to each expert owner.
+    pub hidden: Vec<Array>,
+    /// Checkpoint-global expert ids for each row.
+    pub global_expert_ids: Vec<Array>,
+    /// Original source-rank flattened route indices for each row.
+    pub original_route_indices: Vec<Array>,
+    /// Route weights for each row, applied exactly once by the owner.
+    pub weights: Vec<Array>,
+    /// Number of top-k slots per source token.
+    pub top_k: i32,
+    /// Number of tokens owned by this source rank.
+    pub source_tokens: i32,
+}
+
+/// Returned source-local output from sharded-input dispatch.
+pub struct ShardedReturnedRoutes {
+    /// Weighted route output reduced to source token order.
+    pub output: Array,
+    /// Transport and execution counters.
+    pub statistics: RoutingStatistics,
+}
+
+fn validate_sharded_blocks(blocks: &ShardedRouteBlocks, world: usize) -> Result<(), Error> {
+    if blocks.top_k <= 0 || blocks.source_tokens < 0 {
+        return Err(Error::Parallel(
+            "sharded dispatch requires positive top_k and nonnegative source token count".into(),
+        ));
+    }
+    if blocks.hidden.len() != world
+        || blocks.global_expert_ids.len() != world
+        || blocks.original_route_indices.len() != world
+        || blocks.weights.len() != world
+    {
+        return Err(Error::Parallel(format!(
+            "sharded dispatch requires {world} blocks for every payload and metadata field"
+        )));
+    }
+    for destination in 0..world {
+        let rows = blocks.hidden[destination].dim(0);
+        if blocks.hidden[destination].ndim() != 2
+            || blocks.global_expert_ids[destination].shape() != [rows]
+            || blocks.original_route_indices[destination].shape() != [rows]
+            || blocks.weights[destination].shape() != [rows]
+        {
+            return Err(Error::Parallel(format!(
+                "destination {destination} sharded route fields have inconsistent row counts"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Exchanges sharded-token routes, executes owner-local experts, and returns
+/// exact weighted results to their source ranks.
+///
+/// All payload and metadata exchange uses [`all_to_all_v`]. Collectives are
+/// entered in a fixed order on every rank, including ranks with zero routes.
+pub fn dispatch_sharded(
+    blocks: ShardedRouteBlocks,
+    assignment: &ExpertAssignment,
+    bank: &mut impl LocalExpertBank,
+    group: &Group,
+    stream: &Stream,
+) -> Result<ShardedReturnedRoutes, Error> {
+    let total_started = Instant::now();
+    if group.rank() != assignment.rank() || group.size() != assignment.group_size() {
+        return Err(Error::Parallel(
+            "expert assignment does not match the supplied group".into(),
+        ));
+    }
+    validate_sharded_blocks(&blocks, group.size())?;
+    let total_routes = blocks
+        .hidden
+        .iter()
+        .map(|block| block.dim(0) as usize)
+        .sum();
+    let hidden = all_to_all_v(&blocks.hidden, group, stream)?;
+    let global_ids = all_to_all_v(&blocks.global_expert_ids, group, stream)?;
+    let route_indices = all_to_all_v(&blocks.original_route_indices, group, stream)?;
+    let weights = all_to_all_v(&blocks.weights, group, stream)?;
+    if hidden.source_counts != global_ids.source_counts
+        || hidden.source_counts != route_indices.source_counts
+        || hidden.source_counts != weights.source_counts
+    {
+        return Err(Error::Parallel(
+            "sharded route payload and metadata receive counts diverged".into(),
+        ));
+    }
+    let received_routes = hidden.received.dim(0);
+    let owner_local = Array::from_slice(
+        &assignment
+            .owner_local_ids()
+            .iter()
+            .map(|value| *value as i32)
+            .collect::<Vec<_>>(),
+        &[assignment.global_expert_count() as i32],
+    );
+    let local_ids =
+        owner_local.take(&global_ids.received.as_dtype(Dtype::Int32, stream)?, stream)?;
+    let expert_started = Instant::now();
+    let weighted = if received_routes == 0 {
+        let mut shape = hidden.received.shape().to_vec();
+        shape[0] = 0;
+        zeros_dtype(&shape, hidden.received.dtype(), stream)?
+    } else {
+        bank.execute_local_routes(&hidden.received, &local_ids, stream)?
+            .multiply(weights.received.expand_dims(1, stream)?, stream)?
+    };
+    materialize_timing_phase([&weighted])?;
+    let expert_time = expert_started.elapsed();
+    let mut output_to_source = Vec::with_capacity(group.size());
+    let mut indices_to_source = Vec::with_capacity(group.size());
+    let mut offset = 0i32;
+    for count in &hidden.source_counts {
+        let end = offset + *count as i32;
+        output_to_source.push(weighted.try_index_device(offset..end, stream)?);
+        indices_to_source.push(
+            route_indices
+                .received
+                .try_index_device(offset..end, stream)?,
+        );
+        offset = end;
+    }
+    let returned_output = all_to_all_v(&output_to_source, group, stream)?;
+    let returned_indices = all_to_all_v(&indices_to_source, group, stream)?;
+    if returned_output.source_counts != returned_indices.source_counts {
+        return Err(Error::Parallel(
+            "returned sharded outputs and route indices diverged".into(),
+        ));
+    }
+    let token_indices = returned_indices
+        .received
+        .as_dtype(Dtype::Int32, stream)?
+        .floor_divide(Array::from_int(blocks.top_k), stream)?;
+    let reduction_started = Instant::now();
+    let output = segment_sum_by_index(
+        returned_output.received.clone(),
+        token_indices,
+        blocks.source_tokens,
+        stream,
+    )?;
+    materialize_timing_phase([&output])?;
+    let reduction_time = reduction_started.elapsed();
+    let mut statistics = RoutingStatistics {
+        total_routes,
+        local_routes: received_routes as usize,
+        sent_routes: total_routes,
+        received_routes: received_routes as usize,
+        expert_time,
+        reduction_time,
+        ..Default::default()
+    };
+    for exchange in [
+        hidden,
+        global_ids,
+        route_indices,
+        weights,
+        returned_output,
+        returned_indices,
+    ] {
+        statistics.padding_routes += exchange.statistics.padding_routes;
+        statistics.synchronization_count += exchange.statistics.synchronization_count;
+        statistics.exchanged_bytes += exchange.statistics.exchanged_bytes;
+        statistics.synchronization_time += exchange.statistics.synchronization_time;
+        statistics.exchange_time += exchange.statistics.exchange_time;
+    }
+    statistics.total_time = total_started.elapsed();
+    Ok(ShardedReturnedRoutes { output, statistics })
+}
+
+/// Exchanges destination-major variable-sized blocks using padded all-gather.
+///
+/// `send_blocks[d]` contains rows addressed to destination rank `d`; all
+/// blocks must have the same trailing shape and dtype.  The fallback gathers
+/// `group_size` destination blocks from every source, so peak transfer storage
+/// and bandwidth are `O(group_size)` larger than a native all-to-all.
+pub fn all_to_all_v(
+    send_blocks: &[Array],
+    group: &Group,
+    stream: &Stream,
+) -> Result<ExchangeResult, Error> {
+    let total_started = Instant::now();
+    let world = group.size();
+    if send_blocks.len() != world || send_blocks.is_empty() {
+        return Err(Error::Parallel(format!(
+            "all_to_all_v requires {world} destination blocks"
+        )));
+    }
+    if send_blocks.iter().any(|block| block.ndim() == 0) {
+        return Err(Error::Parallel(
+            "all_to_all_v blocks must have a leading row dimension".into(),
+        ));
+    }
+    let dtype = send_blocks[0].dtype();
+    let first_shape = send_blocks[0].shape();
+    let tail = &first_shape[1..];
+    if send_blocks
+        .iter()
+        .any(|block| block.dtype() != dtype || &block.shape()[1..] != tail)
+    {
+        return Err(Error::Parallel(
+            "all_to_all_v blocks must share dtype and trailing shape".into(),
+        ));
+    }
+    let local_counts = send_blocks
+        .iter()
+        .map(|block| block.dim(0))
+        .collect::<Vec<_>>();
+    // Materialize the tiny host count vector onto the explicit execution
+    // stream before entering the collective.
+    let counts = Array::from_slice(&local_counts, &[world as i32]).copy(stream)?;
+    let gathered_counts = distributed::all_gather(&counts, group, stream)?;
+    let started = std::time::Instant::now();
+    let evaluated_counts = gathered_counts.evaluated()?;
+    let synchronization_time = started.elapsed();
+    let all_counts = evaluated_counts.as_slice::<i32>();
+    let max_rows = all_counts.iter().copied().max().unwrap_or(0) as usize;
+    if max_rows == 0 {
+        let mut shape = send_blocks[0].shape().to_vec();
+        shape[0] = 0;
+        let exchange_time = total_started.elapsed();
+        return Ok(ExchangeResult {
+            received: zeros_dtype(&shape, dtype, stream)?,
+            source_counts: vec![0; world],
+            statistics: RoutingStatistics {
+                synchronization_count: 1,
+                synchronization_time,
+                exchange_time,
+                total_time: exchange_time,
+                ..Default::default()
+            },
+        });
+    }
+    let mut padded = Vec::with_capacity(world);
+    for block in send_blocks {
+        let rows = block.dim(0) as usize;
+        if rows == max_rows {
+            padded.push(block.clone());
+        } else {
+            let mut shape = block.shape().to_vec();
+            shape[0] = (max_rows - rows) as i32;
+            let padding = zeros_dtype(&shape, dtype, stream)?;
+            padded.push(concatenate_axis(&[block, &padding], 0, stream)?);
+        }
+    }
+    let refs = padded.iter().collect::<Vec<_>>();
+    let packed = concatenate_axis(&refs, 0, stream)?;
+    let gathered = distributed::all_gather(&packed, group, stream)?;
+    let mut received = Vec::with_capacity(world);
+    let mut source_counts = Vec::with_capacity(world);
+    for source in 0..world {
+        let count = all_counts[source * world + group.rank()] as usize;
+        source_counts.push(count);
+        let start = (source * world * max_rows + group.rank() * max_rows) as i32;
+        received.push(gathered.try_index_device(start..start + count as i32, stream)?);
+    }
+    let refs = received.iter().collect::<Vec<_>>();
+    let received = concatenate_axis(&refs, 0, stream)?;
+    materialize_timing_phase([&received])?;
+    let sent_routes = local_counts
+        .iter()
+        .map(|value| *value as usize)
+        .sum::<usize>();
+    let received_routes = source_counts.iter().sum::<usize>();
+    let padding_routes = world * world * max_rows
+        - all_counts
+            .iter()
+            .map(|value| *value as usize)
+            .sum::<usize>();
+    let row_bytes = tail
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .product::<usize>()
+        * send_blocks[0].item_size();
+    let exchange_time = total_started.elapsed();
+    Ok(ExchangeResult {
+        received,
+        source_counts,
+        statistics: RoutingStatistics {
+            sent_routes,
+            received_routes,
+            padding_routes,
+            synchronization_count: 1,
+            synchronization_time,
+            exchange_time,
+            total_time: exchange_time,
+            exchanged_bytes: world * world * max_rows * row_bytes,
+            ..Default::default()
+        },
+    })
+}
+
+/// Immutable description of a rank-local expert-parallel model.
+#[derive(Debug, Clone)]
+pub struct ExpertParallelInfo {
+    /// Global rank.
+    pub global_rank: usize,
+    /// Rank in the EP group.
+    pub expert_parallel_rank: usize,
+    /// EP group size.
+    pub expert_parallel_size: usize,
+    /// Loaded architecture.
+    pub model_kind: ModelKind,
+    /// Assignment metadata.
+    pub assignment: ExpertAssignment,
+    /// Bytes in all locally materialized parameters.
+    pub local_parameter_bytes: usize,
+    /// Bytes in local routed-expert tensors.
+    pub routed_expert_bytes: usize,
+    /// Bytes in replicated tensors.
+    pub replicated_parameter_bytes: usize,
+    /// Checkpoint shards opened by this rank.
+    pub opened_checkpoint_shards: Vec<PathBuf>,
+    /// Active route transport.
+    pub exchange_strategy: ExpertExchangeStrategy,
+}
+
+/// Architecture-checked replicated attention cache used by an EP model.
+#[derive(Debug, Clone)]
+pub enum ExpertParallelCache {
+    /// DeepSeek compressed-latent attention cache.
+    DeepSeek(deepseek_v3::Cache),
+    /// Qwen3 standard key/value cache.
+    Qwen3(Vec<Option<ConcatKeyValueCache>>),
+    /// Qwen3 bounded sliding-window key/value cache.
+    Qwen3Sliding(Vec<Option<SlidingKeyValueCache>>),
+}
+
+impl ExpertParallelCache {
+    /// Clears all cached attention state.
+    pub fn reset(&mut self) {
+        match self {
+            Self::DeepSeek(cache) => cache.layers.iter_mut().for_each(|cache| cache.clear()),
+            Self::Qwen3(cache) => cache
+                .iter_mut()
+                .flatten()
+                .for_each(ConcatKeyValueCache::clear),
+            Self::Qwen3Sliding(cache) => cache
+                .iter_mut()
+                .flatten()
+                .for_each(SlidingKeyValueCache::clear),
+        }
+    }
+
+    /// Returns the common replicated cache offset.
+    pub fn offset(&self) -> i32 {
+        match self {
+            Self::DeepSeek(cache) => cache.offset(),
+            Self::Qwen3(cache) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
+            Self::Qwen3Sliding(cache) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
+        }
+    }
+}
+
+enum ExpertArchitecture {
+    DeepSeek(deepseek_v3::Model),
+    Qwen3(qwen3::Model),
+}
+
+/// Executable rank-local pure expert-parallel model.
+pub struct ExpertParallelModel {
+    topology: ParallelTopology,
+    info: ExpertParallelInfo,
+    architecture: ExpertArchitecture,
+    latest_statistics: RoutingStatistics,
+    cumulative_statistics: RoutingStatistics,
+}
+
+impl std::fmt::Debug for ExpertParallelModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExpertParallelModel")
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExpertParallelModel {
+    /// Returns placement, assignment, and memory diagnostics.
+    pub fn info(&self) -> &ExpertParallelInfo {
+        &self.info
+    }
+
+    /// Allocates an empty architecture-appropriate replicated cache.
+    pub fn new_cache(&self) -> ExpertParallelCache {
+        match &self.architecture {
+            ExpertArchitecture::DeepSeek(model) => ExpertParallelCache::DeepSeek(model.new_cache()),
+            ExpertArchitecture::Qwen3(_) => ExpertParallelCache::Qwen3(Vec::new()),
+        }
+    }
+
+    /// Allocates a bounded Qwen3 sliding-window cache.
+    pub fn new_qwen3_sliding_cache(&self, max_size: i32) -> Result<ExpertParallelCache, Error> {
+        if max_size <= 0 {
+            return Err(Error::Parallel(
+                "Qwen3 sliding cache size must be positive".into(),
+            ));
+        }
+        match &self.architecture {
+            ExpertArchitecture::Qwen3(model) => Ok(ExpertParallelCache::Qwen3Sliding(
+                (0..model.model.layers.len())
+                    .map(|_| Some(SlidingKeyValueCache::new(max_size)))
+                    .collect(),
+            )),
+            ExpertArchitecture::DeepSeek(_) => Err(Error::Parallel(
+                "sliding key/value caches are only available for Qwen3 expert parallelism".into(),
+            )),
+        }
+    }
+
+    /// Counters from the most recent complete model forward.
+    pub fn latest_routing_statistics(&self) -> &RoutingStatistics {
+        &self.latest_statistics
+    }
+
+    /// Counters accumulated across all forwards.
+    pub fn cumulative_routing_statistics(&self) -> &RoutingStatistics {
+        &self.cumulative_statistics
+    }
+
+    /// Runs prefill or decode with identical input tokens on every EP rank.
+    pub fn forward(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut ExpertParallelCache,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward_impl(tokens, mask, cache, group, None, stream)
+    }
+
+    /// Runs expert-parallel inference while exposing global router decisions,
+    /// rank-local expert contributions, reduced routed outputs, and shared experts.
+    pub fn forward_with_observer(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut ExpertParallelCache,
+        group: &Group,
+        observer: &mut impl ActivationObserver,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward_impl(tokens, mask, cache, group, Some(observer), stream)
+    }
+
+    fn forward_impl(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut ExpertParallelCache,
+        group: &Group,
+        observer: Option<&mut dyn ActivationObserver>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let total_started = Instant::now();
+        self.validate_group(group)?;
+        self.topology.validate_execution_stream(stream)?;
+        if tokens.ndim() != 2 {
+            return Err(Error::Parallel(format!(
+                "expert-parallel token input must be [batch, sequence], got {:?}",
+                tokens.shape()
+            )));
+        }
+        let mut statistics = RoutingStatistics::default();
+        let logits = match (&mut self.architecture, cache) {
+            (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => model
+                .forward_expert_parallel(
+                    tokens,
+                    mask,
+                    cache,
+                    &self.info.assignment,
+                    group,
+                    &mut statistics,
+                    observer,
+                    stream,
+                )?,
+            (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3(cache)) => model
+                .forward_expert_parallel(
+                    qwen3::ModelInput {
+                        inputs: tokens,
+                        mask,
+                        cache,
+                    },
+                    &self.info.assignment,
+                    group,
+                    &mut statistics,
+                    observer,
+                    stream,
+                )?,
+            (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Sliding(cache)) => model
+                .forward_expert_parallel(
+                qwen3::ModelInput {
+                    inputs: tokens,
+                    mask,
+                    cache,
+                },
+                &self.info.assignment,
+                group,
+                &mut statistics,
+                observer,
+                stream,
+            )?,
+            _ => {
+                return Err(Error::Parallel(
+                    "expert-parallel cache architecture mismatch".into(),
+                ))
+            }
+        };
+        materialize_timing_phase([&logits])?;
+        statistics.model_time = total_started.elapsed();
+        self.latest_statistics = statistics;
+        self.cumulative_statistics
+            .accumulate(&self.latest_statistics);
+        Ok(logits)
+    }
+
+    /// Prompt forward alias.
+    pub fn prefill(
+        &mut self,
+        tokens: &Array,
+        cache: &mut ExpertParallelCache,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward(tokens, None, cache, group, stream)
+    }
+
+    /// Autoregressive decode alias.
+    pub fn decode(
+        &mut self,
+        tokens: &Array,
+        cache: &mut ExpertParallelCache,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward(tokens, None, cache, group, stream)
+    }
+
+    /// Samples on one rank and synchronizes only token ids and stop state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_and_synchronize<S: Sampler>(
+        &self,
+        logits: &Array,
+        sampler: &mut S,
+        temperature: f32,
+        prng_state: Option<&mut safemlx::random::RandomState>,
+        finished: bool,
+        sampling_rank: usize,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<SynchronizedToken, Error> {
+        self.validate_group(group)?;
+        if sampling_rank >= group.size() {
+            return Err(Error::Parallel(format!(
+                "sampling rank {sampling_rank} is outside EP size {}",
+                group.size()
+            )));
+        }
+        let batch = logits.dim(0);
+        let local_token = if group.rank() == sampling_rank {
+            let last = if logits.ndim() == 3 {
+                logits.try_index_device((.., -1, ..), stream)?
+            } else {
+                logits.clone()
+            };
+            sampler
+                .sample(&last, temperature, prng_state, stream)?
+                .reshape(&[batch, 1], stream)?
+        } else {
+            Array::zeros::<u32>(&[batch, 1], stream)?
+        };
+        let token = distributed::all_sum(&local_token, group, stream)?;
+        let local_finished = if group.rank() == sampling_rank && finished {
+            Array::ones::<i32>(&[], stream)?
+        } else {
+            Array::zeros::<i32>(&[], stream)?
+        };
+        let finished = distributed::all_sum(&local_finished, group, stream)?;
+        eval([&token, &finished])?;
+        stream.synchronize()?;
+        Ok(SynchronizedToken {
+            token,
+            finished: finished.try_item::<i32>(stream)? != 0,
+        })
+    }
+
+    fn validate_group(&self, group: &Group) -> Result<(), Error> {
+        if group.rank() != self.topology.global_rank || group.size() != self.topology.world_size {
+            return Err(Error::Parallel(format!(
+                "expert-parallel topology expects group rank {}/{} but received {}/{}",
+                self.topology.global_rank,
+                self.topology.world_size,
+                group.rank(),
+                group.size()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_pure_expert(topology: ParallelTopology) -> Result<(), Error> {
+    if topology.expert_parallel_size <= 1 {
+        return Err(Error::Parallel(
+            "expert-parallel loading requires expert_parallel_size > 1".into(),
+        ));
+    }
+    if topology.tensor_parallel_size != 1 || topology.pipeline_parallel_size != 1 {
+        return Err(Error::Parallel(format!(
+            "pure expert-parallel execution requires TP=1 and PP=1, got TP={} PP={} EP={}; hybrid TP+EP and PP+EP are unsupported",
+            topology.tensor_parallel_size, topology.pipeline_parallel_size, topology.expert_parallel_size
+        )));
+    }
+    if topology.world_size != topology.expert_parallel_size {
+        return Err(Error::Parallel(
+            "pure expert-parallel world size must equal expert-parallel size".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Loads an executable pure-EP DeepSeek-V3/R1 or Qwen3 sparse-MoE model.
+pub fn load_expert_parallel_model(
+    model_dir: impl AsRef<Path>,
+    topology: ParallelTopology,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    load_expert_parallel_model_with_options(
+        model_dir,
+        ModelLoadOptions::with_parallel(topology),
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads an executable pure-EP model with a caller-supplied expert assignment.
+///
+/// The assignment must describe the checkpoint's complete routed-expert set
+/// and match this process's EP rank and group size.
+pub fn load_expert_parallel_model_with_assignment(
+    model_dir: impl AsRef<Path>,
+    topology: ParallelTopology,
+    assignment: ExpertAssignment,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    load_expert_parallel_model_with_options_and_assignment(
+        model_dir,
+        ModelLoadOptions::with_parallel(topology),
+        assignment,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads an executable pure-EP model with explicit load options.
+pub fn load_expert_parallel_model_with_options(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    load_expert_parallel_model_impl(model_dir, options, None, stream, weights_stream)
+}
+
+/// Loads an executable pure-EP model with explicit model options and expert
+/// assignment.
+pub fn load_expert_parallel_model_with_options_and_assignment(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    assignment: ExpertAssignment,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    load_expert_parallel_model_impl(model_dir, options, Some(assignment), stream, weights_stream)
+}
+
+fn load_expert_parallel_model_impl(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let topology = options.parallel.ok_or_else(|| {
+        Error::Parallel("expert-parallel loading requires ModelLoadOptions::parallel".into())
+    })?;
+    validate_pure_expert(topology)?;
+    topology.validate_execution_stream(stream)?;
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension == "gguf")
+    {
+        return Err(Error::Parallel("expert-parallel GGUF loading is unsupported because bounded local-expert selection is unavailable; use safetensors".into()));
+    }
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    match config.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("deepseek_v3") => load_deepseek_ep(
+            model_dir,
+            topology,
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        ),
+        Some("qwen3" | "qwen3_moe") => {
+            load_qwen3_ep(
+                model_dir,
+                topology,
+                options,
+                assignment,
+                stream,
+                weights_stream,
+            )
+        }
+        Some(model_type) => Err(Error::UnsupportedArchitecture(format!("expert-parallel execution supports DeepSeek-V3/R1 and Qwen3 sparse MoE, not {model_type}"))),
+        None => Err(Error::UnsupportedArchitecture("expert-parallel model config is missing model_type".into())),
+    }
+}
+
+fn resolve_model_assignment(
+    assignment: Option<ExpertAssignment>,
+    global_experts: usize,
+    topology: ParallelTopology,
+) -> Result<ExpertAssignment, Error> {
+    let assignment = assignment.map_or_else(
+        || {
+            ExpertAssignment::balanced(
+                global_experts,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )
+        },
+        Ok,
+    )?;
+    if assignment.global_expert_count() != global_experts
+        || assignment.group_size() != topology.expert_parallel_size
+        || assignment.rank() != topology.expert_parallel_rank
+    {
+        return Err(Error::Parallel(format!(
+            "expert assignment describes {} experts at rank {}/{}, but the model and topology require {global_experts} experts at rank {}/{}",
+            assignment.global_expert_count(),
+            assignment.rank(),
+            assignment.group_size(),
+            topology.expert_parallel_rank,
+            topology.expert_parallel_size,
+        )));
+    }
+    if assignment.local_expert_count() == 0 {
+        return Err(Error::Parallel(format!(
+            "expert-parallel model loading does not support an empty local expert bank on rank {}",
+            assignment.rank()
+        )));
+    }
+    Ok(assignment)
+}
+
+fn slice_axis_zero(
+    value: &Array,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let ids = assignment.local_global_expert_ids();
+    let contiguous = ids.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    if contiguous {
+        Ok(value.try_index_device(ids[0] as i32..(ids[ids.len() - 1] + 1) as i32, stream)?)
+    } else {
+        let ids = Array::from_slice(
+            &ids.iter().map(|id| *id as i32).collect::<Vec<_>>(),
+            &[ids.len() as i32],
+        );
+        Ok(value.take_axis(&ids, 0, stream)?)
+    }
+}
+
+fn slice_optional(
+    param: &mut Param<Option<Array>>,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<usize, Error> {
+    if let Some(value) = param.as_ref() {
+        let local = slice_axis_zero(value, assignment, stream)?;
+        let bytes = local.nbytes();
+        *param = Param::new(Some(local));
+        Ok(bytes)
+    } else {
+        Ok(0)
+    }
+}
+
+fn slice_required(
+    param: &mut Param<Array>,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<usize, Error> {
+    let local = slice_axis_zero(param.as_ref(), assignment, stream)?;
+    let bytes = local.nbytes();
+    *param = Param::new(local);
+    Ok(bytes)
+}
+
+fn parameter_bytes(module: &impl ModuleParameters) -> usize {
+    module
+        .parameters()
+        .flatten()
+        .into_values()
+        .map(|value| value.nbytes())
+        .sum()
+}
+
+fn expert_bank_needs_slicing(
+    bank_experts: i32,
+    assignment: &ExpertAssignment,
+) -> Result<bool, Error> {
+    let bank_experts = usize::try_from(bank_experts).map_err(|_| {
+        Error::Parallel(format!(
+            "expert bank has invalid negative expert count {bank_experts}"
+        ))
+    })?;
+    if bank_experts == assignment.global_expert_count() {
+        Ok(true)
+    } else if bank_experts == assignment.local_expert_count() {
+        Ok(false)
+    } else {
+        Err(Error::Parallel(format!(
+            "expert bank contains {bank_experts} experts, expected either {} global experts or {} experts local to EP rank {}",
+            assignment.global_expert_count(),
+            assignment.local_expert_count(),
+            assignment.rank(),
+        )))
+    }
+}
+
+fn finalize_deepseek_expert_bank(
+    bank: &mut RoutedExperts,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<usize, Error> {
+    if !expert_bank_needs_slicing(bank.num_experts, assignment)? {
+        return Ok(parameter_bytes(bank));
+    }
+    let mut bytes = 0;
+    bytes += slice_optional(&mut bank.gate_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_proj_scale_inv, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_proj_scales, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_proj_biases, assignment, stream)?;
+    bytes += slice_optional(&mut bank.up_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.up_proj_scale_inv, assignment, stream)?;
+    bytes += slice_optional(&mut bank.up_proj_scales, assignment, stream)?;
+    bytes += slice_optional(&mut bank.up_proj_biases, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_scale_inv, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_scales, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_biases, assignment, stream)?;
+    bank.num_experts = assignment.local_expert_count() as i32;
+    Ok(bytes)
+}
+
+fn finalize_qwen3_expert_bank(
+    bank: &mut PackedSwiGluExperts,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+) -> Result<usize, Error> {
+    if !expert_bank_needs_slicing(bank.num_experts, assignment)? {
+        return Ok(parameter_bytes(bank));
+    }
+    let mut bytes = 0;
+    bytes += slice_required(&mut bank.gate_up_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_up_proj_scales, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_up_proj_biases, assignment, stream)?;
+    bytes += slice_required(&mut bank.down_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_scales, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_biases, assignment, stream)?;
+    bank.num_experts = assignment.local_expert_count() as i32;
+    Ok(bytes)
+}
+
+fn checkpoint_keys(model_dir: &Path) -> Result<Vec<String>, Error> {
+    let index = model_dir.join("model.safetensors.index.json");
+    if index.exists() {
+        let map: WeightMap = serde_json::from_str(&std::fs::read_to_string(index)?)?;
+        let mut keys = map.weight_map.into_keys().collect::<Vec<_>>();
+        keys.sort();
+        return Ok(keys);
+    }
+    let file = std::fs::File::open(model_dir.join("model.safetensors"))?;
+    // SAFETY: this read-only mapping outlives SafeTensors metadata traversal.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|error| Error::Other(Box::new(error)))?;
+    Ok(tensors.names().into_iter().map(str::to_owned).collect())
+}
+
+fn split_expert_id(name: &str) -> Option<usize> {
+    let (_, rest) = name.split_once(".mlp.experts.")?;
+    rest.split('.').next()?.parse().ok()
+}
+
+fn localize_split_expert_name(name: &str, assignment: &ExpertAssignment) -> Option<String> {
+    let global = split_expert_id(name)?;
+    if assignment.owner(global)? != assignment.rank() {
+        return None;
+    }
+    let local = assignment.owner_local_id(global)?;
+    let marker = format!(".mlp.experts.{global}.");
+    Some(name.replacen(&marker, &format!(".mlp.experts.{local}."), 1))
+}
+
+fn expert_placement_plan(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    assignment: &ExpertAssignment,
+) -> Result<(PlacementPlan, bool), Error> {
+    let mut plan = PlacementPlan::replicated(topology);
+    let mut has_split = false;
+    for key in checkpoint_keys(model_dir)? {
+        if let Some(global) = split_expert_id(&key) {
+            has_split = true;
+            let placement = if assignment.owner(global) == Some(assignment.rank()) {
+                TensorPlacement::Local
+            } else {
+                TensorPlacement::Omit
+            };
+            plan.insert(key, placement);
+        } else if key.contains(".mlp.experts.")
+            && matches!(
+                key.rsplit('.').next(),
+                Some(
+                    "gate_up_proj"
+                        | "gate_proj"
+                        | "up_proj"
+                        | "down_proj"
+                        | "gate_proj_scale_inv"
+                        | "up_proj_scale_inv"
+                        | "down_proj_scale_inv"
+                        | "gate_up_proj_scales"
+                        | "gate_up_proj_biases"
+                        | "gate_proj_scales"
+                        | "gate_proj_biases"
+                        | "up_proj_scales"
+                        | "up_proj_biases"
+                        | "down_proj_scales"
+                        | "down_proj_biases"
+                )
+            )
+        {
+            let ids = assignment.local_global_expert_ids();
+            let placement = if ids.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: ids[0],
+                    end: ids[ids.len() - 1] + 1,
+                }
+            } else {
+                TensorPlacement::Indices {
+                    axis: 0,
+                    indices: ids.to_vec(),
+                }
+            };
+            plan.insert(key, placement);
+        }
+    }
+    Ok((plan, has_split))
+}
+
+fn quantize_qwen3_local_experts(
+    tensors: &mut std::collections::HashMap<String, Array>,
+    num_hidden_layers: i32,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<(), Error> {
+    for layer in 0..num_hidden_layers {
+        for projection in ["gate_up_proj", "down_proj"] {
+            let key = format!("model.layers.{layer}.mlp.experts.{projection}");
+            let value = tensors
+                .remove(&key)
+                .ok_or_else(|| Error::StrictLoadValidation {
+                    missing: vec![key.clone()],
+                    unused: Vec::new(),
+                })?;
+            let quantized = quantize_expert_bank(&value, quantization, stream)?;
+            eval(
+                [&quantized.weight, &quantized.scales]
+                    .into_iter()
+                    .chain(quantized.biases.as_ref()),
+            )?;
+            stream.synchronize()?;
+            tensors.insert(key.clone(), quantized.weight);
+            tensors.insert(format!("{key}_scales"), quantized.scales);
+            if let Some(biases) = quantized.biases {
+                tensors.insert(format!("{key}_biases"), biases);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_deepseek_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    let source_args = deepseek_v3::get_model_args(model_dir)?;
+    if source_args.n_routed_experts <= 0 {
+        return Err(Error::Parallel(
+            "DeepSeek config has no routed experts".into(),
+        ));
+    }
+    if options.quantization.is_some() && source_args.native_fp8_config().is_some() {
+        return Err(Error::Quantization(
+            "native DeepSeek block-FP8 expert-parallel weights cannot be implicitly dequantized and requantized".into(),
+        ));
+    }
+    let quantize_on_load = options
+        .quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "DeepSeek-V3 expert-parallel",
+                source_args.affine_quantization()?,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization_config = None;
+        target_args.quantization = Some(quantization);
+    }
+    let assignment =
+        resolve_model_assignment(assignment, source_args.n_routed_experts as usize, topology)?;
+    let (plan, _) = expert_placement_plan(model_dir, topology, &assignment)?;
+    let mut strict = StrictLoadConfig::default();
+    for index in 0..source_args.num_nextn_predict_layers {
+        strict = strict.allow_unused_prefix(format!(
+            "model.layers.{}.",
+            source_args.num_hidden_layers + index
+        ));
+    }
+    let partition =
+        load_safetensors_partition_on_streams(model_dir, &plan, weights_stream, stream, &strict)?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let mut tensors = partition.into_tensors();
+    let mut model = deepseek_v3::Model::new(target_args, stream)?;
+    assign_module(&mut model, "", &mut tensors, quantize_on_load, stream)?;
+    for layer_index in 0..source_args.num_hidden_layers as usize {
+        let Some(moe) = model.model.layers[layer_index].mlp.moe_mut() else {
+            continue;
+        };
+        let mut localized = Vec::new();
+        for name in tensors.keys() {
+            if name.starts_with(&format!("model.layers.{layer_index}.mlp.experts.")) {
+                if let Some(local) = localize_split_expert_name(name, &assignment) {
+                    localized.push((name.clone(), local));
+                }
+            }
+        }
+        let localized = localized
+            .into_iter()
+            .map(|(global, local)| {
+                let value = tensors.remove(&global).expect("listed local expert tensor");
+                (local, value)
+            })
+            .collect::<Vec<_>>();
+        for (local, value) in localized {
+            tensors.insert(local, value);
+        }
+        load_deepseek_experts(
+            moe,
+            layer_index,
+            (
+                assignment.local_expert_count() as i32,
+                source_args.hidden_size,
+                source_args.moe_intermediate_size,
+            ),
+            &mut tensors,
+            quantize_on_load,
+            stream,
+        )?;
+        moe.experts.num_experts = assignment.local_expert_count() as i32;
+    }
+    if !tensors.is_empty() {
+        let mut unused = tensors.into_keys().collect::<Vec<_>>();
+        unused.sort();
+        return Err(Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused,
+        });
+    }
+    let mut routed_expert_bytes = 0;
+    for layer in &mut model.model.layers {
+        if let Some(moe) = layer.mlp.moe_mut() {
+            routed_expert_bytes +=
+                finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
+        }
+    }
+    let local_parameter_bytes = parameter_bytes(&model);
+    Ok(ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: ModelKind::DeepSeekV3,
+            assignment,
+            local_parameter_bytes,
+            routed_expert_bytes,
+            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture: ExpertArchitecture::DeepSeek(model),
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    })
+}
+
+fn load_qwen3_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    let source_args = qwen3::get_qwen3_model_args(model_dir)?;
+    if source_args.num_experts <= 0 {
+        return Err(Error::Parallel(
+            "Qwen3 config is dense and has no routed experts".into(),
+        ));
+    }
+    let source_quantization = source_args.quantization.or(source_args.quantization_config);
+    let quantize_on_load = options
+        .quantization
+        .map(|requested| {
+            should_quantize_on_load("Qwen3 expert-parallel", source_quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantization_config = None;
+    }
+    let assignment =
+        resolve_model_assignment(assignment, source_args.num_experts as usize, topology)?;
+    let (plan, has_split) = expert_placement_plan(model_dir, topology, &assignment)?;
+    let partition = load_safetensors_partition_on_streams(
+        model_dir,
+        &plan,
+        weights_stream,
+        stream,
+        &StrictLoadConfig::default(),
+    )?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let mut tensors = partition.into_tensors();
+    if has_split {
+        let mut localized = std::collections::HashMap::new();
+        for (name, value) in tensors {
+            if split_expert_id(&name).is_some() {
+                if let Some(local) = localize_split_expert_name(&name, &assignment) {
+                    localized.insert(local, value);
+                }
+            } else {
+                localized.insert(name, value);
+            }
+        }
+        tensors = transform_split_swiglu_experts(
+            localized,
+            assignment.local_expert_count() as i32,
+            stream,
+        )?;
+    }
+    if let Some(quantization) = quantize_on_load {
+        quantize_qwen3_local_experts(
+            &mut tensors,
+            source_args.num_hidden_layers,
+            quantization,
+            stream,
+        )?;
+    }
+    let mut model = qwen3::Model::new(target_args.clone(), stream)?;
+    for (layer_index, layer) in model.model.layers.iter_mut().enumerate() {
+        if let qwen3::FeedForward::Moe(moe) = &mut layer.mlp {
+            let prefix = format!("model.layers.{layer_index}.mlp.experts");
+            moe.experts = PackedSwiGluExperts::new(
+                assignment.local_expert_count() as i32,
+                source_args.hidden_size,
+                source_args.moe_intermediate_size,
+                target_args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                target_args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+        }
+    }
+    assign_module(&mut model, "", &mut tensors, quantize_on_load, stream)?;
+    if !tensors.is_empty() {
+        let mut unused = tensors.into_keys().collect::<Vec<_>>();
+        unused.sort();
+        return Err(Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused,
+        });
+    }
+    let mut routed_expert_bytes = 0;
+    for layer in &mut model.model.layers {
+        if let qwen3::FeedForward::Moe(moe) = &mut layer.mlp {
+            routed_expert_bytes +=
+                finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
+        }
+    }
+    let local_parameter_bytes = parameter_bytes(&model);
+    Ok(ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: ModelKind::Qwen3,
+            assignment,
+            local_parameter_bytes,
+            routed_expert_bytes,
+            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture: ExpertArchitecture::Qwen3(model),
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parallel::DeviceAssignment;
+    use safemlx::{
+        distributed::Backend, module::ModuleParameters, ops::zeros_dtype, Device, DeviceType,
+        ExecutionContext,
+    };
+
+    fn stream() -> Stream {
+        Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
+    }
+
+    #[test]
+    fn timing_profiling_guard_restores_previous_state() {
+        assert!(!timing_profiling_enabled());
+        {
+            let _outer = profile_expert_parallel_timings();
+            assert!(timing_profiling_enabled());
+            {
+                let _inner = profile_expert_parallel_timings();
+                assert!(timing_profiling_enabled());
+            }
+            assert!(timing_profiling_enabled());
+        }
+        assert!(!timing_profiling_enabled());
+    }
+
+    fn save_zero_checkpoint(model: &impl ModuleParameters, directory: &Path, stream: &Stream) {
+        let parameters = model.parameters().flatten();
+        let arrays = parameters
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.to_string(),
+                    zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, array)| (name.as_str(), array)),
+            None,
+            directory.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    fn rank_one_topology() -> ParallelTopology {
+        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+            .unwrap()
+    }
+
+    struct IdentityBank;
+
+    impl LocalExpertBank for IdentityBank {
+        fn execute_local_routes(
+            &mut self,
+            hidden: &Array,
+            _local_expert_ids: &Array,
+            _stream: &Stream,
+        ) -> Result<Array, Error> {
+            Ok(hidden.clone())
+        }
+    }
+
+    #[test]
+    fn assignment_policies_and_round_trips() {
+        let balanced = ExpertAssignment::balanced(7, 3, 1).unwrap();
+        assert_eq!(balanced.owners(), &[0, 0, 0, 1, 1, 2, 2]);
+        assert_eq!(balanced.local_global_expert_ids(), &[3, 4]);
+        assert_eq!(balanced.owner_local_id(4), Some(1));
+        assert_eq!(balanced.global_id(1), Some(4));
+
+        let rr = ExpertAssignment::round_robin(7, 3, 1).unwrap();
+        assert_eq!(rr.local_global_expert_ids(), &[1, 4]);
+        assert_eq!(rr.owner_local_id(4), Some(1));
+
+        let explicit = ExpertAssignment::explicit(vec![1, 0, 1, 0], 2, 0).unwrap();
+        assert_eq!(explicit.local_global_expert_ids(), &[1, 3]);
+        assert_eq!(explicit.global_id(1), Some(3));
+    }
+
+    #[test]
+    fn assignment_rejects_invalid_or_empty_ownership() {
+        assert!(ExpertAssignment::balanced(0, 2, 0).is_err());
+        assert!(ExpertAssignment::balanced(1, 2, 0).is_err());
+        assert!(ExpertAssignment::explicit(vec![0, 2], 2, 0).is_err());
+        assert!(ExpertAssignment::explicit(vec![0, 0], 2, 0).is_err());
+        assert!(ExpertAssignment::explicit_with_empty(vec![0, 0], 2, 1, true).is_ok());
+        assert!(resolve_model_assignment(
+            Some(ExpertAssignment::balanced(6, 2, 1).unwrap()),
+            4,
+            rank_one_topology(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn already_local_expert_bank_is_not_sliced_again_on_nonzero_rank() {
+        let stream = stream();
+        let assignment = ExpertAssignment::balanced(4, 2, 1).unwrap();
+        assert!(!expert_bank_needs_slicing(2, &assignment).unwrap());
+        assert!(expert_bank_needs_slicing(4, &assignment).unwrap());
+        assert!(expert_bank_needs_slicing(3, &assignment).is_err());
+
+        let mut bank = PackedSwiGluExperts::new(2, 4, 3, None, None, &stream).unwrap();
+        let gate_up_shape = bank.gate_up_proj.shape().to_vec();
+        let down_shape = bank.down_proj.shape().to_vec();
+        let expected_bytes = parameter_bytes(&bank);
+        let bytes = finalize_qwen3_expert_bank(&mut bank, &assignment, &stream).unwrap();
+
+        assert_eq!(bytes, expected_bytes);
+        assert_eq!(bank.num_experts, 2);
+        assert_eq!(bank.gate_up_proj.shape(), gate_up_shape);
+        assert_eq!(bank.down_proj.shape(), down_shape);
+    }
+
+    #[test]
+    fn qwen3_round_robin_loader_materializes_only_rank_one_experts() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("config.json"),
+            r#"{
+              "model_type":"qwen3_moe","hidden_size":32,"num_hidden_layers":1,
+              "intermediate_size":64,"num_attention_heads":1,"num_key_value_heads":1,
+              "head_dim":32,"rms_norm_eps":0.000001,"vocab_size":32,
+              "max_position_embeddings":128,"rope_theta":1000000.0,
+              "tie_word_embeddings":false,"rope_scaling":null,
+              "moe_intermediate_size":32,"num_experts":4,
+              "num_experts_per_tok":2,"norm_topk_prob":true
+            }"#,
+        )
+        .unwrap();
+        let args = qwen3::get_qwen3_model_args(fixture.path()).unwrap();
+        let source = qwen3::Model::new(args, stream).unwrap();
+        save_zero_checkpoint(&source, fixture.path(), stream);
+
+        let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+            .with_parallel_topology(rank_one_topology());
+        let assignment = ExpertAssignment::round_robin(4, 2, 1).unwrap();
+        let loaded = load_expert_parallel_model_with_options_and_assignment(
+            fixture.path(),
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[1, 3]);
+        assert_eq!(
+            loaded.info.assignment.policy(),
+            &ExpertAssignmentPolicy::RoundRobin
+        );
+        let ExpertArchitecture::Qwen3(model) = &loaded.architecture else {
+            panic!("expected Qwen3");
+        };
+        let qwen3::FeedForward::Moe(moe) = &model.model.layers[0].mlp else {
+            panic!("expected sparse MoE layer");
+        };
+        assert_eq!(moe.experts.num_experts, 2);
+        assert_eq!(moe.experts.gate_up_proj.shape(), &[2, 64, 4]);
+        assert_eq!(moe.experts.down_proj.shape(), &[2, 32, 4]);
+        assert_eq!(moe.experts.gate_up_proj.dtype(), Dtype::Uint32);
+        assert_eq!(
+            moe.experts
+                .gate_up_proj_scales
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .shape(),
+            &[2, 64, 1]
+        );
+    }
+
+    #[test]
+    fn deepseek_explicit_loader_materializes_only_rank_one_experts() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("config.json"),
+            r#"{
+              "model_type":"deepseek_v3","hidden_size":32,"intermediate_size":64,
+              "moe_intermediate_size":32,"num_hidden_layers":1,"num_attention_heads":1,
+              "vocab_size":32,"rms_norm_eps":0.000001,"max_position_embeddings":128,
+              "rope_theta":10000,"q_lora_rank":null,"kv_lora_rank":32,
+              "qk_nope_head_dim":32,"qk_rope_head_dim":8,"v_head_dim":32,
+              "first_k_dense_replace":0,"moe_layer_freq":1,"n_routed_experts":4,
+              "n_shared_experts":1,"num_experts_per_tok":2,"n_group":2,
+              "topk_group":1,"topk_method":"noaux_tc","scoring_func":"sigmoid",
+              "norm_topk_prob":true,"routed_scaling_factor":1.0,
+              "num_nextn_predict_layers":0,"tie_word_embeddings":false
+            }"#,
+        )
+        .unwrap();
+        let args = deepseek_v3::get_model_args(fixture.path()).unwrap();
+        let source = deepseek_v3::Model::new(args.clone(), stream).unwrap();
+        let parameters = source.parameters().flatten();
+        let mut arrays = parameters
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.to_string(),
+                    zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for expert in 0..args.n_routed_experts {
+            for (projection, shape) in [
+                ("gate_proj", [args.moe_intermediate_size, args.hidden_size]),
+                ("up_proj", [args.moe_intermediate_size, args.hidden_size]),
+                ("down_proj", [args.hidden_size, args.moe_intermediate_size]),
+            ] {
+                arrays.push((
+                    format!("model.layers.0.mlp.experts.{expert}.{projection}.weight"),
+                    Array::zeros::<f32>(&shape, stream).unwrap(),
+                ));
+            }
+        }
+        Array::save_safetensors(
+            arrays.iter().map(|(name, array)| (name.as_str(), array)),
+            None,
+            fixture.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+            .with_parallel_topology(rank_one_topology());
+        let assignment = ExpertAssignment::explicit(vec![1, 0, 0, 1], 2, 1).unwrap();
+        let loaded = load_expert_parallel_model_with_options_and_assignment(
+            fixture.path(),
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[0, 3]);
+        assert_eq!(
+            loaded.info.assignment.policy(),
+            &ExpertAssignmentPolicy::Explicit(vec![1, 0, 0, 1])
+        );
+        let ExpertArchitecture::DeepSeek(model) = &loaded.architecture else {
+            panic!("expected DeepSeek");
+        };
+        let deepseek_v3::FeedForward::Moe(moe) = &model.model.layers[0].mlp else {
+            panic!("expected sparse MoE layer");
+        };
+        assert_eq!(moe.experts.num_experts, 2);
+        assert_eq!(
+            moe.experts.gate_proj.as_ref().as_ref().unwrap().shape(),
+            &[2, 32, 4]
+        );
+        assert_eq!(
+            moe.experts
+                .gate_proj_scales
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .shape(),
+            &[2, 32, 1]
+        );
+    }
+
+    #[test]
+    fn compact_routes_preserves_tokens_slots_and_global_ids() {
+        let stream = stream();
+        let assignment = ExpertAssignment::balanced(4, 2, 1).unwrap();
+        let hidden = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let ids = Array::from_slice(&[0i32, 2, 1, 3], &[2, 2]);
+        let weights = Array::from_slice(&[0.1f32, 0.9, 0.25, 0.75], &[2, 2]);
+        let (routes, stats) =
+            compact_local_routes(&hidden, &ids, &weights, &assignment, &stream).unwrap();
+        eval([
+            &routes.global_expert_ids,
+            &routes.local_expert_ids,
+            &routes.token_indices,
+            &routes.slot_indices,
+            &routes.weights,
+        ])
+        .unwrap();
+        assert_eq!(stats.total_routes, 4);
+        assert_eq!(stats.local_routes, 2);
+        assert_eq!(stats.synchronization_count, 1);
+        assert_eq!(
+            routes
+                .global_expert_ids
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[2, 3]
+        );
+        assert_eq!(
+            routes
+                .local_expert_ids
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[0, 1]
+        );
+        assert_eq!(
+            routes.token_indices.evaluated().unwrap().as_slice::<i32>(),
+            &[0, 1]
+        );
+        assert_eq!(
+            routes.slot_indices.evaluated().unwrap().as_slice::<i32>(),
+            &[1, 1]
+        );
+    }
+
+    #[test]
+    fn replicated_dispatch_recombines_weights_exactly() {
+        let stream = stream();
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let assignment = ExpertAssignment::balanced(3, 1, 0).unwrap();
+        let hidden = Array::from_slice(&[2.0f32, 4.0, 10.0, 20.0], &[2, 2]);
+        let ids = Array::from_slice(&[0i32, 2, 1, 1], &[2, 2]);
+        let weights = Array::from_slice(&[0.25f32, 0.75, 0.4, 0.6], &[2, 2]);
+        let returned = dispatch_replicated(
+            &hidden,
+            &ids,
+            &weights,
+            &assignment,
+            &mut IdentityBank,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        eval([&returned.reduced_output]).unwrap();
+        assert_eq!(
+            returned
+                .reduced_output
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[2.0, 4.0, 10.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn all_to_all_v_singleton_preserves_payload_and_zero_counts() {
+        let stream = stream();
+        let group = Group::init(false, Backend::Any).unwrap();
+        let payload = Array::from_slice(&[1i32, 2, 3, 4], &[2, 2]);
+        let received = all_to_all_v(&[payload], &group, &stream).unwrap();
+        eval([&received.received]).unwrap();
+        assert_eq!(received.source_counts, vec![2]);
+        assert_eq!(
+            received.received.evaluated().unwrap().as_slice::<i32>(),
+            &[1, 2, 3, 4]
+        );
+
+        let empty = Array::from_slice::<i32>(&[], &[0, 2]);
+        let received = all_to_all_v(&[empty], &group, &stream).unwrap();
+        assert_eq!(received.source_counts, vec![0]);
+        assert_eq!(received.received.shape(), &[0, 2]);
+    }
+
+    #[test]
+    fn sharded_and_replicated_dispatch_match_on_singleton() {
+        let stream = stream();
+        let group = Group::init(false, Backend::Any).unwrap();
+        let assignment = ExpertAssignment::balanced(2, 1, 0).unwrap();
+        let hidden = Array::from_slice(&[2.0f32, 4.0, 10.0, 20.0], &[2, 2]);
+        let ids = Array::from_slice(&[0i32, 1, 1, 0], &[2, 2]);
+        let weights = Array::from_slice(&[0.25f32, 0.75, 0.4, 0.6], &[2, 2]);
+        let replicated = dispatch_replicated(
+            &hidden,
+            &ids,
+            &weights,
+            &assignment,
+            &mut IdentityBank,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        let route_tokens = Array::from_slice(&[0i32, 0, 1, 1], &[4]);
+        let routed_hidden = hidden.take_axis(&route_tokens, 0, &stream).unwrap();
+        let sharded = dispatch_sharded(
+            ShardedRouteBlocks {
+                hidden: vec![routed_hidden],
+                global_expert_ids: vec![ids.reshape(&[4], &stream).unwrap()],
+                original_route_indices: vec![
+                    Array::arange::<i32, i32>(Some(0), 4, None, &stream).unwrap()
+                ],
+                weights: vec![weights.reshape(&[4], &stream).unwrap()],
+                top_k: 2,
+                source_tokens: 2,
+            },
+            &assignment,
+            &mut IdentityBank,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        eval([&replicated.reduced_output, &sharded.output]).unwrap();
+        assert_eq!(
+            replicated
+                .reduced_output
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            sharded.output.evaluated().unwrap().as_slice::<f32>()
+        );
+    }
+}

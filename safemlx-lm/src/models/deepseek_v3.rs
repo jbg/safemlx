@@ -1368,6 +1368,27 @@ impl RoutedExperts {
         observe_activation(observer, prefix, "output", &output)?;
         Ok(output)
     }
+
+    /// Executes a compact bank-local route table and reduces it to one output
+    /// row per compact input row. This is the adapter entry point used by the
+    /// architecture-independent expert-parallel dispatcher.
+    pub fn forward_local(
+        &mut self,
+        hidden_states: &Array,
+        local_expert_ids: &Array,
+        route_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut observer = None;
+        self.forward_impl(
+            hidden_states,
+            local_expert_ids,
+            route_weights,
+            stream,
+            "",
+            &mut observer,
+        )
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1466,6 +1487,8 @@ impl Moe {
                     .expect("observed routing scores initialized"),
                 routing_weights: &weights,
                 routed_output: &routed,
+                local_routed_output: None,
+                reduced_routed_output: Some(&routed),
                 shared_output: Some(&shared),
                 combined_output: Some(&combined),
                 num_experts: self.gate.num_experts,
@@ -1473,6 +1496,101 @@ impl Moe {
         }
         let output = combined.reshape(shape, stream)?;
         observe_activation(observer, prefix, "output", &output)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        x: &Array,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        mut observer: ObserverOption<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, x.dim(-1)], stream)?;
+        observe_activation(&mut observer, prefix, "input_flat", &flat)?;
+        crate::expert_parallel::materialize_timing_phase([&flat])?;
+        let moe_started = std::time::Instant::now();
+        let previous_moe_time = statistics.total_time;
+        let router_started = std::time::Instant::now();
+        let (indices, selected_scores, weights) = if let Some(observer) = observer.as_deref_mut() {
+            let routing = self.gate.forward_with_observer(
+                &flat,
+                stream,
+                &activation_name(prefix, "gate"),
+                observer,
+            )?;
+            (routing.indices, Some(routing.scores), routing.weights)
+        } else {
+            let (indices, weights) = self.gate.forward(&flat, stream)?;
+            (indices, None, weights)
+        };
+        let mut router_outputs = vec![&indices, &weights];
+        if let Some(scores) = selected_scores.as_ref() {
+            router_outputs.push(scores);
+        }
+        crate::expert_parallel::materialize_timing_phase(router_outputs)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::expert_parallel::dispatch_replicated(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            &mut self.experts,
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        observe_activation(
+            &mut observer,
+            prefix,
+            "routed_expert_local_output",
+            &returned.local_output,
+        )?;
+        observe_activation(
+            &mut observer,
+            prefix,
+            "routed_expert_reduced_output",
+            &returned.reduced_output,
+        )?;
+        // Shared experts are replicated and deliberately added after the
+        // routed all-sum so their contribution is applied exactly once.
+        let shared_started = std::time::Instant::now();
+        let shared = self.shared_experts.forward_impl(
+            &flat,
+            stream,
+            &activation_name(prefix, "shared_experts"),
+            &mut observer,
+        )?;
+        crate::expert_parallel::materialize_timing_phase([&shared])?;
+        statistics.shared_expert_time += shared_started.elapsed();
+        observe_activation(&mut observer, prefix, "shared_expert_output", &shared)?;
+        let combined = returned.reduced_output.add(&shared, stream)?;
+        observe_activation(&mut observer, prefix, "combined_flat", &combined)?;
+        if let Some(observer) = observer {
+            observer.observe_moe_routing(MoeRoutingObservation {
+                prefix,
+                selected_experts: &indices,
+                selected_scores: selected_scores
+                    .as_ref()
+                    .expect("observed EP routing scores initialized"),
+                routing_weights: &weights,
+                routed_output: &returned.reduced_output,
+                local_routed_output: Some(&returned.local_output),
+                reduced_routed_output: Some(&returned.reduced_output),
+                shared_output: Some(&shared),
+                combined_output: Some(&combined),
+                num_experts: self.gate.num_experts,
+            })?;
+        }
+        let output = combined.reshape(shape, stream)?;
+        crate::expert_parallel::materialize_timing_phase([&output])?;
+        statistics.total_time = previous_moe_time + moe_started.elapsed();
         Ok(output)
     }
 }
@@ -1579,6 +1697,28 @@ impl FeedForward {
         match self {
             Self::Moe(moe) => Some(moe),
             Self::Dense(_) => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        x: &Array,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        observer: ObserverOption<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => {
+                let mut observer = observer;
+                mlp.forward_impl(x, stream, prefix, &mut observer)
+            }
+            Self::Moe(moe) => moe.forward_expert_parallel(
+                x, assignment, group, statistics, prefix, observer, stream,
+            ),
         }
     }
 }
@@ -1740,6 +1880,43 @@ impl DecoderLayer {
             .mlp
             .forward_impl(&normalized, stream, "", &mut observer)?;
         let feed_forward = safemlx::distributed::all_sum(&feed_forward, group, stream)?;
+        hidden.add(feed_forward, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        prefix: &str,
+        observer: ObserverOption<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let mut attention_observer = None;
+        let attention = self.self_attn.forward_impl(
+            &normalized,
+            mask,
+            cache,
+            stream,
+            "",
+            &mut attention_observer,
+        )?;
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = self.mlp.forward_expert_parallel(
+            &normalized,
+            assignment,
+            group,
+            statistics,
+            &activation_name(prefix, "mlp"),
+            observer,
+            stream,
+        )?;
         hidden.add(feed_forward, stream)
     }
 }
@@ -1929,6 +2106,63 @@ impl Model {
     ) -> Result<Array, Exception> {
         let mut observer: ObserverOption<'_> = Some(observer);
         self.forward_logits_impl(input, false, stream, &mut observer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        assignment: &crate::expert_parallel::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        mut observer: ObserverOption<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
+        let offset = cache.offset();
+        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
+            Some(create_causal_mask(
+                hidden.dim(1),
+                Some(offset),
+                None,
+                None,
+                stream,
+            )?)
+        } else {
+            None
+        };
+        let mask = mask.or(generated_mask.as_ref());
+        if cache.layers.len() != self.model.layers.len() {
+            return Err(Exception::custom(
+                "DeepSeek EP cache layer count does not match model",
+            ));
+        }
+        for (index, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(&mut cache.layers)
+            .enumerate()
+        {
+            let layer_observer = observer
+                .as_mut()
+                .map(|observer| &mut **observer as &mut dyn ActivationObserver);
+            hidden = layer.forward_expert_parallel(
+                &hidden,
+                mask,
+                Some(layer_cache),
+                assignment,
+                group,
+                statistics,
+                &format!("model.layers.{index}"),
+                layer_observer,
+                stream,
+            )?;
+        }
+        hidden = self.model.norm.forward(&hidden, stream)?;
+        self.lm_head.forward(&hidden, stream)
     }
 }
 

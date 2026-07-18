@@ -18,6 +18,10 @@ pub struct MoeRoutingObservation<'a> {
     pub routing_weights: &'a Array,
     /// Summed routed expert contribution with shape `[tokens, hidden]`.
     pub routed_output: &'a Array,
+    /// Rank-local routed contribution before an EP reduction, when applicable.
+    pub local_routed_output: Option<&'a Array>,
+    /// Globally reduced routed contribution, when applicable.
+    pub reduced_routed_output: Option<&'a Array>,
     /// Shared expert contribution with shape `[tokens, hidden]`, when present.
     pub shared_output: Option<&'a Array>,
     /// Combined MoE output with shape `[tokens, hidden]`, when present.

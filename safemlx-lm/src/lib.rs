@@ -12,6 +12,8 @@
 pub mod cache;
 /// Error types returned by the language-model runtime.
 pub mod error;
+/// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
+pub mod expert_parallel;
 /// Gemma 4 multi-token prediction generation helpers.
 pub mod gemma4_mtp;
 mod gguf_tokenizer;

@@ -2588,6 +2588,8 @@ impl SparseMoeBlock {
             selected_scores: &selected_scores,
             routing_weights: &routing_weights,
             routed_output: &routed,
+            local_routed_output: None,
+            reduced_routed_output: Some(&routed),
             shared_output: Some(&shared),
             combined_output: Some(&combined),
             num_experts: self.gate.num_experts,

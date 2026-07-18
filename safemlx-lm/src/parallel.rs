@@ -355,6 +355,16 @@ pub enum TensorPlacement {
         /// Exclusive element offset on `axis`.
         end: usize,
     },
+    /// Materialize selected source-tensor indices in the supplied order.
+    ///
+    /// This supports non-contiguous ownership layouts without loading the
+    /// enclosing range or retaining unowned rows in the local partition.
+    Indices {
+        /// Source tensor axis being selected.
+        axis: usize,
+        /// Distinct source indices, ordered as they should appear locally.
+        indices: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -557,6 +567,16 @@ fn validate_plan_entry(plan: &TensorPlan, topology: ParallelTopology) -> Result<
         TensorPlacement::Range { start, end, .. } if start >= end => Err(Error::Parallel(format!(
             "tensor range {start}..{end} must be non-empty"
         ))),
+        TensorPlacement::Indices { indices, .. } if indices.is_empty() => Err(Error::Parallel(
+            "tensor index selection must be non-empty".into(),
+        )),
+        TensorPlacement::Indices { indices, .. }
+            if indices.iter().collect::<HashSet<_>>().len() != indices.len() =>
+        {
+            Err(Error::Parallel(
+                "tensor index selection must not contain duplicates".into(),
+            ))
+        }
         placement => {
             if let Some(shape) = &plan.expected_source_shape {
                 validate_placement(placement, shape, topology)?;
@@ -577,6 +597,7 @@ enum ResolvedPlacement {
     Materialize,
     Omit,
     Shard(TensorSlice),
+    Indices { axis: usize, indices: Vec<usize> },
 }
 
 fn validate_placement(
@@ -610,6 +631,31 @@ fn validate_placement(
             if start >= end || *end > shape[*axis] {
                 return Err(Error::Parallel(format!(
                     "tensor range {start}..{end} is invalid for dimension {} on axis {axis}",
+                    shape[*axis]
+                )));
+            }
+            Ok(())
+        }
+        TensorPlacement::Indices { axis, indices } => {
+            if *axis >= shape.len() {
+                return Err(Error::Parallel(format!(
+                    "tensor index axis {axis} is outside rank {} shape {shape:?}",
+                    shape.len()
+                )));
+            }
+            if indices.is_empty() {
+                return Err(Error::Parallel(
+                    "tensor index selection must be non-empty".into(),
+                ));
+            }
+            if indices.iter().collect::<HashSet<_>>().len() != indices.len() {
+                return Err(Error::Parallel(
+                    "tensor index selection must not contain duplicates".into(),
+                ));
+            }
+            if let Some(index) = indices.iter().copied().find(|index| *index >= shape[*axis]) {
+                return Err(Error::Parallel(format!(
+                    "tensor index {index} is outside dimension {} on axis {axis}",
                     shape[*axis]
                 )));
             }
@@ -659,6 +705,10 @@ fn resolve_placement(
             index: 0,
             parts: 1,
         }),
+        TensorPlacement::Indices { axis, indices } => ResolvedPlacement::Indices {
+            axis: *axis,
+            indices: indices.clone(),
+        },
     })
 }
 
@@ -730,7 +780,8 @@ impl PartitionReport {
                 TensorPlacement::Replicated
                 | TensorPlacement::Local
                 | TensorPlacement::Shard { .. }
-                | TensorPlacement::Range { .. } => true,
+                | TensorPlacement::Range { .. }
+                | TensorPlacement::Indices { .. } => true,
                 TensorPlacement::Omit => false,
                 TensorPlacement::Rank { rank } => rank == plan.topology.global_rank,
                 TensorPlacement::PipelineStage { stage } => {
@@ -942,6 +993,26 @@ fn load_selected_shard(
                         .reshape(&local_shape, source_stream)?
                 };
                 selected.copy(execution_stream)?
+            }
+            ResolvedPlacement::Indices { axis, indices } => {
+                let source_value =
+                    Array::try_from(view).map_err(|error| Error::Other(Box::new(error)))?;
+                let axis = i32::try_from(axis)
+                    .map_err(|_| Error::Parallel("tensor axis does not fit in i32".into()))?;
+                let indices = indices
+                    .iter()
+                    .map(|index| {
+                        i32::try_from(*index)
+                            .map_err(|_| Error::Parallel("tensor index does not fit in i32".into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let index_count = i32::try_from(indices.len()).map_err(|_| {
+                    Error::Parallel("tensor index count does not fit in i32".into())
+                })?;
+                let indices = Array::from_slice(&indices, &[index_count]).copy(source_stream)?;
+                source_value
+                    .take_axis(&indices, axis, source_stream)?
+                    .copy(execution_stream)?
             }
         };
         eval([&value])?;
@@ -1291,6 +1362,45 @@ mod tests {
             reconstructed[1][3],
         ];
         assert_eq!(union, [0, 1, 2, 3, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn selective_loader_materializes_only_ordered_noncontiguous_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = stream();
+        write_i32_tensor(
+            &dir.path().join("model.safetensors"),
+            "experts",
+            &[0, 1, 10, 11, 20, 21, 30, 31, 40, 41],
+            vec![5, 2],
+        );
+        let mut plan = PlacementPlan::new(topology(2, 1, 1, 1, 2));
+        plan.insert_expected(
+            "experts",
+            vec![5, 2],
+            TensorPlacement::Indices {
+                axis: 0,
+                indices: vec![3, 1],
+            },
+        )
+        .unwrap();
+        let partition =
+            load_safetensors_partition(dir.path(), &plan, &stream, &StrictLoadConfig::default())
+                .unwrap();
+        let local = partition.get("experts").unwrap().evaluated().unwrap();
+        assert_eq!(local.as_array().shape(), &[2, 2]);
+        assert_eq!(local.as_slice::<i32>(), &[30, 31, 10, 11]);
+
+        for indices in [vec![], vec![1, 1], vec![1, 5]] {
+            let mut invalid = PlacementPlan::new(topology(2, 1, 1, 1, 2));
+            assert!(invalid
+                .insert_expected(
+                    "experts",
+                    vec![5, 2],
+                    TensorPlacement::Indices { axis: 0, indices },
+                )
+                .is_err());
+        }
     }
 
     #[test]
