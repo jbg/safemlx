@@ -36,7 +36,8 @@ use crate::{
         qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
     module_binding::{
-        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+        build_module_bindings, build_module_bindings_excluding, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
@@ -337,14 +338,19 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings(layer, &format!("model.layers.{index}"), store)?;
         if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("mlp.experts."))
-                .collect())
+            Ok(build_module_bindings_excluding(
+                layer,
+                &format!("model.layers.{index}"),
+                store,
+                |name| name.starts_with("mlp.experts."),
+            )?)
         } else {
-            Ok(bindings)
+            Ok(build_module_bindings(
+                layer,
+                &format!("model.layers.{index}"),
+                store,
+            )?)
         }
     }
 
@@ -645,7 +651,9 @@ mod tests {
     use std::{fs, path::Path};
 
     use safemlx::{
-        module::ModuleParameters, ops::ones_dtype, Array, Device, DeviceType, ExecutionContext,
+        module::ModuleParameters,
+        ops::{indexing::TryIndexOp, ones_dtype},
+        Array, Device, DeviceType, ExecutionContext,
     };
 
     use super::*;
@@ -704,19 +712,45 @@ mod tests {
         }
     }
 
-    fn write_fixture(dir: &Path, model: &qwen3::Model) {
+    fn write_fixture(dir: &Path, model: &qwen3::Model, split_experts: bool, stream: &Stream) {
         let params = model.parameters().flatten();
-        let arrays = params
-            .iter()
-            .map(|(name, value)| {
-                (
-                    crate::module_binding::canonical_checkpoint_name(name),
-                    *value,
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut arrays = Vec::<(String, Array)>::new();
+        for (name, value) in params {
+            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            if split_experts {
+                if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
+                    for expert in 0..model.args.num_experts {
+                        let selected = value.try_index_device(expert, stream).unwrap();
+                        let intermediate = model.args.moe_intermediate_size;
+                        arrays.push((
+                            format!("{prefix}.mlp.experts.{expert}.gate_proj.weight"),
+                            selected
+                                .try_index_device((..intermediate, ..), stream)
+                                .unwrap(),
+                        ));
+                        arrays.push((
+                            format!("{prefix}.mlp.experts.{expert}.up_proj.weight"),
+                            selected
+                                .try_index_device((intermediate.., ..), stream)
+                                .unwrap(),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
+                    for expert in 0..model.args.num_experts {
+                        arrays.push((
+                            format!("{prefix}.mlp.experts.{expert}.down_proj.weight"),
+                            value.try_index_device(expert, stream).unwrap(),
+                        ));
+                    }
+                    continue;
+                }
+            }
+            arrays.push((name, value.clone()));
+        }
         Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
             None,
             dir.join("model.safetensors"),
         )
@@ -761,7 +795,7 @@ mod tests {
         let mut fixture = qwen3::Model::new(args(moe), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture);
+        write_fixture(dir.path(), &fixture, false, gpu.stream());
 
         let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let mut layerwise = load_qwen3_layerwise_model(
@@ -822,12 +856,17 @@ mod tests {
 
     #[test]
     fn qwen3_sparse_expert_cache_prefill_and_decode_parity() {
+        sparse_expert_cache_parity(false);
+        sparse_expert_cache_parity(true);
+    }
+
+    fn sparse_expert_cache_parity(split_experts: bool) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut fixture = qwen3::Model::new(args(true), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture);
+        write_fixture(dir.path(), &fixture, split_experts, gpu.stream());
 
         let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());

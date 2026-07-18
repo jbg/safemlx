@@ -48,7 +48,24 @@ pub fn build_module_bindings(
     prefix: &str,
     store: &dyn WeightStore,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-    build_module_bindings_with_recipes(module, prefix, store, BTreeMap::new())
+    build_module_bindings_excluding(module, prefix, store, |_| false)
+}
+
+/// Builds exact bindings for non-excluded local module parameters.
+///
+/// The predicate receives module-local flattened names and runs before any
+/// checkpoint lookup, allowing independently managed parameter groups to use a
+/// different checkpoint layout.
+pub fn build_module_bindings_excluding<F>(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    exclude: F,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
+    build_module_bindings_with_recipes_excluding(module, prefix, store, BTreeMap::new(), exclude)
 }
 
 /// Builds module bindings while replacing selected local parameters with recipes.
@@ -60,11 +77,28 @@ pub fn build_module_bindings_with_recipes(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn WeightStore,
-    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+    build_module_bindings_with_recipes_excluding(module, prefix, store, recipes, |_| false)
+}
+
+fn build_module_bindings_with_recipes_excluding<F>(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    exclude: F,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
-    let mut local_names = params.keys().map(ToString::to_string).collect::<Vec<_>>();
+    let mut local_names = params
+        .keys()
+        .map(ToString::to_string)
+        .filter(|name| !exclude(name))
+        .collect::<Vec<_>>();
     local_names.sort();
     let mut claimed = BTreeMap::<String, String>::new();
     let mut bindings = Vec::with_capacity(local_names.len());
