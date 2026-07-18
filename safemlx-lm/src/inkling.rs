@@ -1,31 +1,39 @@
 //! Text-decoder layerwise-host execution for Thinking Machines Lab Inkling.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::{Module, ModuleParameters, Param},
     nn,
     ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp},
+    transforms::eval,
     Array, Dtype, Stream,
 };
 
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
     },
     models::{
-        common::{self, generation::CausalLm},
+        common::{self, generation::CausalLm, moe::PackedSwiGluExperts},
         inkling::{
             self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
         },
         input,
     },
-    module_binding::{build_module_bindings_with_recipes, populate_module_from_lease},
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    module_binding::{
+        build_module_bindings_with_recipes, populate_module_from_lease,
+        populate_module_from_lease_excluding,
+    },
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     weight_recipe::DerivedWeightRecipe,
     weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
 };
@@ -56,6 +64,17 @@ impl InklingLayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Returns the persistent checkpoint store.
@@ -126,6 +145,43 @@ pub fn load_inkling_layerwise_model(
     })
 }
 
+/// Loads Inkling with expert-granular sparse caching for routed text experts.
+pub fn load_inkling_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_model_args(model_dir)?;
+    if args.text_config.n_routed_experts <= 0
+        || !(0..args.text_config.num_hidden_layers).any(|layer| !args.text_config.is_dense(layer))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires an Inkling checkpoint with routed MoE layers".into(),
+        ));
+    }
+    let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = inkling_expert_catalog(&args, store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(InklingLayerwiseModel { execution })
+}
+
 /// Adapter for Inkling local/global attention and dense/MoE text blocks.
 struct InklingLayerwiseAdapter {
     args: ModelArgs,
@@ -136,6 +192,8 @@ struct InklingLayerwiseAdapter {
     audio: Option<AudioModel>,
     vision_norm: Option<nn::RmsNorm>,
     vision_depth: usize,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl InklingLayerwiseAdapter {
@@ -184,6 +242,8 @@ impl InklingLayerwiseAdapter {
             audio,
             vision_norm,
             vision_depth,
+            sparse_expert_cache: false,
+            expert_cache: None,
             args,
         })
     }
@@ -788,12 +848,52 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
-        Ok(build_module_bindings_with_recipes(
+        let bindings = build_module_bindings_with_recipes(
             layer,
             &prefix,
             store,
             self.recipes_for_module(layer, &prefix, store)?,
-        )?)
+        )?;
+        Ok(
+            if self.sparse_expert_cache && self.execution_group_id(group)? == "text_decoder" {
+                bindings
+                    .into_iter()
+                    .filter(|binding| !binding.name().starts_with("moe.experts."))
+                    .collect()
+            } else {
+                bindings
+            },
+        )
+    }
+
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("moe.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts.") || key.contains(".moe.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn forward_layer(
@@ -814,6 +914,62 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 Ok(context.vision_jobs[0].hidden.clone())
             }
             ("text_decoder", InklingLayer::Text(layer)) => {
+                if self.sparse_expert_cache && !self.args.text_config.is_dense(index as i32) {
+                    let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling sparse expert cache was not initialized".into(),
+                        )
+                    })?;
+                    let pass = if hidden.dim(1) > 1 {
+                        ExpertPass::Prefill
+                    } else {
+                        ExpertPass::Decode
+                    };
+                    return Ok(layer.forward_with_expert_executor(
+                        hidden,
+                        Some(&mut cache.layers[index]),
+                        stream,
+                        |flat, indices, weights, stream| {
+                            let acquired = expert_cache
+                                .acquire_routes(index, indices, pass, stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            let started = Instant::now();
+                            let text = &self.args.text_config;
+                            let mut bank = PackedSwiGluExperts::new(
+                                acquired.identities().len() as i32,
+                                text.hidden_size,
+                                text.moe_intermediate_size(),
+                                None,
+                                None,
+                                stream,
+                            )?;
+                            bank.gate_up_proj = Param::new(
+                                acquired
+                                    .compact_binding("gate_up_proj", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.down_proj = Param::new(
+                                acquired
+                                    .compact_binding("down_proj", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            expert_cache
+                                .record_compact_bank(
+                                    pass,
+                                    acquired.scratch_bytes(),
+                                    started.elapsed(),
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            let output =
+                                bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+                            eval([&output])?;
+                            acquired
+                                .complete_pending()
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            Ok(output)
+                        },
+                    )?);
+                }
                 Ok(layer.forward(hidden, Some(&mut cache.layers[index]), stream)?)
             }
             _ => Err(Error::UnsupportedArchitecture(format!(
@@ -920,6 +1076,100 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
     }
 }
 
+pub(crate) fn inkling_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let normalized = normalized_checkpoint_keys(store);
+    let text = &args.text_config;
+    let mut entries = Vec::new();
+    for layer in 0..text.num_hidden_layers as usize {
+        if text.is_dense(layer as i32) {
+            continue;
+        }
+        let runtime_prefix = format!("model.layers.{layer}");
+        let gate_up_runtime = format!("{runtime_prefix}.moe.experts.gate_up_proj");
+        let down_runtime = format!("{runtime_prefix}.moe.experts.down_proj");
+        let gate_up_raw = normalized
+            .get(&gate_up_runtime)
+            .cloned()
+            .or_else(|| {
+                normalized
+                    .get(&format!("{runtime_prefix}.mlp.experts.w13_weight"))
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Inkling checkpoint is missing routed gate/up bank for layer {layer}"
+                ))
+            })?;
+        let down_raw = normalized.get(&down_runtime).cloned().ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Inkling checkpoint is missing routed down bank for layer {layer}"
+            ))
+        })?;
+        let gate_metadata = store.metadata(&gate_up_raw)?;
+        let interleaved = gate_metadata.shape.get(1).copied().ok_or_else(|| {
+            Error::UnsupportedArchitecture("Inkling routed gate/up rank is invalid".into())
+        })?;
+        if !normalized.contains_key(&gate_up_runtime) && interleaved % 2 != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling routed w13 bank for layer {layer} has odd interleaved width {interleaved}"
+            )));
+        }
+        for expert in 0..text.n_routed_experts as usize {
+            let identity = ExpertIdentity::new(layer, expert);
+            let selected_expert = DerivedWeightRecipe::source(
+                gate_up_raw.clone(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: expert,
+                    end: expert + 1,
+                },
+            );
+            let gate_up = if normalized.contains_key(&gate_up_runtime) {
+                selected_expert
+            } else {
+                let select = |parity| DerivedWeightRecipe::Select {
+                    input: Box::new(selected_expert.clone()),
+                    selection: TensorSelection::Indices {
+                        axis: 1,
+                        indices: (parity..interleaved).step_by(2).collect(),
+                    },
+                };
+                DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![select(0), select(1)],
+                }
+            };
+            let down = DerivedWeightRecipe::source(
+                down_raw.clone(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: expert,
+                    end: expert + 1,
+                },
+            );
+            let mut bindings = Vec::new();
+            for (name, recipe) in [("gate_up_proj", gate_up), ("down_proj", down)] {
+                let bytes = recipe.infer(store)?.byte_len();
+                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Inkling expert byte total overflowed".into())
+                })
+            })?;
+            entries.push(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
 /// Inkling text token generation using layerwise-host execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
@@ -934,9 +1184,10 @@ mod tests {
         Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
-    use super::load_inkling_layerwise_model;
+    use super::{load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model};
     use crate::{
         cache::KeyValueCache,
+        expert_cache::ExpertCacheLoadOptions,
         layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
@@ -1200,6 +1451,50 @@ mod tests {
     fn inkling_released_layout_layerwise_parity() {
         parity(1);
         parity(2);
+    }
+
+    #[test]
+    fn inkling_sparse_expert_cache_prefill_and_decode_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, gpu.stream());
+        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached =
+            load_inkling_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
+                .unwrap();
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = resident::Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    &tokens,
+                    None,
+                    Some(&mut resident_cache),
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 4);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
     }
 
     #[test]

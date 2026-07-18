@@ -329,8 +329,7 @@ pub fn load_llama_model(
         }
         WeightResidency::SparseExpertCache(_) => {
             return Err(Error::UnsupportedArchitecture(
-                "sparse expert caching is supported only for DeepSeek-V3/R1 and sparse Qwen3"
-                    .into(),
+                "sparse expert caching is not supported for Llama checkpoints".into(),
             ));
         }
     };

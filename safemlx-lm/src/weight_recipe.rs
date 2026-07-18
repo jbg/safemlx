@@ -150,6 +150,13 @@ pub enum DerivedWeightRecipe {
         /// Selection applied before any derived operations.
         selection: TensorSelection,
     },
+    /// Applies another selection to a derived array.
+    Select {
+        /// Child recipe.
+        input: Box<Self>,
+        /// Selection applied to the child output.
+        selection: TensorSelection,
+    },
     /// Concatenates child outputs along an existing axis.
     Concatenate {
         /// Concatenation axis.
@@ -213,7 +220,8 @@ impl DerivedWeightRecipe {
                     input.collect_source_keys(keys);
                 }
             }
-            Self::Reshape { input, .. }
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
             | Self::Transpose { input, .. }
             | Self::Cast { input, .. } => input.collect_source_keys(keys),
         }
@@ -226,6 +234,11 @@ impl DerivedWeightRecipe {
     ) -> Result<WeightRecipeMetadata, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => infer_source(store, key, selection),
+            Self::Select { input, selection } => {
+                let metadata = input.infer(store)?;
+                let shape = selected_shape(metadata.shape, selection)?;
+                metadata_for(shape, metadata.dtype)
+            }
             Self::Concatenate { axis, inputs } => infer_join(store, *axis, inputs, false),
             Self::Stack { axis, inputs } => infer_join(store, *axis, inputs, true),
             Self::Reshape { input, shape } => {
@@ -301,6 +314,33 @@ impl DerivedWeightRecipe {
                 let array = pending.output().clone();
                 sources.push(pending);
                 Ok(array)
+            }
+            Self::Select { input, selection } => {
+                let array = input.materialize_inner(store, stream, sources)?;
+                match selection {
+                    TensorSelection::Full => Ok(array),
+                    TensorSelection::Range { axis, start, end } => {
+                        let indices = (*start..*end)
+                            .map(|index| usize_to_i32(index, "selection index"))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(array.take_axis(
+                            Array::from_slice(&indices, &[indices.len() as i32]),
+                            usize_to_i32(*axis, "selection axis")?,
+                            stream,
+                        )?)
+                    }
+                    TensorSelection::Indices { axis, indices } => {
+                        let indices = indices
+                            .iter()
+                            .map(|index| usize_to_i32(*index, "selection index"))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(array.take_axis(
+                            Array::from_slice(&indices, &[indices.len() as i32]),
+                            usize_to_i32(*axis, "selection axis")?,
+                            stream,
+                        )?)
+                    }
+                }
             }
             Self::Concatenate { axis, inputs } => {
                 let arrays = materialize_inputs(inputs, store, stream, sources)?;
@@ -385,7 +425,14 @@ fn infer_source(
         return Err(WeightRecipeError::EmptySourceKey);
     }
     let metadata = store.metadata(key)?;
-    let mut shape = metadata.shape;
+    let shape = selected_shape(metadata.shape, selection)?;
+    metadata_for(shape, metadata.stored_dtype.into())
+}
+
+fn selected_shape(
+    mut shape: Vec<usize>,
+    selection: &TensorSelection,
+) -> Result<Vec<usize>, WeightRecipeError> {
     match selection {
         TensorSelection::Full => {}
         TensorSelection::Range { axis, start, end } => {
@@ -417,7 +464,7 @@ fn infer_source(
             *dimension = indices.len();
         }
     }
-    metadata_for(shape, metadata.stored_dtype.into())
+    Ok(shape)
 }
 
 fn infer_join(
@@ -683,6 +730,31 @@ mod tests {
             output.evaluated().unwrap().as_slice::<i32>(),
             &[5, 6, 7, 8, 1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn selects_an_axis_from_a_derived_source_selection() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::Select {
+            input: Box::new(DerivedWeightRecipe::source(
+                "left",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )),
+            selection: TensorSelection::Indices {
+                axis: 1,
+                indices: vec![1],
+            },
+        };
+        let metadata = recipe.infer(store.as_ref()).unwrap();
+        assert_eq!(metadata.shape(), &[1, 1]);
+        assert_eq!(recipe.source_keys(), vec!["left"]);
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let output = recipe.materialize(store.as_ref(), &stream).unwrap();
+        assert_eq!(output.evaluated().unwrap().as_slice::<i32>(), &[2]);
     }
 
     #[test]

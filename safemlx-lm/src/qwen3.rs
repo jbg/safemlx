@@ -508,12 +508,20 @@ pub(crate) fn qwen3_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    qwen3_expert_catalog_at(args, store, "model.layers")
+}
+
+pub(crate) fn qwen3_expert_catalog_at(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layer_root: &str,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for layer in 0..usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("Qwen3 layer count is negative".into()))?
     {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
+        let prefix = format!("{layer_root}.{layer}.mlp.experts");
         let packed_gate_up = format!("{prefix}.gate_up_proj");
         let packed_down = format!("{prefix}.down_proj");
         for expert in 0..usize::try_from(args.num_experts)

@@ -322,7 +322,7 @@ pub struct Experts {
 }
 
 impl Experts {
-    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             num_experts: args.num_local_experts,
             hidden_size: args.hidden_size,
@@ -411,7 +411,7 @@ impl Experts {
         output.add(projection_bias.take_axis(expert_ids, 0, stream)?, stream)
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         hidden_states: &Array,
         top_k_index: &Array,
@@ -491,6 +491,22 @@ impl Mlp {
             .forward(&flat, &indices, &weights, stream)?
             .reshape(shape, stream)
     }
+
+    fn forward_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let logits = self.router.forward(&flat, stream)?;
+        let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
+        execute(&flat, &indices, &weights, stream)?.reshape(shape, stream)
+    }
 }
 
 /// One GPT-OSS decoder block.
@@ -544,6 +560,30 @@ impl TransformerBlock {
         )?;
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
         hidden.add(self.mlp.forward(&normed, stream)?, stream)
+    }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut LayerCache,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let hidden = x.add(
+            self.self_attn.forward(&normed, mask, cache, stream)?,
+            stream,
+        )?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        hidden.add(
+            self.mlp
+                .forward_with_expert_executor(&normed, stream, execute)?,
+            stream,
+        )
     }
 }
 

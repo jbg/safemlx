@@ -462,7 +462,15 @@ impl Model {
     ) -> Result<Option<crate::expert_cache::ExpertCacheReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => model.expert_cache_report(),
+            Self::GptOssLayerwise(model) => model.expert_cache_report(),
+            Self::InklingLayerwise(model) => model.expert_cache_report(),
+            Self::Lfm2Layerwise(model) => model.expert_cache_report(),
+            Self::NemotronHLayerwise(model) => model.expert_cache_report(),
             Self::Qwen3Layerwise(model) => model.expert_cache_report(),
+            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
+                model.expert_cache_report()
+            }
+            Self::Qwen3VlMoeLayerwise(model) => model.expert_cache_report(),
             _ => Ok(None),
         }
     }
@@ -1799,6 +1807,38 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
+            ModelKind::GptOss => Ok(Model::GptOssLayerwise(
+                crate::gpt_oss::load_gpt_oss_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Inkling => Ok(Model::InklingLayerwise(
+                crate::inkling::load_inkling_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Lfm2 => Ok(Model::Lfm2Layerwise(
+                crate::lfm2::load_lfm2_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::NemotronH => Ok(Model::NemotronHLayerwise(
+                crate::nemotron_h::load_nemotron_h_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
                 crate::qwen3::load_qwen3_sparse_expert_cache_model(
                     model_dir,
@@ -1807,8 +1847,32 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
+            ModelKind::Qwen3Next => Ok(Model::Qwen3NextLayerwise(
+                crate::qwen_hybrid::load_qwen3_next_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoeLayerwise(
+                crate::qwen3_vl::load_qwen3_vl_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen35Moe => Ok(Model::Qwen35MoeLayerwise(
+                crate::qwen_hybrid::load_qwen35_sparse_expert_cache_model(
+                    model_dir,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             _ => Err(Error::UnsupportedArchitecture(format!(
-                "sparse expert caching supports DeepSeek-V3/R1 and sparse Qwen3, not {}",
+                "sparse expert caching requires a supported safetensors MoE architecture, not {}",
                 kind.model_type_name()
             ))),
         };

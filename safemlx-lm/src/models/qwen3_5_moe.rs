@@ -2547,6 +2547,26 @@ impl SparseMoeBlock {
         })
     }
 
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let shared = self.shared_expert.forward(&flat, stream)?.multiply(
+            sigmoid(self.shared_expert_gate.forward(&flat, stream)?, stream)?,
+            stream,
+        )?;
+        let (selected_experts, routing_weights) = self.gate.forward(&flat, stream)?;
+        let routed = execute(&flat, &selected_experts, &routing_weights, stream)?;
+        routed.add(shared, stream)?.reshape(shape, stream)
+    }
+
     /// Forward pass that reports router and expert activations to an observer.
     pub fn forward_with_observer(
         &mut self,
@@ -2698,6 +2718,21 @@ impl FeedForward {
         }
     }
 
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        match self {
+            Self::Dense(mlp) => mlp.forward(input, stream),
+            Self::Moe(moe) => moe.forward_with_expert_executor(input, stream, execute),
+        }
+    }
+
     fn forward_with_observer(
         &mut self,
         input: &Array,
@@ -2800,6 +2835,69 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    pub(crate) fn forward_sparse_experts<F>(
+        &mut self,
+        input: BlockInput<'_>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let BlockInput { x, mask, cache } = input;
+        let residual = x;
+        let h = self.input_layernorm.forward(x, stream)?;
+        let h = match (self.layer_type, cache) {
+            (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerType::FullAttention, _) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?,
+            (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(
+                    LinearAttentionInput {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerType::LinearAttention, _) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(LinearAttentionInput { x: &h, cache: None }, stream)?,
+        };
+        let h = residual.add(h, stream)?;
+        let residual = h.clone();
+        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
+        let h = self
+            .mlp
+            .forward_with_expert_executor(&post_normed, stream, execute)?;
+        residual.add(h, stream)
+    }
+
     /// Creates an unloaded transformer block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         Self::new_with_format(

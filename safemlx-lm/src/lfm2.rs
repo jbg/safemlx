@@ -1,28 +1,39 @@
 //! Unified fully resident and layerwise-host LFM2/LFM2.5 execution.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use safemlx::{
-    error::Exception, module::Module, nn, ops::indexing::TryIndexOp, quantization::MaybeQuantized,
+    error::Exception,
+    module::{Module, Param},
+    nn,
+    ops::indexing::TryIndexOp,
+    quantization::MaybeQuantized,
+    transforms::eval,
     Array, Dtype, Stream,
 };
 
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
     },
     models::{
+        common::moe::PackedSwiGluExperts,
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerType, ModelArgs},
     },
     module_binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
     weight_recipe::DerivedWeightRecipe,
     weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
@@ -51,6 +62,17 @@ impl Lfm2LayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Returns the persistent checkpoint store.
@@ -120,12 +142,49 @@ pub fn load_lfm2_layerwise_model(
     })
 }
 
+/// Loads MoE LFM2 with expert-granular sparse caching.
+pub fn load_lfm2_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Lfm2LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires an LFM2 MoE checkpoint".into(),
+        ));
+    }
+    let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = lfm2_expert_catalog(&args, store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(Lfm2LayerwiseModel { execution })
+}
+
 /// Adapter shared by dense, MoE, attention, and short-convolution LFM2 blocks.
 pub struct Lfm2LayerwiseAdapter {
     args: ModelArgs,
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl Lfm2LayerwiseAdapter {
@@ -154,6 +213,8 @@ impl Lfm2LayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            sparse_expert_cache: false,
+            expert_cache: None,
         })
     }
 
@@ -393,6 +454,24 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         format!("lfm2.layer.{index:05}")
     }
 
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("feed_forward.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
     fn layer_bindings(
         &self,
         _group: usize,
@@ -400,12 +479,32 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        Ok(build_module_bindings_with_recipes(
+        let bindings = build_module_bindings_with_recipes(
             layer,
             &format!("model.layers.{index}"),
             store,
             self.split_expert_recipes(index, store)?,
-        )?)
+        )?;
+        Ok(if self.sparse_expert_cache {
+            bindings
+                .into_iter()
+                .filter(|binding| !binding.name().starts_with("feed_forward.experts."))
+                .collect()
+        } else {
+            bindings
+        })
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".feed_forward.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn forward_layer(
@@ -419,6 +518,80 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
+        if self.sparse_expert_cache && layer.feed_forward.is_moe {
+            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "LFM2 sparse expert cache was not initialized".into(),
+                )
+            })?;
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            return Ok(layer.forward_with_expert_executor(
+                hidden,
+                context.mask.as_ref(),
+                Some(&mut cache.layers[index]),
+                stream,
+                |flat, indices, weights, stream| {
+                    let acquired = expert_cache
+                        .acquire_routes(index, indices, pass, stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let started = Instant::now();
+                    let prefix = format!("model.layers.{index}.feed_forward.experts");
+                    let mut bank = PackedSwiGluExperts::new(
+                        acquired.identities().len() as i32,
+                        self.args.hidden_size,
+                        self.args.moe_intermediate_size,
+                        self.args
+                            .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                        self.args
+                            .weight_quantization_for(&format!("{prefix}.down_proj")),
+                        stream,
+                    )?;
+                    bank.gate_up_proj = Param::new(
+                        acquired
+                            .compact_binding("gate_up_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj = Param::new(
+                        acquired
+                            .compact_binding("down_proj", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_up_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("gate_up_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_scales = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_biases = Param::new(
+                        acquired
+                            .optional_compact_binding("down_proj_biases", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    expert_cache
+                        .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let output = bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+                    eval([&output])?;
+                    acquired
+                        .complete_pending()
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    Ok(output)
+                },
+            )?);
+        }
         Ok(layer.forward(
             hidden,
             context.mask.as_ref(),
@@ -453,6 +626,111 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
     }
 }
 
+pub(crate) fn lfm2_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let keys = store
+        .keys()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut entries = Vec::new();
+    for layer in args.num_dense_layers as usize..args.num_hidden_layers as usize {
+        let prefix = format!("model.layers.{layer}.feed_forward.experts");
+        let packed_gate_up = format!("{prefix}.gate_up_proj");
+        let packed_down = format!("{prefix}.down_proj");
+        for expert in 0..args.num_experts as usize {
+            let identity = ExpertIdentity::new(layer, expert);
+            let mut bindings = Vec::new();
+            if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
+                for (name, key) in [
+                    ("gate_up_proj", &packed_gate_up),
+                    ("down_proj", &packed_down),
+                ] {
+                    let recipe = DerivedWeightRecipe::source(
+                        key.clone(),
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: expert,
+                            end: expert + 1,
+                        },
+                    );
+                    let bytes = recipe.infer(store)?.byte_len();
+                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                }
+                for (name, key) in [
+                    ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
+                    ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
+                    ("down_proj_scales", format!("{packed_down}_scales")),
+                    ("down_proj_biases", format!("{packed_down}_biases")),
+                ] {
+                    if keys.contains(&key) {
+                        let recipe = DerivedWeightRecipe::source(
+                            key,
+                            TensorSelection::Range {
+                                axis: 0,
+                                start: expert,
+                                end: expert + 1,
+                            },
+                        );
+                        let bytes = recipe.infer(store)?.byte_len();
+                        bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    }
+                }
+            } else {
+                if args
+                    .weight_quantization_for(&format!("{prefix}.gate_up_proj"))
+                    .is_some()
+                    || args
+                        .weight_quantization_for(&format!("{prefix}.down_proj"))
+                        .is_some()
+                {
+                    return Err(Error::Quantization(
+                        "split LFM2 experts cannot be lazily load-time quantized; use checkpoint-native packed expert weights"
+                            .into(),
+                    ));
+                }
+                let gate = expert_source(store, &prefix, expert as i32, &["w1", "gate_proj"])?;
+                let up = expert_source(store, &prefix, expert as i32, &["w3", "up_proj"])?;
+                let down = expert_source(store, &prefix, expert as i32, &["w2", "down_proj"])?;
+                for (name, recipe) in [
+                    (
+                        "gate_up_proj",
+                        DerivedWeightRecipe::Stack {
+                            axis: 0,
+                            inputs: vec![DerivedWeightRecipe::Concatenate {
+                                axis: 0,
+                                inputs: vec![gate, up],
+                            }],
+                        },
+                    ),
+                    (
+                        "down_proj",
+                        DerivedWeightRecipe::Stack {
+                            axis: 0,
+                            inputs: vec![down],
+                        },
+                    ),
+                ] {
+                    let bytes = recipe.infer(store)?.byte_len();
+                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                }
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("LFM2 expert byte total overflowed".into())
+                })
+            })?;
+            entries.push(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
 /// LFM2 token generation iterator using layerwise-host execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, Lfm2LayerwiseModel, Cache, S>;
@@ -467,8 +745,9 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::load_lfm2_layerwise_model;
+    use super::{load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model};
     use crate::{
+        expert_cache::ExpertCacheLoadOptions,
         layerwise::LayerwiseLoadOptions,
         models::lfm2::{self as resident, Cache, LayerCache, Model, ModelArgs},
         offload::{OffloadConfig, ResidencyPolicy},
@@ -662,5 +941,43 @@ mod tests {
     #[test]
     fn lfm2_split_moe_hybrid_layerwise_prefill_and_cached_decode_parity() {
         parity(true, 1);
+    }
+
+    #[test]
+    fn lfm2_sparse_expert_cache_prefill_and_decode_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(true), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, gpu.stream());
+        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached =
+            load_lfm2_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
+                .unwrap();
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 4);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
     }
 }

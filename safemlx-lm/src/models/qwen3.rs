@@ -958,6 +958,44 @@ impl TransformerBlock {
         hidden.add(feed_forward, stream)
     }
 
+    pub(crate) fn forward_sparse_experts_with_rotary<C, F>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let AttentionInput { x, mask, cache } = input;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let attention = self.self_attn.forward_with_rotary_embeddings(
+            AttentionInput {
+                x: &normed,
+                mask,
+                cache,
+            },
+            cos,
+            sin,
+            stream,
+        )?;
+        let hidden = x.add(attention, stream)?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normed, stream)?,
+            FeedForward::Moe(moe) => {
+                let shape = normed.shape();
+                let flat = normed.reshape(&[-1, normed.dim(-1)], stream)?;
+                let (indices, weights) = moe.gate.forward(&flat, stream)?;
+                execute(&flat, &indices, &weights, stream)?.reshape(shape, stream)?
+            }
+        };
+        hidden.add(feed_forward, stream)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_expert_parallel<C>(
         &mut self,

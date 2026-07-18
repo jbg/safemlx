@@ -1,18 +1,23 @@
 //! Shared layerwise-host execution for Qwen3-Next and Qwen3.5 text models.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::{Module, ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp},
     quantization::MaybeQuantized,
+    transforms::eval,
     Array, Stream,
 };
 
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
@@ -21,7 +26,7 @@ use crate::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         qwen3_5_moe::{
-            self as resident, BlockInput, Cache, LayerCache, LayerType, ModelArgs,
+            self as resident, BlockInput, Cache, Experts, LayerCache, LayerType, ModelArgs,
             Qwen3NextRmsNorm, TransformerBlock,
         },
         qwen3_next,
@@ -32,8 +37,9 @@ use crate::{
     },
     module_binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
     weight_recipe::DerivedWeightRecipe,
     weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
@@ -69,6 +75,17 @@ impl QwenHybridLayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Returns the persistent checkpoint store.
@@ -165,6 +182,101 @@ pub fn load_qwen35_layerwise_model(
     )
 }
 
+/// Loads Qwen3-Next with expert-granular sparse caching.
+pub fn load_qwen3_next_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3-Next MoE checkpoint".into(),
+        ));
+    }
+    load_qwen_hybrid_sparse_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen3Next,
+        None,
+        None,
+        None,
+        options,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Loads Qwen3.5 MoE with expert-granular sparse caching.
+pub fn load_qwen35_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let (args, image_token_id, video_token_id, vision) =
+        resident::get_qwen3_5_moe_model_args(model_dir)?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3.5 MoE checkpoint".into(),
+        ));
+    }
+    load_qwen_hybrid_sparse_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen35,
+        image_token_id,
+        video_token_id,
+        vision,
+        options,
+        stream,
+        weights_stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_qwen_hybrid_sparse_model(
+    model_dir: &Path,
+    args: ModelArgs,
+    family: QwenHybridFamily,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    vision_config: Option<VisionConfig>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let mut adapter = QwenHybridLayerwiseAdapter::new(
+        args.clone(),
+        family,
+        image_token_id,
+        video_token_id,
+        vision_config,
+        stream,
+    )?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = qwen_hybrid_expert_catalog(&args, store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(QwenHybridLayerwiseModel { execution })
+}
+
 fn load_qwen_hybrid_layerwise_model(
     model_dir: &Path,
     args: ModelArgs,
@@ -227,6 +339,8 @@ pub struct QwenHybridLayerwiseAdapter {
     vision: Option<QwenVisionLayerwiseStatic>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl QwenHybridLayerwiseAdapter {
@@ -270,6 +384,8 @@ impl QwenHybridLayerwiseAdapter {
             vision,
             image_token_id,
             video_token_id,
+            sparse_expert_cache: false,
+            expert_cache: None,
         })
     }
 
@@ -578,6 +694,161 @@ fn expert_source(
                 "Qwen hybrid checkpoint is missing expert {expert} tensor under {prefix}"
             ))
         })
+}
+
+pub(crate) fn qwen_hybrid_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let normalized = normalized_checkpoint_keys(store);
+    let mut entries = Vec::new();
+    for layer in 0..args.num_hidden_layers as usize {
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        let packed = normalized.contains_key(&format!("{prefix}.gate_up_proj"));
+        for expert in 0..args.num_experts as usize {
+            let identity = ExpertIdentity::new(layer, expert);
+            let mut bindings = Vec::new();
+            if packed {
+                for (name, required) in [
+                    ("gate_up_proj", true),
+                    ("gate_up_proj_scale_inv", false),
+                    ("gate_up_proj_scales", false),
+                    ("gate_up_proj_biases", false),
+                    ("down_proj", true),
+                    ("down_proj_scale_inv", false),
+                    ("down_proj_scales", false),
+                    ("down_proj_biases", false),
+                ] {
+                    let runtime = format!("{prefix}.{name}");
+                    let Some(raw) = normalized.get(&runtime) else {
+                        if required {
+                            return Err(Error::UnsupportedArchitecture(format!(
+                                "Qwen hybrid checkpoint is missing packed expert tensor {runtime}"
+                            )));
+                        }
+                        continue;
+                    };
+                    bindings.push(qwen_hybrid_recipe_binding(
+                        name,
+                        DerivedWeightRecipe::source(
+                            raw.clone(),
+                            TensorSelection::Range {
+                                axis: 0,
+                                start: expert,
+                                end: expert + 1,
+                            },
+                        ),
+                        store,
+                    )?);
+                }
+            } else {
+                let gate = expert_source(
+                    &normalized,
+                    &prefix,
+                    expert as i32,
+                    &["gate_proj", "w1"],
+                    "weight",
+                )?;
+                let up = expert_source(
+                    &normalized,
+                    &prefix,
+                    expert as i32,
+                    &["up_proj", "w3"],
+                    "weight",
+                )?;
+                let down = expert_source(
+                    &normalized,
+                    &prefix,
+                    expert as i32,
+                    &["down_proj", "w2"],
+                    "weight",
+                )?;
+                bindings.push(qwen_hybrid_recipe_binding(
+                    "gate_up_proj",
+                    DerivedWeightRecipe::Stack {
+                        axis: 0,
+                        inputs: vec![DerivedWeightRecipe::Concatenate {
+                            axis: 0,
+                            inputs: vec![gate, up],
+                        }],
+                    },
+                    store,
+                )?);
+                bindings.push(qwen_hybrid_recipe_binding(
+                    "down_proj",
+                    DerivedWeightRecipe::Stack {
+                        axis: 0,
+                        inputs: vec![down],
+                    },
+                    store,
+                )?);
+                if args.uses_fp8() {
+                    let gate = expert_source(
+                        &normalized,
+                        &prefix,
+                        expert as i32,
+                        &["gate_proj"],
+                        "weight_scale_inv",
+                    )?;
+                    let up = expert_source(
+                        &normalized,
+                        &prefix,
+                        expert as i32,
+                        &["up_proj"],
+                        "weight_scale_inv",
+                    )?;
+                    let down = expert_source(
+                        &normalized,
+                        &prefix,
+                        expert as i32,
+                        &["down_proj"],
+                        "weight_scale_inv",
+                    )?;
+                    bindings.push(qwen_hybrid_recipe_binding(
+                        "gate_up_proj_scale_inv",
+                        DerivedWeightRecipe::Stack {
+                            axis: 0,
+                            inputs: vec![DerivedWeightRecipe::Concatenate {
+                                axis: 0,
+                                inputs: vec![gate, up],
+                            }],
+                        },
+                        store,
+                    )?);
+                    bindings.push(qwen_hybrid_recipe_binding(
+                        "down_proj_scale_inv",
+                        DerivedWeightRecipe::Stack {
+                            axis: 0,
+                            inputs: vec![down],
+                        },
+                        store,
+                    )?);
+                }
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "Qwen hybrid expert byte total overflowed".into(),
+                    )
+                })
+            })?;
+            entries.push(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
+fn qwen_hybrid_recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let bytes = recipe.infer(store)?.byte_len();
+    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
 }
 
 /// Input mode for typed prefill and cached text decode.
@@ -982,7 +1253,7 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
-        Ok(build_module_bindings_with_recipes(
+        let bindings = build_module_bindings_with_recipes(
             layer,
             &prefix,
             store,
@@ -992,7 +1263,47 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                 store,
                 (self.execution_group_id(group)? == "text_decoder").then_some(index),
             )?,
-        )?)
+        )?;
+        Ok(
+            if self.sparse_expert_cache && self.execution_group_id(group)? == "text_decoder" {
+                bindings
+                    .into_iter()
+                    .filter(|binding| !binding.name().starts_with("mlp.experts."))
+                    .collect()
+            } else {
+                bindings
+            },
+        )
+    }
+
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("mlp.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn forward_layer(
@@ -1019,6 +1330,85 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                     vision.capture_deepstack(index, &job.hidden, &mut job.state, stream)?;
                 }
                 Ok(context.vision_jobs[0].hidden.clone())
+            }
+            ("text_decoder", QwenHybridLayer::Text(block)) if self.sparse_expert_cache => {
+                let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "Qwen hybrid sparse expert cache was not initialized".into(),
+                    )
+                })?;
+                let pass = if hidden.dim(1) > 1 {
+                    ExpertPass::Prefill
+                } else {
+                    ExpertPass::Decode
+                };
+                Ok(block.forward_sparse_experts(
+                    BlockInput {
+                        x: hidden,
+                        mask: context.mask.as_ref(),
+                        cache: Some(&mut cache.layers[index]),
+                    },
+                    stream,
+                    |flat, indices, weights, stream| {
+                        let acquired = expert_cache
+                            .acquire_routes(index, indices, pass, stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                        let started = Instant::now();
+                        let mut compact_args = self.args.clone();
+                        compact_args.num_experts = acquired.identities().len() as i32;
+                        let mut bank = Experts::new(&compact_args, index, stream)?;
+                        bank.gate_up_proj = Param::new(
+                            acquired
+                                .compact_binding("gate_up_proj", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.gate_up_proj_scale_inv = Param::new(
+                            acquired
+                                .optional_compact_binding("gate_up_proj_scale_inv", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.gate_up_proj_scales = Param::new(
+                            acquired
+                                .optional_compact_binding("gate_up_proj_scales", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.gate_up_proj_biases = Param::new(
+                            acquired
+                                .optional_compact_binding("gate_up_proj_biases", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.down_proj = Param::new(
+                            acquired
+                                .compact_binding("down_proj", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.down_proj_scale_inv = Param::new(
+                            acquired
+                                .optional_compact_binding("down_proj_scale_inv", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.down_proj_scales = Param::new(
+                            acquired
+                                .optional_compact_binding("down_proj_scales", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        bank.down_proj_biases = Param::new(
+                            acquired
+                                .optional_compact_binding("down_proj_biases", stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?,
+                        );
+                        expert_cache
+                            .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                        let output =
+                            bank.forward_chunked(flat, acquired.compact_routes(), weights, stream)?;
+                        eval([&output])?;
+                        acquired
+                            .complete_pending()
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                        Ok(output)
+                    },
+                )?)
             }
             ("text_decoder", QwenHybridLayer::Text(block)) => Ok(block.forward(
                 BlockInput {
@@ -1147,8 +1537,12 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::{load_qwen35_layerwise_model, load_qwen3_next_layerwise_model};
+    use super::{
+        load_qwen35_layerwise_model, load_qwen35_sparse_expert_cache_model,
+        load_qwen3_next_layerwise_model, load_qwen3_next_sparse_expert_cache_model,
+    };
     use crate::{
+        expert_cache::ExpertCacheLoadOptions,
         layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
@@ -1368,6 +1762,71 @@ mod tests {
     fn qwen35_dense_and_moe_hybrid_layerwise_parity() {
         parity(false, false, 1);
         parity(false, true, 1);
+    }
+
+    fn sparse_expert_cache_parity(next: bool) {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(next, true), None, None, None, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, next, gpu.stream());
+        let mut resident = if next {
+            qwen3_next::load_qwen3_next_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+        } else {
+            resident::load_qwen3_5_moe_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+        };
+        let options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached = if next {
+            load_qwen3_next_sparse_expert_cache_model(
+                dir.path(),
+                options,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
+        } else {
+            load_qwen35_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
+                .unwrap()
+        };
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: None,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 4);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
+    }
+
+    #[test]
+    fn qwen_hybrid_sparse_expert_cache_prefill_and_decode_parity() {
+        sparse_expert_cache_parity(true);
+        sparse_expert_cache_parity(false);
     }
 
     #[test]

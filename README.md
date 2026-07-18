@@ -42,11 +42,25 @@ scheduling and logical residency within unified memory, not additional model
 capacity. GGUF layerwise residency, KV-cache offload, pinned host buffers, and
 asynchronous overlap are not supported.
 
-DeepSeek-V3/R1 and sparse Qwen3 safetensors can instead use opt-in sparse expert
-caching through `WeightResidency::SparseExpertCache`. Attention, routers,
-normalization, dense MLPs, and DeepSeek shared experts continue through the
-layerwise host engine. Every routed expert is a separate cacheable unit: hot
-copies remain on the execution device, warm copies may remain on the host
+Supported safetensors MoE models can instead use opt-in sparse expert caching
+through `WeightResidency::SparseExpertCache`. This includes DeepSeek-V3/R1,
+GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and
+Qwen3.5-MoE. The cache accepts the checkpoint-native routed-expert layouts used
+by each loader:
+
+| Family | Sparse-cache expert layouts |
+| --- | --- |
+| DeepSeek-V3/R1 | packed or official split experts; dense, affine, and block-FP8 companions |
+| GPT-OSS | native packed MXFP4 blocks, scales, and biases |
+| Inkling | released interleaved `w13` plus `w2`, or runtime-packed banks |
+| LFM2 | packed banks, including affine companions, or split `w1`/`w3`/`w2` experts |
+| Nemotron-H | public split experts or packed banks with affine companions |
+| Qwen3 and Qwen3-VL-MoE | packed dense/affine banks or supported split SwiGLU experts |
+| Qwen3-Next and Qwen3.5-MoE | packed dense/affine/FP8 banks or supported split dense/FP8 experts |
+
+Attention, routers, normalization, dense MLPs, and shared experts continue
+through the layerwise host engine. Every routed expert is a separate cacheable
+unit: hot copies remain on the execution device, warm copies may remain on the host
 stream, and cold experts remain in the persistent checkpoint store. Packed
 expert-major checkpoints are sliced on axis zero before materialization;
 supported split experts use per-expert recipes. Checkpoint-native dense,
@@ -63,9 +77,10 @@ Apple unified memory does not provide extra physical capacity for the logical
 host and device tiers. Disk-backed inference therefore depends heavily on
 routing locality and filesystem page-cache behavior. Storage diagnostics report
 mapped-shard activity and logical transfers, not exact physical disk reads.
-Pure expert parallelism uses the same cache and catalogs only each rank's owned
-global experts. Other MoE families and GGUF are rejected rather than silently
-falling back to eager expert banks.
+Pure expert parallelism uses the DeepSeek and Qwen3 cache paths and catalogs
+only each rank's owned global experts. GGUF remains fully resident and is
+rejected for sparse caching rather than silently falling back to eager expert
+banks.
 
 The route readback, batched pending-residency protocol, remaining synchronous
 evaluation boundaries, and the event-backed completion API needed for genuine

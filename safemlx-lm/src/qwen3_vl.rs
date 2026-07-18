@@ -1,10 +1,10 @@
 //! Shared layerwise-host execution for dense and MoE Qwen3-VL models.
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::{Module, ModuleParameters, Param},
     nn,
     ops::{
         concatenate_axis,
@@ -12,12 +12,14 @@ use safemlx::{
         zeros_dtype,
     },
     quantization::MaybeQuantized,
+    transforms::eval,
     Array, Stream,
 };
 
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    expert_cache::{ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass},
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
@@ -25,14 +27,16 @@ use crate::{
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input,
-        qwen3::{Qwen3Model, TransformerBlock},
+        qwen3::{Experts as QwenExperts, Qwen3Model, TransformerBlock},
         qwen3_vl::{self as resident, Cache, ModelArgs},
         qwen_vl::{
             grid_thw_from_array, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
-    module_binding::{build_module_bindings, populate_module_from_lease},
+    module_binding::{
+        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+    },
     residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
     weight_store::{SafetensorsWeightStore, WeightStore},
@@ -52,6 +56,17 @@ impl Qwen3VlLayerwiseModel {
     /// Returns the parsed multimodal model arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    /// Returns sparse expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Returns the public architecture type.
@@ -149,6 +164,45 @@ pub fn load_qwen3_vl_layerwise_model(
             weights_stream,
         )?,
     })
+}
+
+/// Loads Qwen3-VL-MoE with expert-granular sparse caching.
+pub fn load_qwen3_vl_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3VlLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_qwen3_vl_model_args(model_dir)?;
+    if !args.text_config.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3-VL-MoE checkpoint".into(),
+        ));
+    }
+    let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = crate::qwen3::qwen3_expert_catalog_at(
+        &args.text_config,
+        store.as_ref(),
+        "model.language_model.layers",
+    )?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(Qwen3VlLayerwiseModel { execution })
 }
 
 /// Family-specific input distinguishing typed prefill from cached decode.
@@ -249,6 +303,8 @@ pub struct Qwen3VlLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl Qwen3VlLayerwiseAdapter {
@@ -275,6 +331,8 @@ impl Qwen3VlLayerwiseAdapter {
             embedding: text.embed_tokens,
             norm: text.norm,
             lm_head,
+            sparse_expert_cache: false,
+            expert_cache: None,
         })
     }
 
@@ -564,11 +622,46 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        Ok(build_module_bindings(
-            layer,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-        )?)
+        let bindings =
+            build_module_bindings(layer, &self.layer_checkpoint_prefix(group, index), store)?;
+        Ok(if self.sparse_expert_cache && group == 1 {
+            bindings
+                .into_iter()
+                .filter(|binding| !binding.name().starts_with("mlp.experts."))
+                .collect()
+        } else {
+            bindings
+        })
+    }
+
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("mlp.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn forward_layer(
@@ -594,16 +687,99 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
                 Ok(output)
             }
             (1, Qwen3VlLayer::Text(block)) => {
-                let mut output = block.forward_with_rotary_embeddings(
-                    AttentionInput {
-                        x: hidden,
-                        mask: context.mask.as_ref(),
-                        cache: cache.kv[index].as_mut(),
-                    },
-                    &context.cos,
-                    &context.sin,
-                    stream,
-                )?;
+                let mut output = if self.sparse_expert_cache {
+                    let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Qwen3-VL sparse expert cache was not initialized".into(),
+                        )
+                    })?;
+                    let pass = if hidden.dim(1) > 1 {
+                        ExpertPass::Prefill
+                    } else {
+                        ExpertPass::Decode
+                    };
+                    block.forward_sparse_experts_with_rotary(
+                        AttentionInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: cache.kv[index].as_mut(),
+                        },
+                        &context.cos,
+                        &context.sin,
+                        stream,
+                        |flat, indices, weights, stream| {
+                            let acquired = expert_cache
+                                .acquire_routes(index, indices, pass, stream)
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            let started = Instant::now();
+                            let prefix = format!("model.language_model.layers.{index}.mlp.experts");
+                            let args = &self.args.text_config;
+                            let mut bank = QwenExperts::new(
+                                acquired.identities().len() as i32,
+                                args.hidden_size,
+                                args.moe_intermediate_size,
+                                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                                args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                                stream,
+                            )?;
+                            bank.gate_up_proj = Param::new(
+                                acquired
+                                    .compact_binding("gate_up_proj", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.gate_up_proj_scales = Param::new(
+                                acquired
+                                    .optional_compact_binding("gate_up_proj_scales", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.gate_up_proj_biases = Param::new(
+                                acquired
+                                    .optional_compact_binding("gate_up_proj_biases", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.down_proj = Param::new(
+                                acquired
+                                    .compact_binding("down_proj", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.down_proj_scales = Param::new(
+                                acquired
+                                    .optional_compact_binding("down_proj_scales", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            bank.down_proj_biases = Param::new(
+                                acquired
+                                    .optional_compact_binding("down_proj_biases", stream)
+                                    .map_err(|error| Exception::custom(error.to_string()))?,
+                            );
+                            expert_cache
+                                .record_compact_bank(
+                                    pass,
+                                    acquired.scratch_bytes(),
+                                    started.elapsed(),
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            let output =
+                                bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+                            eval([&output])?;
+                            acquired
+                                .complete_pending()
+                                .map_err(|error| Exception::custom(error.to_string()))?;
+                            Ok(output)
+                        },
+                    )?
+                } else {
+                    block.forward_with_rotary_embeddings(
+                        AttentionInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: cache.kv[index].as_mut(),
+                        },
+                        &context.cos,
+                        &context.sin,
+                        stream,
+                    )?
+                };
                 if let Some(features) = context.deepstack_features.get(index) {
                     let base = zeros_dtype(output.shape(), output.dtype(), stream)?;
                     let features = features.try_index_device((0, .., ..), stream)?;
@@ -747,7 +923,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{models::qwen3_vl as eager, offload::OffloadConfig};
+    use crate::{
+        expert_cache::ExpertCacheLoadOptions, models::qwen3_vl as eager, offload::OffloadConfig,
+    };
 
     fn config(moe: bool) -> serde_json::Value {
         let model_type = if moe { "qwen3_vl_moe" } else { "qwen3_vl" };
@@ -932,5 +1110,69 @@ mod tests {
     #[test]
     fn qwen3_vl_moe_multimodal_and_decode_parity() {
         parity(true, 1);
+    }
+
+    #[test]
+    fn qwen3_vl_moe_sparse_expert_cache_multimodal_and_decode_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join("config.json"),
+            serde_json::to_vec(&config(true)).unwrap(),
+        )
+        .unwrap();
+        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
+        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, true);
+        let mut resident =
+            eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached = load_qwen3_vl_sparse_expert_cache_model(
+            dir.path(),
+            options,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let before = Array::from_slice(&[1u32], &[1, 1]);
+        let after = Array::from_slice(&[2u32], &[1, 1]);
+        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
+        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let parts = [
+            input::InputPart::text_token_ids(&before),
+            input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
+            input::InputPart::text_token_ids(&after),
+        ];
+        let prompt = input::ModelInput::new(&parts);
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = cached.new_cache();
+        let expected = resident
+            .prefill_input_logits(prompt, &mut resident_cache, gpu.stream())
+            .unwrap();
+        let prompt = input::ModelInput::new(&parts);
+        let actual = cached
+            .prefill_input_logits(prompt, &mut cached_cache, gpu.stream())
+            .unwrap();
+        assert_close(&actual, &expected);
+        let token = Array::from_slice(&[3u32], &[1, 1]);
+        let expected = resident
+            .decode_logits(&token, &mut resident_cache, gpu.stream())
+            .unwrap();
+        let actual = cached
+            .decode_logits(&token, &mut cached_cache, gpu.stream())
+            .unwrap();
+        assert_close(&actual, &expected);
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 8);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
     }
 }

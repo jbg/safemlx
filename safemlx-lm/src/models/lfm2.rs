@@ -631,6 +631,28 @@ impl FeedForward {
             },
         })
     }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        if !self.is_moe {
+            return self.forward(x, stream);
+        }
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let (indices, weights) = self
+            .gate
+            .as_mut()
+            .expect("MoE gate")
+            .forward_with_selection_bias(&flat, self.expert_bias.as_ref().as_ref(), stream)?;
+        execute(&flat, &indices, &weights, stream)?.reshape(shape, stream)
+    }
 }
 
 impl Module<&Array> for FeedForward {
@@ -838,6 +860,59 @@ impl DecoderLayer {
         let feed_forward = self
             .feed_forward
             .forward(&self.ffn_norm.forward(&h, stream)?, stream)?;
+        h.add(feed_forward, stream)
+    }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.operator_norm.forward(x, stream)?;
+        let operator = match (self.layer_type, cache) {
+            (LayerType::FullAttention, Some(LayerCache::Attention(cache))) => {
+                self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerType::FullAttention, _) => {
+                self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?
+            }
+            (LayerType::Conv, Some(LayerCache::Conv(cache))) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, Some(cache), stream)?,
+            (LayerType::Conv, _) => {
+                self.conv
+                    .as_mut()
+                    .expect("conv layer")
+                    .forward(&normalized, None, stream)?
+            }
+        };
+        let h = x.add(operator, stream)?;
+        let normalized = self.ffn_norm.forward(&h, stream)?;
+        let feed_forward =
+            self.feed_forward
+                .forward_with_expert_executor(&normalized, stream, execute)?;
         h.add(feed_forward, stream)
     }
 }

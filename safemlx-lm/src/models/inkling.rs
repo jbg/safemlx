@@ -193,7 +193,7 @@ impl TextArgs {
             .unwrap_or(self.intermediate_size)
     }
 
-    fn moe_intermediate_size(&self) -> i32 {
+    pub(crate) fn moe_intermediate_size(&self) -> i32 {
         self.moe_intermediate_size.unwrap_or(self.intermediate_size)
     }
 
@@ -209,7 +209,7 @@ impl TextArgs {
         (layer + 1) % 6 != 0
     }
 
-    fn is_dense(&self, layer: i32) -> bool {
+    pub(crate) fn is_dense(&self, layer: i32) -> bool {
         if let Some(types) = &self.mlp_layer_types {
             return types
                 .get(layer as usize)
@@ -842,6 +842,32 @@ impl InklingMoe {
                 .forward(&flat, &shared_indices, &shared_weights, stream)?;
         routed.add(shared, stream)?.reshape(&shape, stream)
     }
+
+    fn forward_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let shape = hidden.shape().to_vec();
+        let flat = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
+        let (indices, weights, shared_weights) = self.router.forward(hidden, stream)?;
+        let routed = execute(&flat, &indices, &weights, stream)?;
+        let tokens = flat.dim(0);
+        let shared_indices = broadcast_to(
+            &arange::<i32, i32>(0, self.router.num_shared, 1, stream)?
+                .try_index_device((NewAxis, ..), stream)?,
+            &[tokens, self.router.num_shared],
+            stream,
+        )?;
+        let shared =
+            self.shared_experts
+                .forward(&flat, &shared_indices, &shared_weights, stream)?;
+        routed.add(shared, stream)?.reshape(&shape, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -956,6 +982,50 @@ impl DecoderLayer {
         }
     }
 
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        cache: Option<&mut LayerCache>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        match cache {
+            Some(cache) => {
+                let normalized = self.input_layernorm.forward(hidden, stream)?;
+                let attention = self.self_attn.forward(&normalized, Some(cache), stream)?;
+                let attention = short_convolution(
+                    &self.attn_sconv,
+                    &attention,
+                    Some(&mut cache.convolutions[2]),
+                    stream,
+                )?;
+                let hidden = hidden.add(attention, stream)?;
+                let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+                let mlp = self.forward_mlp_with_expert_executor(&normalized, stream, execute)?;
+                let mlp = short_convolution(
+                    &self.mlp_sconv,
+                    &mlp,
+                    Some(&mut cache.convolutions[3]),
+                    stream,
+                )?;
+                hidden.add(mlp, stream)
+            }
+            None => {
+                let normalized = self.input_layernorm.forward(hidden, stream)?;
+                let attention = self.self_attn.forward(&normalized, None, stream)?;
+                let attention = short_convolution(&self.attn_sconv, &attention, None, stream)?;
+                let hidden = hidden.add(attention, stream)?;
+                let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+                let mlp = self.forward_mlp_with_expert_executor(&normalized, stream, execute)?;
+                let mlp = short_convolution(&self.mlp_sconv, &mlp, None, stream)?;
+                hidden.add(mlp, stream)
+            }
+        }
+    }
+
     fn forward_mlp(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
         if let Some(dense) = &mut self.dense {
             let output = dense.forward(hidden, stream)?;
@@ -968,6 +1038,28 @@ impl DecoderLayer {
             .as_mut()
             .expect("validated sparse layer")
             .forward(hidden, stream)
+    }
+
+    fn forward_mlp_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        if let Some(dense) = &mut self.dense {
+            let output = dense.forward(hidden, stream)?;
+            return match self.dense_global_scale.as_ref() {
+                Some(scale) => output.multiply(scale, stream),
+                None => Ok(output),
+            };
+        }
+        self.moe
+            .as_mut()
+            .expect("validated sparse layer")
+            .forward_with_expert_executor(hidden, stream, execute)
     }
 }
 

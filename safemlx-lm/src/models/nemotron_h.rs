@@ -776,6 +776,26 @@ impl SparseMoeBlock {
             )?,
         })
     }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let (indices, weights) = self.gate.forward(&flat, stream)?;
+        let routed = execute(&flat, &indices, &weights, stream)?;
+        let shared = self
+            .shared_experts
+            .forward(hidden_states, stream)?
+            .reshape(&[-1, shape[2]], stream)?;
+        routed.add(shared, stream)?.reshape(shape, stream)
+    }
 }
 
 impl Module<&Array> for SparseMoeBlock {
@@ -1435,6 +1455,65 @@ impl TransformerBlock {
                 None
             },
         })
+    }
+
+    pub(crate) fn forward_sparse_experts<F>(
+        &mut self,
+        input: BlockInput<'_>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let BlockInput { x, mask, cache } = input;
+        let residual = x;
+        let h = self.norm.forward(x, stream)?;
+        let h = match (self.block_type, cache) {
+            (LayerBlockType::Mamba, Some(LayerCache::Mamba(cache))) => {
+                self.mamba.as_mut().expect("mamba block").forward(
+                    Mamba2Input {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerBlockType::Mamba, _) => self
+                .mamba
+                .as_mut()
+                .expect("mamba block")
+                .forward(Mamba2Input { x: &h, cache: None }, stream)?,
+            (LayerBlockType::Attention, Some(LayerCache::Attention(cache))) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerBlockType::Attention, _) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?
+            }
+            (LayerBlockType::Mlp, _) => {
+                self.mlp.as_mut().expect("mlp block").forward(&h, stream)?
+            }
+            (LayerBlockType::Moe, _) => self
+                .moe
+                .as_mut()
+                .expect("moe block")
+                .forward_with_expert_executor(&h, stream, execute)?,
+        };
+        residual.add(h, stream)
     }
 }
 

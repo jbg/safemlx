@@ -1,28 +1,40 @@
 //! Unified fully resident and layerwise-host GPT-OSS execution.
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use safemlx::{
-    error::Exception, module::Module, nn, ops::indexing::TryIndexOp, quantization::MaybeQuantized,
+    error::Exception,
+    module::{Module, Param},
+    nn,
+    ops::indexing::TryIndexOp,
+    quantization::MaybeQuantized,
+    transforms::eval,
     Array, Dtype, Stream,
 };
 
 use crate::{
     cache::KeyValueCache,
     error::Error,
+    expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, LayerwiseLoadOptions, StaticUnitBindings,
     },
     models::{
         common::{self, generation::CausalLm},
-        gpt_oss::{self as resident, Cache, LayerCache, ModelArgs, TransformerBlock},
+        gpt_oss::{self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock},
         input,
     },
-    module_binding::{build_module_bindings, populate_module_from_lease},
-    residency::{ResidencyReport, ResidentUnitLease},
+    module_binding::{
+        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+    },
+    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
-    weight_store::{SafetensorsWeightStore, WeightStore},
+    weight_recipe::DerivedWeightRecipe,
+    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -48,6 +60,17 @@ impl GptOssLayerwiseModel {
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    /// Returns sparse expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Returns the persistent checkpoint store.
@@ -117,6 +140,36 @@ pub fn load_gpt_oss_layerwise_model(
     })
 }
 
+/// Loads GPT-OSS with expert-granular sparse caching.
+pub fn load_gpt_oss_sparse_expert_cache_model(
+    model_dir: impl AsRef<Path>,
+    options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GptOssLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_model_args(model_dir)?;
+    let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model(
+        model_dir,
+        adapter,
+        options.non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.weight_store_arc();
+    let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+        store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(GptOssLayerwiseModel { execution })
+}
+
 /// Generalized adapter for GPT-OSS native MXFP4 sparse decoder blocks.
 pub struct GptOssLayerwiseAdapter {
     args: ModelArgs,
@@ -124,6 +177,8 @@ pub struct GptOssLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
+    sparse_expert_cache: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl GptOssLayerwiseAdapter {
@@ -152,6 +207,8 @@ impl GptOssLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            sparse_expert_cache: false,
+            expert_cache: None,
         })
     }
 
@@ -300,6 +357,54 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
         format!("model.layers.{index}")
     }
 
+    fn populate_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.sparse_expert_cache {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("mlp.experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn layer_bindings(
+        &self,
+        _group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings = build_module_bindings(layer, &format!("model.layers.{index}"), store)?;
+        Ok(if self.sparse_expert_cache {
+            bindings
+                .into_iter()
+                .filter(|binding| !binding.name().starts_with("mlp.experts."))
+                .collect()
+        } else {
+            bindings
+        })
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.sparse_expert_cache {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| key.contains(".mlp.experts."))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn layer_unit_name(&self, _group: usize, index: usize) -> String {
         format!("gpt_oss.layer.{index:05}")
     }
@@ -330,6 +435,72 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
                 )
             })
             .transpose()?;
+        if self.sparse_expert_cache {
+            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "GPT-OSS sparse expert cache was not initialized".into(),
+                )
+            })?;
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            return Ok(layer.forward_with_expert_executor(
+                hidden,
+                mask.as_ref(),
+                layer_cache,
+                stream,
+                |flat, indices, weights, stream| {
+                    let acquired = expert_cache
+                        .acquire_routes(index, indices, pass, stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let started = Instant::now();
+                    let mut compact_args = self.args.clone();
+                    compact_args.num_local_experts = acquired.identities().len() as i32;
+                    let mut bank = Experts::new(&compact_args, stream)?;
+                    bank.gate_up_proj_blocks = Param::new(
+                        acquired
+                            .compact_binding("gate_up_proj_blocks", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_scales = Param::new(
+                        acquired
+                            .compact_binding("gate_up_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.gate_up_proj_bias = Param::new(
+                        acquired
+                            .compact_binding("gate_up_proj_bias", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_blocks = Param::new(
+                        acquired
+                            .compact_binding("down_proj_blocks", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_scales = Param::new(
+                        acquired
+                            .compact_binding("down_proj_scales", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    bank.down_proj_bias = Param::new(
+                        acquired
+                            .compact_binding("down_proj_bias", stream)
+                            .map_err(|error| Exception::custom(error.to_string()))?,
+                    );
+                    expert_cache
+                        .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let output = bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+                    eval([&output])?;
+                    acquired
+                        .complete_pending()
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    Ok(output)
+                },
+            )?);
+        }
         Ok(layer.forward(hidden, mask.as_ref(), layer_cache, stream)?)
     }
 
@@ -354,6 +525,50 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
     }
 }
 
+pub(crate) fn gpt_oss_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let mut entries = Vec::new();
+    for layer in 0..args.num_hidden_layers as usize {
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        for expert in 0..args.num_local_experts as usize {
+            let identity = ExpertIdentity::new(layer, expert);
+            let mut bindings = Vec::new();
+            for name in [
+                "gate_up_proj_blocks",
+                "gate_up_proj_scales",
+                "gate_up_proj_bias",
+                "down_proj_blocks",
+                "down_proj_scales",
+                "down_proj_bias",
+            ] {
+                let recipe = DerivedWeightRecipe::source(
+                    format!("{prefix}.{name}"),
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: expert,
+                        end: expert + 1,
+                    },
+                );
+                let bytes = recipe.infer(store)?.byte_len();
+                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("GPT-OSS expert byte total overflowed".into())
+                })
+            })?;
+            entries.push(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
 /// GPT-OSS token generation iterator using layerwise-host execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
     common::generation::Generate<'a, GptOssLayerwiseModel, Cache, S>;
@@ -368,9 +583,10 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::load_gpt_oss_layerwise_model;
+    use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
         cache::KeyValueCache,
+        expert_cache::ExpertCacheLoadOptions,
         layerwise::LayerwiseLoadOptions,
         models::gpt_oss::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
         offload::{OffloadConfig, ResidencyPolicy},
@@ -524,5 +740,43 @@ mod tests {
     fn gpt_oss_native_mxfp4_layerwise_prefill_and_cached_decode_parity() {
         parity(1);
         parity(2);
+    }
+
+    #[test]
+    fn gpt_oss_sparse_expert_cache_prefill_and_decode_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(tiny_args(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture);
+        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let options = ExpertCacheLoadOptions::new(
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut cached =
+            load_gpt_oss_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
+                .unwrap();
+        let mut resident_cache = Cache::default();
+        let mut cached_cache = Cache::default();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(&tokens, &mut resident_cache, gpu.stream())
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 4);
+        assert!(report.prefill.requested_routes > 0);
+        assert!(report.decode.requested_routes > 0);
     }
 }
