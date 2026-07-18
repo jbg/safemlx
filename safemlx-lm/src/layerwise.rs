@@ -747,6 +747,12 @@ impl DenseStreamController {
         prefill: bool,
         manager: &ResidencyManager,
     ) -> Result<(), Error> {
+        if self.options.sample_mlx_memory || self.options.sample_process_memory {
+            manager.sample_memory(
+                self.options.sample_mlx_memory,
+                self.options.sample_process_memory,
+            )?;
+        }
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let current = DenseCounterSnapshot::from_report(&offload);
         let mut state = self
@@ -1442,7 +1448,7 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
         let output = self.adapter.finish(&hidden, cache, &context, stream)?;
         eval([&output])?;
         stream.synchronize()?;
-        if self.sample_mlx_memory || self.sample_process_memory {
+        if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }
@@ -1778,7 +1784,7 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         }
 
         let logits = self.adapter.finish(&h, stream)?;
-        if self.sample_mlx_memory || self.sample_process_memory {
+        if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }

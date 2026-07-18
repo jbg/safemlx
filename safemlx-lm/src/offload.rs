@@ -718,6 +718,7 @@ pub struct OffloadTelemetry {
     tier_evictions: [EvictionMetrics; 3],
     mlx_memory: Option<MlxMemoryMetrics>,
     process: ProcessMetrics,
+    process_sampled: bool,
 }
 
 impl OffloadTelemetry {
@@ -825,11 +826,13 @@ impl OffloadTelemetry {
     /// Records an externally obtained process sample.
     pub fn record_process_metrics(&mut self, metrics: ProcessMetrics) {
         self.process = metrics;
+        self.process_sampled = true;
     }
 
     /// Updates process observations using the built-in optional sampler.
     pub fn sample_process_metrics(&mut self) {
         self.process = sample_process_metrics();
+        self.process_sampled = true;
     }
 
     /// Returns an immutable point-in-time report.
@@ -847,6 +850,7 @@ impl OffloadTelemetry {
             tier_evictions: self.tier_evictions,
             mlx_memory: self.mlx_memory,
             process: self.process,
+            process_sampled: self.process_sampled,
         }
     }
 
@@ -871,6 +875,7 @@ pub struct OffloadReport {
     tier_evictions: [EvictionMetrics; 3],
     mlx_memory: Option<MlxMemoryMetrics>,
     process: ProcessMetrics,
+    process_sampled: bool,
 }
 
 impl OffloadReport {
@@ -932,6 +937,11 @@ impl OffloadReport {
     /// Returns the latest optional process sample.
     pub const fn process_metrics(&self) -> ProcessMetrics {
         self.process
+    }
+
+    /// Returns whether process sampling was requested, including unsupported platforms.
+    pub const fn process_sampled(&self) -> bool {
+        self.process_sampled
     }
 }
 
@@ -1103,6 +1113,7 @@ mod tests {
         assert_eq!(report.tier_evictions(MemoryTier::Host).bytes(), 4);
         assert_eq!(report.mlx_memory().unwrap().peak_bytes(), 13);
         assert_eq!(report.process_metrics().rss_bytes(), Some(14));
+        assert!(report.process_sampled());
     }
 
     #[test]
@@ -1118,6 +1129,7 @@ mod tests {
         assert_eq!(snapshot.resident_bytes().get(MemoryTier::Host), 4);
         assert_eq!(snapshot.resident_units().get(MemoryTier::Host), 1);
         assert_eq!(snapshot.evictions(), EvictionMetrics::default());
+        assert!(!snapshot.process_sampled());
 
         telemetry.reset();
         assert_eq!(telemetry.snapshot(), OffloadTelemetry::default().snapshot());
@@ -1162,6 +1174,8 @@ mod tests {
         }
         let mut telemetry = OffloadTelemetry::default();
         telemetry.sample_process_metrics();
-        let _ = telemetry.snapshot().process_metrics();
+        let report = telemetry.snapshot();
+        let _ = report.process_metrics();
+        assert!(report.process_sampled());
     }
 }

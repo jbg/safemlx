@@ -2174,9 +2174,11 @@ mod tests {
         initialize_parameters(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
         write_llama_fixture(dir.path(), &reference);
-        let dense =
+        let mut dense =
             crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
                 .unwrap();
+        dense.sample_mlx_memory = true;
+        dense.sample_process_memory = true;
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
@@ -2204,6 +2206,8 @@ mod tests {
             assert_eq!(layers[0].planned_tier(), MemoryTier::Disk);
             assert!(!layers[0].host_resident());
             assert!(!layers[0].device_resident());
+            assert!(report.residency().offload().mlx_memory().is_none());
+            assert!(!report.residency().offload().process_sampled());
         }
 
         let mut reference_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
@@ -2253,6 +2257,11 @@ mod tests {
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&actual, &expected);
+        }
+        for model in [&first, &last] {
+            let report = model.dense_stream_report().unwrap().unwrap();
+            assert!(report.residency().offload().mlx_memory().is_some());
+            assert!(report.residency().offload().process_sampled());
         }
     }
 
