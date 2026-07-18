@@ -515,9 +515,16 @@ impl DensePassReport {
 
 #[derive(Debug)]
 struct DensePassState {
-    last: DenseCounterSnapshot,
+    active: Option<DensePassActivity>,
     prefill: DensePassReport,
     decode: DensePassReport,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DensePassActivity {
+    prefill: bool,
+    start: DenseCounterSnapshot,
+    peaks: DensePassReport,
 }
 
 #[derive(Debug, Clone)]
@@ -560,7 +567,6 @@ impl DenseStreamController {
                 BackgroundLayerPrefetch::new(manager.clone(), options.background_queue_capacity)
             })
             .transpose()?;
-        let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let groups = groups
             .into_iter()
             .map(|(id, units)| DenseExecutionGroupPlan { id, units })
@@ -578,7 +584,7 @@ impl DenseStreamController {
             groups,
             group_activity: Mutex::new(group_activity),
             pass: Mutex::new(DensePassState {
-                last: DenseCounterSnapshot::from_report(&offload),
+                active: None,
                 prefill: DensePassReport::default(),
                 decode: DensePassReport::default(),
             }),
@@ -709,15 +715,23 @@ impl DenseStreamController {
             .pass
             .lock()
             .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
-        let pass = if prefill {
-            &mut pass.prefill
-        } else {
-            &mut pass.decode
-        };
-        pass.peak_host_layers = pass.peak_host_layers.max(host_layers);
-        pass.peak_host_bytes = pass.peak_host_bytes.max(host_bytes);
-        pass.peak_device_layers = pass.peak_device_layers.max(device_layers);
-        pass.peak_device_bytes = pass.peak_device_bytes.max(device_bytes);
+        let active = pass.active.as_mut().ok_or(
+            crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                "residency was observed without an active forward",
+            ),
+        )?;
+        if active.prefill != prefill {
+            return Err(
+                crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                    "residency observation changed pass category",
+                )
+                .into(),
+            );
+        }
+        active.peaks.peak_host_layers = active.peaks.peak_host_layers.max(host_layers);
+        active.peaks.peak_host_bytes = active.peaks.peak_host_bytes.max(host_bytes);
+        active.peaks.peak_device_layers = active.peaks.peak_device_layers.max(device_layers);
+        active.peaks.peak_device_bytes = active.peaks.peak_device_bytes.max(device_bytes);
         Ok(())
     }
 
@@ -742,11 +756,37 @@ impl DenseStreamController {
         Ok(())
     }
 
-    pub(crate) fn record_forward(
-        &self,
+    pub(crate) fn forward_guard<'a>(
+        &'a self,
         prefill: bool,
-        manager: &ResidencyManager,
-    ) -> Result<(), Error> {
+        manager: &'a ResidencyManager,
+    ) -> Result<DenseStreamForwardGuard<'a>, Error> {
+        let (_, offload, _, _) = manager.telemetry_snapshot()?;
+        let mut state = self
+            .pass
+            .lock()
+            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        if state.active.is_some() {
+            return Err(
+                crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                    "a forward is already active",
+                )
+                .into(),
+            );
+        }
+        state.active = Some(DensePassActivity {
+            prefill,
+            start: DenseCounterSnapshot::from_report(&offload),
+            peaks: DensePassReport::default(),
+        });
+        Ok(DenseStreamForwardGuard {
+            controller: self,
+            manager,
+            armed: true,
+        })
+    }
+
+    fn commit_forward(&self, manager: &ResidencyManager) -> Result<(), Error> {
         if self.options.sample_mlx_memory || self.options.sample_process_memory {
             manager.sample_memory(
                 self.options.sample_mlx_memory,
@@ -759,14 +799,28 @@ impl DenseStreamController {
             .pass
             .lock()
             .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
-        let delta = current.delta(state.last);
-        state.last = current;
-        if prefill {
+        let active = state.active.take().ok_or(
+            crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                "a forward was committed without being started",
+            ),
+        )?;
+        let mut delta = current.delta(active.start);
+        delta.peak_host_layers = active.peaks.peak_host_layers;
+        delta.peak_host_bytes = active.peaks.peak_host_bytes;
+        delta.peak_device_layers = active.peaks.peak_device_layers;
+        delta.peak_device_bytes = active.peaks.peak_device_bytes;
+        if active.prefill {
             state.prefill.accumulate(delta);
         } else {
             state.decode.accumulate(delta);
         }
         Ok(())
+    }
+
+    fn abort_forward(&self) {
+        if let Ok(mut state) = self.pass.lock() {
+            state.active = None;
+        }
     }
 
     pub(crate) fn group_guard<'a>(
@@ -905,6 +959,30 @@ impl DenseStreamController {
                 .transpose()?
                 .unwrap_or_default(),
         })
+    }
+}
+
+pub(crate) struct DenseStreamForwardGuard<'a> {
+    controller: &'a DenseStreamController,
+    manager: &'a ResidencyManager,
+    armed: bool,
+}
+
+impl DenseStreamForwardGuard<'_> {
+    pub(crate) fn complete(mut self) -> Result<(), Error> {
+        let result = self.controller.commit_forward(self.manager);
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for DenseStreamForwardGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.controller.abort_forward();
+        }
     }
 }
 
@@ -1373,6 +1451,11 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             mut context,
         } = self.adapter.begin_forward(input, cache, stream)?;
         let prefill = hidden.dim(1) > 1;
+        let dense_forward = self
+            .dense_stream
+            .as_ref()
+            .map(|streamer| streamer.forward_guard(prefill, &self.residency))
+            .transpose()?;
 
         for (group_index, group) in self.groups.iter().enumerate() {
             let execute_group = self.adapter.should_execute_group(group_index, &context);
@@ -1452,8 +1535,8 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }
-        if let Some(streamer) = &self.dense_stream {
-            streamer.record_forward(prefill, &self.residency)?;
+        if let Some(guard) = dense_forward {
+            guard.complete()?;
         }
         Ok((output, context))
     }
@@ -1728,6 +1811,11 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         } = input;
         let prefill = inputs.dim(1) > 1;
         validate_cache(cache, self.metadata.layer_count)?;
+        let dense_forward = self
+            .dense_stream
+            .as_ref()
+            .map(|streamer| streamer.forward_guard(prefill, &self.residency))
+            .transpose()?;
         let dense_guard = self
             .dense_stream
             .as_ref()
@@ -1788,8 +1876,8 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }
-        if let Some(streamer) = &self.dense_stream {
-            streamer.record_forward(prefill, &self.residency)?;
+        if let Some(guard) = dense_forward {
+            guard.complete()?;
         }
         Ok(logits)
     }
@@ -2217,6 +2305,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        cache::ConcatKeyValueCache,
         llama::{load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel},
         models::llama::{self, ModelArgs},
         offload::TransferDirection,
@@ -2606,6 +2695,98 @@ mod tests {
                 .transfer(TransferDirection::DiskToDevice)
                 .count()
                 >= 3
+        );
+    }
+
+    #[test]
+    fn aborted_dense_forward_does_not_contaminate_completed_pass_telemetry() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut reference =
+            llama::ResidentModel::new(args("llama", true, None), gpu.stream()).unwrap();
+        initialize(&mut reference, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &reference);
+
+        let sizing = load_layerwise_llama(
+            dir.path(),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let metadata = sizing.layerwise_metadata().unwrap();
+        let device_budget = metadata
+            .static_device_bytes()
+            .checked_add(metadata.maximum_window_bytes())
+            .unwrap();
+        let host_budget = metadata.maximum_window_bytes();
+        drop(sizing);
+
+        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();
+        let adapter =
+            crate::llama::LlamaLayerwiseAdapter::new(args("llama", true, None), gpu.stream())
+                .unwrap();
+        let mut streamed =
+            load_layerwise_model(dir.path(), adapter, options, gpu.stream(), cpu.stream()).unwrap();
+
+        {
+            let controller = streamed.dense_stream.as_ref().unwrap();
+            let forward = controller.forward_guard(true, &streamed.residency).unwrap();
+            let group = controller.group_guard(&streamed.residency, streamed.layer_group.id());
+            {
+                let _leases = controller
+                    .prepare(
+                        &streamed.residency,
+                        streamed.layer_group.id(),
+                        streamed.layer_group.units(),
+                        0,
+                        true,
+                    )
+                    .unwrap();
+            }
+            drop(group);
+            drop(forward);
+        }
+
+        let after_abort = streamed.dense_stream_report().unwrap().unwrap();
+        assert_eq!(after_abort.prefill(), DensePassReport::default());
+        assert_eq!(after_abort.decode(), DensePassReport::default());
+        let successful_start = DenseCounterSnapshot::from_report(after_abort.residency().offload());
+
+        let tokens = Array::from_slice(&[1u32], &[1, 1]);
+        let mut cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        streamed
+            .forward_with_cache(
+                LayerwiseInput {
+                    inputs: &tokens,
+                    mask: None,
+                    cache: &mut cache,
+                },
+                gpu.stream(),
+            )
+            .unwrap();
+
+        let report = streamed.dense_stream_report().unwrap().unwrap();
+        assert_eq!(report.prefill(), DensePassReport::default());
+        assert_eq!(report.decode().forwards(), 1);
+        assert_eq!(report.decode().peak_host_layers(), 1);
+        assert_eq!(report.decode().peak_device_layers(), 1);
+        let expected =
+            DenseCounterSnapshot::from_report(report.residency().offload()).delta(successful_start);
+        assert_eq!(report.decode().host_cache(), expected.host_cache);
+        assert_eq!(report.decode().device_cache(), expected.device_cache);
+        assert_eq!(
+            report.decode().disk_to_host_bytes(),
+            expected.disk_to_host_bytes
+        );
+        assert_eq!(
+            report.decode().disk_to_device_bytes(),
+            expected.disk_to_device_bytes
+        );
+        assert_eq!(
+            report.decode().host_to_device_bytes(),
+            expected.host_to_device_bytes
         );
     }
 

@@ -23,6 +23,7 @@ use crate::quantization::{quantize_tensor, WeightQuantization};
 /// parameters and which missing or unused names are accepted.
 #[derive(Debug, Clone, Default)]
 pub struct StrictLoadConfig {
+    allow_all_unused: bool,
     allowed_unused_prefixes: Vec<String>,
     allowed_missing_suffixes: Vec<String>,
     allowed_missing_contains: Vec<String>,
@@ -31,6 +32,12 @@ pub struct StrictLoadConfig {
 }
 
 impl StrictLoadConfig {
+    /// Allows every unused checkpoint tensor while preserving missing-parameter validation.
+    pub fn allow_all_unused(mut self) -> Self {
+        self.allow_all_unused = true;
+        self
+    }
+
     /// Allows unused checkpoint tensors whose names start with `prefix`.
     pub fn allow_unused_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.allowed_unused_prefixes.push(prefix.into());
@@ -62,9 +69,11 @@ impl StrictLoadConfig {
     }
 
     pub(crate) fn is_unused_allowed(&self, key: &str) -> bool {
-        self.allowed_unused_prefixes
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
+        self.allow_all_unused
+            || self
+                .allowed_unused_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
     }
 
     fn is_missing_allowed(&self, key: &str) -> bool {

@@ -803,6 +803,17 @@ fn load_partition(
     load_safetensors_partition_on_streams(model_dir, plan, weights_stream, stream, config)
 }
 
+fn pipeline_load_config(
+    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
+    config: StrictLoadConfig,
+) -> StrictLoadConfig {
+    if dense_stream.is_some_and(|options| !options.strict_loading) {
+        config.allow_all_unused()
+    } else {
+        config
+    }
+}
+
 fn build_pipeline_dense_layers<L, F, B>(
     model_dir: &Path,
     range: Range<usize>,
@@ -1085,13 +1096,8 @@ fn load_llama_pipeline(
         )?;
         insert_module_plan(&mut plan, &head, "lm_head", info.is_last);
     }
-    let partition = load_partition(
-        model_dir,
-        &plan,
-        weights_stream,
-        stream,
-        &StrictLoadConfig::default(),
-    )?;
+    let strict = pipeline_load_config(dense_stream, StrictLoadConfig::default());
+    let partition = load_partition(model_dir, &plan, weights_stream, stream, &strict)?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
     let static_device_bytes = u64::try_from(info.local_parameter_bytes)
@@ -1307,6 +1313,15 @@ impl LlamaStage {
                 .transpose()?
         };
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let dense_forward = self
+            .dense_layers
+            .as_ref()
+            .map(|dense| {
+                dense
+                    .controller
+                    .forward_guard(step.sequence_length > 1, &dense.residency)
+            })
+            .transpose()?;
         if let Some(dense_layers) = &self.dense_layers {
             let dense_guard = dense_layers
                 .controller
@@ -1362,9 +1377,6 @@ impl LlamaStage {
                 stream.synchronize()?;
             }
             dense_guard.complete()?;
-            dense_layers
-                .controller
-                .record_forward(step.sequence_length > 1, &dense_layers.residency)?;
         } else {
             for ((global_layer, layer), cache) in self
                 .range
@@ -1409,7 +1421,7 @@ impl LlamaStage {
                 }
             }
         }
-        if let Some(norm) = &mut self.norm {
+        let output = if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
@@ -1423,10 +1435,14 @@ impl LlamaStage {
                     stream,
                 )?
             };
-            Ok(PipelineStageOutput::Logits(logits))
+            PipelineStageOutput::Logits(logits)
         } else {
-            Ok(PipelineStageOutput::Hidden(hidden))
+            PipelineStageOutput::Hidden(hidden)
+        };
+        if let Some(guard) = dense_forward {
+            guard.complete()?;
         }
+        Ok(output)
     }
 }
 
@@ -1522,6 +1538,7 @@ fn load_deepseek_pipeline(
             source_args.num_hidden_layers + index
         ));
     }
+    strict = pipeline_load_config(dense_stream, strict);
     let partition = load_partition(model_dir, &plan, weights_stream, stream, &strict)?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
@@ -1755,6 +1772,15 @@ impl DeepSeekStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let dense_forward = self
+            .dense_layers
+            .as_ref()
+            .map(|dense| {
+                dense
+                    .controller
+                    .forward_guard(step.sequence_length > 1, &dense.residency)
+            })
+            .transpose()?;
         if let Some(dense_layers) = &self.dense_layers {
             let dense_guard = dense_layers
                 .controller
@@ -1785,9 +1811,6 @@ impl DeepSeekStage {
                 stream.synchronize()?;
             }
             dense_guard.complete()?;
-            dense_layers
-                .controller
-                .record_forward(step.sequence_length > 1, &dense_layers.residency)?;
         } else {
             for ((global_layer, layer), cache) in self
                 .range
@@ -1803,17 +1826,21 @@ impl DeepSeekStage {
                 hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
             }
         }
-        if let Some(norm) = &mut self.norm {
+        let output = if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = self
                 .lm_head
                 .as_mut()
                 .expect("last stage head")
                 .forward(&hidden, stream)?;
-            Ok(PipelineStageOutput::Logits(logits))
+            PipelineStageOutput::Logits(logits)
         } else {
-            Ok(PipelineStageOutput::Hidden(hidden))
+            PipelineStageOutput::Hidden(hidden)
+        };
+        if let Some(guard) = dense_forward {
+            guard.complete()?;
         }
+        Ok(output)
     }
 }
 
@@ -2124,19 +2151,29 @@ mod tests {
         }
     }
 
-    fn write_llama_fixture(dir: &Path, model: &llama::ResidentModel) {
+    fn write_llama_fixture(
+        dir: &Path,
+        model: &llama::ResidentModel,
+        include_unrelated_tensor: bool,
+    ) {
         let params = model.parameters().flatten();
-        let arrays = params
+        let mut arrays = params
             .iter()
             .map(|(name, value)| {
                 (
                     crate::module_binding::canonical_checkpoint_name(name),
-                    *value,
+                    (*value).clone(),
                 )
             })
             .collect::<Vec<_>>();
+        if include_unrelated_tensor {
+            arrays.push((
+                "unrelated.weight".to_string(),
+                Array::from_slice(&[1.0f32], &[1]),
+            ));
+        }
         Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
             None,
             dir.join("model.safetensors"),
         )
@@ -2214,6 +2251,61 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_dense_stream_respects_strict_loading() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut reference = llama::ResidentModel::new(llama_args(true), stream).unwrap();
+        initialize_parameters(&mut reference, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_fixture(dir.path(), &reference, true);
+
+        let mut dense =
+            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
+                .unwrap();
+        let strict_error = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .err()
+        .expect("strict pipeline loading must reject an unrelated checkpoint tensor");
+        assert!(matches!(
+            strict_error,
+            Error::StrictLoadValidation { missing, unused }
+                if missing.is_empty() && unused == ["unrelated.weight"]
+        ));
+
+        dense.strict_loading = false;
+        let model = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+            stream,
+            cpu.stream(),
+        )
+        .expect("non-strict pipeline loading must ignore unrelated checkpoint tensors");
+        assert!(model.dense_stream_report().unwrap().is_some());
+    }
+
+    #[test]
+    fn non_strict_pipeline_config_preserves_architecture_allowances() {
+        let mut dense =
+            crate::dense_stream::DenseDiskStreamLoadOptions::new(8, 0, 0, 1, 0).unwrap();
+        let architecture = StrictLoadConfig::default().allow_unused_prefix("model.mtp.");
+        let strict = pipeline_load_config(Some(dense), architecture.clone());
+        assert!(strict.is_unused_allowed("model.mtp.weight"));
+        assert!(!strict.is_unused_allowed("unrelated.weight"));
+
+        dense.strict_loading = false;
+        let non_strict = pipeline_load_config(Some(dense), architecture);
+        assert!(non_strict.is_unused_allowed("model.mtp.weight"));
+        assert!(non_strict.is_unused_allowed("unrelated.weight"));
+    }
+
+    #[test]
     fn llama_pipeline_dense_stream_is_stage_local_cold_and_matches_decode() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2221,7 +2313,7 @@ mod tests {
         let mut reference = llama::ResidentModel::new(llama_args(true), stream).unwrap();
         initialize_parameters(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
-        write_llama_fixture(dir.path(), &reference);
+        write_llama_fixture(dir.path(), &reference, false);
         let first_requirements =
             llama_pipeline_dense_requirements(dir.path(), gpu_topology(0), stream, cpu.stream());
         let last_requirements =
@@ -2341,7 +2433,7 @@ mod tests {
         let mut reference = llama::ResidentModel::new(llama_args(true), stream).unwrap();
         initialize_parameters(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
-        write_llama_fixture(dir.path(), &reference);
+        write_llama_fixture(dir.path(), &reference, false);
         let (device_bytes, layer_bytes, static_bytes) =
             llama_pipeline_dense_requirements(dir.path(), gpu_topology(0), stream, cpu.stream());
 

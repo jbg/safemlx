@@ -463,6 +463,9 @@ pub enum DenseStreamError {
     /// Shared worker state was poisoned.
     #[error("dense disk streaming worker state is poisoned")]
     StatePoisoned,
+    /// Forward telemetry lifecycle calls were inconsistent.
+    #[error("invalid dense streaming forward telemetry state: {0}")]
+    InvalidForwardTelemetry(&'static str),
     /// The worker ended before accepting or completing required work.
     #[error("dense disk streaming worker disconnected")]
     WorkerDisconnected,
