@@ -24,6 +24,9 @@ use safemlx::{
 
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache_residency::{
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+    },
     error::Error,
     expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -1142,6 +1145,64 @@ impl ExpertParallelModel {
                 ExpertParallelCache::QwenHybrid(model.new_cache())
             }
             ExpertArchitecture::Qwen3Vl(model) => ExpertParallelCache::Qwen3Vl(model.new_cache()),
+        }
+    }
+
+    /// Allocates replicated attention state under an explicit cache policy.
+    ///
+    /// DeepSeek compressed attention and GPT-OSS alternating attention are
+    /// supported. Recurrent, multimodal, and relative-position cache state is
+    /// rejected because it is not represented by paged KV blocks.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<ExpertParallelCache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => match &self.architecture {
+                ExpertArchitecture::DeepSeek(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    let rank = CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: None,
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    };
+                    model
+                        .new_cache_with_manager(manager, Some(rank))
+                        .map(ExpertParallelCache::DeepSeek)
+                        .map_err(Into::into)
+                }
+                ExpertArchitecture::GptOss(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    let rank = CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: None,
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    };
+                    model
+                        .new_cache_with_manager(manager, Some(rank))
+                        .map(ExpertParallelCache::GptOss)
+                        .map_err(Into::into)
+                }
+                _ => Err(Error::Parallel(
+                    "paged cache residency is unsupported for this expert-parallel cache representation"
+                        .into(),
+                )),
+            },
+        }
+    }
+
+    /// Returns aggregate cache-residency telemetry for replicated paged attention state.
+    pub fn cache_residency_report(
+        &self,
+        cache: &ExpertParallelCache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        match cache {
+            ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
+            _ => Ok(None),
         }
     }
 

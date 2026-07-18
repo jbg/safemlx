@@ -14,6 +14,7 @@ use std::{
 
 use safemlx::{
     distributed::{self, Group},
+    error::Exception,
     module::{Module, ModuleParameters},
     nn,
     ops::indexing::TryIndexOp,
@@ -24,7 +25,13 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    cache_residency::{
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+    },
     error::Error,
     inspection::ActivationObserver,
     layerwise::{
@@ -160,6 +167,13 @@ pub enum PipelineLlamaLayerCache {
         /// Layer-local cache state.
         cache: SlidingKeyValueCache,
     },
+    /// Block-addressable full or sliding state.
+    Paged {
+        /// Global decoder-layer index.
+        global_layer: usize,
+        /// Layer-local cache state sharing a stage-wide manager.
+        cache: PagedKeyValueCache,
+    },
 }
 
 /// One globally identified DeepSeek compressed-latent cache entry.
@@ -188,7 +202,8 @@ impl PipelineCache {
                 .iter()
                 .map(|layer| match layer {
                     PipelineLlamaLayerCache::Standard { global_layer, .. }
-                    | PipelineLlamaLayerCache::Sliding { global_layer, .. } => *global_layer,
+                    | PipelineLlamaLayerCache::Sliding { global_layer, .. }
+                    | PipelineLlamaLayerCache::Paged { global_layer, .. } => *global_layer,
                 })
                 .collect(),
             Self::DeepSeek(layers) => layers.iter().map(|layer| layer.global_layer).collect(),
@@ -203,6 +218,9 @@ impl PipelineCache {
                     match layer {
                         PipelineLlamaLayerCache::Standard { cache, .. } => cache.clear(),
                         PipelineLlamaLayerCache::Sliding { cache, .. } => cache.clear(),
+                        PipelineLlamaLayerCache::Paged { cache, .. } => {
+                            let _ = cache.clear();
+                        }
                     }
                 }
             }
@@ -341,6 +359,93 @@ impl PipelineModel {
                     .collect(),
             ),
         }
+    }
+
+    /// Allocates stage-local cache state under an explicit cache policy.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<PipelineCache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                let rank = Some(CacheRankIdentity {
+                    pipeline_rank: Some(self.topology.pipeline_parallel_rank),
+                    tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                        .then_some(self.topology.tensor_parallel_rank),
+                    expert_parallel_rank: (self.topology.expert_parallel_size > 1)
+                        .then_some(self.topology.expert_parallel_rank),
+                });
+                match &self.stage {
+                    ArchitectureStage::Llama(stage) => Ok(PipelineCache::Llama(
+                        stage
+                            .range
+                            .clone()
+                            .map(|global_layer| {
+                                PagedKeyValueCache::new_with_layout(
+                                    manager.clone(),
+                                    global_layer,
+                                    stage.args.sliding_window,
+                                    0,
+                                    rank,
+                                )
+                                .map(|cache| {
+                                    PipelineLlamaLayerCache::Paged {
+                                        global_layer,
+                                        cache,
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )),
+                    ArchitectureStage::DeepSeek(stage) => Ok(PipelineCache::DeepSeek(
+                        stage
+                            .range
+                            .clone()
+                            .map(|global_layer| {
+                                CompressedLatentCache::new_paged(
+                                    manager.clone(),
+                                    global_layer,
+                                    rank,
+                                )
+                                .map(|cache| {
+                                    PipelineDeepSeekLayerCache {
+                                        global_layer,
+                                        cache,
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Returns aggregate cache-residency telemetry for a paged stage cache.
+    pub fn cache_residency_report(
+        &self,
+        cache: &PipelineCache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        let manager = match cache {
+            PipelineCache::Llama(layers) => layers.iter().find_map(|layer| match layer {
+                PipelineLlamaLayerCache::Paged { cache, .. } => Some(cache.manager()),
+                PipelineLlamaLayerCache::Standard { .. }
+                | PipelineLlamaLayerCache::Sliding { .. } => None,
+            }),
+            PipelineCache::DeepSeek(layers) => layers
+                .iter()
+                .find_map(|layer| layer.cache.residency_manager()),
+        };
+        manager
+            .map(|manager| {
+                manager
+                    .report()
+                    .map_err(|error| Exception::custom(error.to_string()).into())
+            })
+            .transpose()
     }
 
     /// Executes only this stage, without communication.
@@ -1287,6 +1392,7 @@ impl LlamaStage {
         let offset = caches.first().map_or(0, |cache| match cache {
             PipelineLlamaLayerCache::Standard { cache, .. } => cache.offset(),
             PipelineLlamaLayerCache::Sliding { cache, .. } => cache.offset(),
+            PipelineLlamaLayerCache::Paged { cache, .. } => cache.offset(),
         });
         let generated_sliding_window = (explicit_mask.is_none() && step.sequence_length > 1)
             .then_some(self.args.sliding_window)
@@ -1368,6 +1474,21 @@ impl LlamaStage {
                         )?;
                         eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
                     }
+                    PipelineLlamaLayerCache::Paged {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
+                    }
                     _ => {
                         return Err(Error::Parallel(format!(
                             "Llama stage cache does not match global layer {global_layer}"
@@ -1400,6 +1521,20 @@ impl LlamaStage {
                         )?;
                     }
                     PipelineLlamaLayerCache::Sliding {
+                        global_layer: cached_layer,
+                        cache,
+                    } if *cached_layer == global_layer => {
+                        hidden = layer.forward(
+                            llama::AttentionInput {
+                                x: &hidden,
+                                mask,
+                                cache: Some(cache),
+                                generated_sliding_window,
+                            },
+                            stream,
+                        )?;
+                    }
+                    PipelineLlamaLayerCache::Paged {
                         global_layer: cached_layer,
                         cache,
                     } if *cached_layer == global_layer => {

@@ -13,7 +13,11 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
+    cache::{KeyValueCache, PagedKeyValueCache},
+    cache_residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest,
+    },
     error::Error,
     expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -55,6 +59,53 @@ impl GptOssLayerwiseModel {
     /// Creates the architecture's alternating sliding/full attention cache.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Creates alternating attention caches independently of weight residency.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => {
+                let adapter = self.execution.adapter();
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                let layers = adapter
+                    .layer_types
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, kind)| {
+                        let window =
+                            (kind == "sliding_attention").then_some(adapter.args.sliding_window);
+                        PagedKeyValueCache::new(manager.clone(), layer, window)
+                            .map(LayerCache::Paged)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Cache { layers })
+            }
+        }
+    }
+
+    /// Lazily catalogs a compatible persisted alternating-attention prefix.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter();
+        let layers = adapter
+            .layer_types
+            .iter()
+            .enumerate()
+            .map(|(layer, kind)| {
+                let window = (kind == "sliding_attention").then_some(adapter.args.sliding_window);
+                PagedKeyValueCache::new(manager.clone(), layer, window).map(LayerCache::Paged)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((Cache { layers }, manifest))
     }
 
     /// Returns current logical residency and transfer telemetry.

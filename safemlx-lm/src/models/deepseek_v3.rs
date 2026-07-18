@@ -39,7 +39,12 @@ use super::{
     qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
 };
 use crate::{
-    cache::CompressedLatentCache,
+    cache::{BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock},
+    cache_residency::{
+        open_prompt_cache, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheOptions,
+    },
     error::Error,
     inspection::{ActivationObserver, MoeRoutingObservation},
     quantization::{quantize_tensor, AffineQuantization, WeightQuantization},
@@ -485,9 +490,87 @@ impl Cache {
         }
     }
 
+    pub(crate) fn new_with_options(
+        num_layers: i32,
+        policy: CacheResidencyPolicy,
+    ) -> Result<Self, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(Self::new(num_layers)),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Self::new_with_manager(num_layers, manager, None)
+            }
+        }
+    }
+
+    fn new_with_manager(
+        num_layers: i32,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layer_count = usize::try_from(num_layers)
+            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
+        let layers = (0..layer_count)
+            .map(|layer| CompressedLatentCache::new_paged(manager.clone(), layer, rank))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layers })
+    }
+
     /// Returns the common token offset.
     pub fn offset(&self) -> i32 {
         self.layers.first().map_or(0, CompressedLatentCache::offset)
+    }
+
+    /// Returns aggregate compressed-cache residency observations.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .first()
+            .and_then(CompressedLatentCache::residency_manager)
+            .map(|manager| {
+                manager
+                    .report()
+                    .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Finalizes and atomically saves an immutable text prefix.
+    pub fn save_prompt_cache(
+        &mut self,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Exception> {
+        for layer in &mut self.layers {
+            layer.finalize()?;
+        }
+        let manager = self
+            .layers
+            .first()
+            .and_then(CompressedLatentCache::residency_manager)
+            .ok_or_else(|| {
+                Exception::custom(
+                    "prompt-cache persistence requires an explicitly configured paged compressed cache",
+                )
+            })?;
+        manager
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    /// Catalogs compatible compressed prefix blocks without eager array loading.
+    pub fn load_prompt_cache(
+        num_layers: i32,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(Self, PromptCacheManifest), Exception> {
+        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok((Self::new_with_manager(num_layers, manager, None)?, manifest))
     }
 }
 
@@ -925,8 +1008,22 @@ impl MultiHeadLatentAttention {
         observe_activation(observer, prefix, "keys_rope", &k_pe)?;
         let new_k_pe = k_pe.try_index_device((.., 0, .., ..), stream)?;
 
+        let mut paged_block_ids = None;
+        let mut paged_tail = None;
+        let mut paged_manager = None;
         let (cached_latent, cached_k_pe) = if let Some(cache) = cache {
-            cache.update_and_fetch(latent.clone(), new_k_pe.clone(), stream)?
+            let updated = cache.update_and_fetch(latent.clone(), new_k_pe.clone(), stream)?;
+            if cache.is_paged() {
+                if observer.is_some() {
+                    return Err(Exception::custom(
+                        "attention-probability inspection is unavailable for paged compressed-latent attention",
+                    ));
+                }
+                paged_block_ids = cache.paged_block_ids()?;
+                paged_tail = cache.paged_tail_block();
+                paged_manager = cache.residency_manager().cloned();
+            }
+            updated
         } else {
             (latent.clone(), new_k_pe.clone())
         };
@@ -940,7 +1037,82 @@ impl MultiHeadLatentAttention {
         // MLX's fused attention path. Initial prefill uses the compact causal
         // mode; cached chunks use the explicit offset-aware mask constructed by
         // `TextModel`. Persistent state remains compressed and head-independent.
-        let attended = if l > 1 {
+        let attended = if let Some(block_ids) = paged_block_ids {
+            let queries = concatenate_axis(
+                &[q_nope, q_pe.transpose_axes(&[0, 2, 1, 3], stream)?],
+                -1,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+            let manager = paged_manager.expect("paged cache manager captured with block ids");
+            let mut accumulator = BlockwiseAttentionAccumulator::new(
+                &queries,
+                self.softmax_scale,
+                mask,
+                offset as i64,
+                None,
+                0,
+                None,
+                offset as i64 + l as i64,
+                stream,
+            )?;
+            let mut reconstructed_scratch = 0u64;
+            let mut scanned_blocks = 0u64;
+            let mut scanned_bytes = 0u64;
+            for id in block_ids {
+                let lease = manager
+                    .lease_block(&id, stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                let (latent, rotary_key) = match lease.arrays() {
+                    CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
+                        (latent.clone(), rotary_key.clone())
+                    }
+                    _ => {
+                        return Err(Exception::custom(
+                            "paged compressed cache found an incompatible block representation",
+                        ))
+                    }
+                };
+                let mut no_observer = None;
+                let (keys, values) = self.reconstruct_keys_values(
+                    &latent,
+                    &rotary_key,
+                    stream,
+                    prefix,
+                    &mut no_observer,
+                )?;
+                reconstructed_scratch =
+                    reconstructed_scratch.max(keys.nbytes() as u64 + values.nbytes() as u64);
+                let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
+                scanned_blocks += 1;
+                scanned_bytes += lease.bytes();
+                accumulator.accumulate(&block, stream)?;
+                drop(lease);
+            }
+            if let Some(block) = paged_tail {
+                let mut no_observer = None;
+                let (keys, values) = self.reconstruct_keys_values(
+                    &block.latent,
+                    &block.rotary_key,
+                    stream,
+                    prefix,
+                    &mut no_observer,
+                )?;
+                reconstructed_scratch =
+                    reconstructed_scratch.max(keys.nbytes() as u64 + values.nbytes() as u64);
+                let kv_block =
+                    KeyValueAttentionBlock::unleased(block.start, block.end, keys, values);
+                scanned_blocks += 1;
+                scanned_bytes += block.bytes;
+                accumulator.accumulate(&kv_block, stream)?;
+            }
+            let output = accumulator.finish(stream)?;
+            eval([&output])?;
+            manager
+                .record_attention_scan(l > 1, scanned_blocks, scanned_bytes, reconstructed_scratch)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            output.transpose_axes(&[0, 2, 1, 3], stream)?
+        } else if l > 1 {
             let (keys, values) = self.reconstruct_keys_values(
                 &cached_latent,
                 &cached_k_pe,
@@ -2238,6 +2410,36 @@ impl Model {
         Cache::new(self.args.num_hidden_layers)
     }
 
+    /// Creates a device-resident or explicitly bounded paged compressed cache.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        Cache::new_with_options(self.args.num_hidden_layers, policy)
+    }
+
+    pub(crate) fn new_cache_with_manager(
+        &self,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Cache, Exception> {
+        Cache::new_with_manager(self.args.num_hidden_layers, manager, rank)
+    }
+
+    /// Lazily catalogs a compatible persisted compressed prefix.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        Cache::load_prompt_cache(
+            self.args.num_hidden_layers,
+            directory,
+            expected,
+            prefix_token_ids,
+            options,
+        )
+    }
+
     /// Returns the dispatched model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
@@ -3374,6 +3576,7 @@ mod tests {
     use super::{load_model, parse_config_value, FeedForward, Model, ModelArgs, ModelInput};
     use crate::{
         cache::CompressedLatentCache,
+        cache_residency::{CacheResidencyPolicy, PagedCacheOptions},
         error::Error,
         inspection::{ActivationObserver, MoeRoutingObservation},
         models::{LoadedModel, ModelKind},
@@ -4069,6 +4272,79 @@ mod tests {
         let (latent, rotary) = cache.layers[0].arrays().unwrap();
         assert_eq!(latent.shape(), &[1, 4, 4]);
         assert_eq!(rotary.shape(), &[1, 4, 2]);
+    }
+
+    #[test]
+    fn paged_compressed_prefill_and_decode_match_resident_cache() {
+        let context = test_context();
+        let stream = context.stream();
+        let mut resident = Model::new(tiny_args(Some(4)), stream).unwrap();
+        initialize_dense_model(&mut resident, stream);
+        let mut paged = resident.clone();
+        let prompt = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let mut resident_cache = resident.new_cache();
+        let options = PagedCacheOptions::new(2, 192, 4096, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut paged_cache = paged
+            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+            .unwrap();
+
+        for model_cache in [&mut resident_cache, &mut paged_cache] {
+            let model = if model_cache.layers[0].is_paged() {
+                &mut paged
+            } else {
+                &mut resident
+            };
+            model
+                .forward(
+                    ModelInput {
+                        inputs: &prompt,
+                        mask: None,
+                        cache: Some(model_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+        }
+
+        for token in [4i32, 5] {
+            let decode = Array::from_slice(&[token], &[1, 1]);
+            let expected = resident
+                .forward(
+                    ModelInput {
+                        inputs: &decode,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = paged
+                .forward(
+                    ModelInput {
+                        inputs: &decode,
+                        mask: None,
+                        cache: Some(&mut paged_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            let max_error = actual
+                .subtract(expected, stream)
+                .unwrap()
+                .abs(stream)
+                .unwrap()
+                .max(None, stream)
+                .unwrap()
+                .item::<f32>(stream);
+            assert!(max_error < 1e-4, "paged MLA error {max_error}");
+        }
+        assert_eq!(paged_cache.offset(), 5);
+        let report = paged_cache.residency_report().unwrap().unwrap();
+        assert_eq!(report.logical_cached_tokens, 5);
+        assert!(report.compressed_latent_blocks >= 4);
+        assert!(report.peak_device_bytes <= 192);
     }
 
     #[test]

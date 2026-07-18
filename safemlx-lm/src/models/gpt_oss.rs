@@ -20,7 +20,11 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
+    cache_residency::{
+        open_prompt_cache, CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy,
+        CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+    },
     error::Error,
     models::{common, common::generation::CausalLm, input},
     quantization::WeightQuantization,
@@ -276,15 +280,19 @@ impl Attention {
         q = self.rope.forward(nn::RopeInput { x: &q, offset }, stream)?;
         k = self.rope.forward(nn::RopeInput { x: &k, offset }, stream)?;
         let (k, v) = cache.update_and_fetch(k, v, stream)?;
-        let attended = safemlx::fast::scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            self.scale,
-            mask.map(ScaledDotProductAttentionMask::Array),
-            self.sinks.as_ref(),
-            stream,
-        )?;
+        let attended =
+            match cache.paged_attention(&q, self.scale, mask, Some(self.sinks.as_ref()), stream)? {
+                Some(output) => output,
+                None => safemlx::fast::scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    self.scale,
+                    mask.map(ScaledDotProductAttentionMask::Array),
+                    self.sinks.as_ref(),
+                    stream,
+                )?,
+            };
         self.o_proj.forward(
             &attended
                 .transpose_axes(&[0, 2, 1, 3], stream)?
@@ -594,6 +602,8 @@ pub enum LayerCache {
     Full(ConcatKeyValueCache),
     /// Bounded sliding-attention cache.
     Sliding(SlidingKeyValueCache),
+    /// Block-addressable full or sliding state.
+    Paged(PagedKeyValueCache),
 }
 
 impl KeyValueCache for LayerCache {
@@ -601,6 +611,7 @@ impl KeyValueCache for LayerCache {
         match self {
             Self::Full(cache) => cache.offset(),
             Self::Sliding(cache) => cache.offset(),
+            Self::Paged(cache) => cache.offset(),
         }
     }
 
@@ -608,6 +619,7 @@ impl KeyValueCache for LayerCache {
         match self {
             Self::Full(cache) => cache.max_size(),
             Self::Sliding(cache) => cache.max_size(),
+            Self::Paged(cache) => cache.max_size(),
         }
     }
 
@@ -615,6 +627,25 @@ impl KeyValueCache for LayerCache {
         match self {
             Self::Full(cache) => cache.retained_arrays(),
             Self::Sliding(cache) => cache.retained_arrays(),
+            Self::Paged(cache) => cache.retained_arrays(),
+        }
+    }
+
+    fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(_))
+    }
+
+    fn paged_attention(
+        &mut self,
+        queries: &Array,
+        scale: f32,
+        mask: Option<&Array>,
+        sinks: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Paged(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
+            Self::Full(_) | Self::Sliding(_) => Ok(None),
         }
     }
 
@@ -627,6 +658,7 @@ impl KeyValueCache for LayerCache {
         match self {
             Self::Full(cache) => cache.update_and_fetch(keys, values, stream),
             Self::Sliding(cache) => cache.update_and_fetch(keys, values, stream),
+            Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
         }
     }
 }
@@ -644,12 +676,52 @@ impl Cache {
             match layer {
                 LayerCache::Full(cache) => cache.clear(),
                 LayerCache::Sliding(cache) => cache.clear(),
+                LayerCache::Paged(cache) => {
+                    let _ = cache.clear();
+                }
             }
         }
     }
 
     pub(crate) fn offset(&self) -> i32 {
         self.layers.first().map_or(0, LayerCache::offset)
+    }
+
+    /// Returns aggregate paged-cache residency observations.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .iter()
+            .find_map(|layer| match layer {
+                LayerCache::Paged(cache) => Some(cache),
+                LayerCache::Full(_) | LayerCache::Sliding(_) => None,
+            })
+            .map(|cache| cache.report())
+            .transpose()
+    }
+
+    /// Finalizes and atomically saves an immutable text prefix.
+    pub fn save_prompt_cache(
+        &mut self,
+        destination: impl AsRef<Path>,
+        descriptor: crate::cache_residency::PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &crate::cache_residency::PromptCacheOptions,
+    ) -> Result<crate::cache_residency::PromptCacheManifest, Exception> {
+        let mut manager = None;
+        for layer in &mut self.layers {
+            if let LayerCache::Paged(cache) = layer {
+                cache.finalize()?;
+                manager.get_or_insert_with(|| cache.manager().clone());
+            }
+        }
+        manager
+            .ok_or_else(|| {
+                Exception::custom(
+                    "prompt-cache persistence requires an explicitly configured paged GPT-OSS cache",
+                )
+            })?
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 }
 
@@ -706,6 +778,35 @@ impl GptOssModel {
                 })
                 .collect(),
         }
+    }
+
+    fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                self.new_cache_with_manager(manager, None)
+            }
+        }
+    }
+
+    fn new_cache_with_manager(
+        &self,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Cache, Exception> {
+        let layers = self
+            .layer_types
+            .iter()
+            .enumerate()
+            .map(|(layer, kind)| {
+                let window = (kind == "sliding_attention").then_some(self.sliding_window);
+                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+                    .map(LayerCache::Paged)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Cache { layers })
     }
 
     pub(crate) fn forward(
@@ -824,6 +925,32 @@ impl Model {
     /// Creates alternating full/sliding caches.
     pub fn new_cache(&self) -> Cache {
         self.model.new_cache()
+    }
+
+    /// Creates alternating attention caches under an explicit cache policy.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        self.model.new_cache_with_options(policy)
+    }
+
+    pub(crate) fn new_cache_with_manager(
+        &self,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Cache, Exception> {
+        self.model.new_cache_with_manager(manager, rank)
+    }
+
+    /// Lazily catalogs a compatible persisted alternating-attention prefix.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok((self.new_cache_with_manager(manager, None)?, manifest))
     }
 
     pub(crate) fn forward(

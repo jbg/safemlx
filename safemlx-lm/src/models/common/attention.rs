@@ -186,7 +186,31 @@ pub fn finish_attention<C>(
 where
     C: KeyValueCache,
 {
-    scaled_dot_product_attention(queries, keys, values, cache, scale, mask, stream)?
+    let attention = if let Some(cache) = cache {
+        match cache.paged_attention(&queries, scale, mask, None, stream)? {
+            Some(output) => output,
+            None => scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                Some(cache),
+                scale,
+                mask,
+                stream,
+            )?,
+        }
+    } else {
+        scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            Option::<&mut C>::None,
+            scale,
+            mask,
+            stream,
+        )?
+    };
+    attention
         .transpose_axes(&[0, 2, 1, 3], stream)?
         .reshape(&[batch, seq_len, -1], stream)
 }

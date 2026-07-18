@@ -8,7 +8,11 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
+    cache_residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+    },
     error::Error,
     layerwise::{
         load_layerwise_model, DenseDiskStreamReport, LayerwiseInput, LayerwiseLoadOptions,
@@ -75,6 +79,8 @@ pub enum LlamaCache {
     Standard(Vec<Option<ConcatKeyValueCache>>),
     /// Bounded caches for Mistral-style sliding-window attention.
     Sliding(Vec<Option<SlidingKeyValueCache>>),
+    /// Block-addressable caches sharing one model-wide residency manager.
+    Paged(Vec<Option<PagedKeyValueCache>>),
 }
 
 impl LlamaCache {
@@ -89,6 +95,10 @@ impl LlamaCache {
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
+            Self::Paged(caches) => caches
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
         }
     }
 
@@ -97,7 +107,54 @@ impl LlamaCache {
         match self {
             Self::Standard(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
             Self::Sliding(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
+            Self::Paged(caches) => {
+                for cache in caches.iter_mut().flatten() {
+                    let _ = cache.clear();
+                }
+            }
         }
+    }
+
+    /// Returns aggregate cache-residency telemetry for a paged cache.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Error> {
+        match self {
+            Self::Paged(caches) => caches
+                .iter()
+                .flatten()
+                .next()
+                .map(|cache| cache.report().map_err(Into::into))
+                .transpose(),
+            Self::Standard(_) | Self::Sliding(_) => Ok(None),
+        }
+    }
+
+    /// Finalizes every mutable tail and atomically persists a completed text prefix.
+    pub fn save_prompt_cache(
+        &mut self,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let Self::Paged(caches) = self else {
+            return Err(Exception::custom(
+                "prompt-cache persistence requires an explicitly configured paged cache",
+            )
+            .into());
+        };
+        for cache in caches.iter_mut().flatten() {
+            cache.finalize()?;
+        }
+        let manager = caches
+            .iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
+            .manager()
+            .clone();
+        manager
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()).into())
     }
 }
 
@@ -182,6 +239,62 @@ impl LlamaModel {
         }
     }
 
+    /// Creates a device-resident or explicitly bounded paged model cache.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<LlamaCache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => self.new_paged_cache(options, None),
+        }
+    }
+
+    /// Catalogs a compatible reusable prefix without loading all cache blocks.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(LlamaCache, PromptCacheManifest), Error> {
+        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let cache = self.new_paged_cache_from_manager(manager)?;
+        Ok((cache, manifest))
+    }
+
+    fn new_paged_cache(
+        &self,
+        options: PagedCacheOptions,
+        manager: Option<CacheResidencyManager>,
+    ) -> Result<LlamaCache, Error> {
+        let manager = match manager {
+            Some(manager) => manager,
+            None => CacheResidencyManager::new(options)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        self.new_paged_cache_from_manager(manager)
+    }
+
+    fn new_paged_cache_from_manager(
+        &self,
+        manager: CacheResidencyManager,
+    ) -> Result<LlamaCache, Error> {
+        let args = self.args();
+        let layer_count = usize::try_from(args.num_hidden_layers).map_err(|_| {
+            LlamaModelError::InvalidLayerCount {
+                count: args.num_hidden_layers,
+            }
+        })?;
+        let caches = (0..layer_count)
+            .map(|layer| {
+                PagedKeyValueCache::new(manager.clone(), layer, args.sliding_window).map(Some)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LlamaCache::Paged(caches))
+    }
+
     /// Runs embedding, decoder layers, final normalization, and projection.
     pub fn forward(
         &mut self,
@@ -219,6 +332,24 @@ impl LlamaModel {
                     stream,
                 ),
             (LlamaExecution::LayerwiseHost(model), LlamaCache::Sliding(caches)) => model
+                .forward_with_cache(
+                    LayerwiseInput {
+                        inputs,
+                        mask: None,
+                        cache: caches,
+                    },
+                    stream,
+                ),
+            (LlamaExecution::FullyResident(model), LlamaCache::Paged(caches)) => Ok(model
+                .forward(
+                    resident::ModelInput {
+                        inputs,
+                        mask: None,
+                        cache: caches,
+                    },
+                    stream,
+                )?),
+            (LlamaExecution::LayerwiseHost(model), LlamaCache::Paged(caches)) => model
                 .forward_with_cache(
                     LayerwiseInput {
                         inputs,
@@ -275,13 +406,14 @@ impl LlamaModel {
         let (kind, actual_layers) = match cache {
             LlamaCache::Standard(caches) => ("standard", caches.len()),
             LlamaCache::Sliding(caches) => ("sliding", caches.len()),
+            LlamaCache::Paged(caches) => ("paged", caches.len()),
         };
         let expected_kind = if self.args().sliding_window.is_some() {
             "sliding"
         } else {
             "standard"
         };
-        if kind != expected_kind {
+        if kind != "paged" && kind != expected_kind {
             return Err(LlamaModelError::CacheTypeMismatch {
                 expected: expected_kind,
                 actual: kind,

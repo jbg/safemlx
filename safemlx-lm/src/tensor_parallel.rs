@@ -23,7 +23,13 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    cache_residency::{
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+    },
     error::Error,
     models::{
         common::{
@@ -83,6 +89,8 @@ pub enum TensorParallelLlamaLayerCache {
     Standard(ConcatKeyValueCache),
     /// Bounded sliding-window cache.
     Sliding(SlidingKeyValueCache),
+    /// Block-addressable local-head state.
+    Paged(PagedKeyValueCache),
 }
 
 /// Architecture-checked rank-local tensor-parallel cache.
@@ -101,6 +109,9 @@ impl TensorParallelCache {
             Self::Llama(caches) => caches.iter_mut().for_each(|cache| match cache {
                 TensorParallelLlamaLayerCache::Standard(cache) => cache.clear(),
                 TensorParallelLlamaLayerCache::Sliding(cache) => cache.clear(),
+                TensorParallelLlamaLayerCache::Paged(cache) => {
+                    let _ = cache.clear();
+                }
             }),
             Self::DeepSeek(caches) => caches.iter_mut().for_each(CompressedLatentCache::clear),
         }
@@ -112,6 +123,7 @@ impl TensorParallelCache {
             Self::Llama(caches) => caches.first().map_or(0, |cache| match cache {
                 TensorParallelLlamaLayerCache::Standard(cache) => cache.offset(),
                 TensorParallelLlamaLayerCache::Sliding(cache) => cache.offset(),
+                TensorParallelLlamaLayerCache::Paged(cache) => cache.offset(),
             }),
             Self::DeepSeek(caches) => caches.first().map_or(0, CompressedLatentCache::offset),
         }
@@ -180,6 +192,74 @@ impl TensorParallelModel {
                     .collect(),
             ),
         }
+    }
+
+    /// Allocates rank-local cache state under an explicit cache policy.
+    pub fn new_cache_with_options(
+        &self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<TensorParallelCache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                let rank = Some(CacheRankIdentity {
+                    pipeline_rank: (self.topology.pipeline_parallel_size > 1)
+                        .then_some(self.topology.pipeline_parallel_rank),
+                    tensor_parallel_rank: Some(self.topology.tensor_parallel_rank),
+                    expert_parallel_rank: (self.topology.expert_parallel_size > 1)
+                        .then_some(self.topology.expert_parallel_rank),
+                });
+                match &self.architecture {
+                    TensorArchitecture::Llama(model) => Ok(TensorParallelCache::Llama(
+                        (0..model.layers.len())
+                            .map(|layer| {
+                                PagedKeyValueCache::new_with_layout(
+                                    manager.clone(),
+                                    layer,
+                                    model.global_args.sliding_window,
+                                    0,
+                                    rank,
+                                )
+                                .map(TensorParallelLlamaLayerCache::Paged)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )),
+                    TensorArchitecture::DeepSeek(model) => Ok(TensorParallelCache::DeepSeek(
+                        (0..model.layers.len())
+                            .map(|layer| {
+                                CompressedLatentCache::new_paged(manager.clone(), layer, rank)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Returns aggregate cache-residency telemetry for a paged rank-local cache.
+    pub fn cache_residency_report(
+        &self,
+        cache: &TensorParallelCache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        let manager = match cache {
+            TensorParallelCache::Llama(caches) => caches.iter().find_map(|cache| match cache {
+                TensorParallelLlamaLayerCache::Paged(cache) => Some(cache.manager()),
+                TensorParallelLlamaLayerCache::Standard(_)
+                | TensorParallelLlamaLayerCache::Sliding(_) => None,
+            }),
+            TensorParallelCache::DeepSeek(caches) => caches
+                .iter()
+                .find_map(CompressedLatentCache::residency_manager),
+        };
+        manager
+            .map(|manager| {
+                manager
+                    .report()
+                    .map_err(|error| Error::Parallel(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Runs prefill or decode and returns this rank's vocabulary-logit shard.
@@ -1273,6 +1353,7 @@ fn forward_llama(
     let offset = caches.first().map_or(0, |cache| match cache {
         TensorParallelLlamaLayerCache::Standard(cache) => cache.offset(),
         TensorParallelLlamaLayerCache::Sliding(cache) => cache.offset(),
+        TensorParallelLlamaLayerCache::Paged(cache) => cache.offset(),
     });
     let generated_sliding_window = (explicit_mask.is_none() && sequence > 1)
         .then_some(model.global_args.sliding_window)
@@ -1304,6 +1385,15 @@ fn forward_llama(
                 stream,
             )?,
             TensorParallelLlamaLayerCache::Sliding(cache) => llama_attention(
+                &mut layer.self_attn,
+                &normalized,
+                mask,
+                Some(cache),
+                generated_sliding_window,
+                group,
+                stream,
+            )?,
+            TensorParallelLlamaLayerCache::Paged(cache) => llama_attention(
                 &mut layer.self_attn,
                 &normalized,
                 mask,
