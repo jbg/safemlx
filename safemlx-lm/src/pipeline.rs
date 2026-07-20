@@ -30,7 +30,10 @@ use crate::{
         SlidingKeyValueCache,
     },
     cache_residency::{
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
     },
     error::Error,
     inspection::ActivationObserver,
@@ -211,25 +214,24 @@ impl PipelineCache {
     }
 
     /// Clears retained state without changing local layer ownership.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), Error> {
         match self {
             Self::Llama(layers) => {
                 for layer in layers {
                     match layer {
                         PipelineLlamaLayerCache::Standard { cache, .. } => cache.clear(),
                         PipelineLlamaLayerCache::Sliding { cache, .. } => cache.clear(),
-                        PipelineLlamaLayerCache::Paged { cache, .. } => {
-                            let _ = cache.clear();
-                        }
+                        PipelineLlamaLayerCache::Paged { cache, .. } => cache.clear()?,
                     }
                 }
             }
             Self::DeepSeek(layers) => {
                 for layer in layers {
-                    layer.cache.clear();
+                    layer.cache.clear()?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -446,6 +448,190 @@ impl PipelineModel {
                     .map_err(|error| Exception::custom(error.to_string()).into())
             })
             .transpose()
+    }
+
+    /// Persists this stage's completed paged prefix below a shared cache root.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut PipelineCache,
+        root: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let manager = match cache {
+            PipelineCache::Llama(layers) => {
+                let mut manager = None;
+                for layer in layers {
+                    let PipelineLlamaLayerCache::Paged { cache, .. } = layer else {
+                        return Err(Error::Parallel(
+                            "pipeline prompt persistence requires a paged cache".into(),
+                        ));
+                    };
+                    cache.finalize()?;
+                    manager.get_or_insert_with(|| cache.manager().clone());
+                }
+                manager
+            }
+            PipelineCache::DeepSeek(layers) => {
+                let mut manager = None;
+                for layer in layers {
+                    layer.cache.finalize()?;
+                    if let Some(paged) = layer.cache.residency_manager() {
+                        manager.get_or_insert_with(|| paged.clone());
+                    } else {
+                        return Err(Error::Parallel(
+                            "pipeline prompt persistence requires a paged cache".into(),
+                        ));
+                    }
+                }
+                manager
+            }
+        }
+        .ok_or_else(|| Error::Parallel("cannot persist an empty pipeline stage cache".into()))?;
+        manager
+            .save_prompt_cache(
+                self.prompt_cache_rank_directory(root.as_ref()),
+                descriptor,
+                prefix_token_ids,
+                options,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    /// Opens this stage's compatible persisted prefix without eager array loading.
+    pub fn load_prompt_cache(
+        &self,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(PipelineCache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (manager, manifest) = open_prompt_cache(
+            self.prompt_cache_rank_directory(root.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let rank = Some(CacheRankIdentity {
+            pipeline_rank: Some(self.topology.pipeline_parallel_rank),
+            tensor_parallel_rank: None,
+            expert_parallel_rank: None,
+        });
+        let cache = match &self.stage {
+            ArchitectureStage::Llama(stage) => PipelineCache::Llama(
+                stage
+                    .range
+                    .clone()
+                    .map(|global_layer| {
+                        PagedKeyValueCache::new_with_layout(
+                            manager.clone(),
+                            global_layer,
+                            stage.args.sliding_window,
+                            0,
+                            rank,
+                        )
+                        .map(|cache| PipelineLlamaLayerCache::Paged {
+                            global_layer,
+                            cache,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            ArchitectureStage::DeepSeek(stage) => PipelineCache::DeepSeek(
+                stage
+                    .range
+                    .clone()
+                    .map(|global_layer| {
+                        CompressedLatentCache::new_paged(manager.clone(), global_layer, rank).map(
+                            |cache| PipelineDeepSeekLayerCache {
+                                global_layer,
+                                cache,
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        Ok((cache, manifest))
+    }
+
+    fn prompt_cache_rank_directory(&self, root: &Path) -> PathBuf {
+        root.join(format!("rank-{:05}", self.topology.global_rank))
+    }
+
+    /// Returns the canonical cache-relevant architecture identity for this stage.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
+    }
+
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        let (
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            range,
+            sliding_window,
+        ) = match &self.stage {
+            ArchitectureStage::Llama(stage) => (
+                "llama".to_string(),
+                stage.args.model_type.clone(),
+                crate::models::llama::prompt_cache_architecture_fingerprint(&stage.args),
+                usize::try_from(stage.args.num_hidden_layers)
+                    .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
+                stage.range.clone(),
+                stage.args.sliding_window,
+            ),
+            ArchitectureStage::DeepSeek(stage) => (
+                "deepseek_v3".to_string(),
+                stage.args.model_type.clone(),
+                crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(&stage.args),
+                usize::try_from(stage.args.num_hidden_layers)
+                    .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                stage.range.clone(),
+                None,
+            ),
+        };
+        Ok(PromptCacheModelIdentity {
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            global_layer_start: range.start,
+            global_layer_end: range.end,
+            sliding_window,
+            sink_tokens: 0,
+            topology: PromptCacheTopology {
+                pipeline: Some((
+                    self.topology.pipeline_parallel_size,
+                    self.topology.pipeline_parallel_rank,
+                )),
+                tensor_parallel: None,
+                expert_parallel: None,
+                expert_parallel_cache_replicated: true,
+            },
+            layer_layouts: match &self.stage {
+                ArchitectureStage::Llama(stage) => PromptCacheModelIdentity::key_value_layouts(
+                    stage.range.len(),
+                    stage.args.num_key_value_heads,
+                    stage.args.head_dim,
+                ),
+                ArchitectureStage::DeepSeek(stage) => PromptCacheModelIdentity::compressed_layouts(
+                    stage.range.len(),
+                    stage.args.kv_lora_rank,
+                    stage.args.qk_rope_head_dim,
+                ),
+            },
+        })
     }
 
     /// Executes only this stage, without communication.

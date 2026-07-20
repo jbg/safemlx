@@ -10,8 +10,9 @@ use safemlx::{
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
     error::Error,
     layerwise::{
@@ -103,16 +104,17 @@ impl LlamaCache {
     }
 
     /// Clears retained arrays without changing cache type or window size.
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> Result<(), Error> {
         match self {
             Self::Standard(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
             Self::Sliding(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
             Self::Paged(caches) => {
                 for cache in caches.iter_mut().flatten() {
-                    let _ = cache.clear();
+                    cache.clear()?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Returns aggregate cache-residency telemetry for a paged cache.
@@ -175,6 +177,11 @@ impl LlamaModel {
             LlamaExecution::FullyResident(model) => &model.args,
             LlamaExecution::LayerwiseHost(model) => model.adapter().args(),
         }
+    }
+
+    /// Returns the canonical cache-relevant architecture identity.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        crate::models::llama::prompt_cache_architecture_fingerprint(self.args())
     }
 
     /// Returns whether all parameters use the eager execution-device engine.
@@ -258,8 +265,32 @@ impl LlamaModel {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(LlamaCache, PromptCacheManifest), Error> {
-        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+        let args = self.args();
+        let layer_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "llama".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: crate::models::llama::prompt_cache_architecture_fingerprint(
+                args,
+            ),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window: args.sliding_window,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layouts: PromptCacheModelIdentity::key_value_layouts(
+                layer_count,
+                args.num_key_value_heads,
+                args.head_dim,
+            ),
+        };
+        validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string()))?;
         let cache = self.new_paged_cache_from_manager(manager)?;
         Ok((cache, manifest))
     }

@@ -97,10 +97,12 @@ pub mod weights;
 
 pub use cache::PagedKeyValueCache;
 pub use cache_residency::{
-    inspect_prompt_cache, open_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheRankIdentity,
-    CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheResidencyPolicy,
-    CacheResidencyReport, CacheTier, LiveCacheDiskPolicy, PagedCacheOptions, PromptCacheBlock,
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
+    inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
+    CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
+    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier,
+    LiveCacheDiskPolicy, PagedCacheOptions, PromptCacheBlock, PromptCacheDescriptor,
+    PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use dense_stream::{BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError};
 pub use expert_cache::SparseExpertDenseStreamLoadOptions;

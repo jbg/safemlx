@@ -23,6 +23,7 @@ pub use super::common::generation::sample;
 
 use crate::{
     cache::{KeyValueCache, SlidingKeyValueCache},
+    cache_residency::derive_prompt_cache_architecture_fingerprint,
     error::Error,
     inspection::ActivationObserver,
     models::{
@@ -133,6 +134,79 @@ impl ModelArgs {
             _ => Some(quantization),
         }
     }
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
+        || "none".to_string(),
+        |config| {
+            let mut entries = config.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| key.as_str());
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        FloatOrString::Float(value) => format!("f32:{:08x}", value.to_bits()),
+                        FloatOrString::String(value) => format!("string:{value}"),
+                        FloatOrString::Bool(value) => format!("bool:{value}"),
+                    };
+                    format!("{key}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        },
+    );
+    let mut quantized_weights = args
+        .quantized_weights
+        .as_ref()
+        .map(|weights| weights.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    quantized_weights.sort_unstable();
+    let mut quantized_weight_configs = args
+        .quantized_weight_configs
+        .as_ref()
+        .map(|configs| {
+            configs
+                .iter()
+                .map(|(name, config)| format!("{name}={config:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quantized_weight_configs.sort_unstable();
+    derive_prompt_cache_architecture_fingerprint(
+        "llama",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("intermediate_size", args.intermediate_size.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("num_key_value_heads", args.num_key_value_heads.to_string()),
+            ("head_dim", args.head_dim.to_string()),
+            (
+                "rms_norm_eps",
+                format!("{:08x}", args.rms_norm_eps.to_bits()),
+            ),
+            ("vocab_size", args.vocab_size.to_string()),
+            (
+                "max_position_embeddings",
+                args.max_position_embeddings.to_string(),
+            ),
+            ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
+            ("rope_traditional", args.rope_traditional.to_string()),
+            ("rope_scaling", rope_scaling),
+            ("sliding_window", format!("{:?}", args.sliding_window)),
+            ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
+            ("attention_bias", args.attention_bias.to_string()),
+            ("mlp_bias", args.mlp_bias.to_string()),
+            ("quantization", format!("{:?}", args.weight_quantization())),
+            ("quantized_weights", quantized_weights.join(";")),
+            (
+                "quantized_weight_configs",
+                quantized_weight_configs.join(";"),
+            ),
+        ],
+    )
 }
 
 fn default_true() -> bool {
@@ -1475,6 +1549,30 @@ mod tests {
         assert_eq!(args.head_dim, 128);
         assert_eq!(args.num_key_value_heads, 8);
         assert_eq!(args.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn prompt_cache_architecture_fingerprint_is_derived_from_rope_configuration() {
+        let mut args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"factor": 2.0, "rope_type": "linear"}
+        }))
+        .unwrap();
+        let first = super::prompt_cache_architecture_fingerprint(&args);
+        assert_eq!(first, super::prompt_cache_architecture_fingerprint(&args));
+        args.rope_theta = 500_000.0;
+        let changed = super::prompt_cache_architecture_fingerprint(&args);
+        assert_ne!(first, changed);
     }
 
     #[test]

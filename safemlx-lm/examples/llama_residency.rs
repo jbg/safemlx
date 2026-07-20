@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
     let prefill = prefill_started.elapsed();
     let time_to_first_token = prefill;
 
-    cache.clear();
+    cache.clear()?;
     let repeated_prefill_started = Instant::now();
     let mut logits = model.prefill(&prompt_array, &mut cache, stream)?;
     stream.synchronize()?;

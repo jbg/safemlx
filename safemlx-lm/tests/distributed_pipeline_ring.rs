@@ -10,19 +10,24 @@ use std::{
 
 use safemlx::{
     distributed::{self, Backend},
-    DeviceType, Stream,
+    module::ModuleParameters,
+    Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
 use safemlx_lm::{
+    models::deepseek_v3,
+    module_binding::canonical_checkpoint_name,
     pipeline::{load_pipeline_model, load_pipeline_model_with_options, PipelineStep},
     sampler::DefaultSampler,
-    DenseDiskStreamLoadOptions, DeviceAssignment, ModelLoadOptions, ParallelTopology,
-    WeightResidency,
+    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ModelLoadOptions,
+    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "SAFEMLX_LM_PIPELINE_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_PIPELINE_CHECKPOINT";
 const DENSE_STREAM: &str = "SAFEMLX_LM_PIPELINE_DENSE_STREAM";
+const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_PIPELINE_PROMPT_CACHE";
 
 #[test]
 fn pipeline_ring_worker() {
@@ -31,6 +36,10 @@ fn pipeline_ring_worker() {
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
+    let deepseek = config["model_type"] == "deepseek_v3";
+    let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
         ParallelTopology::from_group(&group, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
@@ -75,21 +84,25 @@ fn pipeline_ring_worker() {
             .any(|name| name == "lm_head.weight"),
         expected_rank == 1
     );
-    assert!(info.local_parameter_bytes < 1_616);
+    if !deepseek {
+        assert!(info.local_parameter_bytes < 1_616);
+    }
     let opened = info
         .opened_checkpoint_shards
         .iter()
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert_eq!(
-        opened.contains(&format!("layer-{expected_rank}.safetensors")),
-        !dense_stream
-    );
-    assert!(!opened.contains(&format!("layer-{}.safetensors", 1 - expected_rank)));
-    assert_eq!(
-        opened.contains(&"input.safetensors".into()),
-        expected_rank == 0
-    );
+    if !deepseek {
+        assert_eq!(
+            opened.contains(&format!("layer-{expected_rank}.safetensors")),
+            !dense_stream
+        );
+        assert!(!opened.contains(&format!("layer-{}.safetensors", 1 - expected_rank)));
+        assert_eq!(
+            opened.contains(&"input.safetensors".into()),
+            expected_rank == 0
+        );
+    }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
         assert_eq!(report.planned_layer_count(), 1);
@@ -99,12 +112,19 @@ fn pipeline_ring_worker() {
             .iter()
             .all(|unit| !unit.host_resident() && !unit.device_resident()));
     }
-    assert_eq!(
-        opened.contains(&"output.safetensors".into()),
-        expected_rank == 1
-    );
+    if !deepseek {
+        assert_eq!(
+            opened.contains(&"output.safetensors".into()),
+            expected_rank == 1
+        );
+    }
 
-    let mut cache = model.new_cache();
+    let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
+        .unwrap()
+        .with_full_attention(true);
+    let mut cache = model
+        .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
+        .unwrap();
     assert_eq!(cache.global_layers(), vec![expected_rank]);
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
     let mut logits = model
@@ -118,6 +138,71 @@ fn pipeline_ring_worker() {
         )
         .unwrap();
     assert_eq!(logits.is_some(), expected_rank == 1);
+    let descriptor = PromptCacheDescriptor {
+        model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
+        effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
+        checkpoint_fingerprint: "pipeline-ring-fixture".into(),
+        architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
+        layer_count: 2,
+        global_layer_start: expected_rank,
+        global_layer_end: expected_rank + 1,
+        batch_size: 1,
+        sliding_window: None,
+        sink_tokens: 0,
+        topology: PromptCacheTopology {
+            pipeline: Some((2, expected_rank)),
+            tensor_parallel: None,
+            expert_parallel: None,
+            expert_parallel_cache_replicated: true,
+        },
+    };
+    model
+        .save_prompt_cache(
+            &mut cache,
+            &prompt_cache_root,
+            descriptor.clone(),
+            &[1, 2],
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
+    let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
+    let uninterrupted = model
+        .forward_pipeline(
+            (expected_rank == 0).then_some(&token),
+            PipelineStep::new(1, 1).unwrap(),
+            None,
+            &mut cache,
+            &group,
+            &stream,
+        )
+        .unwrap();
+    let uninterrupted_values = uninterrupted.as_ref().map(|value| {
+        let value = value.evaluated().unwrap();
+        value.as_slice::<f32>().to_vec()
+    });
+    let (mut cache, manifest) = model
+        .load_prompt_cache(&prompt_cache_root, &descriptor, &[1, 2], paged)
+        .unwrap();
+    assert_eq!(manifest.topology, descriptor.topology);
+    let restored = model
+        .forward_pipeline(
+            (expected_rank == 0).then_some(&token),
+            PipelineStep::new(1, 1).unwrap(),
+            None,
+            &mut cache,
+            &group,
+            &stream,
+        )
+        .unwrap();
+    match (&uninterrupted_values, &restored) {
+        (Some(uninterrupted), Some(restored)) => {
+            let restored = restored.evaluated().unwrap();
+            assert_eq!(uninterrupted, restored.as_slice::<f32>());
+        }
+        (None, None) => {}
+        _ => panic!("pipeline prompt-cache restoration changed stage output ownership"),
+    }
+    logits = restored;
 
     let mut sampler = DefaultSampler;
     for _ in 0..2 {
@@ -320,6 +405,72 @@ fn write_fixture(directory: &Path) {
     .unwrap();
 }
 
+fn write_deepseek_fixture(directory: &Path, layers: i32) {
+    let config = serde_json::json!({
+        "model_type": "deepseek_v3",
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": layers,
+        "num_attention_heads": 2,
+        "vocab_size": 8,
+        "rms_norm_eps": 0.000001,
+        "max_position_embeddings": 64,
+        "rope_theta": 10000.0,
+        "q_lora_rank": null,
+        "kv_lora_rank": 4,
+        "qk_nope_head_dim": 2,
+        "qk_rope_head_dim": 2,
+        "v_head_dim": 2,
+        "first_k_dense_replace": layers,
+        "moe_layer_freq": 1,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "n_group": 2,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.0,
+        "num_nextn_predict_layers": 0,
+        "split_kv_b": false,
+        "tie_word_embeddings": false
+    });
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let args: deepseek_v3::ModelArgs = serde_json::from_value(config.clone()).unwrap();
+    let mut model = deepseek_v3::Model::new(args, stream).unwrap();
+    for (name, parameter) in model.parameters_mut().flatten() {
+        let shape = parameter.shape().to_vec();
+        *parameter = if name.ends_with("norm.weight") {
+            Array::ones::<f32>(&shape, stream).unwrap()
+        } else {
+            Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
+        };
+    }
+    let arrays = model
+        .parameters()
+        .flatten()
+        .into_iter()
+        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
+        .collect::<Vec<_>>();
+    Array::save_safetensors(
+        arrays.iter().map(|(name, value)| (name.as_str(), value)),
+        None,
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    assert!(arrays
+        .iter()
+        .all(|(_, value)| value.dtype() == MlxDtype::Float32));
+}
+
 fn reserve_two_ports() -> (TcpListener, TcpListener, u16, u16) {
     let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let second = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -342,7 +493,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_pipeline() {
-    run_ring_pipeline(false);
+    run_ring_pipeline(false, false);
 }
 
 /// Run with:
@@ -350,13 +501,25 @@ fn ring_two_process_pipeline() {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_dense_stream_pipeline() {
-    run_ring_pipeline(true);
+    run_ring_pipeline(true, false);
 }
 
-fn run_ring_pipeline(dense_stream: bool) {
+/// Verifies DeepSeek MLA paged-prefix persistence across two pipeline stages.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_pipeline_persistence() {
+    run_ring_pipeline(false, true);
+}
+
+fn run_ring_pipeline(dense_stream: bool, deepseek: bool) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    write_fixture(checkpoint.path());
+    if deepseek {
+        write_deepseek_fixture(checkpoint.path(), 2);
+    } else {
+        write_fixture(checkpoint.path());
+    }
+    let prompt_cache = tempfile::tempdir().unwrap();
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();
     let hostfile = ring.path().join("ring-hosts.json");
@@ -365,19 +528,19 @@ fn run_ring_pipeline(dense_stream: bool) {
         format!("[[\"127.0.0.1:{first_port}\"],[\"127.0.0.1:{second_port}\"]]"),
     )
     .unwrap();
-    drop(first_socket);
-    drop(second_socket);
-
     let executable = std::env::current_exe().unwrap();
     let mut children = ChildGuard {
         children: Vec::with_capacity(2),
     };
+    let mut reservations = [Some(first_socket), Some(second_socket)];
     for rank in 0..2 {
+        drop(reservations[rank].take());
         let mut command = Command::new(&executable);
         command
             .args(["--exact", "pipeline_ring_worker", "--nocapture"])
             .env(WORKER_RANK, rank.to_string())
             .env(CHECKPOINT_DIR, checkpoint.path())
+            .env(PROMPT_CACHE_ROOT, prompt_cache.path())
             .env("MLX_RANK", rank.to_string())
             .env("MLX_HOSTFILE", &hostfile)
             .env_remove("MLX_RING_VERBOSE")

@@ -117,7 +117,7 @@ where
             nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
             stream,
         )?;
-        (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+        (keys, values) = cache.update_for_attention(keys, values, stream)?;
     } else {
         queries = rope.forward(nn::RopeInput::new(&queries), stream)?;
         keys = rope.forward(nn::RopeInput::new(&keys), stream)?;
@@ -165,7 +165,7 @@ where
         .multiply(&cos, stream)?
         .add(rotate_half(&keys)?.multiply(&sin, stream)?, stream)?;
     if let Some(cache) = cache.as_mut() {
-        (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+        (keys, values) = cache.update_for_attention(keys, values, stream)?;
     }
     Ok((queries, keys, values))
 }

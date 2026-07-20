@@ -41,9 +41,10 @@ use super::{
 use crate::{
     cache::{BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock},
     cache_residency::{
-        open_prompt_cache, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheOptions,
+        derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
+        validate_prompt_cache_model_identity, CacheBlockArrays, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
     error::Error,
     inspection::{ActivationObserver, MoeRoutingObservation},
@@ -474,6 +475,100 @@ impl ModelArgs {
     }
 }
 
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
+        || "none".to_string(),
+        |config| {
+            [
+                format!("type={}", config.r#type),
+                format!("factor={:08x}", config.factor.to_bits()),
+                format!(
+                    "original_max_position_embeddings={}",
+                    config.original_max_position_embeddings
+                ),
+                format!("beta_fast={:08x}", config.beta_fast.to_bits()),
+                format!("beta_slow={:08x}", config.beta_slow.to_bits()),
+                format!("mscale={:08x}", config.mscale.to_bits()),
+                format!("mscale_all_dim={:08x}", config.mscale_all_dim.to_bits()),
+            ]
+            .join(";")
+        },
+    );
+    let mut quantized_weight_configs = args
+        .quantized_weight_configs
+        .as_ref()
+        .map(|configs| {
+            configs
+                .iter()
+                .map(|(name, config)| format!("{name}={config:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quantized_weight_configs.sort_unstable();
+    derive_prompt_cache_architecture_fingerprint(
+        "deepseek_v3",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("intermediate_size", args.intermediate_size.to_string()),
+            (
+                "moe_intermediate_size",
+                args.moe_intermediate_size.to_string(),
+            ),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("vocab_size", args.vocab_size.to_string()),
+            (
+                "rms_norm_eps",
+                format!("{:08x}", args.rms_norm_eps.to_bits()),
+            ),
+            (
+                "max_position_embeddings",
+                args.max_position_embeddings.to_string(),
+            ),
+            ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
+            ("rope_scaling", rope_scaling),
+            ("q_lora_rank", format!("{:?}", args.q_lora_rank)),
+            ("kv_lora_rank", args.kv_lora_rank.to_string()),
+            ("qk_nope_head_dim", args.qk_nope_head_dim.to_string()),
+            ("qk_rope_head_dim", args.qk_rope_head_dim.to_string()),
+            ("v_head_dim", args.v_head_dim.to_string()),
+            (
+                "first_k_dense_replace",
+                args.first_k_dense_replace.to_string(),
+            ),
+            ("moe_layer_freq", args.moe_layer_freq.to_string()),
+            ("n_routed_experts", args.n_routed_experts.to_string()),
+            ("n_shared_experts", args.n_shared_experts.to_string()),
+            ("num_experts_per_tok", args.num_experts_per_tok.to_string()),
+            ("n_group", args.n_group.to_string()),
+            ("topk_group", args.topk_group.to_string()),
+            ("topk_method", args.topk_method.clone()),
+            ("scoring_func", args.scoring_func.clone()),
+            ("norm_topk_prob", args.norm_topk_prob.to_string()),
+            (
+                "routed_scaling_factor",
+                format!("{:08x}", args.routed_scaling_factor.to_bits()),
+            ),
+            (
+                "num_nextn_predict_layers",
+                args.num_nextn_predict_layers.to_string(),
+            ),
+            (
+                "quantization_config",
+                format!("{:?}", args.quantization_config),
+            ),
+            ("quantization", format!("{:?}", args.quantization)),
+            (
+                "quantized_weight_configs",
+                quantized_weight_configs.join(";"),
+            ),
+            ("split_kv_b", args.split_kv_b.to_string()),
+            ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
+        ],
+    )
+}
+
 /// One compressed MLA cache per decoder layer.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -561,15 +656,17 @@ impl Cache {
     }
 
     /// Catalogs compatible compressed prefix blocks without eager array loading.
-    pub fn load_prompt_cache(
+    pub(crate) fn load_prompt_cache(
         num_layers: i32,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
+        model: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Self, PromptCacheManifest), Exception> {
-        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
-            .map_err(|error| Exception::custom(error.to_string()))?;
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, model, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string()))?;
         Ok((Self::new_with_manager(num_layers, manager, None)?, manifest))
     }
 }
@@ -1011,6 +1108,7 @@ impl MultiHeadLatentAttention {
         let mut paged_block_ids = None;
         let mut paged_tail = None;
         let mut paged_manager = None;
+        let mut paged_global_layer = None;
         let (cached_latent, cached_k_pe) = if let Some(cache) = cache {
             let updated = cache.update_and_fetch(latent.clone(), new_k_pe.clone(), stream)?;
             if cache.is_paged() {
@@ -1022,6 +1120,7 @@ impl MultiHeadLatentAttention {
                 paged_block_ids = cache.paged_block_ids()?;
                 paged_tail = cache.paged_tail_block();
                 paged_manager = cache.residency_manager().cloned();
+                paged_global_layer = cache.paged_global_layer();
             }
             updated
         } else {
@@ -1109,7 +1208,13 @@ impl MultiHeadLatentAttention {
             let output = accumulator.finish(stream)?;
             eval([&output])?;
             manager
-                .record_attention_scan(l > 1, scanned_blocks, scanned_bytes, reconstructed_scratch)
+                .record_attention_scan(
+                    paged_global_layer.expect("paged cache layer captured with block ids"),
+                    l > 1,
+                    scanned_blocks,
+                    scanned_bytes,
+                    reconstructed_scratch,
+                )
                 .map_err(|error| Exception::custom(error.to_string()))?;
             output.transpose_axes(&[0, 2, 1, 3], stream)?
         } else if l > 1 {
@@ -2431,10 +2536,31 @@ impl Model {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = usize::try_from(self.args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "deepseek_v3".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window: None,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layouts: PromptCacheModelIdentity::compressed_layouts(
+                layer_count,
+                self.args.kv_lora_rank,
+                self.args.qk_rope_head_dim,
+            ),
+        };
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
             self.args.num_hidden_layers,
             directory,
             expected,
+            &identity,
             prefix_token_ids,
             options,
         )

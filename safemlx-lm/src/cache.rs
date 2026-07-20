@@ -63,6 +63,20 @@ pub trait KeyValueCache {
         Ok(None)
     }
 
+    /// Adds keys and values for an immediate attention operation.
+    ///
+    /// Paged implementations return only the submitted arrays because the
+    /// subsequent attention call scans history blockwise. Ordinary caches use
+    /// the contiguous history returned by [`KeyValueCache::update_and_fetch`].
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        self.update_and_fetch(keys, values, stream)
+    }
+
     /// Adds the newest keys and values and returns the full keys and values to attend over.
     fn update_and_fetch(
         &mut self,
@@ -146,6 +160,11 @@ impl CompressedLatentCache {
         self.paged.as_deref().map(|paged| &paged.manager)
     }
 
+    /// Returns the global layer identity for a paged compressed cache.
+    pub(crate) fn paged_global_layer(&self) -> Option<usize> {
+        self.paged.as_deref().map(|paged| paged.global_layer)
+    }
+
     /// Returns ordered identities for sealed compressed blocks.
     pub(crate) fn paged_block_ids(&self) -> Result<Option<Vec<CacheBlockId>>, Exception> {
         self.paged
@@ -192,10 +211,9 @@ impl CompressedLatentCache {
     }
 
     /// Clears all retained state.
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> Result<(), Exception> {
         if let Some(paged) = self.paged.as_deref_mut() {
-            let _ = paged.clear();
-            return;
+            return paged.clear();
         }
         self.latent_storage = None;
         self.rotary_key_storage = None;
@@ -204,6 +222,7 @@ impl CompressedLatentCache {
         self.offset = 0;
         self.length = 0;
         self.capacity = 0;
+        Ok(())
     }
 
     fn grown_capacity(&self, required: i32) -> i32 {
@@ -414,32 +433,66 @@ impl PagedCompressedLatentCache {
                 ));
             }
         }
+        let previous_tail_latent = self.tail_latent.clone();
+        let previous_tail_rotary = self.tail_rotary.clone();
+        let previous_tail_start = self.tail_start;
+        let previous_offset = self.offset;
+        let previous_blocks = self.block_ids()?;
+        let result = self.append_inner(latent, rotary, stream);
+        if let Err(error) = result {
+            let rollback = self.rollback_append(
+                previous_tail_latent,
+                previous_tail_rotary,
+                previous_tail_start,
+                previous_offset,
+                &previous_blocks,
+            );
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(Exception::custom(format!(
+                    "{error}; additionally failed to roll back compressed cache append: {rollback}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    fn append_inner(
+        &mut self,
+        latent: Array,
+        rotary: Array,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         let block_size = self.manager.options().block_size_tokens();
         let input_len = latent.dim(1);
         let mut input_start = 0;
         while input_start < input_len {
-            if self.tail_latent.is_none() {
-                self.tail_start = self.offset + input_start as i64;
-            }
+            let candidate_tail_start = if self.tail_latent.is_none() {
+                self.offset + input_start as i64
+            } else {
+                self.tail_start
+            };
             let take = (block_size - self.tail_len()).min(input_len - input_start);
             let input_end = input_start + take;
             let latent_part = latent.try_index_device((.., input_start..input_end, ..), stream)?;
             let rotary_part = rotary.try_index_device((.., input_start..input_end, ..), stream)?;
-            self.tail_latent = Some(match self.tail_latent.take() {
-                Some(previous) => concatenate_axis(&[previous, latent_part], 1, stream)?,
+            let candidate_latent = match &self.tail_latent {
+                Some(previous) => concatenate_axis(&[previous.clone(), latent_part], 1, stream)?,
                 None => latent_part,
-            });
-            self.tail_rotary = Some(match self.tail_rotary.take() {
-                Some(previous) => concatenate_axis(&[previous, rotary_part], 1, stream)?,
+            };
+            let candidate_rotary = match &self.tail_rotary {
+                Some(previous) => concatenate_axis(&[previous.clone(), rotary_part], 1, stream)?,
                 None => rotary_part,
-            });
+            };
+            let candidate_bytes =
+                candidate_latent.nbytes() as u64 + candidate_rotary.nbytes() as u64;
+            let candidate_end = candidate_tail_start + candidate_latent.dim(1) as i64;
             self.manager
-                .set_tail_state(
-                    self.global_layer,
-                    self.tail_bytes(),
-                    self.tail_start + self.tail_len() as i64,
-                )
+                .set_tail_state(self.global_layer, candidate_bytes, candidate_end)
                 .map_err(cache_residency_exception)?;
+            self.tail_start = candidate_tail_start;
+            self.tail_latent = Some(candidate_latent);
+            self.tail_rotary = Some(candidate_rotary);
             input_start = input_end;
             if self.tail_len() == block_size {
                 self.seal_tail()?;
@@ -447,6 +500,50 @@ impl PagedCompressedLatentCache {
         }
         self.offset += input_len as i64;
         Ok(())
+    }
+
+    fn rollback_append(
+        &mut self,
+        previous_tail_latent: Option<Array>,
+        previous_tail_rotary: Option<Array>,
+        previous_tail_start: i64,
+        previous_offset: i64,
+        previous_blocks: &[CacheBlockId],
+    ) -> Result<(), Exception> {
+        self.tail_latent = previous_tail_latent;
+        self.tail_rotary = previous_tail_rotary;
+        self.tail_start = previous_tail_start;
+        self.offset = previous_offset;
+        let current_blocks = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::CompressedLatentRotary,
+                0,
+                i64::MAX,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        let mut rollback_error = None;
+        for id in current_blocks
+            .into_iter()
+            .rev()
+            .filter(|id| !previous_blocks.contains(id))
+        {
+            if let Err(error) = self.manager.remove_block(&id) {
+                rollback_error.get_or_insert_with(|| cache_residency_exception(error));
+            }
+        }
+        if let Err(error) =
+            self.manager
+                .set_tail_state(self.global_layer, self.tail_bytes(), previous_offset)
+        {
+            rollback_error.get_or_insert_with(|| cache_residency_exception(error));
+        }
+        match rollback_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn seal_tail(&mut self) -> Result<(), Exception> {
@@ -572,6 +669,15 @@ where
         T::paged_attention(self, queries, scale, mask, sinks, stream)
     }
 
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        T::update_for_attention(self, keys, values, stream)
+    }
+
     fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -664,6 +770,89 @@ impl PagedKeyValueCache {
         self.manager.report().map_err(cache_residency_exception)
     }
 
+    /// Visits immutable blocks and the live tail intersecting an attention range.
+    ///
+    /// The callback runs while each sealed block is leased, so callers can
+    /// implement architecture-specific blockwise attention without retaining
+    /// the entire key/value history on the device.
+    pub(crate) fn visit_attention_blocks(
+        &self,
+        start: i64,
+        end: i64,
+        stream: &Stream,
+        mut visit: impl FnMut(&KeyValueAttentionBlock) -> Result<(), Exception>,
+    ) -> Result<(u64, u64), Exception> {
+        let ids = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                start,
+                end,
+                self.prefix_tokens as i64,
+            )
+            .map_err(cache_residency_exception)?;
+        let mut scanned_blocks = 0;
+        let mut scanned_bytes = 0;
+        for id in ids {
+            let lease = self
+                .manager
+                .lease_block(&id, stream)
+                .map_err(cache_residency_exception)?;
+            let (keys, values) = match lease.arrays() {
+                CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
+                _ => {
+                    return Err(Exception::custom(
+                        "paged key/value cache found an incompatible block representation",
+                    ))
+                }
+            };
+            let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
+            visit(&block)?;
+            scanned_blocks += 1;
+            scanned_bytes += lease.bytes();
+        }
+        if self.tail_start < end {
+            if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
+                let block = KeyValueAttentionBlock::unleased(
+                    self.tail_start,
+                    self.offset,
+                    keys.clone(),
+                    values.clone(),
+                );
+                visit(&block)?;
+                scanned_blocks += 1;
+                scanned_bytes += block.bytes;
+            }
+        }
+        Ok((scanned_blocks, scanned_bytes))
+    }
+
+    pub(crate) fn record_architecture_attention_scan(
+        &self,
+        prefill: bool,
+        scanned_blocks: u64,
+        scanned_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), Exception> {
+        self.manager
+            .record_attention_scan(
+                self.global_layer,
+                prefill,
+                scanned_blocks,
+                scanned_bytes,
+                scratch_bytes,
+            )
+            .map_err(cache_residency_exception)
+    }
+
+    pub(crate) fn reset_local_after_manager_clear(&mut self) {
+        self.tail_keys = None;
+        self.tail_values = None;
+        self.tail_start = 0;
+        self.offset = 0;
+    }
+
     /// Seals a partially filled tail so it is safe to persist.
     pub fn finalize(&mut self) -> Result<(), Exception> {
         self.seal_tail()
@@ -680,33 +869,35 @@ impl PagedKeyValueCache {
         if len >= self.tail_start {
             let retained = i32::try_from(len - self.tail_start)
                 .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
-            self.tail_keys = self
+            let candidate_keys = self
                 .tail_keys
-                .take()
+                .as_ref()
                 .map(|keys| keys.try_index_device((.., .., ..retained, ..), stream))
                 .transpose()?;
-            self.tail_values = self
+            let candidate_values = self
                 .tail_values
-                .take()
+                .as_ref()
                 .map(|values| values.try_index_device((.., .., ..retained, ..), stream))
                 .transpose()?;
-            if retained == 0 {
-                self.tail_keys = None;
-                self.tail_values = None;
-            }
-            self.offset = len;
+            let (candidate_keys, candidate_values) = if retained == 0 {
+                (None, None)
+            } else {
+                (candidate_keys, candidate_values)
+            };
+            let candidate_bytes = candidate_keys
+                .iter()
+                .chain(candidate_values.iter())
+                .map(|array| array.nbytes() as u64)
+                .sum();
             self.manager
-                .set_tail_state(self.global_layer, self.tail_bytes(), len)
+                .set_tail_state(self.global_layer, candidate_bytes, len)
                 .map_err(cache_residency_exception)?;
+            self.tail_keys = candidate_keys;
+            self.tail_values = candidate_values;
+            self.offset = len;
             return Ok(());
         }
 
-        self.tail_keys = None;
-        self.tail_values = None;
-        self.tail_start = len;
-        self.manager
-            .set_tail_state(self.global_layer, 0, len)
-            .map_err(cache_residency_exception)?;
         let ids = self
             .manager
             .layer_block_ids(
@@ -717,45 +908,47 @@ impl PagedKeyValueCache {
                 self.prefix_tokens as i64,
             )
             .map_err(cache_residency_exception)?;
-        for id in ids.into_iter().rev() {
-            if id.start >= len {
-                self.manager
-                    .remove_block(&id)
-                    .map_err(cache_residency_exception)?;
-            } else if id.end > len {
-                let lease = self
-                    .manager
-                    .lease_block(&id, stream)
-                    .map_err(cache_residency_exception)?;
-                let retained = i32::try_from(len - id.start)
-                    .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
-                let (keys, values) = match lease.arrays() {
-                    CacheBlockArrays::KeyValue { keys, values } => (
-                        keys.try_index_device((.., .., ..retained, ..), stream)?,
-                        values.try_index_device((.., .., ..retained, ..), stream)?,
-                    ),
-                    _ => {
-                        return Err(Exception::custom(
-                            "paged key/value cache found an incompatible block representation",
-                        ))
-                    }
-                };
-                drop(lease);
-                self.manager
-                    .remove_block(&id)
-                    .map_err(cache_residency_exception)?;
-                self.manager
-                    .seal_block(
-                        self.global_layer,
-                        id.start,
-                        len,
-                        self.rank,
-                        CacheBlockArrays::KeyValue { keys, values },
-                        len <= self.prefix_tokens as i64,
-                    )
-                    .map_err(cache_residency_exception)?;
-            }
-        }
+        let crossing = ids.into_iter().find(|id| id.start < len && id.end > len);
+        let mut crossing_lease = None;
+        let replacement = if let Some(id) = crossing {
+            let lease = self
+                .manager
+                .lease_block(&id, stream)
+                .map_err(cache_residency_exception)?;
+            let retained = i32::try_from(len - id.start)
+                .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
+            let (keys, values) = match lease.arrays() {
+                CacheBlockArrays::KeyValue { keys, values } => (
+                    keys.try_index_device((.., .., ..retained, ..), stream)?,
+                    values.try_index_device((.., .., ..retained, ..), stream)?,
+                ),
+                _ => {
+                    return Err(Exception::custom(
+                        "paged key/value cache found an incompatible block representation",
+                    ))
+                }
+            };
+            safemlx::transforms::eval([&keys, &values])?;
+            stream.synchronize()?;
+            let keys = keys.deep_clone()?;
+            let values = values.deep_clone()?;
+            crossing_lease = Some(lease);
+            Some((id, CacheBlockArrays::KeyValue { keys, values }))
+        } else {
+            None
+        };
+        self.manager
+            .truncate_layer_transaction(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                len,
+                replacement,
+                self.prefix_tokens as i64,
+            )
+            .map_err(cache_residency_exception)?;
+        drop(crossing_lease);
+        self.tail_keys = None;
+        self.tail_values = None;
         self.offset = len;
         self.tail_start = len;
         Ok(())
@@ -851,34 +1044,76 @@ impl PagedKeyValueCache {
                 ));
             }
         }
+        let previous_tail_keys = self.tail_keys.clone();
+        let previous_tail_values = self.tail_values.clone();
+        let previous_tail_start = self.tail_start;
+        let previous_offset = self.offset;
+        let previous_blocks = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                0,
+                i64::MAX,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        let result = self.append_inner(keys, values, stream);
+        if let Err(error) = result {
+            let rollback = self.rollback_append(
+                previous_tail_keys,
+                previous_tail_values,
+                previous_tail_start,
+                previous_offset,
+                &previous_blocks,
+            );
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(Exception::custom(format!(
+                    "{error}; additionally failed to roll back key/value cache append: {rollback}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    fn append_inner(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         let block_size = self.manager.options().block_size_tokens();
         let mut input_start = 0;
         let input_len = keys.dim(-2);
         while input_start < input_len {
-            if self.tail_keys.is_none() {
-                self.tail_start = self.offset + input_start as i64;
-            }
+            let candidate_tail_start = if self.tail_keys.is_none() {
+                self.offset + input_start as i64
+            } else {
+                self.tail_start
+            };
             let available = block_size - self.tail_len();
             let take = available.min(input_len - input_start);
             let input_end = input_start + take;
             let key_part = keys.try_index_device((.., .., input_start..input_end, ..), stream)?;
             let value_part =
                 values.try_index_device((.., .., input_start..input_end, ..), stream)?;
-            self.tail_keys = Some(match self.tail_keys.take() {
-                Some(previous) => concatenate_axis(&[previous, key_part], -2, stream)?,
+            let candidate_keys = match &self.tail_keys {
+                Some(previous) => concatenate_axis(&[previous.clone(), key_part], -2, stream)?,
                 None => key_part,
-            });
-            self.tail_values = Some(match self.tail_values.take() {
-                Some(previous) => concatenate_axis(&[previous, value_part], -2, stream)?,
+            };
+            let candidate_values = match &self.tail_values {
+                Some(previous) => concatenate_axis(&[previous.clone(), value_part], -2, stream)?,
                 None => value_part,
-            });
+            };
+            let candidate_bytes = candidate_keys.nbytes() as u64 + candidate_values.nbytes() as u64;
+            let candidate_end = candidate_tail_start + candidate_keys.dim(-2) as i64;
             self.manager
-                .set_tail_state(
-                    self.global_layer,
-                    self.tail_bytes(),
-                    self.tail_start + self.tail_len() as i64,
-                )
+                .set_tail_state(self.global_layer, candidate_bytes, candidate_end)
                 .map_err(cache_residency_exception)?;
+            self.tail_start = candidate_tail_start;
+            self.tail_keys = Some(candidate_keys);
+            self.tail_values = Some(candidate_values);
             input_start = input_end;
             if self.tail_len() == block_size {
                 self.seal_tail()?;
@@ -897,6 +1132,50 @@ impl PagedKeyValueCache {
                 .map_err(cache_residency_exception)?;
         }
         Ok(())
+    }
+
+    fn rollback_append(
+        &mut self,
+        previous_tail_keys: Option<Array>,
+        previous_tail_values: Option<Array>,
+        previous_tail_start: i64,
+        previous_offset: i64,
+        previous_blocks: &[CacheBlockId],
+    ) -> Result<(), Exception> {
+        self.tail_keys = previous_tail_keys;
+        self.tail_values = previous_tail_values;
+        self.tail_start = previous_tail_start;
+        self.offset = previous_offset;
+        let current_blocks = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                0,
+                i64::MAX,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        let mut rollback_error = None;
+        for id in current_blocks
+            .into_iter()
+            .rev()
+            .filter(|id| !previous_blocks.contains(id))
+        {
+            if let Err(error) = self.manager.remove_block(&id) {
+                rollback_error.get_or_insert_with(|| cache_residency_exception(error));
+            }
+        }
+        if let Err(error) =
+            self.manager
+                .set_tail_state(self.global_layer, self.tail_bytes(), previous_offset)
+        {
+            rollback_error.get_or_insert_with(|| cache_residency_exception(error));
+        }
+        match rollback_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn contiguous_visible(
@@ -1096,9 +1375,26 @@ impl KeyValueCache for PagedKeyValueCache {
         let output = accumulator.finish(stream)?;
         safemlx::transforms::eval([&output])?;
         self.manager
-            .record_attention_scan(query_len > 1, scanned_blocks, scanned_bytes, scratch)
+            .record_attention_scan(
+                self.global_layer,
+                query_len > 1,
+                scanned_blocks,
+                scanned_bytes,
+                scratch,
+            )
             .map_err(cache_residency_exception)?;
         Ok(Some(output))
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let submitted = (keys.clone(), values.clone());
+        self.append(keys, values, stream)?;
+        Ok(submitted)
     }
 
     fn update_and_fetch(
@@ -1222,6 +1518,15 @@ impl BlockwiseAttentionAccumulator {
         block: &KeyValueAttentionBlock,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        self.accumulate_with_bias(block, None, stream)
+    }
+
+    pub(crate) fn accumulate_with_bias(
+        &mut self,
+        block: &KeyValueAttentionBlock,
+        additive_bias: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         let block_start = block.start;
         let block_end = block.end;
         let keys = &block.keys;
@@ -1272,6 +1577,9 @@ impl BlockwiseAttentionAccumulator {
             &keys.swap_axes(-1, -2, stream)?,
             stream,
         )?;
+        if let Some(bias) = additive_bias {
+            scores = scores.add(bias, stream)?;
+        }
         let allowed = absolute_attention_mask(
             self.query_start,
             self.query_len,
@@ -1281,7 +1589,7 @@ impl BlockwiseAttentionAccumulator {
             self.prefix_tokens,
         );
         let allowed = Array::from_slice(&allowed, &[self.query_len, key_len]);
-        if let Some(mask) = &self.explicit_mask {
+        let effective_mask = if let Some(mask) = &self.explicit_mask {
             let relative_start = block_start - self.mask_origin;
             let relative_end = block_end - self.mask_origin;
             if relative_start < 0 || relative_end > mask.dim(1) as i64 {
@@ -1294,16 +1602,21 @@ impl BlockwiseAttentionAccumulator {
             if mask.dtype() == Dtype::Bool {
                 let combined = allowed.logical_and(&mask, stream)?;
                 scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                combined
             } else {
+                let combined =
+                    allowed.logical_and(&mask.is_neg_inf(stream)?.logical_not(stream)?, stream)?;
                 scores = scores.add(mask, stream)?;
-                scores = r#where(&allowed, scores, Array::from_f32(f32::MIN), stream)?;
+                scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                combined
             }
         } else {
             scores = r#where(&allowed, scores, Array::from_f32(f32::MIN), stream)?;
-        }
+            allowed
+        };
         let block_max = scores.max_axis(-1, true, stream)?;
         let mut weights = scores.subtract(&block_max, stream)?.exp(stream)?;
-        weights = weights.multiply(allowed.as_dtype(Dtype::Float32, stream)?, stream)?;
+        weights = weights.multiply(effective_mask.as_dtype(Dtype::Float32, stream)?, stream)?;
         let block_sum = sum_axis(&weights, -1, true, stream)?;
         let block_accumulator = matmul(&weights, &values, stream)?;
         match (&self.running_max, &self.running_sum, &self.accumulator) {
@@ -1367,15 +1680,15 @@ impl BlockwiseAttentionAccumulator {
     }
 
     pub(crate) fn finish(self, stream: &Stream) -> Result<Array, Exception> {
-        let output = self
+        let accumulator = self
             .accumulator
-            .ok_or_else(|| Exception::custom("blockwise attention received no cache blocks"))?
-            .divide(
-                self.running_sum.as_ref().ok_or_else(|| {
-                    Exception::custom("blockwise attention normalization is empty")
-                })?,
-                stream,
-            )?;
+            .ok_or_else(|| Exception::custom("blockwise attention received no cache blocks"))?;
+        let running_sum = self
+            .running_sum
+            .ok_or_else(|| Exception::custom("blockwise attention normalization is empty"))?;
+        let nonzero = running_sum.gt(Array::from_f32(0.0), stream)?;
+        let safe_sum = r#where(&nonzero, &running_sum, Array::from_f32(1.0), stream)?;
+        let output = accumulator.divide(safe_sum, stream)?;
         output.as_dtype(self.output_dtype, stream)
     }
 }
@@ -1736,12 +2049,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
+        BlockwiseAttentionAccumulator, CompressedLatentCache, ConcatKeyValueCache,
+        KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     };
     use crate::cache_residency::{
-        inspect_prompt_cache, open_prompt_cache, CacheRankIdentity, CacheResidencyManager,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+        inspect_prompt_cache, open_prompt_cache, CacheRankIdentity, CacheRepresentation,
+        CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
     };
     use safemlx::{
         fast::ScaledDotProductAttentionMask, ops::indexing::TryIndexOp, transforms::eval, Array,
@@ -1832,6 +2146,59 @@ mod tests {
         PagedCacheOptions::new(2, 96, 4096, 1)
             .unwrap()
             .with_full_attention(full_attention)
+    }
+
+    fn fully_masked_blockwise_output(mask: &Array, stream: &safemlx::Stream) -> f32 {
+        let queries = Array::zeros::<f32>(&[1, 1, 1, 1], stream).unwrap();
+        let first = KeyValueAttentionBlock::unleased(
+            0,
+            2,
+            Array::zeros::<f32>(&[1, 1, 2, 1], stream).unwrap(),
+            Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]),
+        );
+        let second = KeyValueAttentionBlock::unleased(
+            2,
+            4,
+            Array::zeros::<f32>(&[1, 1, 2, 1], stream).unwrap(),
+            Array::from_slice(&[3.0f32, 4.0], &[1, 1, 2, 1]),
+        );
+        let mut accumulator = BlockwiseAttentionAccumulator::new(
+            &queries,
+            1.0,
+            Some(mask),
+            3,
+            None,
+            0,
+            None,
+            4,
+            stream,
+        )
+        .unwrap();
+        accumulator.accumulate(&first, stream).unwrap();
+        accumulator.accumulate(&second, stream).unwrap();
+        let output = accumulator.finish(stream).unwrap();
+        eval([&output]).unwrap();
+        output.evaluated().unwrap().as_slice::<f32>()[0]
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_returns_zero_for_fully_false_boolean_mask() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mask = Array::from_slice(&[false, false, false, false], &[1, 4]);
+        let output = fully_masked_blockwise_output(&mask, context.stream());
+        assert_eq!(output, 0.0);
+        assert!(output.is_finite());
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_returns_zero_for_all_negative_infinity_mask() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mask = Array::from_slice(&[f32::NEG_INFINITY; 4], &[1, 4]);
+        let output = fully_masked_blockwise_output(&mask, context.stream());
+        assert_eq!(output, 0.0);
+        assert!(output.is_finite());
     }
 
     #[test]
@@ -1948,6 +2315,83 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
+    fn rejected_key_value_append_restores_tail_and_newly_sealed_blocks() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let options = PagedCacheOptions::new(2, 20, 4096, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let manager = CacheResidencyManager::new(options).unwrap();
+        let mut cache = PagedKeyValueCache::new(manager.clone(), 0, None).unwrap();
+        cache
+            .append(
+                Array::from_slice(&[1.0f32], &[1, 1, 1, 1]),
+                Array::from_slice(&[10.0f32], &[1, 1, 1, 1]),
+                stream,
+            )
+            .unwrap();
+
+        let error = cache
+            .append(
+                Array::from_slice(&[2.0f32, 3.0], &[1, 1, 2, 1]),
+                Array::from_slice(&[20.0f32, 30.0], &[1, 1, 2, 1]),
+                stream,
+            )
+            .expect_err("the protected sealed block plus tail must exceed the device budget");
+        assert!(error.what().contains("budget exceeded"));
+        assert_eq!(cache.offset, 1);
+        assert_eq!(cache.tail_start, 0);
+        assert_eq!(cache.tail_len(), 1);
+        assert!(manager
+            .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+        let report = manager.report().unwrap();
+        assert_eq!(report.mutable_tail_bytes, 8);
+        assert_eq!(report.current_device_bytes, 8);
+        assert_eq!(report.logical_cached_tokens, 1);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn rejected_compressed_append_restores_tail_and_newly_sealed_blocks() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let options = PagedCacheOptions::new(2, 20, 4096, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let manager = CacheResidencyManager::new(options).unwrap();
+        let mut cache = CompressedLatentCache::new_paged(manager.clone(), 0, None).unwrap();
+        cache
+            .update_and_fetch(
+                Array::from_slice(&[1.0f32], &[1, 1, 1]),
+                Array::from_slice(&[10.0f32], &[1, 1, 1]),
+                stream,
+            )
+            .unwrap();
+
+        let error = cache
+            .update_and_fetch(
+                Array::from_slice(&[2.0f32, 3.0], &[1, 2, 1]),
+                Array::from_slice(&[20.0f32, 30.0], &[1, 2, 1]),
+                stream,
+            )
+            .expect_err("the protected sealed block plus tail must exceed the device budget");
+        assert!(error.what().contains("budget exceeded"));
+        assert_eq!(cache.offset(), 1);
+        let tail = cache
+            .paged_tail_block()
+            .expect("the original compressed tail must be restored");
+        assert_eq!((tail.start, tail.end), (0, 1));
+        assert!(cache.paged_block_ids().unwrap().unwrap().is_empty());
+        let report = manager.report().unwrap();
+        assert_eq!(report.mutable_tail_bytes, 8);
+        assert_eq!(report.current_device_bytes, 8);
+        assert_eq!(report.logical_cached_tokens, 1);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
     fn paged_cache_truncates_at_and_inside_sealed_blocks() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
@@ -1970,6 +2414,54 @@ mod tests {
         cache.truncate(2, stream).unwrap();
         assert_eq!(cache.offset(), 2);
         assert_eq!(manager.report().unwrap().logical_cached_tokens, 2);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn rejected_sealed_truncation_preserves_local_and_manager_state() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let manager = CacheResidencyManager::new(paged_options(true)).unwrap();
+        let mut cache = PagedKeyValueCache::new(manager.clone(), 0, None).unwrap();
+        let states = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 7, 1]);
+        cache
+            .update_and_fetch(states.clone(), states, stream)
+            .unwrap();
+        let before_ids = manager
+            .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap();
+        let leased_id = before_ids.iter().find(|id| id.start == 2).unwrap().clone();
+        let suffix_lease = manager.lease_block(&leased_id, stream).unwrap();
+
+        let error = cache
+            .truncate(1, stream)
+            .expect_err("a leased middle suffix block must reject truncation");
+        assert!(error.what().contains("leased by active attention"));
+        assert_eq!(cache.offset(), 7);
+        assert_eq!(cache.tail_start, 6);
+        assert_eq!(cache.tail_len(), 1);
+        assert_eq!(
+            cache
+                .tail_keys
+                .as_ref()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[6.0]
+        );
+        assert_eq!(
+            manager
+                .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+                .unwrap(),
+            before_ids
+        );
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 7);
+
+        drop(suffix_lease);
+        cache.truncate(1, stream).unwrap();
+        assert_eq!(cache.offset(), 1);
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 1);
     }
 
     #[test]
@@ -2094,10 +2586,29 @@ mod tests {
 
         let mut incompatible = descriptor.clone();
         incompatible.topology.pipeline = Some((2, 0));
-        assert!(open_prompt_cache(&destination, &incompatible, &tokens, options.clone()).is_err());
+        let identity = PromptCacheModelIdentity {
+            model_family: descriptor.model_family.clone(),
+            effective_model_type: descriptor.effective_model_type.clone(),
+            architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
+            layer_count: 1,
+            global_layer_start: 0,
+            global_layer_end: 1,
+            sliding_window: None,
+            sink_tokens: 0,
+            topology: descriptor.topology.clone(),
+            layer_layouts: PromptCacheModelIdentity::key_value_layouts(1, 1, 1),
+        };
+        assert!(open_prompt_cache(
+            &destination,
+            &incompatible,
+            &identity,
+            &tokens,
+            options.clone()
+        )
+        .is_err());
 
         let (loaded_manager, loaded_manifest) =
-            open_prompt_cache(&destination, &descriptor, &tokens, options).unwrap();
+            open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
         assert_eq!(loaded_manifest.blocks.len(), 3);
         let mut restored =
             PagedKeyValueCache::new_with_layout(loaded_manager.clone(), 0, None, 0, Some(rank))
@@ -2128,7 +2639,7 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let directory = tempfile::tempdir().unwrap();
-        let options = PagedCacheOptions::new(2, 64, 0, 1)
+        let options = PagedCacheOptions::new(2, 64, 32, 1)
             .unwrap()
             .with_full_attention(true)
             .with_live_disk(directory.path(), 4096, 2)
@@ -2144,7 +2655,14 @@ mod tests {
         cache
             .update_and_fetch(states.clone(), states, stream)
             .unwrap();
-        let report = manager.report().unwrap();
+        let mut report = manager.report().unwrap();
+        for _ in 0..100 {
+            if report.disk_demotions == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            report = manager.report().unwrap();
+        }
         assert_eq!(report.disk_blocks, 1);
         assert_eq!(report.disk_demotions, 1);
         assert!(fs::read_dir(directory.path()).unwrap().next().is_some());

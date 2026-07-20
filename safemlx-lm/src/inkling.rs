@@ -13,6 +13,7 @@ use safemlx::{
 
 use crate::{
     cache::KeyValueCache,
+    cache_residency::{CacheResidencyPolicy, CacheResidencyReport},
     error::Error,
     expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -59,6 +60,25 @@ impl InklingLayerwiseModel {
     /// Creates global/sliding KV and short-convolution state for every layer.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Creates global/sliding paged attention state while retaining the small
+    /// short-convolution state on device.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => {
+                Cache::new_paged(&self.args().text_config, options, None).map_err(Into::into)
+            }
+        }
+    }
+
+    /// Returns aggregate KV residency telemetry when paging is active.
+    pub fn cache_residency_report(
+        &self,
+        cache: &Cache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        cache.residency_report().map_err(Into::into)
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -1229,6 +1249,7 @@ mod tests {
             input as runtime_input,
         },
         offload::{OffloadConfig, ResidencyPolicy},
+        PagedCacheOptions,
     };
 
     fn config() -> serde_json::Value {
@@ -1485,6 +1506,46 @@ mod tests {
     fn inkling_released_layout_layerwise_parity() {
         parity(1);
         parity(2);
+    }
+
+    #[test]
+    fn inkling_global_and_sliding_attention_paged_parity() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let mut expected_model = Model::new(args(), gpu.stream()).unwrap();
+        let mut paged_model = Model::new(args(), gpu.stream()).unwrap();
+        initialize(&mut expected_model, gpu.stream());
+        initialize(&mut paged_model, gpu.stream());
+        let mut expected_cache = expected_model.new_cache();
+        let paging = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut paged_cache = paged_model.new_paged_cache(paging).unwrap();
+
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3, 4, 5], &[1, 5]),
+            Array::from_slice(&[6u32], &[1, 1]),
+            Array::from_slice(&[7u32], &[1, 1]),
+        ] {
+            let expected = expected_model
+                .forward_logits(
+                    &tokens,
+                    None,
+                    Some(&mut expected_cache),
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = paged_model
+                .forward_logits(&tokens, None, Some(&mut paged_cache), false, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+            assert_eq!(paged_cache.offset(), expected_cache.offset());
+        }
+
+        let report = paged_cache.residency_report().unwrap().unwrap();
+        assert!(report.key_value_blocks > 0);
+        assert!(report.prefill_full_attention_blocks > 0);
+        assert!(report.decode_full_attention_blocks > 0);
     }
 
     #[test]

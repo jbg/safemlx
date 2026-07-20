@@ -28,7 +28,10 @@ use crate::{
         SlidingKeyValueCache,
     },
     cache_residency::{
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
     },
     error::Error,
     models::{
@@ -104,17 +107,24 @@ pub enum TensorParallelCache {
 
 impl TensorParallelCache {
     /// Clears all retained sequence state.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), Error> {
         match self {
-            Self::Llama(caches) => caches.iter_mut().for_each(|cache| match cache {
-                TensorParallelLlamaLayerCache::Standard(cache) => cache.clear(),
-                TensorParallelLlamaLayerCache::Sliding(cache) => cache.clear(),
-                TensorParallelLlamaLayerCache::Paged(cache) => {
-                    let _ = cache.clear();
+            Self::Llama(caches) => {
+                for cache in caches {
+                    match cache {
+                        TensorParallelLlamaLayerCache::Standard(cache) => cache.clear(),
+                        TensorParallelLlamaLayerCache::Sliding(cache) => cache.clear(),
+                        TensorParallelLlamaLayerCache::Paged(cache) => cache.clear()?,
+                    }
                 }
-            }),
-            Self::DeepSeek(caches) => caches.iter_mut().for_each(CompressedLatentCache::clear),
+            }
+            Self::DeepSeek(caches) => {
+                for cache in caches {
+                    cache.clear()?;
+                }
+            }
         }
+        Ok(())
     }
 
     /// Returns the common cache sequence offset.
@@ -260,6 +270,184 @@ impl TensorParallelModel {
                     .map_err(|error| Error::Parallel(error.to_string()))
             })
             .transpose()
+    }
+
+    /// Persists this rank's completed paged prefix below a shared cache root.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut TensorParallelCache,
+        root: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let manager = match cache {
+            TensorParallelCache::Llama(caches) => {
+                let mut manager = None;
+                for cache in caches {
+                    let TensorParallelLlamaLayerCache::Paged(cache) = cache else {
+                        return Err(Error::Parallel(
+                            "tensor-parallel prompt persistence requires a paged cache".into(),
+                        ));
+                    };
+                    cache.finalize()?;
+                    manager.get_or_insert_with(|| cache.manager().clone());
+                }
+                manager
+            }
+            TensorParallelCache::DeepSeek(caches) => {
+                let mut manager = None;
+                for cache in caches {
+                    cache.finalize()?;
+                    if let Some(paged) = cache.residency_manager() {
+                        manager.get_or_insert_with(|| paged.clone());
+                    } else {
+                        return Err(Error::Parallel(
+                            "tensor-parallel prompt persistence requires a paged cache".into(),
+                        ));
+                    }
+                }
+                manager
+            }
+        }
+        .ok_or_else(|| Error::Parallel("cannot persist an empty rank-local cache".into()))?;
+        manager
+            .save_prompt_cache(
+                self.prompt_cache_rank_directory(root.as_ref()),
+                descriptor,
+                prefix_token_ids,
+                options,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    /// Opens this rank's compatible persisted prefix without eager array loading.
+    pub fn load_prompt_cache(
+        &self,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(TensorParallelCache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (manager, manifest) = open_prompt_cache(
+            self.prompt_cache_rank_directory(root.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let rank = Some(CacheRankIdentity {
+            pipeline_rank: None,
+            tensor_parallel_rank: Some(self.topology.tensor_parallel_rank),
+            expert_parallel_rank: None,
+        });
+        let cache = match &self.architecture {
+            TensorArchitecture::Llama(model) => TensorParallelCache::Llama(
+                (0..model.layers.len())
+                    .map(|layer| {
+                        PagedKeyValueCache::new_with_layout(
+                            manager.clone(),
+                            layer,
+                            model.global_args.sliding_window,
+                            0,
+                            rank,
+                        )
+                        .map(TensorParallelLlamaLayerCache::Paged)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            TensorArchitecture::DeepSeek(model) => TensorParallelCache::DeepSeek(
+                (0..model.layers.len())
+                    .map(|layer| CompressedLatentCache::new_paged(manager.clone(), layer, rank))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        Ok((cache, manifest))
+    }
+
+    fn prompt_cache_rank_directory(&self, root: &Path) -> PathBuf {
+        root.join(format!("rank-{:05}", self.topology.global_rank))
+    }
+
+    /// Returns the canonical cache-relevant architecture identity for this rank.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
+    }
+
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        let (
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            sliding_window,
+        ) = match &self.architecture {
+            TensorArchitecture::Llama(model) => (
+                "llama".to_string(),
+                model.global_args.model_type.clone(),
+                crate::models::llama::prompt_cache_architecture_fingerprint(&model.global_args),
+                usize::try_from(model.global_args.num_hidden_layers)
+                    .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
+                model.global_args.sliding_window,
+            ),
+            TensorArchitecture::DeepSeek(model) => (
+                "deepseek_v3".to_string(),
+                model.global_args.model_type.clone(),
+                crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(
+                    &model.global_args,
+                ),
+                usize::try_from(model.global_args.num_hidden_layers)
+                    .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                None,
+            ),
+        };
+        Ok(PromptCacheModelIdentity {
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window,
+            sink_tokens: 0,
+            topology: PromptCacheTopology {
+                pipeline: None,
+                tensor_parallel: Some((
+                    self.topology.tensor_parallel_size,
+                    self.topology.tensor_parallel_rank,
+                )),
+                expert_parallel: None,
+                expert_parallel_cache_replicated: true,
+            },
+            layer_layouts: match &self.architecture {
+                TensorArchitecture::Llama(model) => {
+                    let local_kv_heads = exact_division(
+                        "Llama prompt-cache KV heads",
+                        model.global_args.num_key_value_heads,
+                        self.topology.tensor_parallel_size,
+                    )?;
+                    PromptCacheModelIdentity::key_value_layouts(
+                        layer_count,
+                        local_kv_heads,
+                        model.global_args.head_dim,
+                    )
+                }
+                TensorArchitecture::DeepSeek(model) => {
+                    PromptCacheModelIdentity::compressed_layouts(
+                        layer_count,
+                        model.global_args.kv_lora_rank,
+                        model.global_args.qk_rope_head_dim,
+                    )
+                }
+            },
+        })
     }
 
     /// Runs prefill or decode and returns this rank's vocabulary-logit shard.
@@ -830,7 +1018,8 @@ fn load_llama(
         source_args.hidden_size,
         source_args.affine_quantization_for("model.embed_tokens.weight"),
         stream,
-    )?;
+    )
+    .map_err(|error| Error::Parallel(format!("construct source Llama embedding: {error}")))?;
     insert_vocabulary_plan(
         &mut plan,
         &source_embedding,
@@ -838,7 +1027,12 @@ fn load_llama(
         &vocabulary,
     );
     for index in 0..source_args.num_hidden_layers as usize {
-        let layer = llama::TransformerBlock::new_for_layer(&source_args, index as i32, stream)?;
+        let layer = llama::TransformerBlock::new_for_layer(&source_args, index as i32, stream)
+            .map_err(|error| {
+                Error::Parallel(format!(
+                    "construct source Llama tensor-parallel layer {index}: {error}"
+                ))
+            })?;
         insert_llama_layer_plan(&mut plan, &layer, index)?;
     }
     let source_norm = nn::RmsNorm::unloaded(
@@ -865,7 +1059,8 @@ fn load_llama(
         weights_stream,
         stream,
         &StrictLoadConfig::default(),
-    )?;
+    )
+    .map_err(|error| Error::Parallel(format!("load Llama tensor partition: {error}")))?;
     let info = partition_info(
         &partition,
         topology,
@@ -892,9 +1087,16 @@ fn load_llama(
         target_args.hidden_size,
         target_args.affine_quantization_for("model.embed_tokens.weight"),
         stream,
-    )?;
+    )
+    .map_err(|error| Error::Parallel(format!("construct local Llama embedding: {error}")))?;
     let mut layers = (0..target_args.num_hidden_layers)
-        .map(|index| llama::TransformerBlock::new_for_layer(&target_args, index, stream))
+        .map(|index| {
+            llama::TransformerBlock::new_for_layer(&target_args, index, stream).map_err(|error| {
+                Error::Parallel(format!(
+                    "construct local Llama tensor-parallel layer {index}: {error}"
+                ))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut norm = nn::RmsNorm::unloaded(
         target_args.hidden_size,
