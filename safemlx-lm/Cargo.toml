@@ -49,6 +49,9 @@ libc = "0.2"
 image = { version = "0.25", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 lazy_static = "1"
 tempfile.workspace = true

@@ -2053,13 +2053,13 @@ mod tests {
         KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     };
     use crate::cache_residency::{
-        inspect_prompt_cache, open_prompt_cache, CacheRankIdentity, CacheRepresentation,
-        CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheTopology,
+        inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheRankIdentity,
+        CacheRepresentation, CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     };
     use safemlx::{
         fast::ScaledDotProductAttentionMask, ops::indexing::TryIndexOp, transforms::eval, Array,
-        Device, DeviceType, ExecutionContext,
+        Device, DeviceType, Dtype, ExecutionContext,
     };
 
     #[test]
@@ -2181,6 +2181,137 @@ mod tests {
         output.evaluated().unwrap().as_slice::<f32>()[0]
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct BlockwiseAttentionCase {
+        batch: i32,
+        query_heads: i32,
+        key_value_heads: i32,
+        query_len: i32,
+        context_len: i32,
+        head_dim: i32,
+        block_size: i32,
+        dtype: Dtype,
+        logit_magnitude: f32,
+        tolerance: f64,
+    }
+
+    fn patterned_values(length: usize, stride: usize, modulus: usize, scale: f32) -> Vec<f32> {
+        (0..length)
+            .map(|index| {
+                let centered =
+                    ((index * stride + stride / 2) % modulus) as f32 - (modulus / 2) as f32;
+                centered * scale
+            })
+            .collect()
+    }
+
+    fn assert_blockwise_attention_matches_reference(
+        case: BlockwiseAttentionCase,
+        stream: &safemlx::Stream,
+    ) -> Array {
+        assert!(case.query_len <= case.context_len);
+        assert_eq!(case.query_heads % case.key_value_heads, 0);
+        let query_elements =
+            (case.batch * case.query_heads * case.query_len * case.head_dim) as usize;
+        let key_elements =
+            (case.batch * case.key_value_heads * case.context_len * case.head_dim) as usize;
+        let query = Array::from_slice(
+            &patterned_values(query_elements, 7, 23, 0.125 * case.logit_magnitude),
+            &[case.batch, case.query_heads, case.query_len, case.head_dim],
+        )
+        .as_dtype(case.dtype, stream)
+        .unwrap();
+        let keys = Array::from_slice(
+            &patterned_values(key_elements, 11, 29, 0.1 * case.logit_magnitude),
+            &[
+                case.batch,
+                case.key_value_heads,
+                case.context_len,
+                case.head_dim,
+            ],
+        )
+        .as_dtype(case.dtype, stream)
+        .unwrap();
+        let values = Array::from_slice(
+            &patterned_values(key_elements, 5, 19, 0.05),
+            &[
+                case.batch,
+                case.key_value_heads,
+                case.context_len,
+                case.head_dim,
+            ],
+        )
+        .as_dtype(case.dtype, stream)
+        .unwrap();
+        let scale = (case.head_dim as f32).sqrt().recip();
+        let query_start = (case.context_len - case.query_len) as i64;
+        let mut accumulator = BlockwiseAttentionAccumulator::new(
+            &query,
+            scale,
+            None,
+            query_start,
+            None,
+            0,
+            None,
+            case.context_len as i64,
+            stream,
+        )
+        .unwrap();
+        let mut block_start = 0;
+        while block_start < case.context_len {
+            let block_end = (block_start + case.block_size).min(case.context_len);
+            let block = KeyValueAttentionBlock::unleased(
+                block_start as i64,
+                block_end as i64,
+                keys.try_index_device((.., .., block_start..block_end, ..), stream)
+                    .unwrap(),
+                values
+                    .try_index_device((.., .., block_start..block_end, ..), stream)
+                    .unwrap(),
+            );
+            accumulator.accumulate(&block, stream).unwrap();
+            block_start = block_end;
+        }
+        let actual = accumulator.finish(stream).unwrap();
+        assert_eq!(actual.dtype(), case.dtype);
+
+        // Compare in FP32 after quantizing the inputs to the requested runtime
+        // dtype. This isolates the online reduction from input quantization and
+        // verifies that lower-precision caches still accumulate in FP32.
+        let query_reference = query.as_dtype(Dtype::Float32, stream).unwrap();
+        let key_reference = keys.as_dtype(Dtype::Float32, stream).unwrap();
+        let value_reference = values.as_dtype(Dtype::Float32, stream).unwrap();
+        let allowed = super::absolute_attention_mask(
+            query_start,
+            case.query_len,
+            0,
+            case.context_len as i64,
+            None,
+            0,
+        );
+        let mask = Array::from_slice(&allowed, &[case.query_len, case.context_len]);
+        let reference = safemlx::fast::scaled_dot_product_attention(
+            query_reference,
+            key_reference,
+            value_reference,
+            scale,
+            Some(ScaledDotProductAttentionMask::Array(&mask)),
+            None,
+            stream,
+        )
+        .unwrap();
+        let actual = actual.as_dtype(Dtype::Float32, stream).unwrap();
+        eval([&actual, &reference]).unwrap();
+        assert!(
+            actual
+                .all_close(&reference, case.tolerance, case.tolerance, None, stream)
+                .unwrap()
+                .item::<bool>(stream),
+            "blockwise attention case did not match its contiguous reference: {case:?}"
+        );
+        actual
+    }
+
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn blockwise_attention_returns_zero_for_fully_false_boolean_mask() {
@@ -2199,6 +2330,102 @@ mod tests {
         let output = fully_masked_blockwise_output(&mask, context.stream());
         assert_eq!(output, 0.0);
         assert!(output.is_finite());
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_matches_multiple_block_sizes_and_batched_queries() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        for block_size in [1, 2, 3, 5, 8] {
+            assert_blockwise_attention_matches_reference(
+                BlockwiseAttentionCase {
+                    batch: 2,
+                    query_heads: 4,
+                    key_value_heads: 4,
+                    query_len: 3,
+                    context_len: 8,
+                    head_dim: 4,
+                    block_size,
+                    dtype: Dtype::Float32,
+                    logit_magnitude: 1.0,
+                    tolerance: 1e-5,
+                },
+                context.stream(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_matches_grouped_and_multi_query_attention() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        for key_value_heads in [2, 1] {
+            assert_blockwise_attention_matches_reference(
+                BlockwiseAttentionCase {
+                    batch: 2,
+                    query_heads: 4,
+                    key_value_heads,
+                    query_len: 2,
+                    context_len: 7,
+                    head_dim: 4,
+                    block_size: 3,
+                    dtype: Dtype::Float32,
+                    logit_magnitude: 1.0,
+                    tolerance: 1e-5,
+                },
+                context.stream(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_accumulates_lower_precision_inputs_in_float32() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        for (dtype, tolerance) in [(Dtype::Float16, 2e-3), (Dtype::Bfloat16, 1e-2)] {
+            assert_blockwise_attention_matches_reference(
+                BlockwiseAttentionCase {
+                    batch: 2,
+                    query_heads: 4,
+                    key_value_heads: 2,
+                    query_len: 3,
+                    context_len: 7,
+                    head_dim: 4,
+                    block_size: 3,
+                    dtype,
+                    logit_magnitude: 1.0,
+                    tolerance,
+                },
+                context.stream(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn blockwise_attention_remains_finite_with_large_logits() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let output = assert_blockwise_attention_matches_reference(
+            BlockwiseAttentionCase {
+                batch: 2,
+                query_heads: 4,
+                key_value_heads: 1,
+                query_len: 3,
+                context_len: 9,
+                head_dim: 8,
+                block_size: 4,
+                dtype: Dtype::Float32,
+                logit_magnitude: 1_000.0,
+                tolerance: 1e-5,
+            },
+            context.stream(),
+        );
+        assert!(output
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .iter()
+            .all(|value| value.is_finite()));
     }
 
     #[test]
@@ -2486,6 +2713,132 @@ mod tests {
         assert_eq!(after.compressed_latent_blocks, 3);
         assert_eq!(after.mutable_tail_bytes, 0);
         assert_eq!(after.logical_cached_tokens, 5);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn compressed_latent_host_demotion_and_rehydration_preserve_atomic_pairs() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        // Each two-token latent/rotary pair occupies 24 bytes. Two blocks fit
+        // on the device and one fits in the finite host tier.
+        let options = PagedCacheOptions::new(2, 48, 24, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let manager = CacheResidencyManager::new(options).unwrap();
+        let mut cache = CompressedLatentCache::new_paged(manager.clone(), 0, None).unwrap();
+        let latent_values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+        let rotary_values = (100..106).map(|value| value as f32).collect::<Vec<_>>();
+        cache
+            .update_and_fetch(
+                Array::from_slice(&latent_values, &[1, 6, 2]),
+                Array::from_slice(&rotary_values, &[1, 6, 1]),
+                stream,
+            )
+            .unwrap();
+
+        let report = manager.report().unwrap();
+        assert_eq!(report.compressed_latent_blocks, 3);
+        assert_eq!(report.device_blocks, 2);
+        assert_eq!(report.host_blocks, 1);
+        assert_eq!(report.current_device_bytes, 48);
+        assert_eq!(report.current_host_bytes, 24);
+        assert_eq!(report.host_demotions, 1);
+        let first = cache.paged_block_ids().unwrap().unwrap().remove(0);
+        assert_eq!(
+            first.representation,
+            CacheRepresentation::CompressedLatentRotary
+        );
+
+        let lease = manager.lease_block(&first, stream).unwrap();
+        match lease.arrays() {
+            CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
+                eval([latent, rotary_key]).unwrap();
+                assert_eq!(
+                    latent.evaluated().unwrap().as_slice::<f32>(),
+                    &latent_values[..4]
+                );
+                assert_eq!(
+                    rotary_key.evaluated().unwrap().as_slice::<f32>(),
+                    &rotary_values[..2]
+                );
+            }
+            CacheBlockArrays::KeyValue { .. } => {
+                panic!("compressed-latent block was rehydrated as key/value state")
+            }
+        }
+        drop(lease);
+        let report = manager.report().unwrap();
+        assert_eq!(report.host_promotions, 1);
+        assert!(report.host_demotions >= 2);
+        assert!(report.current_device_bytes <= manager.options().device_budget_bytes());
+        assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn compressed_latent_live_disk_demotion_and_rehydration_preserve_atomic_pairs() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let directory = tempfile::tempdir().unwrap();
+        let options = PagedCacheOptions::new(2, 48, 24, 1)
+            .unwrap()
+            .with_full_attention(true)
+            .with_live_disk(directory.path(), 4096, 2)
+            .unwrap();
+        let manager = CacheResidencyManager::new(options).unwrap();
+        let mut cache = CompressedLatentCache::new_paged(manager.clone(), 0, None).unwrap();
+        let latent_values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let rotary_values = (100..108).map(|value| value as f32).collect::<Vec<_>>();
+        cache
+            .update_and_fetch(
+                Array::from_slice(&latent_values, &[1, 8, 2]),
+                Array::from_slice(&rotary_values, &[1, 8, 1]),
+                stream,
+            )
+            .unwrap();
+
+        let mut report = manager.report().unwrap();
+        for _ in 0..100 {
+            if report.disk_blocks >= 1 && report.in_flight_write_blocks == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            report = manager.report().unwrap();
+        }
+        assert_eq!(report.compressed_latent_blocks, 4);
+        assert!(report.disk_blocks >= 1);
+        assert!(report.disk_demotions >= 1);
+        assert!(report.current_device_bytes <= manager.options().device_budget_bytes());
+        assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
+        let first = cache.paged_block_ids().unwrap().unwrap().remove(0);
+
+        let lease = manager.lease_block(&first, stream).unwrap();
+        match lease.arrays() {
+            CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
+                eval([latent, rotary_key]).unwrap();
+                assert_eq!(
+                    latent.evaluated().unwrap().as_slice::<f32>(),
+                    &latent_values[..4]
+                );
+                assert_eq!(
+                    rotary_key.evaluated().unwrap().as_slice::<f32>(),
+                    &rotary_values[..2]
+                );
+            }
+            CacheBlockArrays::KeyValue { .. } => {
+                panic!("compressed-latent disk block was rehydrated as key/value state")
+            }
+        }
+        drop(lease);
+        let report = manager.report().unwrap();
+        assert!(report.disk_promotions >= 1);
+        assert!(report.current_device_bytes <= manager.options().device_budget_bytes());
+        assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
+
+        drop(cache);
+        drop(manager);
+        assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
     }
 
     #[test]
