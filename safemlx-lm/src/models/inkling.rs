@@ -26,7 +26,13 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{
+        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    cache_residency::{
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
+    },
     error::Error,
     models::{
         common::{
@@ -304,6 +310,7 @@ pub struct VisionArgs {
 pub enum InklingKvCache {
     Global(ConcatKeyValueCache),
     Sliding(SlidingKeyValueCache),
+    Paged(PagedKeyValueCache),
 }
 
 impl KeyValueCache for InklingKvCache {
@@ -311,6 +318,7 @@ impl KeyValueCache for InklingKvCache {
         match self {
             Self::Global(cache) => cache.offset(),
             Self::Sliding(cache) => cache.offset(),
+            Self::Paged(cache) => cache.offset(),
         }
     }
 
@@ -318,6 +326,7 @@ impl KeyValueCache for InklingKvCache {
         match self {
             Self::Global(cache) => cache.max_size(),
             Self::Sliding(cache) => cache.max_size(),
+            Self::Paged(cache) => cache.max_size(),
         }
     }
 
@@ -325,6 +334,7 @@ impl KeyValueCache for InklingKvCache {
         match self {
             Self::Global(cache) => cache.retained_arrays(),
             Self::Sliding(cache) => cache.retained_arrays(),
+            Self::Paged(cache) => cache.retained_arrays(),
         }
     }
 
@@ -337,7 +347,25 @@ impl KeyValueCache for InklingKvCache {
         match self {
             Self::Global(cache) => cache.update_and_fetch(keys, values, stream),
             Self::Sliding(cache) => cache.update_and_fetch(keys, values, stream),
+            Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
         }
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Global(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Sliding(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Paged(cache) => cache.update_for_attention(keys, values, stream),
+        }
+    }
+
+    fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(_))
     }
 }
 
@@ -359,6 +387,25 @@ impl LayerCache {
             convolutions: std::array::from_fn(|_| CausalConv1dCache::default()),
         }
     }
+
+    fn new_paged(
+        args: &TextArgs,
+        layer: usize,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let local = args.is_local(layer as i32);
+        Ok(Self {
+            kv: InklingKvCache::Paged(PagedKeyValueCache::new_with_layout(
+                manager,
+                layer,
+                local.then_some(args.sliding_window_size),
+                0,
+                rank,
+            )?),
+            convolutions: std::array::from_fn(|_| CausalConv1dCache::default()),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -376,18 +423,63 @@ impl Cache {
         }
     }
 
+    pub(crate) fn new_paged(
+        args: &TextArgs,
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let manager = CacheResidencyManager::new(options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Self::new_paged_with_manager(args, manager, rank)
+    }
+
+    pub(crate) fn new_paged_with_manager(
+        args: &TextArgs,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layer_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid Inkling cache layer count"))?;
+        Ok(Self {
+            layers: (0..layer_count)
+                .map(|layer| LayerCache::new_paged(args, layer, manager.clone(), rank))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .iter()
+            .find_map(|layer| match &layer.kv {
+                InklingKvCache::Paged(cache) => Some(cache.report()),
+                _ => None,
+            })
+            .transpose()
+    }
+
     pub fn offset(&self) -> i32 {
         self.layers.first().map_or(0, |layer| layer.kv.offset())
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
+        let paged_manager = self.layers.iter().find_map(|layer| match &layer.kv {
+            InklingKvCache::Paged(cache) => Some(cache.manager().clone()),
+            _ => None,
+        });
+        if let Some(manager) = paged_manager {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         for layer in &mut self.layers {
             match &mut layer.kv {
                 InklingKvCache::Global(cache) => cache.clear(),
                 InklingKvCache::Sliding(cache) => cache.clear(),
+                InklingKvCache::Paged(cache) => cache.reset_local_after_manager_clear(),
             }
             layer.convolutions = std::array::from_fn(|_| CausalConv1dCache::default());
         }
+        Ok(())
     }
 }
 
@@ -547,12 +639,20 @@ impl InklingAttention {
             let v = v
                 .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim], stream)?
                 .transpose_axes(&[0, 2, 1, 3], stream)?;
-            let (k, v) = cache.kv.update_and_fetch(k, v, stream)?;
-            let key_len = k.dim(2);
-            let key_offset = q_offset + seq_len - key_len;
-            self.attend_chunked(
-                q, k, v, &relative, batch, seq_len, q_offset, key_offset, stream,
-            )
+            if cache.kv.is_paged() {
+                cache.kv.update_for_attention(k, v, stream)?;
+                let InklingKvCache::Paged(cache) = &cache.kv else {
+                    unreachable!("paged Inkling cache variant checked above")
+                };
+                self.attend_paged(q, &relative, batch, seq_len, q_offset, cache, stream)
+            } else {
+                let (k, v) = cache.kv.update_and_fetch(k, v, stream)?;
+                let key_len = k.dim(2);
+                let key_offset = q_offset + seq_len - key_len;
+                self.attend_chunked(
+                    q, k, v, &relative, batch, seq_len, q_offset, key_offset, stream,
+                )
+            }
         } else {
             k = short_convolution(&self.k_sconv, &k, None, stream)?;
             v = short_convolution(&self.v_sconv, &v, None, stream)?;
@@ -648,6 +748,123 @@ impl InklingAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn attend_paged(
+        &mut self,
+        q: Array,
+        relative: &Array,
+        batch: i32,
+        query_len: i32,
+        query_offset: i32,
+        cache: &PagedKeyValueCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        const TARGET_SCORE_ELEMENTS: i32 = 16 * 1024 * 1024;
+        let chunk_size = if self.local {
+            256
+        } else {
+            (TARGET_SCORE_ELEMENTS / (self.n_heads * cache.offset().max(1))).clamp(1, 256)
+        };
+        let mut outputs = Vec::new();
+        let mut scanned_blocks = 0;
+        let mut scanned_bytes = 0;
+        let mut scratch_bytes = 0;
+        let mut start = 0;
+        while start < query_len {
+            let end = (start + chunk_size).min(query_len);
+            let query_abs_start = query_offset + start;
+            let mut q_chunk = q.try_index_device((.., .., start..end, ..), stream)?;
+            let relative_chunk = relative.try_index_device((.., start..end, ..), stream)?;
+            if let Some(tau) = self.global_query_scale(query_abs_start, end - start, stream)? {
+                q_chunk = q_chunk.multiply(tau, stream)?;
+            }
+            let mut accumulator = BlockwiseAttentionAccumulator::new(
+                &q_chunk,
+                1.0 / self.head_dim as f32,
+                None,
+                query_abs_start as i64,
+                self.local.then_some(self.sliding_window),
+                0,
+                None,
+                cache.offset() as i64,
+                stream,
+            )?;
+            let visible_start = if self.local {
+                (query_abs_start - self.sliding_window + 1).max(0) as i64
+            } else {
+                0
+            };
+            let (blocks, bytes) = cache.visit_attention_blocks(
+                visible_start,
+                cache.offset() as i64,
+                stream,
+                |block| {
+                    let (bias, _, _) = self.position_data(
+                        &relative_chunk,
+                        batch,
+                        end - start,
+                        i32::try_from(block.end - block.start).map_err(|_| {
+                            Exception::custom("Inkling paged cache block length overflow")
+                        })?,
+                        query_abs_start,
+                        i32::try_from(block.start).map_err(|_| {
+                            Exception::custom("Inkling paged cache position overflow")
+                        })?,
+                        stream,
+                    )?;
+                    accumulator.accumulate_with_bias(block, Some(&bias), stream)
+                },
+            )?;
+            scanned_blocks += blocks;
+            scanned_bytes += bytes;
+            scratch_bytes = scratch_bytes.max(
+                batch as u64
+                    * self.n_heads as u64
+                    * (end - start) as u64
+                    * cache.manager().options().block_size_tokens() as u64
+                    * 4,
+            );
+            outputs.push(accumulator.finish(stream)?);
+            start = end;
+        }
+        cache.record_architecture_attention_scan(
+            query_len > 1,
+            scanned_blocks,
+            scanned_bytes,
+            scratch_bytes,
+        )?;
+        let attended = concatenate_axis(&outputs, 2, stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?
+            .reshape(&[batch, query_len, self.n_heads * self.head_dim], stream)?;
+        self.o_proj.forward(&attended, stream)
+    }
+
+    fn global_query_scale(
+        &self,
+        query_offset: i32,
+        query_len: i32,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        if self.local {
+            return Ok(None);
+        }
+        let Some(floor) = self.log_scaling_n_floor else {
+            return Ok(None);
+        };
+        let positions =
+            arange::<i32, i32>(query_offset + 1, query_offset + query_len + 1, 1, stream)?
+                .as_dtype(Dtype::Float32, stream)?;
+        let ratio = positions.divide(Array::from_f32(floor as f32), stream)?;
+        let ratio = safemlx::ops::maximum(ratio, Array::from_f32(1.0), stream)?;
+        Ok(Some(
+            ratio
+                .log(stream)?
+                .multiply(Array::from_f32(self.log_scaling_alpha), stream)?
+                .add(Array::from_f32(1.0), stream)?
+                .reshape(&[1, 1, query_len, 1], stream)?,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn position_data(
         &self,
         relative: &Array,
@@ -684,17 +901,7 @@ impl InklingAttention {
         )?;
         bias = r#where(&relative_valid, bias, Array::from_f32(0.0), stream)?;
         let tau = if !self.local {
-            if let Some(floor) = self.log_scaling_n_floor {
-                let positions =
-                    arange::<i32, i32>(query_offset + 1, query_offset + query_len + 1, 1, stream)?
-                        .as_dtype(Dtype::Float32, stream)?;
-                let ratio = positions.divide(Array::from_f32(floor as f32), stream)?;
-                let ratio = safemlx::ops::maximum(ratio, Array::from_f32(1.0), stream)?;
-                let tau = ratio
-                    .log(stream)?
-                    .multiply(Array::from_f32(self.log_scaling_alpha), stream)?
-                    .add(Array::from_f32(1.0), stream)?
-                    .reshape(&[1, 1, query_len, 1], stream)?;
+            if let Some(tau) = self.global_query_scale(query_offset, query_len, stream)? {
                 bias = bias.multiply(&tau, stream)?;
                 Some(tau)
             } else {
@@ -1455,6 +1662,18 @@ impl Model {
 
     pub fn new_cache(&self) -> Cache {
         Cache::new(&self.args.text_config)
+    }
+
+    pub fn new_paged_cache(&self, options: PagedCacheOptions) -> Result<Cache, Exception> {
+        Cache::new_paged(&self.args.text_config, options, None)
+    }
+
+    pub(crate) fn new_paged_cache_with_manager(
+        &self,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Cache, Exception> {
+        Cache::new_paged_with_manager(&self.args.text_config, manager, rank)
     }
 
     pub(crate) fn forward_logits(

@@ -33,11 +33,13 @@ use safemlx_lm::{
     },
     quantization::{AffineQuantization, WeightQuantization},
     sampler::DefaultSampler,
-    DeviceAssignment, ParallelTopology, WeightResidency,
+    CacheResidencyPolicy, DeviceAssignment, PagedCacheOptions, ParallelTopology,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_EXPERT_MODEL_CHECKPOINT";
+const PAGED_PROMPT_MARKER: &str = ".paged-prompt-parity";
 const EXPECTED_FILE: &str = "SAFEMLX_LM_EXPERT_MODEL_EXPECTED";
 const ARCHITECTURE: &str = "SAFEMLX_LM_EXPERT_MODEL_ARCHITECTURE";
 const ENCODING: &str = "SAFEMLX_LM_EXPERT_MODEL_ENCODING";
@@ -224,7 +226,17 @@ fn expert_parallel_model_ring_worker() {
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut cache = model.new_cache();
+    let paged_prompt = checkpoint.join(PAGED_PROMPT_MARKER).exists();
+    let paged = PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
+        .unwrap()
+        .with_full_attention(true);
+    let mut cache = if paged_prompt {
+        model
+            .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
+            .unwrap()
+    } else {
+        model.new_cache()
+    };
     let prefill = model.prefill(&prompt, &mut cache, &group, stream).unwrap();
     assert_close(&prefill, &expected["prefill"]);
     assert_eq!(
@@ -247,9 +259,65 @@ fn expert_parallel_model_ring_worker() {
     );
     assert!(!first.finished);
 
-    let decode = model
+    let uninterrupted = model
         .decode(&first.token, &mut cache, &group, stream)
         .unwrap();
+    let decode = if paged_prompt {
+        let uninterrupted_values = uninterrupted.evaluated().unwrap();
+        let uninterrupted_values = uninterrupted_values.as_slice::<f32>().to_vec();
+        let model_type = config["model_type"].as_str().unwrap().to_string();
+        let descriptor = PromptCacheDescriptor {
+            model_family: if architecture == "DeepSeekV3" {
+                "deepseek_v3".into()
+            } else {
+                "gpt_oss".into()
+            },
+            effective_model_type: model_type,
+            checkpoint_fingerprint: "expert-ring-fixture".into(),
+            architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
+            layer_count: num_layers,
+            global_layer_start: 0,
+            global_layer_end: num_layers,
+            batch_size: 1,
+            sliding_window: (architecture == "GptOss")
+                .then(|| config["sliding_window"].as_i64().unwrap() as i32),
+            sink_tokens: 0,
+            topology: PromptCacheTopology {
+                pipeline: None,
+                tensor_parallel: None,
+                expert_parallel: Some((2, expected_rank)),
+                expert_parallel_cache_replicated: true,
+            },
+        };
+        let root = checkpoint.join("prompt-cache");
+        // Persist the prefix state, not the uninterrupted suffix token.
+        cache.reset().unwrap();
+        let _ = model.prefill(&prompt, &mut cache, &group, stream).unwrap();
+        model
+            .save_prompt_cache(
+                &mut cache,
+                &root,
+                descriptor.clone(),
+                &[1, 2, 3],
+                &PromptCacheOptions::default(),
+            )
+            .unwrap();
+        let (mut restored, manifest) = model
+            .load_prompt_cache(&root, &descriptor, &[1, 2, 3], paged)
+            .unwrap();
+        assert_eq!(manifest.topology, descriptor.topology);
+        let restored = model
+            .decode(&first.token, &mut restored, &group, stream)
+            .map(|restored_logits| (restored, restored_logits))
+            .unwrap();
+        let restored_values = restored.1.evaluated().unwrap();
+        assert_eq!(uninterrupted_values, restored_values.as_slice::<f32>());
+        drop(restored_values);
+        cache = restored.0;
+        restored.1
+    } else {
+        uninterrupted
+    };
     assert_close(&decode, &expected["decode"]);
     assert_eq!(
         model.latest_routing_statistics().total_routes,
@@ -345,7 +413,8 @@ fn expert_parallel_model_ring_worker() {
     }
 
     if architecture == "Qwen3" {
-        let mut sliding_cache = model.new_qwen3_sliding_cache(2).unwrap();
+        let paging = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1).unwrap();
+        let mut sliding_cache = model.new_qwen3_sliding_cache(2, paging).unwrap();
         let sliding_prefill = model
             .prefill(&prompt, &mut sliding_cache, &group, stream)
             .unwrap();
@@ -392,7 +461,8 @@ fn expert_parallel_model_ring_worker() {
         assert_close(&sliding_decode_second, &expected["sliding_decode_second"]);
         assert_eq!(sliding_cache.offset(), 5);
     } else {
-        assert!(model.new_qwen3_sliding_cache(2).is_err());
+        let paging = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1).unwrap();
+        assert!(model.new_qwen3_sliding_cache(2, paging).is_err());
     }
     assert_eq!(architecture, format!("{:?}", model.info().model_kind));
 }
@@ -1347,4 +1417,43 @@ fn ring_two_process_model_parity() {
             "expected.safetensors",
         );
     }
+}
+
+/// Verifies rank-local paged prompt save/load parity for the two EP cache
+/// representations supported by persistence: DeepSeek MLA and GPT-OSS KV.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_two_process_paged_prompt_cache_parity() {
+    assert!(distributed::is_available(Backend::Ring));
+    let fixture = tempfile::tempdir().unwrap();
+
+    let deepseek = fixture.path().join("deepseek-v3-prompt");
+    std::fs::create_dir_all(&deepseek).unwrap();
+    write_deepseek_fixture(&deepseek);
+    std::fs::write(deepseek.join(PAGED_PROMPT_MARKER), b"1").unwrap();
+    run_ring_fixture(
+        "DeepSeekV3 paged prompt cache",
+        "DeepSeekV3",
+        "dense",
+        "balanced",
+        "resident",
+        &deepseek,
+        "expected.safetensors",
+    );
+
+    let gpt = write_additional_sparse_fixtures(fixture.path())
+        .into_iter()
+        .find(|(_, architecture, _)| *architecture == "GptOss")
+        .map(|(_, _, directory)| directory)
+        .unwrap();
+    std::fs::write(gpt.join(PAGED_PROMPT_MARKER), b"1").unwrap();
+    run_ring_fixture(
+        "GPT-OSS paged prompt cache",
+        "GptOss",
+        "dense",
+        "balanced",
+        "sparse-cache",
+        &gpt,
+        "expected.safetensors",
+    );
 }

@@ -32,8 +32,9 @@ use crate::sampler::{DefaultSampler, Sampler};
 use crate::{
     cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
     error::Error,
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
@@ -532,6 +533,30 @@ impl Model {
         }
     }
 
+    /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
+        match self {
+            Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(&model.args)),
+            Self::LlamaLayerwise(model) => {
+                Ok(llama::prompt_cache_architecture_fingerprint(model.args()))
+            }
+            Self::DeepSeekV3(model) => Ok(deepseek_v3::prompt_cache_architecture_fingerprint(
+                &model.args,
+            )),
+            Self::DeepSeekV3Layerwise(model) => Ok(
+                deepseek_v3::prompt_cache_architecture_fingerprint(model.args()),
+            ),
+            Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(&model.args)),
+            Self::GptOssLayerwise(model) => {
+                Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args()))
+            }
+            _ => Err(Exception::custom(format!(
+                "prompt-cache architecture identity is unsupported for model type {}",
+                self.model_type()
+            ))),
+        }
+    }
+
     /// Runs a detailed instrumented forward pass for supported model families.
     ///
     /// DeepSeek-V3/R1, Llama, Qwen3, Qwen3.5 MoE, and Gemma4 currently report
@@ -812,9 +837,10 @@ impl Model {
     /// Creates ordinary cache state or an explicitly bounded paged cache.
     ///
     /// Paged construction is currently supported for Llama-compatible text
-    /// attention, DeepSeek compressed-latent attention, and the corresponding
-    /// bounded weight-execution wrappers. Other cache representations return a
-    /// precise unsupported error and retain their device-resident defaults.
+    /// attention, DeepSeek compressed-latent attention, GPT-OSS, Inkling
+    /// relative-position attention, and the corresponding bounded
+    /// weight-execution wrappers. Other cache representations return a precise
+    /// unsupported error and retain their device-resident defaults.
     pub fn new_cache_with_options(
         &self,
         policy: CacheResidencyPolicy,
@@ -853,6 +879,11 @@ impl Model {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::GptOss)
                     .map_err(|error| Exception::custom(error.to_string())),
+                Self::Inkling(model) => model.new_paged_cache(options).map(ModelCache::Inkling),
+                Self::InklingLayerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Inkling)
+                    .map_err(|error| Exception::custom(error.to_string())),
                 _ => Err(Exception::custom(format!(
                     "paged cache residency is unsupported for model type {}",
                     self.model_type()
@@ -871,11 +902,35 @@ impl Model {
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
         match self {
             Self::Llama(model) => {
-                let (manager, manifest) =
-                    open_prompt_cache(directory, expected, prefix_token_ids, options)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
+                let identity = PromptCacheModelIdentity {
+                        model_family: "llama".into(),
+                        effective_model_type: model.args.model_type.clone(),
+                        architecture_fingerprint:
+                            llama::prompt_cache_architecture_fingerprint(&model.args),
+                        layer_count,
+                        global_layer_start: 0,
+                        global_layer_end: layer_count,
+                        sliding_window: model.sliding_window(),
+                        sink_tokens: 0,
+                        topology: Default::default(),
+                        layer_layouts: PromptCacheModelIdentity::key_value_layouts(
+                            layer_count,
+                            model.args.num_key_value_heads,
+                            model.args.head_dim,
+                        ),
+                    };
+                validate_prompt_cache_model_identity(expected, &identity)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                let (manager, manifest) = open_prompt_cache(
+                    directory,
+                    expected,
+                    &identity,
+                    prefix_token_ids,
+                    options,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = (0..layer_count)
                     .map(|layer| {
                         PagedKeyValueCache::new(
@@ -1210,6 +1265,7 @@ impl ModelCache {
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DeepSeekV3(cache) => cache.residency_report(),
             Self::GptOss(cache) => cache.residency_report(),
+            Self::Inkling(cache) => cache.residency_report(),
             _ => Ok(None),
         }
     }
@@ -1678,6 +1734,11 @@ impl LoadedModel {
         policy: CacheResidencyPolicy,
     ) -> Result<ModelCache, Exception> {
         self.model.new_cache_with_options(policy)
+    }
+
+    /// Returns the canonical cache-relevant architecture identity for this loaded model.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
+        self.model.prompt_cache_architecture_fingerprint()
     }
 
     /// Lazily catalogs a compatible reusable text prefix for this loaded model.

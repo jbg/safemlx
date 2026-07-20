@@ -14,7 +14,8 @@ use safemlx::{
 
 use crate::{
     cache_residency::{
-        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
     },
     error::Error,
     expert_cache::{
@@ -55,6 +56,11 @@ impl DeepSeekV3LayerwiseModel {
         self.execution.adapter().args()
     }
 
+    /// Returns the canonical cache-relevant architecture identity.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        resident::prompt_cache_architecture_fingerprint(self.args())
+    }
+
     /// Creates one compressed MLA cache per decoder block.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
@@ -73,10 +79,32 @@ impl DeepSeekV3LayerwiseModel {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Error> {
+        let args = self.args();
+        let layer_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "deepseek_v3".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window: None,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layouts: PromptCacheModelIdentity::compressed_layouts(
+                layer_count,
+                args.kv_lora_rank,
+                args.qk_rope_head_dim,
+            ),
+        };
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
             self.args().num_hidden_layers,
             directory,
             expected,
+            &identity,
             prefix_token_ids,
             options,
         )

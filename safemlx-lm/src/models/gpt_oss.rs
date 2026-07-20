@@ -22,8 +22,10 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
-        open_prompt_cache, CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy,
-        CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
+        validate_prompt_cache_model_identity, CacheRankIdentity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity,
     },
     error::Error,
     models::{common, common::generation::CausalLm, input},
@@ -176,6 +178,64 @@ impl ModelArgs {
             })
             .collect()
     }
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
+        || "none".to_string(),
+        |config| {
+            let mut entries = config.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| key.as_str());
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        FloatOrString::Float(value) => format!("f32:{:08x}", value.to_bits()),
+                        FloatOrString::String(value) => format!("string:{value}"),
+                        FloatOrString::Bool(value) => format!("bool:{value}"),
+                    };
+                    format!("{key}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        },
+    );
+    derive_prompt_cache_architecture_fingerprint(
+        "gpt_oss",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("intermediate_size", args.intermediate_size.to_string()),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("num_key_value_heads", args.num_key_value_heads.to_string()),
+            ("head_dim", args.head_dim.to_string()),
+            ("vocab_size", args.vocab_size.to_string()),
+            ("num_local_experts", args.num_local_experts.to_string()),
+            ("num_experts_per_tok", args.num_experts_per_tok.to_string()),
+            (
+                "rms_norm_eps",
+                format!("{:08x}", args.rms_norm_eps.to_bits()),
+            ),
+            ("sliding_window", args.sliding_window.to_string()),
+            (
+                "max_position_embeddings",
+                args.max_position_embeddings.to_string(),
+            ),
+            ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
+            ("rope_scaling", rope_scaling),
+            ("layer_types", args.layer_types.join(";")),
+            (
+                "quantization_config",
+                args.quantization_config.quant_method.clone(),
+            ),
+            ("quantization", format!("{:?}", args.quantization)),
+            (
+                "swiglu_limit",
+                format!("{:08x}", args.swiglu_limit.to_bits()),
+            ),
+        ],
+    )
 }
 
 /// Validates a parsed GPT-OSS configuration.
@@ -661,6 +721,19 @@ impl KeyValueCache for LayerCache {
             Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
         }
     }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Full(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Sliding(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Paged(cache) => cache.update_for_attention(keys, values, stream),
+        }
+    }
 }
 
 /// Heterogeneous generation cache for GPT-OSS.
@@ -671,16 +744,17 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
             match layer {
                 LayerCache::Full(cache) => cache.clear(),
                 LayerCache::Sliding(cache) => cache.clear(),
                 LayerCache::Paged(cache) => {
-                    let _ = cache.clear();
+                    cache.clear()?;
                 }
             }
         }
+        Ok(())
     }
 
     pub(crate) fn offset(&self) -> i32 {
@@ -948,8 +1022,29 @@ impl Model {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Exception> {
-        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+        let layer_count = usize::try_from(self.args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid GPT-OSS cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "gpt_oss".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window: Some(self.args.sliding_window),
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layouts: PromptCacheModelIdentity::key_value_layouts(
+                layer_count,
+                self.args.num_key_value_heads,
+                self.args.head_dim,
+            ),
+        };
+        validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string()))?;
         Ok((self.new_cache_with_manager(manager, None)?, manifest))
     }
 

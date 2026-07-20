@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{error::Exception, nested::NestedValue, ops::broadcast_to, Array, Dtype, Stream};
+use crate::{error::Exception, nested::NestedValue, ops::zeros_dtype, Array, Dtype, Stream};
 
 use super::ModuleParameters;
 
@@ -72,9 +72,7 @@ impl Param<Array> {
         dtype: Dtype,
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
-        let stream = stream.as_ref();
-        let scalar = Array::from_f32(0.0).as_dtype(dtype, stream)?;
-        Ok(Self::new(broadcast_to(scalar, shape, stream)?))
+        Ok(Self::new(zeros_dtype(shape, dtype, stream)?))
     }
 }
 

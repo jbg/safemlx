@@ -454,6 +454,8 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_deepseek_pipeline_persistence -- --ignored --exact --nocapture
 ```
 
 See `cargo run -p safemlx-lm --example pipeline_generate -- MODEL_DIR` for the
@@ -511,6 +513,8 @@ cargo test -p safemlx --test distributed_ring \
   ring_two_process_loopback -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_tensor_parallel -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
+  ring_two_process_deepseek_tensor_parallel_persistence -- --ignored --exact --nocapture
 ```
 
 The model-level probe is:
@@ -868,7 +872,8 @@ routed contribution, replicated shared-expert contribution, and final combined
 MoE output as distinct fields. Detailed activation observation is currently
 unavailable on the sparse expert-cache EP path. Qwen3 callers can select the
 standard growing cache with `new_cache()` or a bounded cache with
-`new_qwen3_sliding_cache(window)`; both retain the same EP routing semantics.
+`new_qwen3_sliding_cache(window, paging_options)`; the bounded form uses the
+shared paged residency manager and both retain the same EP routing semantics.
 
 Every supported packed or split expert layout is selected by placement before
 payload materialization; remote-only indexed shards are not opened. Dense,

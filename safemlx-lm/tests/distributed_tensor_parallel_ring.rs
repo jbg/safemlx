@@ -10,16 +10,20 @@ use std::{
 
 use safemlx::{
     distributed::{self, Backend},
-    DeviceType, Stream,
+    module::ModuleParameters,
+    Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    sampler::DefaultSampler, tensor_parallel::load_tensor_parallel_model, DeviceAssignment,
-    ParallelTopology,
+    models::deepseek_v3, module_binding::canonical_checkpoint_name, sampler::DefaultSampler,
+    tensor_parallel::load_tensor_parallel_model, CacheResidencyPolicy, DeviceAssignment,
+    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "SAFEMLX_LM_TENSOR_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_TENSOR_CHECKPOINT";
+const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_TENSOR_PROMPT_CACHE";
 
 #[test]
 fn tensor_ring_worker() {
@@ -28,6 +32,12 @@ fn tensor_ring_worker() {
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
+    let deepseek = config["model_type"] == "deepseek_v3";
+    let layer_count = config["num_hidden_layers"].as_u64().unwrap() as usize;
+    let vocab_size = config["vocab_size"].as_u64().unwrap() as usize;
+    let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
         ParallelTopology::from_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
@@ -40,20 +50,78 @@ fn tensor_ring_worker() {
     assert_eq!(info.local_kv_heads, 1);
     assert_eq!(
         info.local_vocabulary_range,
-        if expected_rank == 0 { 0..3 } else { 3..5 }
+        if deepseek {
+            if expected_rank == 0 {
+                0..4
+            } else {
+                4..8
+            }
+        } else if expected_rank == 0 {
+            0..3
+        } else {
+            3..5
+        }
     );
-    assert!(info.local_parameter_bytes < 656);
+    if !deepseek {
+        assert!(info.local_parameter_bytes < 656);
+    }
     assert!(info
         .owned_tensors
         .iter()
         .any(|name| name == "model.embed_tokens.weight"));
 
-    let mut cache = model.new_cache();
+    let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
+        .unwrap()
+        .with_full_attention(true);
+    let mut cache = model
+        .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
+        .unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let mut logits = model.prefill(&prompt, &mut cache, &group, &stream).unwrap();
-    assert_eq!(logits.shape(), &[1, 2, 5]);
+    let logits = model.prefill(&prompt, &mut cache, &group, &stream).unwrap();
+    assert_eq!(logits.shape(), &[1, 2, vocab_size as i32]);
+    let descriptor = PromptCacheDescriptor {
+        model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
+        effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
+        checkpoint_fingerprint: "tensor-ring-fixture".into(),
+        architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
+        layer_count,
+        global_layer_start: 0,
+        global_layer_end: layer_count,
+        batch_size: 1,
+        sliding_window: None,
+        sink_tokens: 0,
+        topology: PromptCacheTopology {
+            pipeline: None,
+            tensor_parallel: Some((2, expected_rank)),
+            expert_parallel: None,
+            expert_parallel_cache_replicated: true,
+        },
+    };
+    model
+        .save_prompt_cache(
+            &mut cache,
+            &prompt_cache_root,
+            descriptor.clone(),
+            &[1, 2],
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
+    let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
+    let uninterrupted = model.decode(&token, &mut cache, &group, &stream).unwrap();
+    let uninterrupted = uninterrupted.evaluated().unwrap();
+    let uninterrupted_values = uninterrupted.as_slice::<f32>().to_vec();
+    drop(uninterrupted);
+    let (mut cache, manifest) = model
+        .load_prompt_cache(&prompt_cache_root, &descriptor, &[1, 2], paged)
+        .unwrap();
+    assert_eq!(manifest.topology, descriptor.topology);
+    let restored = model.decode(&token, &mut cache, &group, &stream).unwrap();
+    let restored = restored.evaluated().unwrap();
+    assert_eq!(uninterrupted_values, restored.as_slice::<f32>());
+    let mut logits = restored.as_array().clone();
+    drop(restored);
     let mut sampler = DefaultSampler;
-    for _ in 0..2 {
+    for _ in 0..1 {
         let synchronized = model
             .sample_and_synchronize(&logits, &mut sampler, 0.0, None, false, 0, &group, &stream)
             .unwrap();
@@ -63,7 +131,7 @@ fn tensor_ring_worker() {
         logits = model
             .decode(&synchronized.token, &mut cache, &group, &stream)
             .unwrap();
-        assert_eq!(logits.shape(), &[1, 1, 5]);
+        assert_eq!(logits.shape(), &[1, 1, vocab_size as i32]);
     }
     assert_eq!(cache.offset(), 4);
 }
@@ -144,6 +212,69 @@ fn write_fixture(directory: &Path) {
     .unwrap();
 }
 
+fn write_deepseek_fixture(directory: &Path, layers: i32) {
+    let config = serde_json::json!({
+        "model_type": "deepseek_v3",
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": layers,
+        "num_attention_heads": 2,
+        "vocab_size": 8,
+        "rms_norm_eps": 0.000001,
+        "max_position_embeddings": 64,
+        "rope_theta": 10000.0,
+        "q_lora_rank": null,
+        "kv_lora_rank": 4,
+        "qk_nope_head_dim": 2,
+        "qk_rope_head_dim": 2,
+        "v_head_dim": 2,
+        "first_k_dense_replace": layers,
+        "moe_layer_freq": 1,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "n_group": 2,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.0,
+        "num_nextn_predict_layers": 0,
+        "split_kv_b": false,
+        "tie_word_embeddings": false
+    });
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let args: deepseek_v3::ModelArgs = serde_json::from_value(config.clone()).unwrap();
+    let mut model = deepseek_v3::Model::new(args, stream).unwrap();
+    for (name, parameter) in model.parameters_mut().flatten() {
+        let shape = parameter.shape().to_vec();
+        *parameter = if name.ends_with("norm.weight") {
+            Array::ones::<f32>(&shape, stream).unwrap()
+        } else {
+            Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
+        };
+    }
+    let arrays = model
+        .parameters()
+        .flatten()
+        .into_iter()
+        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
+        .collect::<Vec<_>>();
+    Array::save_safetensors(
+        arrays.iter().map(|(name, value)| (name.as_str(), value)),
+        None,
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+}
+
 struct ChildGuard(Vec<Child>);
 
 impl ChildGuard {
@@ -188,9 +319,25 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_tensor_parallel() {
+    run_ring_tensor_parallel(false);
+}
+
+/// Verifies DeepSeek MLA paged-prefix persistence across two tensor ranks.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_tensor_parallel_persistence() {
+    run_ring_tensor_parallel(true);
+}
+
+fn run_ring_tensor_parallel(deepseek: bool) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    write_fixture(checkpoint.path());
+    if deepseek {
+        write_deepseek_fixture(checkpoint.path(), 1);
+    } else {
+        write_fixture(checkpoint.path());
+    }
+    let prompt_cache = tempfile::tempdir().unwrap();
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();
     let hostfile = ring.path().join("ring-hosts.json");
@@ -199,17 +346,21 @@ fn ring_two_process_tensor_parallel() {
         format!("[[\"127.0.0.1:{first_port}\"],[\"127.0.0.1:{second_port}\"]]"),
     )
     .unwrap();
-    drop(first_socket);
-    drop(second_socket);
-
     let executable = std::env::current_exe().unwrap();
     let mut children = ChildGuard(Vec::with_capacity(2));
+    let mut reservations = [Some(first_socket), Some(second_socket)];
     for rank in 0..2 {
+        // Release only the address this rank will bind immediately before its
+        // process is spawned. Keeping the peer address reserved closes the
+        // previous socket-setup race where either port could be stolen between
+        // dropping both listeners and launching the workers.
+        drop(reservations[rank].take());
         children.0.push(
             Command::new(&executable)
                 .args(["--exact", "tensor_ring_worker", "--nocapture"])
                 .env(WORKER_RANK, rank.to_string())
                 .env(CHECKPOINT_DIR, checkpoint.path())
+                .env(PROMPT_CACHE_ROOT, prompt_cache.path())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)
                 .env_remove("MLX_RING_VERBOSE")

@@ -23,9 +23,12 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, SlidingKeyValueCache},
+    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
     },
     error::Error,
     expert_cache::{
@@ -1023,6 +1026,8 @@ pub enum ExpertParallelCache {
     Qwen3(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3 bounded sliding-window key/value cache.
     Qwen3Sliding(Vec<Option<SlidingKeyValueCache>>),
+    /// Qwen3 globally budgeted paged key/value cache.
+    Qwen3Paged(Vec<Option<PagedKeyValueCache>>),
     /// GPT-OSS alternating full/sliding attention cache.
     GptOss(gpt_oss::Cache),
     /// Inkling attention and convolution cache.
@@ -1039,9 +1044,13 @@ pub enum ExpertParallelCache {
 
 impl ExpertParallelCache {
     /// Clears all cached attention state.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), Error> {
         match self {
-            Self::DeepSeek(cache) => cache.layers.iter_mut().for_each(|cache| cache.clear()),
+            Self::DeepSeek(cache) => {
+                for cache in &mut cache.layers {
+                    cache.clear()?;
+                }
+            }
             Self::Qwen3(cache) => cache
                 .iter_mut()
                 .flatten()
@@ -1050,13 +1059,25 @@ impl ExpertParallelCache {
                 .iter_mut()
                 .flatten()
                 .for_each(SlidingKeyValueCache::clear),
-            Self::GptOss(cache) => cache.reset(),
-            Self::Inkling(cache) => cache.reset(),
+            Self::Qwen3Paged(caches) => {
+                if let Some(first) = caches.iter().flatten().next() {
+                    first
+                        .manager()
+                        .clear()
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                }
+                for cache in caches.iter_mut().flatten() {
+                    cache.reset_local_after_manager_clear();
+                }
+            }
+            Self::GptOss(cache) => cache.reset()?,
+            Self::Inkling(cache) => cache.reset()?,
             Self::Lfm2(cache) => cache.reset(),
             Self::NemotronH(cache) => cache.reset(),
             Self::QwenHybrid(cache) => cache.reset(),
             Self::Qwen3Vl(cache) => *cache = qwen3_vl::Cache::default(),
         }
+        Ok(())
     }
 
     /// Returns the common replicated cache offset.
@@ -1068,6 +1089,10 @@ impl ExpertParallelCache {
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
             Self::Qwen3Sliding(cache) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
+            Self::Qwen3Paged(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
@@ -1150,8 +1175,9 @@ impl ExpertParallelModel {
 
     /// Allocates replicated attention state under an explicit cache policy.
     ///
-    /// DeepSeek compressed attention and GPT-OSS alternating attention are
-    /// supported. Recurrent, multimodal, and relative-position cache state is
+    /// DeepSeek compressed attention, GPT-OSS alternating attention, Qwen3 KV,
+    /// and Inkling relative-position attention are supported. Inkling's
+    /// convolution state remains resident; recurrent and multimodal state is
     /// rejected because it is not represented by paged KV blocks.
     pub fn new_cache_with_options(
         &self,
@@ -1186,6 +1212,42 @@ impl ExpertParallelModel {
                         .map(ExpertParallelCache::GptOss)
                         .map_err(Into::into)
                 }
+                ExpertArchitecture::Qwen3(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    let rank = Some(CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: None,
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    });
+                    let caches = (0..model.model.layers.len())
+                        .map(|layer| {
+                            PagedKeyValueCache::new_with_layout(
+                                manager.clone(),
+                                layer,
+                                None,
+                                0,
+                                rank,
+                            )
+                            .map(Some)
+                            .map_err(Error::from)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(ExpertParallelCache::Qwen3Paged(caches))
+                }
+                ExpertArchitecture::Inkling(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    let rank = Some(CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: None,
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    });
+                    model
+                        .new_paged_cache_with_manager(manager, rank)
+                        .map(ExpertParallelCache::Inkling)
+                        .map_err(Into::into)
+                }
                 _ => Err(Error::Parallel(
                     "paged cache residency is unsupported for this expert-parallel cache representation"
                         .into(),
@@ -1202,23 +1264,196 @@ impl ExpertParallelModel {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::Qwen3Paged(caches) => caches
+                .iter()
+                .flatten()
+                .next()
+                .map(PagedKeyValueCache::report)
+                .transpose()
+                .map_err(Into::into),
+            ExpertParallelCache::Inkling(cache) => cache.residency_report().map_err(Into::into),
             _ => Ok(None),
         }
     }
 
+    /// Persists this rank's replicated paged attention prefix below a shared root.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut ExpertParallelCache,
+        root: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let directory = self.prompt_cache_rank_directory(root.as_ref());
+        match cache {
+            ExpertParallelCache::DeepSeek(cache) => cache
+                .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
+                .map_err(Into::into),
+            ExpertParallelCache::GptOss(cache) => cache
+                .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
+                .map_err(Into::into),
+            _ => Err(Error::Parallel(
+                "expert-parallel prompt persistence requires a supported paged attention cache"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Opens this rank's compatible replicated prefix without eager array loading.
+    pub fn load_prompt_cache(
+        &self,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<(ExpertParallelCache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (manager, manifest) = open_prompt_cache(
+            self.prompt_cache_rank_directory(root.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let rank = Some(CacheRankIdentity {
+            pipeline_rank: None,
+            tensor_parallel_rank: None,
+            expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+        });
+        let cache =
+            match &self.architecture {
+                ExpertArchitecture::DeepSeek(model) => model
+                    .new_cache_with_manager(manager, rank)
+                    .map(ExpertParallelCache::DeepSeek)?,
+                ExpertArchitecture::GptOss(model) => model
+                    .new_cache_with_manager(manager, rank)
+                    .map(ExpertParallelCache::GptOss)?,
+                _ => return Err(Error::Parallel(
+                    "expert-parallel prompt loading is unsupported for this cache representation"
+                        .into(),
+                )),
+            };
+        Ok((cache, manifest))
+    }
+
+    fn prompt_cache_rank_directory(&self, root: &Path) -> PathBuf {
+        root.join(format!("rank-{:05}", self.topology.global_rank))
+    }
+
+    /// Returns the canonical cache-relevant architecture identity for this rank.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
+    }
+
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        let (
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            sliding_window,
+        ) =
+            match &self.architecture {
+                ExpertArchitecture::DeepSeek(model) => (
+                    "deepseek_v3".to_string(),
+                    model.args.model_type.clone(),
+                    crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(&model.args),
+                    usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                    None,
+                ),
+                ExpertArchitecture::GptOss(model) => (
+                    "gpt_oss".to_string(),
+                    model.args.model_type.clone(),
+                    crate::models::gpt_oss::prompt_cache_architecture_fingerprint(&model.args),
+                    usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
+                    Some(model.args.sliding_window),
+                ),
+                _ => return Err(Error::Parallel(
+                    "prompt-cache persistence is unsupported for this expert-parallel architecture"
+                        .into(),
+                )),
+            };
+        Ok(PromptCacheModelIdentity {
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window,
+            sink_tokens: 0,
+            topology: PromptCacheTopology {
+                pipeline: None,
+                tensor_parallel: None,
+                expert_parallel: Some((
+                    self.topology.expert_parallel_size,
+                    self.topology.expert_parallel_rank,
+                )),
+                expert_parallel_cache_replicated: true,
+            },
+            layer_layouts: match &self.architecture {
+                ExpertArchitecture::DeepSeek(model) => {
+                    PromptCacheModelIdentity::compressed_layouts(
+                        layer_count,
+                        model.args.kv_lora_rank,
+                        model.args.qk_rope_head_dim,
+                    )
+                }
+                ExpertArchitecture::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
+                    layer_count,
+                    model.args.num_key_value_heads,
+                    model.args.head_dim,
+                ),
+                _ => unreachable!("identity rejects unsupported expert architectures"),
+            },
+        })
+    }
+
     /// Allocates a bounded Qwen3 sliding-window cache.
-    pub fn new_qwen3_sliding_cache(&self, max_size: i32) -> Result<ExpertParallelCache, Error> {
+    pub fn new_qwen3_sliding_cache(
+        &self,
+        max_size: i32,
+        options: PagedCacheOptions,
+    ) -> Result<ExpertParallelCache, Error> {
         if max_size <= 0 {
             return Err(Error::Parallel(
                 "Qwen3 sliding cache size must be positive".into(),
             ));
         }
         match &self.architecture {
-            ExpertArchitecture::Qwen3(model) => Ok(ExpertParallelCache::Qwen3Sliding(
-                (0..model.model.layers.len())
-                    .map(|_| Some(SlidingKeyValueCache::new(max_size)))
-                    .collect(),
-            )),
+            ExpertArchitecture::Qwen3(model) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                let rank = Some(CacheRankIdentity {
+                    pipeline_rank: None,
+                    tensor_parallel_rank: None,
+                    expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                });
+                Ok(ExpertParallelCache::Qwen3Paged(
+                    (0..model.model.layers.len())
+                        .map(|layer| {
+                            PagedKeyValueCache::new_with_layout(
+                                manager.clone(),
+                                layer,
+                                Some(max_size),
+                                0,
+                                rank,
+                            )
+                            .map(Some)
+                            .map_err(Error::from)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
             _ => Err(Error::Parallel(
                 "sliding key/value caches are only available for Qwen3 expert parallelism".into(),
             )),
@@ -1373,6 +1608,46 @@ impl ExpertParallelModel {
                     )?
                 }
                 (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Sliding(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_qwen3(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Paged(cache)) => {
                     let args = model.args.clone();
                     model.forward_cached_expert_parallel(
                         qwen3::ModelInput {
@@ -1680,6 +1955,19 @@ impl ExpertParallelModel {
                         stream,
                     )?
                 }
+                (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3Paged(cache)) => model
+                    .forward_expert_parallel(
+                        qwen3::ModelInput {
+                            inputs: tokens,
+                            mask,
+                            cache,
+                        },
+                        &self.info.assignment,
+                        group,
+                        &mut statistics,
+                        observer,
+                        stream,
+                    )?,
                 _ => {
                     return Err(Error::Parallel(
                         "expert-parallel cache architecture mismatch".into(),

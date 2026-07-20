@@ -32,9 +32,6 @@ struct Args {
     /// Stable content-based checkpoint identity.
     #[arg(long)]
     checkpoint_fingerprint: String,
-    /// Stable identity covering RoPE and cache-relevant architecture settings.
-    #[arg(long)]
-    architecture_fingerprint: String,
     /// Sliding attention window, when the model uses one.
     #[arg(long)]
     sliding_window: Option<i32>,
@@ -135,7 +132,7 @@ fn main() -> anyhow::Result<()> {
         model_family: model_family.into(),
         effective_model_type: model_type,
         checkpoint_fingerprint: args.checkpoint_fingerprint,
-        architecture_fingerprint: args.architecture_fingerprint,
+        architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
         layer_count: args.layer_count,
         global_layer_start: 0,
         global_layer_end: args.layer_count,

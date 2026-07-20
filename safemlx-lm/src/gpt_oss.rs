@@ -15,8 +15,9 @@ use safemlx::{
 use crate::{
     cache::{KeyValueCache, PagedKeyValueCache},
     cache_residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest,
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity,
     },
     error::Error,
     expert_cache::{
@@ -56,6 +57,11 @@ impl GptOssLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    /// Returns the canonical cache-relevant architecture identity.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        resident::prompt_cache_architecture_fingerprint(self.args())
+    }
+
     /// Creates the architecture's alternating sliding/full attention cache.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
@@ -93,8 +99,30 @@ impl GptOssLayerwiseModel {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Error> {
-        let (manager, manifest) = open_prompt_cache(directory, expected, prefix_token_ids, options)
+        let args = self.args();
+        let layer_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid GPT-OSS cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "gpt_oss".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sliding_window: Some(args.sliding_window),
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layouts: PromptCacheModelIdentity::key_value_layouts(
+                layer_count,
+                args.num_key_value_heads,
+                args.head_dim,
+            ),
+        };
+        validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string()))?;
         let adapter = self.execution.adapter();
         let layers = adapter
             .layer_types
