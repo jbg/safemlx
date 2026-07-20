@@ -2644,18 +2644,22 @@ impl CacheResidencyManager {
 
             if replacing {
                 let generation = generations.join(&generation_name);
-                fs::rename(&temporary, &generation).map_err(|source| CacheResidencyError::Io {
-                    action: "publish prompt cache generation",
-                    path: generation.clone(),
-                    source,
+                durable_rename(&temporary, &generation, false).map_err(|source| {
+                    CacheResidencyError::Io {
+                        action: "publish prompt cache generation",
+                        path: generation.clone(),
+                        source,
+                    }
                 })?;
                 sync_directory(&generations)?;
                 publish_prompt_cache_generation(destination, &generation_name, nonce)?;
             } else {
-                fs::rename(&temporary, destination).map_err(|source| CacheResidencyError::Io {
-                    action: "publish prompt cache",
-                    path: destination.to_path_buf(),
-                    source,
+                durable_rename(&temporary, destination, false).map_err(|source| {
+                    CacheResidencyError::Io {
+                        action: "publish prompt cache",
+                        path: destination.to_path_buf(),
+                        source,
+                    }
                 })?;
             }
             sync_directory(parent)?;
@@ -4221,7 +4225,7 @@ fn publish_prompt_cache_generation(
         path: temporary.clone(),
         source,
     })?;
-    fs::rename(&temporary, &current).map_err(|source| CacheResidencyError::Io {
+    durable_rename(&temporary, &current, true).map_err(|source| CacheResidencyError::Io {
         action: "switch prompt cache generation",
         path: current,
         source,
@@ -4264,6 +4268,7 @@ fn sync_file(path: &Path) -> Result<(), CacheResidencyError> {
         })
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -4272,6 +4277,82 @@ fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
+    // Windows has no POSIX-style directory fsync. Prompt-cache metadata is
+    // published with MOVEFILE_WRITE_THROUGH in `durable_rename`; validate the
+    // expected directory here without trying to open it as an ordinary file.
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(CacheResidencyError::Io {
+            action: "validate cache directory before durable publication",
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "cache publication path is not a directory",
+            ),
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(CacheResidencyError::Io {
+            action: "validate cache directory before publication",
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "cache publication path is not a directory",
+            ),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn durable_rename(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn durable_rename(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows cache publication path contains an embedded NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the
+    // duration of the call. The source and destination are sibling paths, so
+    // publication cannot become a copy across volumes.
+    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -4412,7 +4493,7 @@ pub enum CacheResidencyError {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_shard_payload, hash_token_ids, inspect_prompt_cache, live_block_paths,
+        durable_rename, hash_shard_payload, hash_token_ids, inspect_prompt_cache, live_block_paths,
         map_prompt_cache_shard, open_prompt_cache, publish_live_block_file,
         publish_prompt_cache_generation, safe_shard_path, validate_prompt_cache_model_identity,
         verify_disk_payload, CacheBlockArrays, CacheBlockId, CacheBlockRecord,
@@ -4795,6 +4876,26 @@ mod tests {
                 .as_deref(),
             Some("new")
         );
+    }
+
+    #[test]
+    fn durable_rename_publishes_directories_and_replaces_pointer_files() {
+        let root = tempfile::tempdir().unwrap();
+        let pointer = root.path().join("CURRENT");
+        let temporary_pointer = root.path().join(".CURRENT.tmp");
+        fs::write(&pointer, b"old\n").unwrap();
+        fs::write(&temporary_pointer, b"new\n").unwrap();
+        durable_rename(&temporary_pointer, &pointer, true).unwrap();
+        assert_eq!(fs::read(&pointer).unwrap(), b"new\n");
+        assert!(!temporary_pointer.exists());
+
+        let temporary_generation = root.path().join(".generation.tmp");
+        let generation = root.path().join("generation-1");
+        fs::create_dir(&temporary_generation).unwrap();
+        fs::write(temporary_generation.join("manifest.json"), b"{}").unwrap();
+        durable_rename(&temporary_generation, &generation, false).unwrap();
+        assert_eq!(fs::read(generation.join("manifest.json")).unwrap(), b"{}");
+        assert!(!temporary_generation.exists());
     }
 
     #[test]

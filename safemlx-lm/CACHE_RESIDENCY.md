@@ -132,7 +132,10 @@ rename. Replacement writes an immutable generation under the existing
 destination and atomically switches its flushed `CURRENT` pointer, so the
 canonical cache path always resolves to either the previous complete generation
 or the new complete generation. Existing destinations are replaced only when
-`PromptCacheOptions::replace_existing` is true.
+`PromptCacheOptions::replace_existing` is true. Unix publication synchronizes
+the affected directories after renames; Windows publication uses
+`MoveFileExW` with write-through semantics because ordinary file handles cannot
+flush directory metadata there.
 
 `inspect_prompt_cache` reads a bounded safetensors header and validates tensor
 metadata and payload boundaries without reading payload bytes or creating MLX
