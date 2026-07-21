@@ -1,6 +1,5 @@
-//! Regenerate Stage 0 fixtures while checked out before the Rust integration.
-//! The legacy `Array::load_gguf` call below must still route through patched MLX.
-use safemlx::{Array, Device, DeviceType, Dtype, Stream};
+//! Regenerate Stage 0 fixtures through the pure-Rust streaming integration.
+use safemlx::{ops::GgufCheckpoint, Array, Device, DeviceType, Dtype, Stream};
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -83,7 +82,14 @@ fn main() {
                 }],
             )
             .unwrap();
-        let arrays = Array::load_gguf(&path, &stream).unwrap();
+        let checkpoint = GgufCheckpoint::open(&path).unwrap();
+        let mut arrays = std::collections::HashMap::new();
+        checkpoint
+            .for_each_converted_tensor(|tensor| {
+                arrays.extend(tensor.into_arrays());
+                Ok(())
+            })
+            .unwrap();
         print!("{}|{}", ty.code(), hex(&raw));
         for name in ["oracle.weight", "oracle.scales", "oracle.biases"] {
             if let Some(a) = arrays.get(name) {

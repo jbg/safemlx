@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -12,6 +13,12 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    #[error("failed to read GGUF shard {path:?}: {source}")]
+    Shard {
+        path: PathBuf,
+        #[source]
+        source: Box<Error>,
+    },
     #[error("invalid GGUF header: {0}")]
     InvalidHeader(String),
     #[error("invalid GGUF metadata key {key:?}: {reason}")]
@@ -22,6 +29,24 @@ pub enum Error {
     DuplicateMetadata(String),
     #[error("duplicate GGUF tensor name {0:?}")]
     DuplicateTensor(String),
+    #[error("invalid GGUF checkpoint: {0}")]
+    InvalidShardSet(String),
+    #[error(
+        "GGUF logical tensor name {name:?} is produced by both {first_source:?} and {second_source:?}"
+    )]
+    DuplicateLogicalTensor {
+        name: String,
+        first_source: String,
+        second_source: String,
+    },
+    #[error(
+        "GGUF tensor names {first_source:?} and {second_source:?} collide after translation to {name:?}"
+    )]
+    TranslatedTensorCollision {
+        name: String,
+        first_source: String,
+        second_source: String,
+    },
     #[error("unsupported GGUF version {0}")]
     UnsupportedVersion(u32),
     #[error("unsupported GGUF metadata type {0}")]

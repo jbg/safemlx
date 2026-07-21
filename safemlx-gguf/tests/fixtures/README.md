@@ -16,4 +16,4 @@ bytes, positive and negative half scales, and consecutive blocks. Separate
 tests cover all-zero and maximum-code blocks.
 
 The example remains as regeneration documentation; it must be run at a revision
-where `Array::load_gguf` still uses patched MLX, such as commit `4e53c5ec`.
+where GGUF loading still used patched MLX, such as commit `4e53c5ec`.

@@ -65,6 +65,55 @@ pub enum ConvertedTensor {
     Affine(AffineTensor),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversionKind {
+    Dense(DenseDtype),
+    Affine { bits: u8, group_size: u32 },
+}
+
+pub(crate) fn conversion_kind(ty: GgmlType) -> Result<ConversionKind> {
+    if let Some(dtype) = dense_dtype(ty) {
+        return Ok(ConversionKind::Dense(dtype));
+    }
+    if matches!(ty, GgmlType::Q5_0 | GgmlType::Q5_1) {
+        return Ok(ConversionKind::Dense(DenseDtype::F16));
+    }
+    let (bits, group_size) = match ty {
+        GgmlType::Q2K => (2, 16),
+        GgmlType::Q3K => (3, 16),
+        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4K => (4, 32),
+        GgmlType::Q5K => (5, 32),
+        GgmlType::Q6K => (6, 16),
+        GgmlType::Q8_0 => (8, 32),
+        other => return Err(Error::UnsupportedTensorType(other.code())),
+    };
+    Ok(ConversionKind::Affine { bits, group_size })
+}
+
+pub(crate) fn affine_shapes(
+    desc: &TensorDescriptor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut weight_shape = desc.mlx_shape();
+    let last = weight_shape
+        .last_mut()
+        .ok_or_else(|| Error::tensor(&desc.name, "quantized scalar is invalid"))?;
+    if *last % u64::from(group_size) != 0 {
+        return Err(Error::tensor(
+            &desc.name,
+            format!("last dimension is not divisible by group size {group_size}"),
+        ));
+    }
+    *last = last
+        .checked_mul(u64::from(bits))
+        .ok_or(Error::Overflow("affine packed dimension"))?
+        / 32;
+    let mut scale_shape = desc.mlx_shape();
+    *scale_shape.last_mut().unwrap() /= u64::from(group_size);
+    Ok((weight_shape, scale_shape))
+}
+
 pub(crate) fn convert(
     desc: &TensorDescriptor,
     raw: &[u8],
@@ -76,15 +125,18 @@ pub(crate) fn convert(
             "payload length does not match descriptor",
         ));
     }
-    if let Some(dtype) = dense_dtype(desc.ggml_type) {
-        return Ok(ConvertedTensor::Dense(DenseTensor {
-            shape: desc.mlx_shape(),
-            dtype,
-            data: normalize_dense(raw, dtype, endian),
-        }));
-    }
-    if matches!(desc.ggml_type, GgmlType::Q5_0 | GgmlType::Q5_1) {
-        return legacy_q5(desc, raw, endian).map(ConvertedTensor::Dense);
+    match conversion_kind(desc.ggml_type)? {
+        ConversionKind::Dense(_) if matches!(desc.ggml_type, GgmlType::Q5_0 | GgmlType::Q5_1) => {
+            return legacy_q5(desc, raw, endian).map(ConvertedTensor::Dense);
+        }
+        ConversionKind::Dense(dtype) => {
+            return Ok(ConvertedTensor::Dense(DenseTensor {
+                shape: desc.mlx_shape(),
+                dtype,
+                data: normalize_dense(raw, dtype, endian),
+            }));
+        }
+        ConversionKind::Affine { .. } => {}
     }
     affine(desc, raw, endian).map(ConvertedTensor::Affine)
 }
@@ -124,28 +176,13 @@ fn normalize_dense(raw: &[u8], dtype: DenseDtype, endian: Endian) -> Vec<u8> {
 }
 
 fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
-    let (bits, group_size) = match desc.ggml_type {
-        GgmlType::Q2K => (2, 16),
-        GgmlType::Q3K => (3, 16),
-        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4K => (4, 32),
-        GgmlType::Q5K => (5, 32),
-        GgmlType::Q6K => (6, 16),
-        GgmlType::Q8_0 => (8, 32),
-        other => return Err(Error::UnsupportedTensorType(other.code())),
-    };
-    let mut weight_shape = desc.mlx_shape();
-    let last = weight_shape
-        .last_mut()
-        .ok_or_else(|| Error::tensor(&desc.name, "quantized scalar is invalid"))?;
-    if *last % group_size != 0 {
+    let ConversionKind::Affine { bits, group_size } = conversion_kind(desc.ggml_type)? else {
         return Err(Error::tensor(
             &desc.name,
-            format!("last dimension is not divisible by group size {group_size}"),
+            "dense tensor was sent to affine conversion",
         ));
-    }
-    *last = *last * (bits as u64) / 32;
-    let mut scale_shape = desc.mlx_shape();
-    *scale_shape.last_mut().unwrap() /= group_size;
+    };
+    let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;
     let groups = scale_shape.iter().try_fold(1u64, |a, &b| {
         a.checked_mul(b)
             .ok_or(Error::Overflow("affine group count"))
@@ -157,7 +194,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
         weight_shape,
         scale_shape,
         bits,
-        group_size: group_size as u32,
+        group_size,
         weights: Vec::with_capacity(words as usize),
         scales: Vec::with_capacity(groups as usize),
         biases: Vec::with_capacity(groups as usize),

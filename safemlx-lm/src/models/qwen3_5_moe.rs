@@ -15,7 +15,8 @@ use safemlx::{
         grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         matmul, quantized_matmul_with_mode, quantized_packed_dimension, sigmoid, stack_axis,
-        sum_axis, topk_route_plan, zeros, GgufMetadataValue, QuantizationMode,
+        sum_axis, topk_route_plan, zeros, GgufCheckpoint, GgufMetadataValue, GgufTensor,
+        QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -53,9 +54,9 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_strict,
-        safetensors_files, StrictLoadConfig, StrictLoadReport,
+        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_quantized_strict,
+        load_array_strict, load_named_array_strict, load_safetensors_strict, safetensors_files,
+        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -3678,21 +3679,13 @@ pub(crate) fn load_qwen3_5_moe_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen35Gguf, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    load_qwen3_5_moe_gguf_data(arrays, metadata, stream, weights_stream)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    load_qwen3_5_moe_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_qwen3_5_moe_gguf_data(
-    arrays: HashMap<String, Array>,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen35Gguf, Error> {
-    load_qwen3_5_moe_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
-}
-
-pub(crate) fn load_qwen3_5_moe_gguf_data_with_quantization(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -3705,16 +3698,12 @@ pub(crate) fn load_qwen3_5_moe_gguf_data_with_quantization(
         )));
     }
     let is_moe = architecture == "qwen35moe";
-    if arrays
-        .keys()
-        .any(|name| name.starts_with("v.") || name.starts_with("mm."))
-    {
+    if checkpoint.any_gguf_tensor(|name| name.starts_with("v.") || name.starts_with("mm.")) {
         return Err(Error::UnsupportedArchitecture(
             "multimodal Qwen3.5 GGUF checkpoints are not supported; load a text-only qwen35 or qwen35moe checkpoint"
                 .into(),
         ));
     }
-
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let block_count = qwen35_gguf_i32(&metadata, &key("block_count"), weights_stream)?;
     let nextn_layers =
@@ -3731,62 +3720,120 @@ pub(crate) fn load_qwen3_5_moe_gguf_data_with_quantization(
         )));
     }
     let num_hidden_layers = block_count - nextn_layers;
-
-    // Released Qwen3.5 GGUF files append MTP tensors as additional blk.N entries.
-    // The text runtime, like the safetensors loader, intentionally ignores them.
-    let arrays = arrays
-        .into_iter()
-        .filter(|(name, _)| {
-            qwen35_gguf_block_index(name).is_none_or(|index| index < num_hidden_layers)
-        })
-        .collect::<HashMap<_, _>>();
     let mut args = qwen35_args_from_gguf(
-        &arrays,
+        checkpoint,
         &metadata,
         &architecture,
         num_hidden_layers,
         weights_stream,
     )?;
-
-    let arrays = qwen35_dequantize_non_experts(arrays, weights_stream)?;
-    let mut translated = HashMap::with_capacity(arrays.len());
-    for (name, value) in arrays {
-        let (name, value) = qwen35_translate_gguf_weight(name, value, &args, weights_stream)?;
-        if translated.insert(name.clone(), value).is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3.5 GGUF tensors collide after translating {name:?}"
-            )));
+    let mut configs = gguf_affine_configs(checkpoint, qwen35_translate_gguf_weight_name)?
+        .into_iter()
+        .filter(|(name, _)| name.contains(".mlp.experts."))
+        .collect::<HashMap<_, _>>();
+    if is_moe {
+        for layer in 0..num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.mlp.experts");
+            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
+                configs.remove(&format!("{prefix}.up_proj"));
+                configs.insert(format!("{prefix}.gate_up_proj"), config);
+            }
         }
     }
-    if is_moe {
-        qwen35_pack_expert_banks(&mut translated, &args, weights_stream)?;
-    }
-    let quantized_weight_configs = qwen35_gguf_quantized_weight_configs(&translated)?;
     if let Some(quantization) = quantization {
         args.quantization = Some(quantization);
         args.quantized_weight_configs = None;
     } else {
-        args.quantized_weight_configs = Some(quantized_weight_configs);
+        args.quantized_weight_configs = Some(configs);
     }
 
     let mut model = Model::new(args, None, None, None, stream)?;
     let config = qwen3_5_moe_strict_load_config(false).allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    let mut materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let physical_name = &tensor.descriptor().name;
+        if qwen35_gguf_block_index(physical_name).is_some_and(|index| index >= num_hidden_layers)
+            || (is_moe
+                && (physical_name.contains("ffn_gate_exps")
+                    || physical_name.contains("ffn_up_exps")))
+        {
+            continue;
+        }
+        let group = materializer.converted_tensor(physical_name)?;
+        let arrays = match group {
+            GgufTensor::Affine(affine) if !qwen35_is_routed_expert_weight(physical_name) => {
+                let group_size = i32::try_from(affine.group_size()).map_err(|_| {
+                    Error::Quantization("GGUF affine group size exceeds i32".into())
+                })?;
+                let bits = i32::from(affine.bits());
+                let [weight, scales, biases] = affine.into_arrays();
+                let (name, weight) = weight.into_parts();
+                let (_, scales) = scales.into_parts();
+                let (_, biases) = biases.into_parts();
+                vec![(
+                    name,
+                    dequantize(&weight, &scales, &biases, group_size, bits, weights_stream)?,
+                )]
+            }
+            group => group.into_arrays(),
+        };
+        for (name, value) in arrays {
+            let (name, value) =
+                qwen35_translate_gguf_weight(name, value, &model.args, weights_stream)?;
+            load_named_array_strict(
+                &mut model,
+                name,
+                value,
+                quantization.map(|value| (value, stream)),
+                &config,
+                &mut report,
+            )?;
+        }
+    }
+    if is_moe {
+        for layer in 0..num_hidden_layers {
+            let source_prefix = format!("blk.{layer}");
+            let target_prefix = format!("model.layers.{layer}.mlp.experts");
+            let gate = materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let up = materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            for (source_suffix, target_suffix) in
+                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
+            {
+                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
+                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
+                let gate = gate.get(&gate_name).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Qwen3.5 GGUF is missing routed expert tensor {gate_name:?}"
+                    ))
+                })?;
+                let up = up.get(&up_name).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Qwen3.5 GGUF is missing routed expert tensor {up_name:?}"
+                    ))
+                })?;
+                let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
+                load_named_array_strict(
+                    &mut model,
+                    format!("{target_prefix}.gate_up_proj{target_suffix}"),
+                    value,
+                    quantization.map(|value| (value, stream)),
+                    &config,
+                    &mut report,
+                )?;
+            }
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-
     let eos_token_ids =
         qwen35_gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
             .and_then(|value| u32::try_from(value).ok())
@@ -3799,7 +3846,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_data_with_quantization(
 }
 
 fn qwen35_args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     num_hidden_layers: i32,
@@ -3867,8 +3914,8 @@ fn qwen35_args_from_gguf(
         head_dim,
         max_position_embeddings: qwen35_gguf_i32(metadata, &key("context_length"), stream)?,
         rms_norm_eps: qwen35_gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
-        attention_bias: arrays.keys().any(|name| {
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
+        attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
                 || name.ends_with("attn_k.bias")
                 || name.ends_with("attn_v.bias")
@@ -3931,51 +3978,6 @@ fn qwen35_is_routed_expert_weight(name: &str) -> bool {
     name.contains(".ffn_gate_exps.")
         || name.contains(".ffn_up_exps.")
         || name.contains(".ffn_down_exps.")
-}
-
-fn qwen35_dequantize_non_experts(
-    mut arrays: HashMap<String, Array>,
-    stream: &Stream,
-) -> Result<HashMap<String, Array>, Error> {
-    let scale_names = arrays
-        .keys()
-        .filter(|name| name.ends_with(".scales"))
-        .cloned()
-        .collect::<Vec<_>>();
-    for scales_name in scale_names {
-        if qwen35_is_routed_expert_weight(&scales_name) {
-            continue;
-        }
-        let prefix = scales_name
-            .strip_suffix(".scales")
-            .expect("filtered GGUF scale suffix");
-        let weight_name = format!("{prefix}.weight");
-        let biases_name = format!("{prefix}.biases");
-        let scales = arrays.remove(&scales_name).ok_or_else(|| {
-            Error::Quantization(format!("missing GGUF scales tensor {scales_name:?}"))
-        })?;
-        let weight = arrays.remove(&weight_name).ok_or_else(|| {
-            Error::Quantization(format!(
-                "GGUF quantization scales {scales_name:?} have no matching weight"
-            ))
-        })?;
-        let biases = arrays.remove(&biases_name).ok_or_else(|| {
-            Error::Quantization(format!(
-                "GGUF quantized tensor {weight_name:?} is missing affine biases"
-            ))
-        })?;
-        let config = qwen35_gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
-        let value = dequantize(
-            &weight,
-            &scales,
-            &biases,
-            config.group_size,
-            config.bits,
-            stream,
-        )?;
-        arrays.insert(weight_name, value);
-    }
-    Ok(arrays)
 }
 
 fn qwen35_translate_gguf_weight(
@@ -4154,74 +4156,7 @@ fn qwen35_translate_gguf_weight_name(name: &str) -> String {
     name.to_string()
 }
 
-fn qwen35_pack_expert_banks(
-    arrays: &mut HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<(), Error> {
-    for layer in 0..args.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        for suffix in ["", "_scales", "_biases"] {
-            let gate_name = format!("{prefix}.gate_proj{suffix}");
-            let up_name = format!("{prefix}.up_proj{suffix}");
-            let gate = arrays.remove(&gate_name).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5 GGUF is missing routed expert tensor {gate_name:?}"
-                ))
-            })?;
-            let up = arrays.remove(&up_name).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5 GGUF is missing routed expert tensor {up_name:?}"
-                ))
-            })?;
-            if gate.shape().len() != 3 || gate.shape()[0] != args.num_experts {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5 GGUF expert tensor {gate_name:?} has invalid shape {:?}",
-                    gate.shape()
-                )));
-            }
-            if gate.shape()[0] != up.shape()[0] || gate.shape()[2] != up.shape()[2] {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5 GGUF gate/up expert tensor shapes are incompatible: {:?} and {:?}",
-                    gate.shape(),
-                    up.shape()
-                )));
-            }
-            arrays.insert(
-                format!("{prefix}.gate_up_proj{suffix}"),
-                concatenate_axis(&[gate, up], 1, stream)?,
-            );
-        }
-        for suffix in ["", "_scales", "_biases"] {
-            let source = format!("{prefix}.down_proj{suffix}");
-            let value = arrays.remove(&source).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3.5 GGUF is missing routed expert tensor {source:?}"
-                ))
-            })?;
-            arrays.insert(source, value);
-        }
-    }
-    Ok(())
-}
-
-fn qwen35_gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let Some(weight_name) = scales_name.strip_suffix("_scales") else {
-            continue;
-        };
-        let Some(weight) = arrays.get(weight_name) else {
-            continue;
-        };
-        let config = qwen35_gguf_affine_quantization(weight.shape(), scales.shape(), weight_name)?;
-        configs.insert(weight_name.to_string(), config);
-    }
-    Ok(configs)
-}
-
+#[cfg(test)]
 fn qwen35_gguf_affine_quantization(
     weight_shape: &[i32],
     scales_shape: &[i32],

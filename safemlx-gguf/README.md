@@ -4,6 +4,22 @@
 parses GGUF v1-v3 in either byte order, exposes typed metadata and validated
 tensor descriptors, reads one payload at a time, converts supported GGML blocks
 to MLX's affine representation, and writes deterministic seekable GGUF files.
+`Checkpoint` discovers canonical shards, validates the complete descriptor
+set, exposes converted logical tensor layouts without reading payload bytes, and
+materializes one dense tensor or atomic affine group at a time.
+For bounded out-of-order access, `Checkpoint::materializer` indexes physical
+names once and reuses the current shard reader across named requests.
+
+```rust,no_run
+use safemlx_gguf::Checkpoint;
+
+let checkpoint = Checkpoint::open("model-00001-of-00004.gguf")?;
+checkpoint.for_each_converted_tensor(|tensor| {
+    println!("{}", tensor.descriptor().name);
+    Ok(())
+})?;
+# Ok::<(), safemlx_gguf::Error>(())
+```
 
 Dense support: F32, F16, BF16, F64, I8, I16, I32, and I64. Affine support:
 Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, and Q6_K. Legacy Q5_0 and Q5_1

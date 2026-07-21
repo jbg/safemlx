@@ -95,6 +95,7 @@ pub(crate) fn should_quantize_on_load(
 }
 
 /// Infers the exact affine layout emitted by the native GGUF converters.
+#[cfg(test)]
 pub(crate) fn gguf_affine_quantization(
     weight_shape: &[i32],
     scales_shape: &[i32],

@@ -10,7 +10,7 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -43,9 +43,10 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_quantized_strict,
-        load_safetensors_dir_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
-        StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_named_array_strict,
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
+        load_safetensors_dir_strict_with_split_swiglu_experts, GgufTensorNames, StrictLoadConfig,
+        StrictLoadReport,
     },
 };
 
@@ -1284,12 +1285,13 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    Ok(load_gguf_data(arrays, metadata, None, stream, weights_stream)?.model)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
-pub(crate) fn load_gguf_data(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1302,23 +1304,27 @@ pub(crate) fn load_gguf_data(
         )));
     }
     let is_moe = architecture == "lfm2moe";
-    let mut args = args_from_gguf(&arrays, &metadata, &architecture, is_moe, weights_stream)?;
-    let mut translated = HashMap::with_capacity(arrays.len());
-    for (name, mut value) in arrays {
-        if name.ends_with(".shortconv.conv.weight") && value.ndim() == 2 {
-            value = value.reshape(&[value.dim(0), 1, value.dim(1)], weights_stream)?;
-        }
-        let translated_name = translate_gguf_weight_name(&name, is_moe);
-        if translated.insert(translated_name.clone(), value).is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "LFM2 GGUF tensors collide after translating {translated_name:?}"
-            )));
-        }
-    }
+    let mut args = args_from_gguf(checkpoint, &metadata, &architecture, is_moe, weights_stream)?;
+    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
+    checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut configs = gguf_affine_configs(checkpoint, translate)?;
     if is_moe {
-        pack_moe_experts(&mut translated, &args, weights_stream)?;
+        for layer in args.num_dense_layers..args.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.feed_forward.experts");
+            for suffix in ["", "_scales", "_biases"] {
+                let gate = format!("{prefix}.gate_proj{suffix}");
+                let up = format!("{prefix}.up_proj{suffix}");
+                let combined = format!("{prefix}.gate_up_proj{suffix}");
+                if let Some(config) = configs.remove(&gate) {
+                    configs.remove(&up);
+                    configs.insert(combined, config);
+                }
+            }
+        }
     }
-    let configs = gguf_quantized_weight_configs(&translated)?;
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     if let Some(quantization) = quantization {
@@ -1332,17 +1338,65 @@ pub(crate) fn load_gguf_data(
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    let mut materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let physical_name = &tensor.descriptor().name;
+        if is_moe
+            && (physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps"))
+        {
+            continue;
+        }
+        for (name, mut value) in materializer.converted_tensor(physical_name)?.into_arrays() {
+            if name.ends_with(".shortconv.conv.weight") && value.ndim() == 2 {
+                value = value.reshape(&[value.dim(0), 1, value.dim(1)], weights_stream)?;
+            }
+            load_named_array_strict(
+                &mut model,
+                translate_gguf_weight_name(&name, is_moe),
+                value,
+                quantization.map(|value| (value, stream)),
+                &config,
+                &mut report,
+            )?;
+        }
+    }
+    if is_moe {
+        for layer in model.args.num_dense_layers..model.args.num_hidden_layers {
+            let source_prefix = format!("blk.{layer}");
+            let target_prefix = format!("model.layers.{layer}.feed_forward.experts");
+            let gate =
+                materializer.converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?;
+            let up =
+                materializer.converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?;
+            let gate = gate.into_arrays().into_iter().collect::<HashMap<_, _>>();
+            let up = up.into_arrays().into_iter().collect::<HashMap<_, _>>();
+            for (source_suffix, target_suffix) in
+                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
+            {
+                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
+                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
+                match (gate.get(&gate_name), up.get(&up_name)) {
+                    (Some(gate), Some(up)) => {
+                        let value =
+                            concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
+                        load_named_array_strict(
+                            &mut model,
+                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
+                            value,
+                            quantization.map(|value| (value, stream)),
+                            &config,
+                            &mut report,
+                        )?;
+                    }
+                    (None, None) if source_suffix == "biases" => {}
+                    _ => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                        "LFM2 MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
+                    )))
+                    }
+                }
+            }
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -1357,7 +1411,7 @@ pub(crate) fn load_gguf_data(
 }
 
 fn args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
@@ -1410,14 +1464,13 @@ fn args_from_gguf(
         layer_types,
         conv_l_cache: gguf_i32(metadata, &key("shortconv.l_cache"), stream)?,
         conv_bias: arrays
-            .keys()
-            .any(|name| name.contains("shortconv") && name.ends_with(".bias")),
+            .any_gguf_tensor(|name| name.contains("shortconv") && name.ends_with(".bias")),
         block_multiple_of: 1,
         block_ffn_dim_multiplier: 1.0,
         block_auto_adjust_ff_dim: false,
         block_dim: None,
         block_ff_dim: None,
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
             .unwrap_or_else(default_rope_theta),
         rope_parameters: None,
@@ -1448,7 +1501,7 @@ fn args_from_gguf(
         },
         routed_scaling_factor: gguf_optional_f32(metadata, &key("expert_weights_scale"))?
             .unwrap_or_else(default_routed_scaling_factor),
-        use_expert_bias: arrays.keys().any(|name| expert_bias_name(name)),
+        use_expert_bias: arrays.any_gguf_tensor(expert_bias_name),
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -1523,68 +1576,6 @@ fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
         }
     }
     name.to_string()
-}
-
-fn pack_moe_experts(
-    arrays: &mut HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<(), Error> {
-    for layer in args.num_dense_layers..args.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.feed_forward.experts");
-        let affine = arrays.contains_key(&format!("{prefix}.gate_proj_scales"))
-            || arrays.contains_key(&format!("{prefix}.up_proj_scales"));
-        let suffixes: &[&str] = if affine {
-            &["", "_scales", "_biases"]
-        } else {
-            &[""]
-        };
-        for suffix in suffixes {
-            let gate_name = format!("{prefix}.gate_proj{suffix}");
-            let up_name = format!("{prefix}.up_proj{suffix}");
-            match (arrays.remove(&gate_name), arrays.remove(&up_name)) {
-                (Some(gate), Some(up)) => {
-                    arrays.insert(
-                        format!("{prefix}.gate_up_proj{suffix}"),
-                        concatenate_axis(&[gate, up], 1, stream)?,
-                    );
-                }
-                (None, None) if *suffix == "_biases" => {}
-                _ => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "LFM2 MoE GGUF has incomplete gate/up expert tensors under {prefix}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
-            format!("{prefix}.weight")
-        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
-            prefix.to_string()
-        } else {
-            continue;
-        };
-        if let Some(weight) = arrays.get(&weight_name) {
-            configs.insert(
-                weight_name.clone(),
-                crate::quantization::gguf_affine_quantization(
-                    weight.shape(),
-                    scales.shape(),
-                    &weight_name,
-                )?,
-            );
-        }
-    }
-    Ok(configs)
 }
 
 fn gguf_i64_values(

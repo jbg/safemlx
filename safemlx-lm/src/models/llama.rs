@@ -11,7 +11,7 @@ use safemlx::{
     module::{Module, ModuleParametersExt},
     nn,
     ops::indexing::TryIndexOp,
-    ops::GgufMetadataValue,
+    ops::{GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -45,8 +45,8 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -1012,21 +1012,13 @@ pub(crate) fn load_llama_gguf_with_metadata(
     weights_stream: &Stream,
 ) -> Result<LoadedLlamaGguf, Error> {
     let gguf_file = gguf_file.as_ref();
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    load_llama_gguf_data(arrays, metadata, stream, weights_stream)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    load_llama_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_llama_gguf_data(
-    arrays: HashMap<String, Array>,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedLlamaGguf, Error> {
-    load_llama_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
-}
-
-pub(crate) fn load_llama_gguf_data_with_quantization(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_llama_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1039,27 +1031,18 @@ pub(crate) fn load_llama_gguf_data_with_quantization(
         )));
     }
 
-    let mut args = llama_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
-    let translated = arrays
-        .into_iter()
-        .map(|(name, value)| (translate_gguf_weight_name(&name), value))
-        .collect::<HashMap<_, _>>();
-
-    let quantized_weight_configs = llama_gguf_quantized_weight_configs(&translated)?;
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args = llama_args_from_gguf(checkpoint, &metadata, &architecture, weights_stream)?;
+    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
     if let Some(quantization) = quantization {
         args.quantized_weights = None;
         args.quantization = Some(quantization);
         args.quantized_weight_configs = None;
     } else {
-        args.quantized_weights = Some(
-            translated
-                .keys()
-                .filter_map(|name| {
-                    name.strip_suffix(".scales")
-                        .map(|prefix| format!("{prefix}.weight"))
-                })
-                .collect(),
-        );
+        args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
         args.quantization = None;
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
@@ -1067,18 +1050,14 @@ pub(crate) fn load_llama_gguf_data_with_quantization(
     let mut model = ResidentModel::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
-    }
+    load_gguf_strict(
+        &mut model,
+        checkpoint,
+        quantization.map(|value| (value, stream)),
+        &config,
+        &mut report,
+        |name, value| Ok((translate_gguf_weight_name(&name), value)),
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -1087,37 +1066,14 @@ pub(crate) fn load_llama_gguf_data_with_quantization(
             .and_then(|value| u32::try_from(value).ok())
             .into_iter()
             .collect();
-
     Ok(LoadedLlamaGguf {
         model,
         eos_token_ids,
     })
 }
 
-fn llama_gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let Some(prefix) = scales_name.strip_suffix(".scales") else {
-            continue;
-        };
-        let weight_name = format!("{prefix}.weight");
-        let Some(weight) = arrays.get(&weight_name) else {
-            continue;
-        };
-        let config = crate::quantization::gguf_affine_quantization(
-            weight.shape(),
-            scales.shape(),
-            &weight_name,
-        )?;
-        configs.insert(weight_name, config);
-    }
-    Ok(configs)
-}
-
 fn llama_args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     stream: &Stream,
@@ -1173,8 +1129,8 @@ fn llama_args_from_gguf(
         rope_theta,
         rope_traditional: true,
         head_dim,
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
-        attention_bias: arrays.keys().any(|name| {
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
+        attention_bias: arrays.any_gguf_tensor(|name| {
             name.starts_with("blk.")
                 && matches!(
                     name.rsplit_once('.'),
@@ -1184,7 +1140,7 @@ fn llama_args_from_gguf(
                         || prefix.ends_with("attn_output")
                 )
         }),
-        mlp_bias: arrays.keys().any(|name| {
+        mlp_bias: arrays.any_gguf_tensor(|name| {
             name.starts_with("blk.")
                 && matches!(
                     name.rsplit_once('.'),
@@ -1523,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_dense_mistral_from_gguf_named_arrays() {
+    fn loads_dense_mistral_from_synthetic_gguf_checkpoint() {
         use safemlx::module::ModuleParameters;
 
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -1628,18 +1584,19 @@ mod tests {
             ),
         ]);
 
-        let quantized_arrays = arrays.clone();
-        let quantized_metadata = metadata.clone();
-        let loaded = super::load_llama_gguf_data(arrays, metadata, stream, stream).unwrap();
+        let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
+        let loaded = super::load_llama_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
 
         assert_eq!(loaded.model.model_type(), "mistral");
         assert_eq!(loaded.model.sliding_window(), Some(16));
         assert_eq!(loaded.eos_token_ids, vec![2]);
 
         let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let quantized = super::load_llama_gguf_data_with_quantization(
-            quantized_arrays,
-            quantized_metadata,
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::weights::gguf_metadata(&checkpoint);
+        let quantized = super::load_llama_gguf_checkpoint(
+            &checkpoint,
+            metadata,
             Some(crate::quantization::WeightQuantization::MxFp4),
             gpu.stream(),
             stream,

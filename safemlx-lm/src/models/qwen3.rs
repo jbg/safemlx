@@ -10,7 +10,7 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -46,8 +46,9 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_named_array_strict,
+        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -1496,12 +1497,6 @@ pub(crate) struct LoadedQwen3Gguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
-pub(crate) struct PreparedQwen3Gguf {
-    pub(crate) args: ModelArgs,
-    pub(crate) arrays: HashMap<String, Array>,
-    pub(crate) eos_token_ids: Vec<u32>,
-}
-
 /// Loads a Qwen3 GGUF checkpoint.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
@@ -1520,21 +1515,13 @@ pub(crate) fn load_qwen3_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen3Gguf, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    load_qwen3_gguf_data(arrays, metadata, stream, weights_stream)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    load_qwen3_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_qwen3_gguf_data(
-    arrays: HashMap<String, Array>,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen3Gguf, Error> {
-    load_qwen3_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
-}
-
-pub(crate) fn load_qwen3_gguf_data_with_quantization(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_qwen3_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1547,12 +1534,26 @@ pub(crate) fn load_qwen3_gguf_data_with_quantization(
         )));
     }
     let is_moe = architecture == "qwen3moe";
-    let PreparedQwen3Gguf {
-        mut args,
-        arrays: translated,
-        eos_token_ids,
-    } = prepare_qwen3_gguf_data(arrays, &metadata, &architecture, is_moe, weights_stream)?;
-
+    let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
+    checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args =
+        qwen3_args_from_gguf(checkpoint, &metadata, &architecture, is_moe, weights_stream)?;
+    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    if is_moe {
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.mlp.experts");
+            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
+                configs.remove(&format!("{prefix}.up_proj"));
+                configs.insert(format!("{prefix}.gate_up_proj"), config);
+            }
+        }
+    }
+    args.quantized_weights = Some(configs.keys().cloned().collect());
+    args.quantized_weight_configs = Some(configs);
+    args.quantization = None;
     if let Some(quantization) = quantization {
         args.quantization = Some(quantization);
         args.quantization_config = None;
@@ -1563,73 +1564,113 @@ pub(crate) fn load_qwen3_gguf_data_with_quantization(
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
+    if !is_moe {
+        load_gguf_strict(
             &mut model,
-            translated,
-            stream,
-            quantization,
+            checkpoint,
+            quantization.map(|value| (value, stream)),
             &config,
             &mut report,
+            |name, value| Ok((translate_gguf_weight_name(&name), value)),
         )?;
     } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+        let mut materializer = checkpoint.materializer();
+        for tensor in checkpoint.catalog().tensors() {
+            let physical_name = &tensor.descriptor().name;
+            if physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps") {
+                continue;
+            }
+            for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
+                load_named_array_strict(
+                    &mut model,
+                    translate_qwen3_gguf_weight_name(&name, true),
+                    value,
+                    quantization.map(|value| (value, stream)),
+                    &config,
+                    &mut report,
+                )?;
+            }
+        }
+        for layer in 0..model.args.num_hidden_layers {
+            let source_prefix = format!("blk.{layer}");
+            let target_prefix = format!("model.layers.{layer}.mlp.experts");
+            let gate = materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let up = materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            for (source_suffix, target_suffix) in
+                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
+            {
+                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
+                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
+                match (gate.get(&gate_name), up.get(&up_name)) {
+                    (Some(gate), Some(up)) => {
+                        let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
+                        load_named_array_strict(
+                            &mut model,
+                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
+                            value,
+                            quantization.map(|value| (value, stream)),
+                            &config,
+                            &mut report,
+                        )?;
+                    }
+                    (None, None) if source_suffix != "weight" => {}
+                    _ => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Qwen3 MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
+                        )))
+                    }
+                }
+            }
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-
+    let eos_token_ids =
+        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
     Ok(LoadedQwen3Gguf {
         model,
         eos_token_ids,
     })
 }
 
-/// Parses and translates a Qwen3-family GGUF text model without constructing
-/// the owning architecture. Multimodal architectures reuse this to embed the
-/// Qwen3 decoder under their own parameter-tree prefix.
-pub(crate) fn prepare_qwen3_gguf_data(
-    arrays: HashMap<String, Array>,
+pub(crate) fn prepare_qwen3_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
     weights_stream: &Stream,
-) -> Result<PreparedQwen3Gguf, Error> {
-    let mut args = qwen3_args_from_gguf(&arrays, metadata, architecture, is_moe, weights_stream)?;
-    let mut translated = HashMap::with_capacity(arrays.len());
-    for (name, value) in arrays {
-        let name = if is_moe {
-            translate_qwen3_gguf_weight_name(&name, true)
-        } else {
-            translate_gguf_weight_name(&name)
-        };
-        if translated.insert(name.clone(), value).is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3 GGUF tensors collide after translating {name:?}"
-            )));
-        }
-    }
-    if is_moe {
-        pack_qwen3_moe_expert_banks(&mut translated, &args, weights_stream)?;
-    }
-    let configs = qwen3_gguf_quantized_weight_configs(&translated)?;
+) -> Result<(ModelArgs, Vec<u32>), Error> {
+    let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
+    checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args =
+        qwen3_args_from_gguf(checkpoint, metadata, architecture, is_moe, weights_stream)?;
+    let configs = gguf_affine_configs(checkpoint, translate)?;
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-
     let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
         .and_then(|value| u32::try_from(value).ok())
         .into_iter()
         .collect();
-
-    Ok(PreparedQwen3Gguf {
-        args,
-        arrays: translated,
-        eos_token_ids,
-    })
+    Ok((args, eos_token_ids))
 }
 
 fn qwen3_args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
@@ -1688,7 +1729,7 @@ fn qwen3_args_from_gguf(
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
             .unwrap_or(1_000_000.0),
         head_dim,
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         rope_scaling: gguf_rope_scaling(metadata, architecture, stream)?,
         quantization: None,
         quantization_config: None,
@@ -1745,7 +1786,7 @@ fn gguf_rope_scaling(
     }
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     translate_qwen3_gguf_weight_name(name, false)
 }
 
@@ -1813,82 +1854,6 @@ fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
         }
     }
     name.to_string()
-}
-
-fn pack_qwen3_moe_expert_banks(
-    arrays: &mut HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<(), Error> {
-    for layer in 0..args.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        let affine = arrays.contains_key(&format!("{prefix}.gate_proj_scales"))
-            || arrays.contains_key(&format!("{prefix}.up_proj_scales"));
-        let suffixes: &[&str] = if affine {
-            &["", "_scales", "_biases"]
-        } else {
-            &[""]
-        };
-        for suffix in suffixes {
-            let gate_name = format!("{prefix}.gate_proj{suffix}");
-            let up_name = format!("{prefix}.up_proj{suffix}");
-            let gate = arrays.remove(&gate_name).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3 MoE GGUF is missing expert tensor {gate_name:?}"
-                ))
-            })?;
-            let up = arrays.remove(&up_name).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Qwen3 MoE GGUF is missing expert tensor {up_name:?}"
-                ))
-            })?;
-            if gate.shape().len() != 3
-                || gate.shape()[0] != args.num_experts
-                || gate.shape()[0] != up.shape()[0]
-                || gate.shape()[2] != up.shape()[2]
-            {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Qwen3 MoE gate/up expert shapes are incompatible: {:?} and {:?}",
-                    gate.shape(),
-                    up.shape()
-                )));
-            }
-            arrays.insert(
-                format!("{prefix}.gate_up_proj{suffix}"),
-                concatenate_axis(&[gate, up], 1, stream)?,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn qwen3_gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
-            format!("{prefix}.weight")
-        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
-            prefix.to_string()
-        } else {
-            continue;
-        };
-        let Some(weight) = arrays.get(&weight_name) else {
-            continue;
-        };
-        let config = qwen3_gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
-        configs.insert(weight_name, config);
-    }
-    Ok(configs)
-}
-
-fn qwen3_gguf_affine_quantization(
-    weight_shape: &[i32],
-    scales_shape: &[i32],
-    weight_name: &str,
-) -> Result<AffineQuantization, Error> {
-    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
 }
 
 pub(crate) fn gguf_string(
@@ -2155,27 +2120,33 @@ mod tests {
             "model.layers.3.mlp.experts.down_proj"
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[4096, 256], &[4096, 64], "q_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[4096, 256], &[4096, 64], "q_proj",)
+                .unwrap(),
             AffineQuantization::new(32, 4).unwrap()
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[512, 512], &[512, 64], "k_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[512, 512], &[512, 64], "k_proj",)
+                .unwrap(),
             AffineQuantization::new(32, 8).unwrap()
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[4096, 320], &[4096, 64], "v_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[4096, 320], &[4096, 64], "v_proj",)
+                .unwrap(),
             AffineQuantization::new(32, 5).unwrap()
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[1024, 192], &[1024, 64], "down_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[1024, 192], &[1024, 64], "down_proj",)
+                .unwrap(),
             AffineQuantization::new(16, 6).unwrap()
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[1024, 64], &[1024, 64], "q2_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[1024, 64], &[1024, 64], "q2_proj",)
+                .unwrap(),
             AffineQuantization::new(16, 2).unwrap()
         );
         assert_eq!(
-            super::qwen3_gguf_affine_quantization(&[1024, 96], &[1024, 64], "q3_proj").unwrap(),
+            crate::quantization::gguf_affine_quantization(&[1024, 96], &[1024, 64], "q3_proj",)
+                .unwrap(),
             AffineQuantization::new(16, 3).unwrap()
         );
     }
@@ -2288,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_dense_qwen3_from_gguf_named_arrays() {
+    fn loads_dense_qwen3_from_synthetic_gguf_checkpoint() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let stream = ctx.stream();
         let source = super::Model::new(tiny_args(), stream).unwrap();
@@ -2367,9 +2338,127 @@ mod tests {
             ),
         ]);
 
-        let loaded = super::load_qwen3_gguf_data(arrays, metadata, stream, stream).unwrap();
+        let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
+        let loaded = super::load_qwen3_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
         assert_eq!(loaded.model.args.head_dim, 32);
         assert_eq!(loaded.eos_token_ids, vec![1]);
+    }
+
+    #[test]
+    fn pairs_moe_gate_and_up_banks_across_synthetic_gguf_shards() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_args();
+        args.model_type = "qwen3_moe".into();
+        args.intermediate_size = 0;
+        args.moe_intermediate_size = 8;
+        args.num_experts = 4;
+        args.num_experts_per_tok = 2;
+        args.norm_topk_prob = true;
+        let mut source = super::Model::new(args, stream).unwrap();
+        let gate = Array::full::<f32>(&[4, 8, 32], Array::from_f32(3.0), stream).unwrap();
+        let up = Array::full::<f32>(&[4, 8, 32], Array::from_f32(7.0), stream).unwrap();
+        let gate_up =
+            safemlx::ops::concatenate_axis(&[gate.clone(), up.clone()], 1, stream).unwrap();
+        **source
+            .parameters_mut()
+            .flatten()
+            .get_mut("model.layers.0.mlp.experts.gate_up_proj")
+            .unwrap() = gate_up.clone();
+
+        let mut arrays = HashMap::new();
+        for (name, value) in source.parameters().flatten() {
+            if name.as_ref() == "model.layers.0.mlp.experts.gate_up_proj" {
+                arrays.insert("blk.0.ffn_gate_exps.weight".into(), gate.clone());
+                arrays.insert("blk.0.ffn_up_exps.weight".into(), up.clone());
+                continue;
+            }
+            let name = if name.as_ref() == "model.layers.0.mlp.experts.down_proj" {
+                "blk.0.ffn_down_exps.weight".into()
+            } else {
+                name.replace("model.layers.", "blk.")
+                    .replace("self_attn.q_norm", "attn_q_norm")
+                    .replace("self_attn.k_norm", "attn_k_norm")
+                    .replace("self_attn.q_proj", "attn_q")
+                    .replace("self_attn.k_proj", "attn_k")
+                    .replace("self_attn.v_proj", "attn_v")
+                    .replace("self_attn.o_proj", "attn_output")
+                    .replace("input_layernorm", "attn_norm")
+                    .replace("post_attention_layernorm", "ffn_norm")
+                    .replace("mlp.gate.weight", "ffn_gate_inp.weight")
+                    .replace("model.embed_tokens", "token_embd")
+                    .replace("model.norm", "output_norm")
+            };
+            arrays.insert(name, value.clone());
+        }
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen3moe".into()),
+            ),
+            (
+                "qwen3moe.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            ("qwen3moe.block_count".into(), GgufMetadataValue::Uint32(1)),
+            (
+                "qwen3moe.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            ("qwen3moe.expert_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "qwen3moe.expert_used_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "qwen3moe.attention.head_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "qwen3moe.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "qwen3moe.attention.key_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "qwen3moe.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "qwen3moe.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "qwen3moe.rope.freq_base".into(),
+                GgufMetadataValue::Float32(1_000_000.0),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
+            ),
+        ]);
+        let fixture =
+            crate::test_utils::SyntheticGguf::sharded_dense(&arrays, &metadata, 2, |name| {
+                usize::from(name == "blk.0.ffn_up_exps.weight")
+            });
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        assert_eq!(checkpoint.catalog().shards().len(), 2);
+        assert_eq!(checkpoint.catalog().physical_tensor_count(), arrays.len());
+
+        let loaded = super::load_qwen3_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
+        assert_eq!(loaded.model.model_type(), "qwen3_moe");
+        let parameters = loaded.model.parameters().flatten();
+        let paired = &parameters["model.layers.0.mlp.experts.gate_up_proj"];
+        assert!(paired
+            .all_close(&gate_up, None, None, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     #[test]

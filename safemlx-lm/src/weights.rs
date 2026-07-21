@@ -7,7 +7,7 @@ use std::{
 use memmap2::MmapOptions;
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
-    ops::{concatenate_axis, stack_axis},
+    ops::{concatenate_axis, stack_axis, GgufCheckpoint, GgufMetadataValue},
     transforms::eval,
     Array, Stream,
 };
@@ -15,7 +15,158 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::quantization::{quantize_tensor, WeightQuantization};
+use crate::quantization::{quantize_tensor, AffineQuantization, WeightQuantization};
+
+pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
+    checkpoint
+        .metadata()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+pub(crate) trait GgufTensorNames {
+    fn contains_gguf_tensor(&self, name: &str) -> bool;
+
+    fn any_gguf_tensor<F>(&self, predicate: F) -> bool
+    where
+        F: FnMut(&str) -> bool;
+
+    fn has_affine_gguf_tensor(&self) -> bool;
+}
+
+impl GgufTensorNames for GgufCheckpoint {
+    fn contains_gguf_tensor(&self, name: &str) -> bool {
+        self.catalog()
+            .tensors()
+            .any(|tensor| tensor.descriptor().name == name)
+    }
+
+    fn any_gguf_tensor<F>(&self, mut predicate: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.catalog()
+            .tensors()
+            .any(|tensor| predicate(&tensor.descriptor().name))
+    }
+
+    fn has_affine_gguf_tensor(&self) -> bool {
+        self.catalog()
+            .tensors()
+            .any(|tensor| tensor.affine().is_some())
+    }
+}
+
+#[cfg(test)]
+impl GgufTensorNames for HashMap<String, Array> {
+    fn contains_gguf_tensor(&self, name: &str) -> bool {
+        self.contains_key(name)
+    }
+
+    fn any_gguf_tensor<F>(&self, predicate: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.keys().map(String::as_str).any(predicate)
+    }
+
+    fn has_affine_gguf_tensor(&self) -> bool {
+        self.keys().any(|name| {
+            name.ends_with(".scales")
+                || name.ends_with(".biases")
+                || name.ends_with("_scales")
+                || name.ends_with("_biases")
+        })
+    }
+}
+
+pub(crate) fn gguf_affine_configs<F>(
+    checkpoint: &GgufCheckpoint,
+    mut translate: F,
+) -> Result<HashMap<String, AffineQuantization>, Error>
+where
+    F: FnMut(&str) -> String,
+{
+    let mut configs = HashMap::new();
+    for tensor in checkpoint.catalog().tensors() {
+        let Some((bits, group_size)) = tensor.affine() else {
+            continue;
+        };
+        let weight_name = translate(&tensor.outputs()[0].name);
+        let group_size = i32::try_from(group_size).map_err(|_| {
+            Error::Quantization(format!(
+                "GGUF group size {group_size} does not fit in an i32"
+            ))
+        })?;
+        let config = AffineQuantization::new(group_size, i32::from(bits))?;
+        if configs.insert(weight_name.clone(), config).is_some() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF tensors collide after translating {weight_name:?}"
+            )));
+        }
+    }
+    Ok(configs)
+}
+
+pub(crate) fn load_gguf_strict<M, F>(
+    model: &mut M,
+    checkpoint: &GgufCheckpoint,
+    quantization: Option<(WeightQuantization, &Stream)>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+    mut transform: F,
+) -> Result<(), Error>
+where
+    M: ModuleParameters,
+    F: FnMut(String, Array) -> Result<(String, Array), Error>,
+{
+    let mut params = model.parameters_mut().flatten();
+    for tensor in checkpoint.converted_tensors() {
+        for (name, value) in tensor?.into_arrays() {
+            let (name, value) = transform(name, value)?;
+            if let Some((quantization, stream)) = quantization {
+                load_array_quantized_strict(
+                    &mut params,
+                    name,
+                    value,
+                    stream,
+                    quantization,
+                    config,
+                    report,
+                )?;
+            } else {
+                load_array_strict(&mut params, name, value, config, report);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn load_named_array_strict<M: ModuleParameters>(
+    model: &mut M,
+    name: String,
+    value: Array,
+    quantization: Option<(WeightQuantization, &Stream)>,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    let mut params = model.parameters_mut().flatten();
+    if let Some((quantization, stream)) = quantization {
+        load_array_quantized_strict(
+            &mut params,
+            name,
+            value,
+            stream,
+            quantization,
+            config,
+            report,
+        )
+    } else {
+        load_array_strict(&mut params, name, value, config, report);
+        Ok(())
+    }
+}
 
 /// Options for strict checkpoint loading.
 ///
@@ -227,6 +378,7 @@ pub(crate) fn load_arrays_strict<M: ModuleParameters>(
 /// Strict-loads and quantizes eligible tensors from an in-memory named-array
 /// source such as an unquantized GGUF. The map is consumed so each dense source
 /// array can be released after its packed replacement is materialized.
+#[cfg(test)]
 pub(crate) fn load_arrays_quantized_strict<M: ModuleParameters>(
     model: &mut M,
     loaded: HashMap<String, Array>,

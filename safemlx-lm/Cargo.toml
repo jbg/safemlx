@@ -49,4 +49,5 @@ rustfft = { version = "6", optional = true }
 
 [dev-dependencies]
 lazy_static = "1"
+safemlx-gguf.workspace = true
 tempfile.workspace = true

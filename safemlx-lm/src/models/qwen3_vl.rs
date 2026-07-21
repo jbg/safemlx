@@ -13,7 +13,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{masked_scatter, TryIndexOp},
-        stack_axis, zeros_dtype, GgufMetadataArray, GgufMetadataValue,
+        stack_axis, zeros_dtype, GgufCheckpoint, GgufMetadataArray, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Stream,
@@ -33,7 +33,7 @@ use crate::{
     quantization::WeightQuantization,
     utils::{create_attention_mask, AttentionMask},
     weights::{
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_dir_quantized_strict,
+        gguf_metadata, load_named_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
@@ -705,31 +705,14 @@ pub(crate) fn load_qwen3_vl_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen3VlGguf, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    let (vision_arrays, vision_metadata) =
-        Array::load_gguf_with_metadata(mmproj_file, weights_stream)?;
-    load_qwen3_vl_gguf_data(
-        arrays,
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    let vision_metadata = gguf_metadata(&vision_checkpoint);
+    load_qwen3_vl_gguf_checkpoint(
+        &checkpoint,
         metadata,
-        vision_arrays,
-        vision_metadata,
-        stream,
-        weights_stream,
-    )
-}
-
-pub(crate) fn load_qwen3_vl_gguf_data(
-    arrays: HashMap<String, Array>,
-    metadata: HashMap<String, GgufMetadataValue>,
-    vision_arrays: HashMap<String, Array>,
-    vision_metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen3VlGguf, Error> {
-    load_qwen3_vl_gguf_data_with_quantization(
-        arrays,
-        metadata,
-        vision_arrays,
+        &vision_checkpoint,
         vision_metadata,
         None,
         stream,
@@ -737,10 +720,10 @@ pub(crate) fn load_qwen3_vl_gguf_data(
     )
 }
 
-pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_qwen3_vl_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
-    mut vision_arrays: HashMap<String, Array>,
+    vision_checkpoint: &GgufCheckpoint,
     vision_metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -753,12 +736,13 @@ pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
         )));
     }
     validate_qwen3_vl_mmproj(&vision_metadata)?;
-
-    let qwen3::PreparedQwen3Gguf {
-        mut args,
-        arrays,
-        eos_token_ids,
-    } = qwen3::prepare_qwen3_gguf_data(arrays, &metadata, &architecture, false, weights_stream)?;
+    let (mut args, eos_token_ids) = qwen3::prepare_qwen3_gguf_checkpoint(
+        checkpoint,
+        &metadata,
+        &architecture,
+        false,
+        weights_stream,
+    )?;
     args.model_type = "qwen3_vl_text".into();
     if let Some(quantization) = quantization {
         args.quantization = Some(quantization);
@@ -771,7 +755,6 @@ pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
             "qwen3vl GGUF with an untied output head is not supported".into(),
         ));
     }
-
     let mrope_section = gguf_integer_array(&metadata, "qwen3vl.rope.dimension_sections", Some(3))?;
     if mrope_section.iter().sum::<i32>() != args.head_dim / 2 {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -779,14 +762,30 @@ pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
             args.head_dim
         )));
     }
-
     let deepstack_visual_indexes = gguf_deepstack_layers(&vision_metadata)?;
     let hidden_size = qwen3::gguf_i32(
         &vision_metadata,
         "clip.vision.embedding_length",
         weights_stream,
     )?;
-    let num_position_embeddings = vision_num_position_embeddings(&vision_arrays, hidden_size)?;
+    let position_layout = vision_checkpoint
+        .catalog()
+        .tensors()
+        .find(|tensor| tensor.descriptor().name == "v.position_embd.weight")
+        .and_then(|tensor| tensor.outputs().first())
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "qwen3vl mmproj is missing v.position_embd.weight".into(),
+            )
+        })?;
+    if position_layout.shape.len() != 2 || position_layout.shape[1] != hidden_size as u64 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "unexpected qwen3vl position embedding shape {:?}",
+            position_layout.shape
+        )));
+    }
+    let num_position_embeddings = i32::try_from(position_layout.shape[0])
+        .map_err(|_| Error::UnsupportedArchitecture("qwen3vl position count exceeds i32".into()))?;
     let vision_config = VisionConfig {
         depth: qwen3::gguf_i32(&vision_metadata, "clip.vision.block_count", weights_stream)?,
         hidden_size,
@@ -848,32 +847,17 @@ pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
             vision_config.out_hidden_size, args.hidden_size
         )));
     }
-
-    let image_token_id = gguf_token_id(&metadata, "<|image_pad|>")?;
-    let video_token_id = gguf_token_id(&metadata, "<|video_pad|>")?;
-    let mut translated = HashMap::with_capacity(arrays.len() + vision_arrays.len());
-    for (name, value) in arrays {
-        let name = name
-            .strip_prefix("model.")
-            .map(|name| format!("model.language_model.{name}"))
-            .unwrap_or(name);
-        insert_translated(&mut translated, name, value)?;
-    }
-
-    if vision_arrays
-        .keys()
-        .any(|name| name.ends_with(".scales") || name.ends_with(".biases"))
+    if vision_checkpoint
+        .catalog()
+        .tensors()
+        .any(|tensor| tensor.affine().is_some())
     {
         return Err(Error::UnsupportedArchitecture(
             "quantized qwen3vl mmproj GGUF tensors are not supported; use the F16 projector".into(),
         ));
     }
-    reassemble_patch_embedding(&mut vision_arrays, weights_stream)?;
-    for (name, value) in vision_arrays {
-        let name = translate_qwen3_vl_mmproj_name(&name, &vision_config.deepstack_visual_indexes);
-        insert_translated(&mut translated, name, value)?;
-    }
-
+    let image_token_id = gguf_token_id(&metadata, "<|image_pad|>")?;
+    let video_token_id = gguf_token_id(&metadata, "<|video_pad|>")?;
     let model_args = ModelArgs {
         text_config: args,
         vision_config,
@@ -884,18 +868,63 @@ pub(crate) fn load_qwen3_vl_gguf_data_with_quantization(
     let mut model = Model::new(model_args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    for tensor in checkpoint.converted_tensors() {
+        for (name, value) in tensor?.into_arrays() {
+            let name = qwen3::translate_gguf_weight_name(&name);
+            let name = name
+                .strip_prefix("model.")
+                .map(|name| format!("model.language_model.{name}"))
+                .unwrap_or(name);
+            load_named_array_strict(
+                &mut model,
+                name,
+                value,
+                quantization.map(|value| (value, stream)),
+                &config,
+                &mut report,
+            )?;
+        }
     }
+    let mut vision_materializer = vision_checkpoint.materializer();
+    for tensor in vision_checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        if matches!(
+            name.as_str(),
+            "v.patch_embd.weight" | "v.patch_embd.weight.1"
+        ) {
+            continue;
+        }
+        for (name, value) in vision_materializer.converted_tensor(name)?.into_arrays() {
+            let name = translate_qwen3_vl_mmproj_name(
+                &name,
+                &model.args.vision_config.deepstack_visual_indexes,
+            );
+            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
+        }
+    }
+    let first = vision_materializer
+        .converted_tensor("v.patch_embd.weight")?
+        .into_arrays()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
+        .1;
+    let second = vision_materializer
+        .converted_tensor("v.patch_embd.weight.1")?
+        .into_arrays()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
+        .1;
+    let patch = stack_axis(&[first, second], 2, weights_stream)?;
+    load_named_array_strict(
+        &mut model,
+        "model.visual.patch_embed.proj.weight".into(),
+        patch,
+        None,
+        &config,
+        &mut report,
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(LoadedQwen3VlGguf {
@@ -966,26 +995,6 @@ fn gguf_deepstack_layers(metadata: &HashMap<String, GgufMetadataValue>) -> Resul
         .map_err(|_| Error::UnsupportedArchitecture("DeepStack layer index exceeds i32".into()))
 }
 
-fn vision_num_position_embeddings(
-    arrays: &HashMap<String, Array>,
-    hidden_size: i32,
-) -> Result<i32, Error> {
-    let shape = arrays
-        .get("v.position_embd.weight")
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(
-                "qwen3vl mmproj is missing v.position_embd.weight".into(),
-            )
-        })?
-        .shape();
-    if shape.len() != 2 || shape[1] != hidden_size {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "unexpected qwen3vl position embedding shape {shape:?}"
-        )));
-    }
-    Ok(shape[0])
-}
-
 fn gguf_token_id(metadata: &HashMap<String, GgufMetadataValue>, token: &str) -> Result<u32, Error> {
     let tokens = metadata
         .get("tokenizer.ggml.tokens")
@@ -1001,23 +1010,6 @@ fn gguf_token_id(metadata: &HashMap<String, GgufMetadataValue>, token: &str) -> 
         })?;
     u32::try_from(index)
         .map_err(|_| Error::UnsupportedArchitecture("qwen3vl token id exceeds u32".into()))
-}
-
-fn reassemble_patch_embedding(
-    arrays: &mut HashMap<String, Array>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    let first = arrays.remove("v.patch_embd.weight").ok_or_else(|| {
-        Error::UnsupportedArchitecture("qwen3vl mmproj is missing v.patch_embd.weight".into())
-    })?;
-    let second = arrays.remove("v.patch_embd.weight.1").ok_or_else(|| {
-        Error::UnsupportedArchitecture("qwen3vl mmproj is missing v.patch_embd.weight.1".into())
-    })?;
-    arrays.insert(
-        "v.patch_embd.weight".into(),
-        stack_axis(&[first, second], 2, stream)?,
-    );
-    Ok(())
 }
 
 fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32]) -> String {
@@ -1058,19 +1050,6 @@ fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32]) -> Strin
         }
     }
     name.to_string()
-}
-
-fn insert_translated(
-    arrays: &mut HashMap<String, Array>,
-    name: String,
-    value: Array,
-) -> Result<(), Error> {
-    if arrays.insert(name.clone(), value).is_some() {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "qwen3vl GGUF tensors collide after translating {name:?}"
-        )));
-    }
-    Ok(())
 }
 
 /// Finds the dense sibling mmproj used by the single-path model loader.
@@ -1359,8 +1338,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn strict_loads_dense_qwen3_vl_from_gguf_named_arrays() {
+    fn strict_loads_dense_qwen3_vl_from_synthetic_gguf_checkpoints() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let source = tiny_model(stream);
@@ -1518,11 +1496,12 @@ mod tests {
             ),
         ]);
 
-        let loaded = super::load_qwen3_vl_gguf_data(
-            arrays,
-            metadata,
-            vision_arrays,
-            vision_metadata,
+        let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
+        let vision_fixture =
+            crate::test_utils::SyntheticGguf::dense(&vision_arrays, &vision_metadata);
+        let loaded = super::load_qwen3_vl_gguf_with_metadata(
+            fixture.path(),
+            vision_fixture.path(),
             stream,
             stream,
         )

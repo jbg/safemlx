@@ -325,13 +325,13 @@ MLX's 32-value affine groups, while Q2_K, Q3_K, and Q6_K map exactly to
 16-value affine groups. Group-16 K-quants use tiled quantized matrix kernels for
 prefill and the corresponding vector kernels for decode. These formats execute
 without expanding matrix weights to float16.
-Q5_0 and Q5_1 tensors are converted to float16 while loading; other GGUF
-quantization types use MLX's bundled converter when
-supported, and unsupported tensor types return an error. Model dispatch uses
-`general.architecture`; the current GGUF adapters support text-only `gemma4`,
-`llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense
-`qwen35`, and `qwen35moe` architectures, plus dense `qwen3vl` with its separate
-vision projector. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
+Q5_0 and Q5_1 tensors are converted to float16 while loading; unsupported GGUF
+tensor types return an error. Model dispatch uses
+`general.architecture`; the current GGUF adapters support text-only `deepseek2`,
+`gemma4`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
+`nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
+architectures, plus dense `qwen3vl` with its separate vision projector. For
+Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
 can use `models::qwen3_vl::load_qwen3_vl_gguf`.
@@ -419,8 +419,8 @@ Quantized companions remain colocated. Dense and supported prequantized
 safetensors are supported for Llama-compatible models. DeepSeek supports its
 official split-expert safetensors, native block-FP8 and affine layouts, and
 local expert-bank packing. Requested on-load quantization is applied only to
-selected local tensors. Pipeline GGUF is rejected early because the current
-GGUF reader cannot guarantee local-layer bounded memory.
+selected local tensors. Pipeline GGUF remains unsupported because its
+placement-aware loader has not yet been migrated to the GGUF tensor stream.
 
 `PipelineCache` contains only the local global-layer range: standard or
 sliding-window KV entries for Llama and compressed-latent entries for DeepSeek.

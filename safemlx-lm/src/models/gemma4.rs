@@ -18,7 +18,7 @@ use safemlx::{
         concatenate_axis, dequantize_with_mode,
         indexing::{NewAxis, TryIndexOp},
         mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt, tanh,
-        GgufMetadataValue, QuantizationMode,
+        GgufCheckpoint, GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -55,8 +55,8 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        load_arrays_quantized_strict, load_arrays_strict, load_safetensors_quantized_strict,
-        load_safetensors_strict, StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
+        load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -2611,21 +2611,13 @@ pub(crate) fn load_gemma4_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    load_gemma4_gguf_data(arrays, metadata, stream, weights_stream)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    load_gemma4_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_gemma4_gguf_data(
-    arrays: HashMap<String, Array>,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGemma4Gguf, Error> {
-    load_gemma4_gguf_data_with_quantization(arrays, metadata, None, stream, weights_stream)
-}
-
-pub(crate) fn load_gemma4_gguf_data_with_quantization(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_gemma4_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -2637,20 +2629,17 @@ pub(crate) fn load_gemma4_gguf_data_with_quantization(
             "GGUF architecture {architecture:?}; this loader supports only gemma4"
         )));
     }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
 
-    let mut args = gemma4_args_from_gguf(&arrays, &metadata, weights_stream)?;
-    let translated = arrays
-        .into_iter()
-        .map(|(name, value)| (translate_gguf_weight_name(&name), value))
-        .collect::<HashMap<_, _>>();
-    let quantized_weights = translated
+    let mut args = gemma4_args_from_gguf(checkpoint, &metadata, weights_stream)?;
+    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let quantized_weights = quantized_weight_configs
         .keys()
-        .filter_map(|name| {
-            name.strip_suffix(".scales")
-                .map(|prefix| format!("{prefix}.weight"))
-        })
+        .cloned()
         .collect::<HashSet<_>>();
-    let quantized_weight_configs = gemma4_gguf_quantized_weight_configs(&translated)?;
     let has_quantized_tensors = !quantized_weights.is_empty();
     if let Some(quantization) = quantization {
         args.quantized = true;
@@ -2681,18 +2670,14 @@ pub(crate) fn load_gemma4_gguf_data_with_quantization(
             .allow_unused_prefix(format!("{prefix}.k_norm."));
     }
     let mut report = StrictLoadReport::default();
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
-    }
+    load_gguf_strict(
+        &mut model,
+        checkpoint,
+        quantization.map(|value| (value, stream)),
+        &config,
+        &mut report,
+        |name, value| Ok((translate_gguf_weight_name(&name), value)),
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -2701,42 +2686,19 @@ pub(crate) fn load_gemma4_gguf_data_with_quantization(
             .and_then(|value| u32::try_from(value).ok())
             .into_iter()
             .collect();
-
     Ok(LoadedGemma4Gguf {
         model,
         eos_token_ids,
     })
 }
 
-fn gemma4_gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let Some(prefix) = scales_name.strip_suffix(".scales") else {
-            continue;
-        };
-        let weight_name = format!("{prefix}.weight");
-        let Some(weight) = arrays.get(&weight_name) else {
-            continue;
-        };
-        let config = crate::quantization::gguf_affine_quantization(
-            weight.shape(),
-            scales.shape(),
-            &weight_name,
-        )?;
-        configs.insert(weight_name, config);
-    }
-    Ok(configs)
-}
-
 fn gemma4_args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     if gguf_optional_i64(metadata, "gemma4.expert_count", stream)?.unwrap_or(0) > 0
-        || arrays.keys().any(|name| name.contains("_exps."))
+        || arrays.any_gguf_tensor(|name| name.contains("_exps."))
     {
         return Err(Error::UnsupportedArchitecture(
             "Gemma 4 MoE GGUF checkpoints are not supported yet".into(),
@@ -2878,8 +2840,8 @@ fn gemma4_args_from_gguf(
             **kind == LayerType::FullAttention && *index < first_shared_layer.max(0) as usize
         })
         .is_some_and(|(index, _)| {
-            arrays.contains_key(&format!("blk.{index}.attn_k.weight"))
-                && !arrays.contains_key(&format!("blk.{index}.attn_v.weight"))
+            arrays.contains_gguf_tensor(&format!("blk.{index}.attn_k.weight"))
+                && !arrays.contains_gguf_tensor(&format!("blk.{index}.attn_v.weight"))
         });
 
     Ok(ModelArgs {
@@ -2901,8 +2863,8 @@ fn gemma4_args_from_gguf(
         rope_theta: sliding_rope_theta,
         head_dim,
         global_head_dim: (global_head_dim != head_dim).then_some(global_head_dim),
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
-        attention_bias: arrays.keys().any(|name| {
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
+        attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
                 || name.ends_with("attn_k.bias")
                 || name.ends_with("attn_v.bias")

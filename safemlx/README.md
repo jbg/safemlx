@@ -5,7 +5,7 @@ Rust bindings for the MLX machine learning framework.
 `safemlx` provides a safe, idiomatic Rust interface over the low-level
 `safemlx-sys` bindings. It includes array operations, neural-network building
 blocks, transforms, optimizers, quantization helpers, optional SafeTensors
-support, and typed GGUF tensor/metadata loading.
+support, and typed streaming GGUF tensor/metadata loading.
 
 This crate targets macOS 14+, iOS/iPadOS 17+, tvOS 17+, and visionOS 1+ on
 Apple silicon, as well as CPU-only and NVIDIA CUDA Linux systems and native
@@ -14,6 +14,13 @@ Apple targets; those features are ignored on Linux and Windows, where `cuda`
 can be selected explicitly. Cross-compilation, Xcode Metal-resource integration,
 and native backend prerequisites are documented in the
 [`safemlx-sys` README](../safemlx-sys/README.md).
+
+GGUF checkpoints are opened with `ops::GgufCheckpoint`. Opening validates all
+canonical shard headers without reading payloads; `converted_tensors` and
+`for_each_converted_tensor` then materialize one physical tensor as either a
+dense array or one atomic affine weight/scales/biases group.
+`GgufCheckpoint::materializer` provides indexed named access while reusing one
+open shard reader, which is useful for bounded multi-tensor model transforms.
 
 ## Features
 

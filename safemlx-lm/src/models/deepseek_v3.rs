@@ -18,7 +18,7 @@ use safemlx::{
         broadcast_to, concatenate_axis, einsum, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         quantized_packed_dimension, r#where, softmax_axis, stack_axis, topk_route_plan,
-        GgufMetadataValue,
+        GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -48,9 +48,8 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
-        load_arrays_quantized_strict, load_arrays_strict, safetensors_files, StrictLoadConfig,
-        StrictLoadReport,
+        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_quantized_strict,
+        load_array_strict, safetensors_files, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -2951,12 +2950,13 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    Ok(load_gguf_data(arrays, metadata, None, stream, weights_stream)?.model)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
-pub(crate) fn load_gguf_data(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -2968,18 +2968,13 @@ pub(crate) fn load_gguf_data(
             "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
         )));
     }
-    let mut args = args_from_gguf(&arrays, &metadata, weights_stream)?;
-    let mut translated = HashMap::with_capacity(arrays.len());
-    for (name, value) in arrays {
-        let translated_name = translate_gguf_weight_name(&name);
-        if translated.insert(translated_name.clone(), value).is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek GGUF tensors collide after translating {translated_name:?}"
-            )));
-        }
-    }
-    let configs = gguf_quantized_weight_configs(&translated)?;
-    args.quantized_weight_configs = Some(configs);
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args = args_from_gguf(checkpoint, &metadata, weights_stream)?;
+    args.quantized_weight_configs =
+        Some(gguf_affine_configs(checkpoint, translate_gguf_weight_name)?);
     if let Some(quantization) = quantization {
         args.quantization = Some(quantization);
         args.quantization_config = None;
@@ -2990,25 +2985,64 @@ pub(crate) fn load_gguf_data(
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    let mut translated = translated;
-    load_gguf_expert_banks(
-        &mut model,
-        &mut translated,
-        quantization,
-        stream,
-        &mut report,
-    )?;
-    if let Some(quantization) = quantization {
-        load_arrays_quantized_strict(
-            &mut model,
-            translated,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    } else {
-        load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    let expert_keys = expected_expert_banks(&model.args)
+        .into_iter()
+        .map(|key| (target_expert_key(key), key))
+        .collect::<HashMap<_, _>>();
+    for tensor in checkpoint.converted_tensors() {
+        for (source_name, value) in tensor?.into_arrays() {
+            let name = translate_gguf_weight_name(&source_name);
+            if let Some(&key) = expert_keys.get(&name) {
+                if let Some(quantization) = quantization {
+                    if key.component != ExpertComponent::Weight {
+                        continue;
+                    }
+                    let quantized =
+                        common::moe::quantize_expert_bank(&value, quantization, stream)?;
+                    let scales_key = ExpertBankKey {
+                        component: ExpertComponent::AffineScales,
+                        ..key
+                    };
+                    let biases_key = ExpertBankKey {
+                        component: ExpertComponent::AffineBiases,
+                        ..key
+                    };
+                    let mut evaluated = vec![&quantized.weight, &quantized.scales];
+                    if let Some(biases) = &quantized.biases {
+                        evaluated.push(biases);
+                    }
+                    eval(evaluated)?;
+                    stream.synchronize()?;
+                    assign_expert_bank(&mut model, key, quantized.weight)?;
+                    assign_expert_bank(&mut model, scales_key, quantized.scales)?;
+                    report.record_loaded(name);
+                    report.record_loaded(target_expert_key(scales_key));
+                    if let Some(biases) = quantized.biases {
+                        assign_expert_bank(&mut model, biases_key, biases)?;
+                        report.record_loaded(target_expert_key(biases_key));
+                    }
+                } else {
+                    assign_expert_bank(&mut model, key, value)?;
+                    report.record_loaded(name);
+                }
+                continue;
+            }
+
+            let mut params = model.parameters_mut().flatten();
+            if let Some(quantization) = quantization {
+                load_array_quantized_strict(
+                    &mut params,
+                    name,
+                    value,
+                    stream,
+                    quantization,
+                    &config,
+                    &mut report,
+                )?;
+            } else {
+                load_array_strict(&mut params, name, value, &config, &mut report);
+            }
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -3022,67 +3056,8 @@ pub(crate) fn load_gguf_data(
     })
 }
 
-fn load_gguf_expert_banks(
-    model: &mut Model,
-    arrays: &mut HashMap<String, Array>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    if let Some(quantization) = quantization {
-        for key in expected_expert_banks(&model.args)
-            .into_iter()
-            .filter(|key| key.component == ExpertComponent::Weight)
-        {
-            let name = target_expert_key(key);
-            let value = arrays
-                .remove(&name)
-                .ok_or_else(|| Error::StrictLoadValidation {
-                    missing: vec![name.clone()],
-                    unused: Vec::new(),
-                })?;
-            let quantized = common::moe::quantize_expert_bank(&value, quantization, stream)?;
-            let scales_key = ExpertBankKey {
-                component: ExpertComponent::AffineScales,
-                ..key
-            };
-            let biases_key = ExpertBankKey {
-                component: ExpertComponent::AffineBiases,
-                ..key
-            };
-            let mut evaluated = vec![&quantized.weight, &quantized.scales];
-            if let Some(biases) = &quantized.biases {
-                evaluated.push(biases);
-            }
-            eval(evaluated)?;
-            stream.synchronize()?;
-            assign_expert_bank(model, key, quantized.weight)?;
-            assign_expert_bank(model, scales_key, quantized.scales)?;
-            report.record_loaded(name);
-            report.record_loaded(target_expert_key(scales_key));
-            if let Some(biases) = quantized.biases {
-                assign_expert_bank(model, biases_key, biases)?;
-                report.record_loaded(target_expert_key(biases_key));
-            }
-        }
-    } else {
-        for key in expected_expert_banks(&model.args) {
-            let name = target_expert_key(key);
-            let value = arrays
-                .remove(&name)
-                .ok_or_else(|| Error::StrictLoadValidation {
-                    missing: vec![name.clone()],
-                    unused: Vec::new(),
-                })?;
-            assign_expert_bank(model, key, value)?;
-            report.record_loaded(name);
-        }
-    }
-    Ok(())
-}
-
 fn args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
@@ -3140,7 +3115,7 @@ fn args_from_gguf(
         }
         None => gguf_i32(metadata, &key("vocab_size"), stream)?,
     };
-    if !arrays.contains_key("output.weight") {
+    if !arrays.contains_gguf_tensor("output.weight") {
         return Err(Error::UnsupportedArchitecture(
             "DeepSeek GGUF is missing the untied output.weight tensor".into(),
         ));
@@ -3191,7 +3166,7 @@ fn args_from_gguf(
         quantization_config: None,
         quantization: None,
         quantized_weight_configs: None,
-        split_kv_b: arrays.keys().any(|name| name.contains(".attn_k_b.")),
+        split_kv_b: arrays.any_gguf_tensor(|name| name.contains(".attn_k_b.")),
         tie_word_embeddings: false,
     })
 }
@@ -3260,32 +3235,6 @@ fn translate_gguf_weight_name(name: &str) -> String {
         }
     }
     name.to_string()
-}
-
-fn gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
-            format!("{prefix}.weight")
-        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
-            prefix.to_string()
-        } else {
-            continue;
-        };
-        if let Some(weight) = arrays.get(&weight_name) {
-            configs.insert(
-                weight_name.clone(),
-                crate::quantization::gguf_affine_quantization(
-                    weight.shape(),
-                    scales.shape(),
-                    &weight_name,
-                )?,
-            );
-        }
-    }
-    Ok(configs)
 }
 
 fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
@@ -4419,8 +4368,9 @@ mod tests {
     }
 
     #[test]
-    fn loads_dense_and_mixed_affine_deepseek2_gguf_arrays() {
-        use crate::quantization::{quantize_tensor, AffineQuantization};
+    fn loads_dense_and_mixed_affine_deepseek2_gguf_checkpoints() {
+        use crate::quantization::AffineQuantization;
+        use safemlx_gguf::GgmlType;
         let context = test_context();
         let stream = context.stream();
         let mut source =
@@ -4436,10 +4386,9 @@ mod tests {
             super::translate_gguf_weight_name("blk.1.attn_kv_a_mqa.weight"),
             "model.layers.1.self_attn.kv_a_proj_with_mqa.weight"
         );
-        let mut dense =
-            super::load_gguf_data(arrays.clone(), gguf_metadata(), None, stream, stream)
-                .unwrap()
-                .model;
+        let metadata = gguf_metadata();
+        let dense_fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
+        let mut dense = super::load_gguf(dense_fixture.path(), stream, stream).unwrap();
         let logits = dense
             .forward(
                 ModelInput {
@@ -4453,10 +4402,10 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 2, 32]);
 
         let q4 = AffineQuantization::new(32, 4).unwrap();
-        let q8 = AffineQuantization::new(32, 8).unwrap();
-        let mut on_load = super::load_gguf_data(
-            arrays.clone(),
-            gguf_metadata(),
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(dense_fixture.path()).unwrap();
+        let mut on_load = super::load_gguf_checkpoint(
+            &checkpoint,
+            crate::weights::gguf_metadata(&checkpoint),
             Some(q4.into()),
             stream,
             stream,
@@ -4475,26 +4424,22 @@ mod tests {
             .unwrap();
         assert_eq!(logits.shape(), &[1, 1, 32]);
 
-        let mut mixed = HashMap::new();
-        for (name, value) in arrays {
-            if name.ends_with(".weight")
-                && !name.ends_with("ffn_gate_inp.weight")
-                && value.ndim() >= 2
-                && value.dtype().is_float()
-            {
-                let config = if name.contains("ffn_up_exps") { q8 } else { q4 };
-                let quantized = quantize_tensor(&value, config, stream).unwrap();
-                let prefix = name.strip_suffix(".weight").unwrap().to_string();
-                mixed.insert(name, quantized.weight);
-                mixed.insert(format!("{prefix}.scales"), quantized.scales);
-                mixed.insert(format!("{prefix}.biases"), quantized.biases.unwrap());
-            } else {
-                mixed.insert(name, value);
-            }
-        }
-        let mut quantized = super::load_gguf_data(mixed, gguf_metadata(), None, stream, stream)
-            .unwrap()
-            .model;
+        let packed_fixture = crate::test_utils::SyntheticGguf::with_packed_tensors(
+            &arrays,
+            &metadata,
+            |name, value| {
+                (name.ends_with(".weight")
+                    && !name.ends_with("ffn_gate_inp.weight")
+                    && value.ndim() >= 2
+                    && value.dtype().is_float())
+                .then_some(if name.contains("ffn_up_exps") {
+                    GgmlType::Q8_0
+                } else {
+                    GgmlType::Q4_0
+                })
+            },
+        );
+        let mut quantized = super::load_gguf(packed_fixture.path(), stream, stream).unwrap();
         let experts = quantized.model.layers[1]
             .mlp
             .moe_mut()

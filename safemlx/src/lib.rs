@@ -262,7 +262,8 @@
 //!
 //! `safemlx` supports loading from `.npy`, `.safetensors`, and `.gguf` files and
 //! saving to `.safetensors` files. Canonically named sharded GGUF checkpoints
-//! are loaded by passing their first `-00001-of-NNNNN.gguf` shard. Module
+//! are streamed through [`ops::GgufCheckpoint`] by passing their first
+//! `-00001-of-NNNNN.gguf` shard. Module
 //! parameters and optimizer states can also be saved and loaded from
 //! `.safetensors` files.
 //!
@@ -270,7 +271,7 @@
 //! |------|---------------|----------------|
 //! | [`Array`] | [`Array::load_numpy`] | [`Array::save_numpy`] |
 //! | `HashMap<String, Array>` | [`Array::load_safetensors`] | [`Array::save_safetensors`] |
-//! | `(HashMap<String, Array>, HashMap<String, ops::GgufMetadataValue>)` | [`Array::load_gguf_with_metadata`] | — |
+//! | [`ops::GgufTensor`] | [`ops::GgufCheckpoint::converted_tensors`] | — |
 //! | [`module::Module`] | [`module::ModuleParametersExt::load_safetensors`] | [`module::ModuleParametersExt::save_safetensors`] |
 //! | [`optimizers::Optimizer`] | [`optimizers::OptimizerState::load_safetensors`] | [`optimizers::OptimizerState::save_safetensors`] |
 //!

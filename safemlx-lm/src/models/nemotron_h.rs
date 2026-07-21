@@ -14,7 +14,8 @@ use safemlx::{
         arange, broadcast_to, concatenate_axis, exp, gather_grouped_rows, gather_qmm,
         grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufMetadataValue,
+        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufCheckpoint,
+        GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -41,8 +42,9 @@ use crate::{
     quantization::AffineQuantization,
     utils::{create_attention_mask, AttentionMask},
     weights::{
-        load_arrays_strict, load_safetensors_dir_strict_with_split_relu2_experts,
-        transform_split_relu2_experts, StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict,
+        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
+        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -2062,12 +2064,13 @@ pub(crate) fn load_nemotron_h_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedNemotronHGguf, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
-    load_nemotron_h_gguf_data(arrays, metadata, stream, weights_stream)
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    load_nemotron_h_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)
 }
 
-pub(crate) fn load_nemotron_h_gguf_data(
-    arrays: HashMap<String, Array>,
+pub(crate) fn load_nemotron_h_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2079,11 +2082,10 @@ pub(crate) fn load_nemotron_h_gguf_data(
         )));
     }
     let is_moe = architecture == "nemotron_h_moe";
-    let metadata_prefix = architecture.as_str();
-    let expert_count_key = format!("{metadata_prefix}.expert_count");
+    let expert_count_key = format!("{architecture}.expert_count");
     let has_experts = gguf_optional_i64(&metadata, &expert_count_key, weights_stream)?.unwrap_or(0)
         > 0
-        || arrays.keys().any(|name| name.contains("_exps"));
+        || checkpoint.any_gguf_tensor(|name| name.contains("_exps"));
     if !is_moe && has_experts {
         return Err(Error::UnsupportedArchitecture(
             "dense nemotron_h GGUF metadata contains MoE expert tensors".into(),
@@ -2094,38 +2096,38 @@ pub(crate) fn load_nemotron_h_gguf_data(
             "nemotron_h_moe GGUF metadata does not contain routed experts".into(),
         ));
     }
-    let latent_size_key = format!("{metadata_prefix}.moe_latent_size");
+    let latent_size_key = format!("{architecture}.moe_latent_size");
     if gguf_optional_i64(&metadata, &latent_size_key, weights_stream)?.unwrap_or(0) > 0
-        || arrays.keys().any(|name| name.contains("ffn_latent_"))
+        || checkpoint.any_gguf_tensor(|name| name.contains("ffn_latent_"))
     {
         return Err(Error::UnsupportedArchitecture(
             "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
         ));
     }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
 
-    let mut args = nemotron_h_args_from_gguf(&arrays, &metadata, &architecture, weights_stream)?;
-    let mut translated = HashMap::with_capacity(arrays.len());
-    for (name, value) in arrays {
-        let (name, value) = translate_gguf_weight(name, value, weights_stream)?;
-        translated.insert(name, value);
-    }
-
-    let quantized_weight_configs = gguf_quantized_weight_configs(&translated)?;
-    let quantized_weights = quantized_weight_configs
-        .keys()
-        .cloned()
-        .collect::<HashSet<_>>();
-    args.quantized_weights = Some(quantized_weights);
+    let mut args = nemotron_h_args_from_gguf(checkpoint, &metadata, &architecture, weights_stream)?;
+    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
     args.quantization = None;
     args.quantized_weight_configs = Some(quantized_weight_configs);
 
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
-    load_arrays_strict(&mut model, translated, &config, &mut report)?;
+    load_gguf_strict(
+        &mut model,
+        checkpoint,
+        None,
+        &config,
+        &mut report,
+        |name, value| translate_gguf_weight(name, value, weights_stream),
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-
     let eos_token_ids =
         gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
             .and_then(|value| u32::try_from(value).ok())
@@ -2138,7 +2140,7 @@ pub(crate) fn load_nemotron_h_gguf_data(
 }
 
 fn nemotron_h_args_from_gguf(
-    arrays: &HashMap<String, Array>,
+    arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     stream: &Stream,
@@ -2225,7 +2227,7 @@ fn nemotron_h_args_from_gguf(
     Ok(ModelArgs {
         model_type: "nemotron_h".into(),
         vocab_size,
-        tie_word_embeddings: !arrays.contains_key("output.weight"),
+        tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         hidden_size,
         intermediate_size,
         num_hidden_layers,
@@ -2236,18 +2238,18 @@ fn nemotron_h_args_from_gguf(
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
             .unwrap_or_else(default_rope_theta),
         max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
-        attention_bias: arrays.keys().any(|name| {
+        attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
                 || name.ends_with("attn_k.bias")
                 || name.ends_with("attn_v.bias")
                 || name.ends_with("attn_output.bias")
         }),
-        mlp_bias: arrays
-            .keys()
-            .any(|name| name.ends_with("ffn_up.bias") || name.ends_with("ffn_down.bias")),
-        use_bias: arrays
-            .keys()
-            .any(|name| name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")),
+        mlp_bias: arrays.any_gguf_tensor(|name| {
+            name.ends_with("ffn_up.bias") || name.ends_with("ffn_down.bias")
+        }),
+        use_bias: arrays.any_gguf_tensor(|name| {
+            name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")
+        }),
         layer_norm_epsilon: norm_eps,
         norm_eps,
         residual_in_fp32: false,
@@ -2268,10 +2270,10 @@ fn nemotron_h_args_from_gguf(
         time_step_min: default_time_step_min(),
         time_step_max: default_time_step_max(),
         time_step_floor: default_time_step_floor(),
-        use_conv_bias: arrays.keys().any(|name| name.ends_with("ssm_conv1d.bias")),
-        mamba_proj_bias: arrays
-            .keys()
-            .any(|name| name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")),
+        use_conv_bias: arrays.any_gguf_tensor(|name| name.ends_with("ssm_conv1d.bias")),
+        mamba_proj_bias: arrays.any_gguf_tensor(|name| {
+            name.ends_with("ssm_in.bias") || name.ends_with("ssm_out.bias")
+        }),
         chunk_size: default_chunk_size(),
         rescale_prenorm_residual: true,
         mlp_hidden_act: "relu2".into(),
@@ -2317,27 +2319,7 @@ fn nemotron_h_args_from_gguf(
     })
 }
 
-fn gguf_quantized_weight_configs(
-    arrays: &HashMap<String, Array>,
-) -> Result<HashMap<String, AffineQuantization>, Error> {
-    let mut configs = HashMap::new();
-    for (scales_name, scales) in arrays {
-        let weight_name = if let Some(prefix) = scales_name.strip_suffix(".scales") {
-            format!("{prefix}.weight")
-        } else if let Some(prefix) = scales_name.strip_suffix("_scales") {
-            prefix.to_string()
-        } else {
-            continue;
-        };
-        let Some(weight) = arrays.get(&weight_name) else {
-            continue;
-        };
-        let config = gguf_affine_quantization(weight.shape(), scales.shape(), &weight_name)?;
-        configs.insert(weight_name, config);
-    }
-    Ok(configs)
-}
-
+#[cfg(test)]
 fn gguf_affine_quantization(
     weight_shape: &[i32],
     scales_shape: &[i32],

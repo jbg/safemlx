@@ -1,16 +1,12 @@
-use crate::error::{Exception, IoError};
-use crate::ops::{GgufMetadata, GgufMetadataValue};
+use crate::error::IoError;
+use crate::ops::GgufMetadataValue;
 use crate::utils::guard::Guarded;
 use crate::utils::io::SafeTensors;
 use crate::utils::SUCCESS;
 use crate::{Array, Dtype, Stream};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::path::{Path, PathBuf};
-
-const GGUF_SPLIT_NO: &str = "split.no";
-const GGUF_SPLIT_COUNT: &str = "split.count";
-const GGUF_SPLIT_TENSORS_COUNT: &str = "split.tensors.count";
+use std::path::Path;
 
 fn check_file_extension(path: &Path, expected: &str) -> Result<(), IoError> {
     match path.extension().and_then(|ext| ext.to_str()) {
@@ -74,39 +70,6 @@ impl Array {
         let metadata = safetensors.metadata()?;
 
         Ok((data, metadata))
-    }
-
-    /// Loads all tensors from a GGUF checkpoint.
-    ///
-    /// MLX preserves Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors in its packed
-    /// affine representation. Some other GGUF quantization formats are
-    /// converted to floating point by MLX while loading; formats unsupported
-    /// by MLX's bundled GGUF converter return an error.
-    ///
-    /// Canonically named sharded checkpoints are loaded automatically when
-    /// `path` points to the first `-00001-of-NNNNN.gguf` shard.
-    pub fn load_gguf(
-        path: impl AsRef<Path>,
-        stream: impl AsRef<Stream>,
-    ) -> Result<HashMap<String, Array>, IoError> {
-        Ok(load_gguf_shards(path.as_ref(), stream.as_ref(), false)?.0)
-    }
-
-    /// Loads all tensors and typed metadata from a GGUF checkpoint.
-    ///
-    /// Canonically named sharded checkpoints are loaded automatically when
-    /// `path` points to the first `-00001-of-NNNNN.gguf` shard. Metadata is
-    /// returned from that first shard.
-    ///
-    /// Use [`GgufMetadata::from_file`] when only metadata is needed; that API
-    /// parses on the host and does not require an MLX stream.
-    #[allow(clippy::type_complexity)]
-    pub fn load_gguf_with_metadata(
-        path: impl AsRef<Path>,
-        stream: impl AsRef<Stream>,
-    ) -> Result<(HashMap<String, Array>, HashMap<String, GgufMetadataValue>), IoError> {
-        let (data, metadata) = load_gguf_shards(path.as_ref(), stream.as_ref(), true)?;
-        Ok((data, metadata.expect("metadata was requested")))
     }
 
     /// Save dense arrays and typed metadata as a deterministic GGUF v3 file.
@@ -328,312 +291,13 @@ fn gguf_dense_bytes(
     })
 }
 
-type GgufData = (
-    HashMap<String, Array>,
-    Option<HashMap<String, GgufMetadataValue>>,
-);
-
-fn load_gguf_shards(
-    path: &Path,
-    _stream: &Stream,
-    with_metadata: bool,
-) -> Result<GgufData, IoError> {
-    let (first, first_metadata) = load_one_gguf(path)?;
-    let split_count = gguf_split_value(&first_metadata, GGUF_SPLIT_COUNT)?.unwrap_or(0);
-    if split_count <= 1 {
-        let data = first;
-        let metadata = with_metadata.then(|| first_metadata.into_inner());
-        return Ok((data, metadata));
-    }
-
-    let split_no = required_gguf_split_value(&first_metadata, GGUF_SPLIT_NO, path)?;
-    if split_no != 0 {
-        return Err(invalid_gguf_shards(format!(
-            "sharded GGUF must be loaded from its first shard, but {:?} has {GGUF_SPLIT_NO}={split_no}",
-            path.display()
-        )));
-    }
-    let expected_tensors =
-        required_gguf_split_value(&first_metadata, GGUF_SPLIT_TENSORS_COUNT, path)?;
-    let shard_paths = gguf_shard_paths(path, split_count)?;
-
-    let mut data = first;
-    for (split_no, shard_path) in shard_paths.into_iter().enumerate().skip(1) {
-        if !shard_path.is_file() {
-            return Err(invalid_gguf_shards(format!(
-                "missing GGUF shard {:?}",
-                shard_path.display()
-            )));
-        }
-        let (shard, shard_metadata) = load_one_gguf(&shard_path)?;
-        let actual_split_no =
-            required_gguf_split_value(&shard_metadata, GGUF_SPLIT_NO, &shard_path)?;
-        if actual_split_no != split_no {
-            return Err(invalid_gguf_shards(format!(
-                "GGUF shard {:?} has {GGUF_SPLIT_NO}={actual_split_no}, expected {split_no}",
-                shard_path.display()
-            )));
-        }
-        if let Some(actual_count) = gguf_split_value(&shard_metadata, GGUF_SPLIT_COUNT)? {
-            if actual_count != split_count {
-                return Err(invalid_gguf_shards(format!(
-                    "GGUF shard {:?} has {GGUF_SPLIT_COUNT}={actual_count}, expected {split_count}",
-                    shard_path.display()
-                )));
-            }
-        }
-        for (name, value) in shard {
-            if data.insert(name.clone(), value).is_some() {
-                return Err(invalid_gguf_shards(format!(
-                    "tensor {name:?} is duplicated across GGUF shards"
-                )));
-            }
-        }
-    }
-
-    let loaded_tensors = gguf_tensor_count(&data);
-    if loaded_tensors != expected_tensors {
-        return Err(invalid_gguf_shards(format!(
-            "sharded GGUF declares {expected_tensors} tensors in {GGUF_SPLIT_TENSORS_COUNT}, but {loaded_tensors} were loaded"
-        )));
-    }
-
-    let metadata = with_metadata.then(|| first_metadata.into_inner());
-    Ok((data, metadata))
-}
-
-fn load_one_gguf(path: &Path) -> Result<(HashMap<String, Array>, GgufMetadata), IoError> {
-    if !path.is_file() {
-        return Err(IoError::NotFile);
-    }
-    if !path
-        .extension()
-        .and_then(|v| v.to_str())
-        .is_some_and(|v| v.eq_ignore_ascii_case("gguf"))
-    {
-        return Err(IoError::UnsupportedFormat);
-    }
-    let mut reader = safemlx_gguf::Reader::open(path)
-        .map_err(|e| IoError::InvalidGguf(format!("{}: {e}", path.display())))?;
-    let metadata = reader
-        .metadata()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let descriptors = reader.tensors().to_vec();
-    let mut arrays = HashMap::new();
-    for descriptor in descriptors {
-        let converted = reader.read_tensor(&descriptor).map_err(|e| {
-            IoError::InvalidGguf(format!(
-                "{} tensor {:?}: {e}",
-                path.display(),
-                descriptor.name
-            ))
-        })?;
-        match converted {
-            safemlx_gguf::ConvertedTensor::Dense(dense) => {
-                let shape = mlx_shape_i32(&descriptor.name, &dense.shape)?;
-                let dtype = match dense.dtype {
-                    safemlx_gguf::DenseDtype::F32 => Dtype::Float32,
-                    safemlx_gguf::DenseDtype::F16 => Dtype::Float16,
-                    safemlx_gguf::DenseDtype::Bf16 => Dtype::Bfloat16,
-                    safemlx_gguf::DenseDtype::I8 => Dtype::Int8,
-                    safemlx_gguf::DenseDtype::I16 => Dtype::Int16,
-                    safemlx_gguf::DenseDtype::I32 => Dtype::Int32,
-                    safemlx_gguf::DenseDtype::I64 => Dtype::Int64,
-                    safemlx_gguf::DenseDtype::F64 => Dtype::Float64,
-                };
-                let array =
-                    unsafe { Array::from_raw_data(dense.data.as_ptr().cast(), &shape, dtype) };
-                if arrays.insert(descriptor.name.clone(), array).is_some() {
-                    return Err(IoError::InvalidGguf(format!(
-                        "duplicate tensor {:?}",
-                        descriptor.name
-                    )));
-                }
-            }
-            safemlx_gguf::ConvertedTensor::Affine(affine) => {
-                let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
-                let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
-                let weight = unsafe {
-                    Array::from_raw_data(
-                        affine.weights.as_ptr().cast(),
-                        &weight_shape,
-                        Dtype::Uint32,
-                    )
-                };
-                let scales = unsafe {
-                    Array::from_raw_data(
-                        affine.scales.as_ptr().cast(),
-                        &scale_shape,
-                        Dtype::Float16,
-                    )
-                };
-                let biases = unsafe {
-                    Array::from_raw_data(
-                        affine.biases.as_ptr().cast(),
-                        &scale_shape,
-                        Dtype::Float16,
-                    )
-                };
-                let prefix = descriptor.name.strip_suffix(".weight").ok_or_else(|| {
-                    IoError::InvalidGguf(format!(
-                        "quantized tensor {:?} must end in .weight",
-                        descriptor.name
-                    ))
-                })?;
-                for (name, array) in [
-                    (descriptor.name.clone(), weight),
-                    (format!("{prefix}.scales"), scales),
-                    (format!("{prefix}.biases"), biases),
-                ] {
-                    if arrays.insert(name.clone(), array).is_some() {
-                        return Err(IoError::InvalidGguf(format!(
-                            "generated tensor name {name:?} is duplicated"
-                        )));
-                    }
-                }
-            }
-        }
-    }
-    Ok((arrays, metadata))
-}
-
-fn mlx_shape_i32(name: &str, shape: &[u64]) -> Result<Vec<i32>, IoError> {
-    shape
-        .iter()
-        .map(|&v| {
-            i32::try_from(v).map_err(|_| {
-                IoError::InvalidGguf(format!(
-                    "tensor {name:?} dimension {v} exceeds MLX i32 shape limits"
-                ))
-            })
-        })
-        .collect()
-}
-
-fn gguf_tensor_count(data: &HashMap<String, Array>) -> usize {
-    data.keys()
-        .filter(|name| {
-            let Some((prefix, suffix)) = name.rsplit_once('.') else {
-                return true;
-            };
-            if !matches!(suffix, "scales" | "biases") {
-                return true;
-            }
-            !(data.contains_key(&format!("{prefix}.weight"))
-                && data.contains_key(&format!(
-                    "{prefix}.{}",
-                    if suffix == "scales" {
-                        "biases"
-                    } else {
-                        "scales"
-                    }
-                )))
-        })
-        .count()
-}
-
-fn gguf_split_value(metadata: &GgufMetadata, key: &str) -> Result<Option<usize>, IoError> {
-    metadata
-        .get(key)
-        .map(|value| {
-            value
-                .as_i64()
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| {
-                    invalid_gguf_shards(format!(
-                        "GGUF metadata key {key:?} must be a non-negative integer scalar"
-                    ))
-                })
-        })
-        .transpose()
-}
-
-fn required_gguf_split_value(
-    metadata: &GgufMetadata,
-    key: &str,
-    path: &Path,
-) -> Result<usize, IoError> {
-    gguf_split_value(metadata, key)?.ok_or_else(|| {
-        invalid_gguf_shards(format!(
-            "GGUF shard {:?} is missing required metadata key {key:?}",
-            path.display()
-        ))
-    })
-}
-
-fn gguf_shard_paths(path: &Path, split_count: usize) -> Result<Vec<PathBuf>, IoError> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .ok_or(IoError::InvalidUtf8)?;
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or(IoError::InvalidUtf8)?;
-    let (prefix_and_no, filename_count) = stem.rsplit_once("-of-").ok_or_else(|| {
-        invalid_gguf_shards(format!(
-            "sharded GGUF filename {:?} must end in -00001-of-NNNNN.gguf",
-            path.display()
-        ))
-    })?;
-    let (prefix, filename_no) = prefix_and_no.rsplit_once('-').ok_or_else(|| {
-        invalid_gguf_shards(format!(
-            "sharded GGUF filename {:?} must end in -00001-of-NNNNN.gguf",
-            path.display()
-        ))
-    })?;
-    let valid_digits =
-        |value: &str| value.len() == 5 && value.bytes().all(|byte| byte.is_ascii_digit());
-    if prefix.is_empty() || !valid_digits(filename_no) || !valid_digits(filename_count) {
-        return Err(invalid_gguf_shards(format!(
-            "sharded GGUF filename {:?} must end in -00001-of-NNNNN.gguf",
-            path.display()
-        )));
-    }
-    let filename_no = filename_no
-        .parse::<usize>()
-        .map_err(|error| invalid_gguf_shards(format!("invalid GGUF shard number: {error}")))?;
-    let filename_count = filename_count
-        .parse::<usize>()
-        .map_err(|error| invalid_gguf_shards(format!("invalid GGUF shard count: {error}")))?;
-    if filename_no != 1 {
-        return Err(invalid_gguf_shards(format!(
-            "sharded GGUF must be loaded from shard 00001, got {filename_no:05}"
-        )));
-    }
-    if filename_count != split_count {
-        return Err(invalid_gguf_shards(format!(
-            "GGUF filename declares {filename_count} shards, but {GGUF_SPLIT_COUNT}={split_count}"
-        )));
-    }
-    if split_count > 99_999 {
-        return Err(invalid_gguf_shards(format!(
-            "GGUF shard count {split_count} cannot be represented by the canonical five-digit filename"
-        )));
-    }
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    Ok((1..=split_count)
-        .map(|index| {
-            parent.join(format!(
-                "{prefix}-{index:05}-of-{split_count:05}.{extension}"
-            ))
-        })
-        .collect())
-}
-
-fn invalid_gguf_shards(message: impl Into<String>) -> IoError {
-    IoError::Exception(Exception::custom(format!(
-        "invalid sharded GGUF: {}",
-        message.into()
-    )))
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::{ops::GgufMetadataValue, Array};
+    use crate::{
+        ops::{GgufCheckpoint, GgufMetadataValue},
+        Array,
+    };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     fn io_test_dir() -> (tempfile::TempDir, PathBuf) {
@@ -652,6 +316,20 @@ mod tests {
 
     fn gguf_test_stream() -> crate::Stream {
         crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0))
+    }
+
+    fn collect_gguf(path: &Path) -> (HashMap<String, Array>, GgufCheckpoint) {
+        let checkpoint = GgufCheckpoint::open(path).unwrap();
+        let mut arrays = HashMap::new();
+        checkpoint
+            .for_each_converted_tensor(|tensor| {
+                for (name, array) in tensor.into_arrays() {
+                    assert!(arrays.insert(name, array).is_none());
+                }
+                Ok(())
+            })
+            .unwrap();
+        (arrays, checkpoint)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -736,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_gguf_with_metadata() {
+    fn test_stream_gguf_with_metadata() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let (_tmp_dir, test_dir) = unicode_gguf_test_dir();
         let path = test_dir.join("test metadata.gguf");
@@ -759,7 +437,8 @@ mod tests {
         ]);
         Array::save_gguf([("tensor", &tensor)], Some(&metadata), &path).unwrap();
 
-        let (arrays, metadata) = Array::load_gguf_with_metadata(&path, &stream).unwrap();
+        let (arrays, checkpoint) = collect_gguf(&path);
+        let metadata = checkpoint.metadata();
         assert_eq!(arrays["tensor"].shape(), &[2, 2]);
         assert!(arrays["tensor"].clone().try_item::<f32>(&stream).is_err());
         match &metadata["answer"] {
@@ -780,7 +459,6 @@ mod tests {
 
     #[test]
     fn test_load_quantized_gguf_without_mlx_gguf() {
-        let stream = gguf_test_stream();
         let (_tmp_dir, test_dir) = unicode_gguf_test_dir();
         let path = test_dir.join("quantized weights.gguf");
         let formats = [
@@ -823,7 +501,7 @@ mod tests {
                 &inputs,
             )
             .unwrap();
-        let arrays = Array::load_gguf(&path, &stream).unwrap();
+        let (arrays, _) = collect_gguf(&path);
         for (name, _) in &formats[..8] {
             let prefix = name.strip_suffix(".weight").unwrap();
             assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint32);
@@ -842,28 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gguf_shard_paths() {
-        let paths = super::gguf_shard_paths(Path::new("dir/model-00001-of-00003.gguf"), 3).unwrap();
-        assert_eq!(
-            paths,
-            [
-                "dir/model-00001-of-00003.gguf",
-                "dir/model-00002-of-00003.gguf",
-                "dir/model-00003-of-00003.gguf",
-            ]
-            .map(std::path::PathBuf::from)
-        );
-
-        let error = super::gguf_shard_paths(Path::new("model.gguf"), 2)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("must end in -00001-of-NNNNN.gguf"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn test_load_sharded_gguf() {
         let stream = gguf_test_stream();
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -872,13 +528,12 @@ mod tests {
         save_gguf_shard(&first, "first.weight", 1.0, 0, 2, 2, "first", &stream);
         save_gguf_shard(&second, "second.weight", 2.0, 1, 2, 2, "second", &stream);
 
-        let arrays = Array::load_gguf(&first, &stream).unwrap();
+        let (arrays, checkpoint) = collect_gguf(&first);
         assert_eq!(arrays.len(), 2);
         assert_eq!(arrays["first.weight"].clone().item::<f32>(&stream), 1.0);
         assert_eq!(arrays["second.weight"].clone().item::<f32>(&stream), 2.0);
 
-        let (arrays, metadata) = Array::load_gguf_with_metadata(&first, &stream).unwrap();
-        assert_eq!(arrays.len(), 2);
+        let metadata = checkpoint.metadata();
         match &metadata["general.name"] {
             GgufMetadataValue::String(value) => assert_eq!(value, "first"),
             value => panic!("unexpected name metadata: {value:?}"),
@@ -892,7 +547,7 @@ mod tests {
         let first = tmp_dir.path().join("model-00001-of-00002.gguf");
         save_gguf_shard(&first, "weight", 1.0, 0, 2, 2, "first", &stream);
 
-        let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&first).unwrap_err().to_string();
         assert!(error.contains("missing GGUF shard"), "{error}");
         assert!(error.contains("model-00002-of-00002.gguf"), "{error}");
     }
@@ -904,7 +559,7 @@ mod tests {
         let second = tmp_dir.path().join("model-00002-of-00002.gguf");
         save_gguf_shard(&second, "weight", 1.0, 1, 2, 2, "second", &stream);
 
-        let error = Array::load_gguf(&second, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&second).unwrap_err().to_string();
         assert!(
             error.contains("must be loaded from its first shard"),
             "{error}"
@@ -918,7 +573,7 @@ mod tests {
         let first = tmp_dir.path().join("model-00001-of-00002.gguf");
         save_gguf_shard(&first, "weight", 1.0, 0, 3, 3, "first", &stream);
 
-        let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&first).unwrap_err().to_string();
         assert!(
             error.contains("filename declares 2 shards, but split.count=3"),
             "{error}"
@@ -934,7 +589,7 @@ mod tests {
         save_gguf_shard(&first, "first", 1.0, 0, 2, 2, "first", &stream);
         save_gguf_shard(&second, "second", 2.0, 0, 2, 2, "second", &stream);
 
-        let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&first).unwrap_err().to_string();
         assert!(error.contains("split.no=0, expected 1"), "{error}");
     }
 
@@ -947,7 +602,7 @@ mod tests {
         save_gguf_shard(&first, "weight", 1.0, 0, 2, 2, "first", &stream);
         save_gguf_shard(&second, "weight", 2.0, 1, 2, 2, "second", &stream);
 
-        let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&first).unwrap_err().to_string();
         assert!(
             error.contains("is duplicated across GGUF shards"),
             "{error}"
@@ -963,9 +618,9 @@ mod tests {
         save_gguf_shard(&first, "first", 1.0, 0, 2, 3, "first", &stream);
         save_gguf_shard(&second, "second", 2.0, 1, 2, 3, "second", &stream);
 
-        let error = Array::load_gguf(&first, &stream).unwrap_err().to_string();
+        let error = GgufCheckpoint::open(&first).unwrap_err().to_string();
         assert!(
-            error.contains("declares 3 tensors in split.tensors.count, but 2 were loaded"),
+            error.contains("declares 3 tensors in split.tensors.count, but 2 were cataloged"),
             "{error}"
         );
     }

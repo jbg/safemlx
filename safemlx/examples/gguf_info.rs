@@ -1,8 +1,8 @@
 use std::{error::Error, path::PathBuf};
 
 use safemlx::{
-    ops::{indexing::TryIndexOp, GgufMetadataValue},
-    Array, Device, DeviceType, Stream,
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    Device, DeviceType, Stream,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -22,30 +22,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .map(|value| value.to_string_lossy().into_owned());
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let (tensors, metadata) = Array::load_gguf_with_metadata(&path, &stream)?;
+    let checkpoint = GgufCheckpoint::open(&path)?;
+    let metadata = checkpoint.metadata();
 
     println!("file: {}", path.display());
     if let Some(GgufMetadataValue::String(architecture)) = metadata.get("general.architecture") {
         println!("architecture: {architecture}");
     }
     println!("metadata entries: {}", metadata.len());
-    println!("tensors: {}", tensors.len());
+    println!(
+        "physical tensors: {}",
+        checkpoint.catalog().physical_tensor_count()
+    );
 
-    let mut tensor_names = tensors.keys().collect::<Vec<_>>();
-    tensor_names.sort_unstable();
-    for name in tensor_names.into_iter().take(max_tensors) {
-        let tensor = &tensors[name];
-        println!("{name}: {:?} {:?}", tensor.shape(), tensor.dtype());
+    let mut layouts = checkpoint.catalog().logical_outputs().collect::<Vec<_>>();
+    layouts.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    for layout in layouts.into_iter().take(max_tensors) {
+        println!("{}: {:?} {:?}", layout.name, layout.shape, layout.dtype);
     }
 
     if let Some(name) = sample_tensor {
-        let tensor = tensors
-            .get(&name)
-            .ok_or_else(|| format!("tensor {name:?} was not found"))?;
+        let mut tensor = None;
+        for group in checkpoint.converted_tensors() {
+            if let Some((_, array)) = group?
+                .into_arrays()
+                .into_iter()
+                .find(|(logical_name, _)| logical_name == &name)
+            {
+                tensor = Some(array);
+                break;
+            }
+        }
+        let tensor = tensor.ok_or_else(|| format!("tensor {name:?} was not found"))?;
         let sample_source = if tensor.ndim() > 1 {
             tensor.try_index_device(0, &stream)?
         } else {
-            tensor.clone()
+            tensor
         };
         let flat = sample_source.flatten(None, None, &stream)?;
         let mut sample = Vec::new();

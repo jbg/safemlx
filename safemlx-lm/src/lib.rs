@@ -84,6 +84,8 @@ pub mod residency;
 pub mod sampler;
 /// Executable pure tensor-parallel model loading and inference.
 pub mod tensor_parallel;
+#[cfg(test)]
+mod test_utils;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
 pub mod utils;
 /// Composable metadata-validated checkpoint-derived weight recipes.

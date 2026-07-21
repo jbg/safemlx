@@ -24,7 +24,10 @@ pub use conversion::*;
 pub use convolution::*;
 pub use cumulative::*;
 pub use factory::*;
-pub use gguf::{GgufMetadata, GgufMetadataArray, GgufMetadataValue};
+pub use gguf::{
+    GgufAffineTensor, GgufArray, GgufCheckpoint, GgufMaterializer, GgufMetadata, GgufMetadataArray,
+    GgufMetadataValue, GgufTensor, GgufTensorIter,
+};
 pub use logical::*;
 pub use moe::*;
 pub use other::*;

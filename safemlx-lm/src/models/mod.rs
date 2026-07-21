@@ -10,7 +10,7 @@ use std::path::Path;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
-    ops::{GgufMetadata, GgufMetadataValue},
+    ops::{GgufCheckpoint, GgufMetadata, GgufMetadataValue},
     Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
@@ -1597,7 +1597,8 @@ fn load_gguf_model_data(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGgufModel, Error> {
-    let (arrays, metadata) = Array::load_gguf_with_metadata(gguf_file, weights_stream)?;
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = crate::weights::gguf_metadata(&checkpoint);
     let architecture = match metadata.get("general.architecture") {
         Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
         Some(_) => {
@@ -1623,12 +1624,12 @@ fn load_gguf_model_data(
     let tokenizer = load_tokenizer
         .then(|| load_gguf_tokenizer_from_metadata(gguf_file, &metadata))
         .transpose()?;
-    validate_gguf_quantization_source(&arrays, &metadata, options.quantization)?;
+    validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
 
     let (model, eos_token_ids) = match architecture.as_str() {
         "deepseek2" => {
-            let loaded = deepseek_v3::load_gguf_data(
-                arrays,
+            let loaded = deepseek_v3::load_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1637,8 +1638,8 @@ fn load_gguf_model_data(
             (Model::DeepSeekV3(loaded.model), loaded.eos_token_ids)
         }
         "gemma4" => {
-            let loaded = gemma4::load_gemma4_gguf_data_with_quantization(
-                arrays,
+            let loaded = gemma4::load_gemma4_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1647,8 +1648,8 @@ fn load_gguf_model_data(
             (Model::Gemma4(loaded.model), loaded.eos_token_ids)
         }
         "llama" | "mistral" => {
-            let loaded = llama::load_llama_gguf_data_with_quantization(
-                arrays,
+            let loaded = llama::load_llama_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1657,8 +1658,8 @@ fn load_gguf_model_data(
             (Model::Llama(loaded.model), loaded.eos_token_ids)
         }
         "lfm2" | "lfm2moe" => {
-            let loaded = lfm2::load_gguf_data(
-                arrays,
+            let loaded = lfm2::load_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1673,8 +1674,8 @@ fn load_gguf_model_data(
                         .into(),
                 ));
             }
-            let loaded = nemotron_h::load_nemotron_h_gguf_data(
-                arrays,
+            let loaded = nemotron_h::load_nemotron_h_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 stream,
                 weights_stream,
@@ -1682,8 +1683,8 @@ fn load_gguf_model_data(
             (Model::NemotronH(loaded.model), loaded.eos_token_ids)
         }
         "qwen3" | "qwen3moe" => {
-            let loaded = qwen3::load_qwen3_gguf_data_with_quantization(
-                arrays,
+            let loaded = qwen3::load_qwen3_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1693,12 +1694,12 @@ fn load_gguf_model_data(
         }
         "qwen3vl" => {
             let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-            let (vision_arrays, vision_metadata) =
-                Array::load_gguf_with_metadata(mmproj_file, weights_stream)?;
-            let loaded = qwen3_vl::load_qwen3_vl_gguf_data_with_quantization(
-                arrays,
+            let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+            let vision_metadata = crate::weights::gguf_metadata(&vision_checkpoint);
+            let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
+                &checkpoint,
                 metadata,
-                vision_arrays,
+                &vision_checkpoint,
                 vision_metadata,
                 options.quantization,
                 stream,
@@ -1707,8 +1708,8 @@ fn load_gguf_model_data(
             (Model::Qwen3Vl(loaded.model), loaded.eos_token_ids)
         }
         "qwen35" | "qwen35moe" => {
-            let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_data_with_quantization(
-                arrays,
+            let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_checkpoint(
+                &checkpoint,
                 metadata,
                 options.quantization,
                 stream,
@@ -1728,8 +1729,8 @@ fn load_gguf_model_data(
     })
 }
 
-fn validate_gguf_quantization_source(
-    arrays: &std::collections::HashMap<String, Array>,
+fn validate_gguf_quantization_source<S: crate::weights::GgufTensorNames>(
+    source: &S,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
 ) -> Result<(), Error> {
@@ -1738,12 +1739,7 @@ fn validate_gguf_quantization_source(
     };
     quantization.validate()?;
 
-    let has_packed_companions = arrays.keys().any(|name| {
-        name.ends_with(".scales")
-            || name.ends_with(".biases")
-            || name.ends_with("_scales")
-            || name.ends_with("_biases")
-    });
+    let has_packed_companions = source.has_affine_gguf_tensor();
     if has_packed_companions {
         return Err(Error::Quantization(
             "load-time quantization accepts only unquantized F32/F16/BF16 GGUF weights; packed GGUF tensors cannot be implicitly transcoded"
