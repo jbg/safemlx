@@ -7,9 +7,9 @@ use safemlx::{
     ops::{
         arange, argpartition_axis, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode,
         gather_route_values, grouped_matmul,
-        indexing::{take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, quantized_packed_dimension, r#where, segment_sum_by_index, sigmoid, softmax_axis,
-        sum_axis, topk_route_plan, GroupedRoutePlan,
+        indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
+        matmul, quantized_packed_dimension, r#where, sigmoid, softmax_axis, sum_axis,
+        topk_route_plan, zeros_dtype, GroupedRoutePlan,
     },
     Array, Dtype, Stream,
 };
@@ -437,7 +437,24 @@ pub fn weighted_route_sum(
     let weights = gather_route_values(top_k_weights, plan, stream)?
         .try_index_device((.., NewAxis), stream)?;
     let weighted = current.multiply(weights, stream)?;
-    segment_sum_by_index(weighted, &plan.token_indices, num_tokens, stream)
+
+    // Each route index is unique, so restore the expert-major rows with a
+    // collision-free scatter and reduce the original top-k slots in their
+    // stable order. A segment sum can use unordered GPU atomics here; the
+    // resulting roundoff was sufficient to change near-tied downstream routing
+    // decisions between identical passes.
+    let routes = weighted.dim(0);
+    let width = weighted.dim(-1);
+    let ordered = scatter_single(
+        zeros_dtype(&[routes, width], weighted.dtype(), stream)?,
+        &plan.route_indices,
+        weighted.reshape(&[routes, 1, width], stream)?,
+        0,
+        stream,
+    )?;
+    let top_k = top_k_weights.dim(-1);
+    let ordered = ordered.reshape(&[num_tokens, top_k, width], stream)?;
+    sum_axis(ordered, 1, false, stream)
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -503,6 +520,30 @@ impl PackedRelu2Experts {
 
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weighted_route_sum;
+    use safemlx::{ops::topk_route_plan, Array, Device, DeviceType, ExecutionContext};
+
+    #[test]
+    fn weighted_route_sum_restores_original_topk_order() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let expert_ids = Array::from_slice(&[2i32, 0, 1, 2, 0, 1], &[3, 2]);
+        let plan = topk_route_plan(&expert_ids, 3, stream).unwrap();
+
+        // The plan orders original routes [1, 4, 2, 5, 0, 3] by expert id.
+        let expert_major = Array::from_slice(&[2.0f32, 5.0, 3.0, 6.0, 1.0, 4.0], &[6, 1]);
+        let weights = Array::ones::<f32>(&[3, 2], stream).unwrap();
+        let reduced = weighted_route_sum(expert_major, &weights, &plan, 3, stream).unwrap();
+
+        assert_eq!(
+            reduced.evaluated().unwrap().as_slice::<f32>(),
+            &[3.0, 7.0, 11.0]
+        );
+    }
 }
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;

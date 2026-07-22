@@ -10,6 +10,9 @@
 
 use std::cell::RefCell;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 #[cfg(feature = "cuda")]
 use safemlx::fast::CudaKernel;
 #[cfg(not(feature = "cuda"))]
@@ -27,16 +30,24 @@ thread_local! {
     static ACT_QUANT_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static LINEAR_PAIR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static LINEAR_PAIR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static GROUPED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static GROUPED_LINEAR_SCALAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SEGMENTED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SEGMENTED_TRANSPOSED_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_QUANTIZATION_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[cfg(feature = "cuda")]
 thread_local! {
     static ACT_QUANT_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
     static LINEAR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
+    static LINEAR_PAIR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
     static GROUPED_LINEAR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
     static SEGMENTED_LINEAR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
     static SEGMENTED_TRANSPOSED_LINEAR_KERNEL: RefCell<Option<CudaKernel>> = const { RefCell::new(None) };
@@ -64,6 +75,17 @@ fn linear_tiled_config(rows: i32, in_dim: i32, out_dim: i32, scale_cols: i32) ->
         .with_grid([out_grid, rows * REDUCTION_TILE, 1])
         .with_thread_group([OUT_TILE, REDUCTION_TILE, 1])
         .with_output_arg([rows, out_dim], Dtype::Float32)
+}
+
+fn linear_pair_config(
+    rows: i32,
+    in_dim: i32,
+    first_out_dim: i32,
+    second_out_dim: i32,
+    scale_cols: i32,
+) -> MetalKernelConfig {
+    linear_tiled_config(rows, in_dim, first_out_dim + second_out_dim, scale_cols)
+        .with_template_arg_int("FIRST_OUT_DIM", first_out_dim)
 }
 
 fn grouped_tiled_config(
@@ -157,6 +179,9 @@ fn quantize_activations(
     in_dim: i32,
     stream: &Stream,
 ) -> Result<QuantizedActivations, Exception> {
+    #[cfg(test)]
+    ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let scale_cols = ceil_div(in_dim, SCALE_BLOCK);
     let config = MetalKernelConfig::new()
         .with_template_arg_int("IN_DIM", in_dim)
@@ -327,6 +352,99 @@ pub fn linear(
     let input = quantize_activations(&input, rows, in_dim, stream)?;
     let scale_cols = scale.dim(1);
 
+    let out = linear_quantized(
+        &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+    )?;
+
+    finish_linear_output(out, input_shape, output_dtype, out_dim, stream)
+}
+
+/// Applies two rank-2 block-scaled E4M3 matrices with one dynamic activation
+/// quantization and one paired projection kernel.
+pub(crate) fn linear_pair(
+    input: &Array,
+    first_weight: &Array,
+    first_scale: &Array,
+    second_weight: &Array,
+    second_scale: &Array,
+    stream: &Stream,
+) -> Result<(Array, Array), Exception> {
+    if input.ndim() < 1
+        || first_weight.ndim() != 2
+        || first_scale.ndim() != 2
+        || second_weight.ndim() != 2
+        || second_scale.ndim() != 2
+    {
+        return Err(Exception::custom(
+            "paired block-FP8 linear expects an input with at least one dimension and rank-2 weight/scale arrays",
+        ));
+    }
+    let input_shape = input.shape();
+    let output_dtype = activation_dtype(input)?;
+    let in_dim = input.dim(-1);
+    let first_out_dim = validate_linear_dimensions(first_weight, first_scale, in_dim)?;
+    let second_out_dim = validate_linear_dimensions(second_weight, second_scale, in_dim)?;
+    if is_cpu_stream(stream)? {
+        return Ok((
+            linear(input, first_weight, first_scale, stream)?,
+            linear(input, second_weight, second_scale, stream)?,
+        ));
+    }
+
+    let rows = (input.size() as i32) / in_dim;
+    let flattened = input.reshape(&[rows, in_dim], stream)?;
+    let quantized = quantize_activations(&flattened, rows, in_dim, stream)?;
+    let fused = linear_pair_quantized(
+        &quantized,
+        first_weight,
+        first_scale,
+        second_weight,
+        second_scale,
+        rows,
+        in_dim,
+        first_out_dim,
+        second_out_dim,
+        first_scale.dim(1),
+        stream,
+    )?;
+    let first = fused.try_index_device((.., ..first_out_dim), stream)?;
+    let second = fused.try_index_device((.., first_out_dim..), stream)?;
+    Ok((
+        finish_linear_output(first, input_shape, output_dtype, first_out_dim, stream)?,
+        finish_linear_output(second, input_shape, output_dtype, second_out_dim, stream)?,
+    ))
+}
+
+fn validate_linear_dimensions(
+    weight: &Array,
+    scale: &Array,
+    in_dim: i32,
+) -> Result<i32, Exception> {
+    let out_dim = weight.dim(0);
+    if in_dim <= 0
+        || out_dim <= 0
+        || weight.dim(1) != in_dim
+        || scale.dim(0) != ceil_div(out_dim, SCALE_BLOCK)
+        || scale.dim(1) != ceil_div(in_dim, SCALE_BLOCK)
+    {
+        return Err(Exception::custom(
+            "invalid block-FP8 linear weight or scale dimensions",
+        ));
+    }
+    Ok(out_dim)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_quantized(
+    input: &QuantizedActivations,
+    weight: &Array,
+    scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     #[cfg(feature = "cuda")]
     let out = linear_tiled_cuda(
         &input.values,
@@ -367,6 +485,80 @@ pub fn linear(
         )?
     };
 
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_pair_quantized(
+    input: &QuantizedActivations,
+    first_weight: &Array,
+    first_scale: &Array,
+    second_weight: &Array,
+    second_scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    first_out_dim: i32,
+    second_out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    #[cfg(feature = "cuda")]
+    return linear_pair_tiled_cuda(
+        &input.values,
+        &input.scales,
+        first_weight,
+        first_scale,
+        second_weight,
+        second_scale,
+        rows,
+        in_dim,
+        first_out_dim,
+        second_out_dim,
+        scale_cols,
+        stream,
+    );
+
+    #[cfg(not(feature = "cuda"))]
+    if rows <= TILED_ROW_THRESHOLD {
+        linear_pair_tiled(
+            &input.values,
+            &input.scales,
+            first_weight,
+            first_scale,
+            second_weight,
+            second_scale,
+            rows,
+            in_dim,
+            first_out_dim,
+            second_out_dim,
+            scale_cols,
+            stream,
+        )
+    } else {
+        linear_pair_scalar(
+            &input.values,
+            &input.scales,
+            first_weight,
+            first_scale,
+            second_weight,
+            second_scale,
+            rows,
+            in_dim,
+            first_out_dim,
+            second_out_dim,
+            scale_cols,
+            stream,
+        )
+    }
+}
+
+fn finish_linear_output(
+    out: Array,
+    input_shape: &[i32],
+    output_dtype: Dtype,
+    out_dim: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     let mut output_shape = input_shape.to_vec();
     *output_shape.last_mut().expect("linear input rank") = out_dim;
     let out = out.reshape(&output_shape, stream)?;
@@ -395,6 +587,45 @@ fn linear_tiled_cuda(
             .as_ref()
             .expect("CUDA FP8 linear kernel initialized")
             .apply_one_device([input, input_scale, weight, scale], &config, stream)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+fn linear_pair_tiled_cuda(
+    input: &Array,
+    input_scale: &Array,
+    first_weight: &Array,
+    first_scale: &Array,
+    second_weight: &Array,
+    second_scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    first_out_dim: i32,
+    second_out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    LINEAR_PAIR_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(linear_pair_kernel_cuda()?);
+        }
+        let config = linear_pair_config(rows, in_dim, first_out_dim, second_out_dim, scale_cols);
+        cell.borrow()
+            .as_ref()
+            .expect("CUDA paired FP8 linear kernel initialized")
+            .apply_one_device(
+                [
+                    input,
+                    input_scale,
+                    first_weight,
+                    first_scale,
+                    second_weight,
+                    second_scale,
+                ],
+                &config,
+                stream,
+            )
     })
 }
 
@@ -434,6 +665,52 @@ fn linear_kernel_cuda() -> Result<CudaKernel, Exception> {
     )
 }
 
+#[cfg(feature = "cuda")]
+fn linear_pair_kernel_cuda() -> Result<CudaKernel, Exception> {
+    CudaKernel::new(
+        "block_fp8_linear_pair_k16",
+        [
+            "input",
+            "input_scale",
+            "first_weight",
+            "first_scale",
+            "second_weight",
+            "second_scale",
+        ],
+        ["out"],
+        concat!(
+            "uint32_t fused_col = blockIdx.x * blockDim.x + threadIdx.x;",
+            "uint32_t row = blockIdx.y;",
+            "uint32_t lane_k = threadIdx.y;",
+            "uint32_t local_col = threadIdx.x;",
+            "__shared__ float partial[REDUCTION_TILE][OUT_TILE];",
+            "float acc = 0.0f;",
+            "if (fused_col < OUT_DIM) {",
+            " bool first = fused_col < FIRST_OUT_DIM;",
+            " uint32_t out_col = first ? fused_col : fused_col - FIRST_OUT_DIM;",
+            " for (uint32_t k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
+            "  uint8_t raw = first ? first_weight[out_col * IN_DIM + k] : second_weight[out_col * IN_DIM + k];",
+            "  float x = fp8_e4m3_to_float(input[row * IN_DIM + k]);",
+            "  uint32_t scale_col = k / SCALE_BLOCK;",
+            "  float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
+            "  float ws = first ? float(first_scale[(out_col / SCALE_BLOCK) * SCALE_COLS + scale_col]) : float(second_scale[(out_col / SCALE_BLOCK) * SCALE_COLS + scale_col]);",
+            "  acc += x * fp8_e4m3_to_float(raw) * xs * ws;",
+            " }",
+            "}",
+            "partial[threadIdx.y][threadIdx.x] = acc;",
+            "__syncthreads();",
+            "if (lane_k == 0 && fused_col < OUT_DIM) {",
+            " float sum = 0.0f;",
+            " for (uint32_t lane = 0; lane < REDUCTION_TILE; ++lane) sum += partial[lane][local_col];",
+            " out[row * OUT_DIM + fused_col] = sum;",
+            "}"
+        ),
+        CUDA_HEADER,
+        true,
+        0,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(feature = "cuda"))]
 fn linear_tiled(
@@ -456,6 +733,45 @@ fn linear_tiled(
             .as_ref()
             .expect("FP8 linear kernel initialized")
             .apply_one_device([input, input_scale, weight, scale], &config, stream)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
+fn linear_pair_tiled(
+    input: &Array,
+    input_scale: &Array,
+    first_weight: &Array,
+    first_scale: &Array,
+    second_weight: &Array,
+    second_scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    first_out_dim: i32,
+    second_out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    LINEAR_PAIR_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(linear_pair_kernel()?);
+        }
+        let config = linear_pair_config(rows, in_dim, first_out_dim, second_out_dim, scale_cols);
+        cell.borrow()
+            .as_ref()
+            .expect("paired FP8 linear kernel initialized")
+            .apply_one_device(
+                [
+                    input,
+                    input_scale,
+                    first_weight,
+                    first_scale,
+                    second_weight,
+                    second_scale,
+                ],
+                &config,
+                stream,
+            )
     })
 }
 
@@ -488,6 +804,54 @@ fn linear_scalar(
             .as_ref()
             .expect("scalar FP8 linear kernel initialized")
             .apply_one_device([input, input_scale, weight, scale], &config, stream)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "cuda"))]
+fn linear_pair_scalar(
+    input: &Array,
+    input_scale: &Array,
+    first_weight: &Array,
+    first_scale: &Array,
+    second_weight: &Array,
+    second_scale: &Array,
+    rows: i32,
+    in_dim: i32,
+    first_out_dim: i32,
+    second_out_dim: i32,
+    scale_cols: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    LINEAR_PAIR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(linear_pair_scalar_kernel()?);
+        }
+        let out_dim = first_out_dim + second_out_dim;
+        let config = MetalKernelConfig::new()
+            .with_template_arg_int("IN_DIM", in_dim)
+            .with_template_arg_int("OUT_DIM", out_dim)
+            .with_template_arg_int("FIRST_OUT_DIM", first_out_dim)
+            .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
+            .with_template_arg_int("SCALE_COLS", scale_cols)
+            .with_grid([rows * out_dim, 1, 1])
+            .with_thread_group([256, 1, 1])
+            .with_output_arg([rows, out_dim], Dtype::Float32);
+        cell.borrow()
+            .as_ref()
+            .expect("paired scalar FP8 linear kernel initialized")
+            .apply_one_device(
+                [
+                    input,
+                    input_scale,
+                    first_weight,
+                    first_scale,
+                    second_weight,
+                    second_scale,
+                ],
+                &config,
+                stream,
+            )
     })
 }
 
@@ -530,6 +894,53 @@ fn linear_kernel() -> Result<MetalKernel, Exception> {
 }
 
 #[cfg(not(feature = "cuda"))]
+fn linear_pair_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "block_fp8_linear_pair_k16",
+        [
+            "input",
+            "input_scale",
+            "first_weight",
+            "first_scale",
+            "second_weight",
+            "second_scale",
+        ],
+        ["out"],
+        concat!(
+            "uint fused_col = thread_position_in_grid.x;",
+            "uint row = thread_position_in_grid.y / REDUCTION_TILE;",
+            "uint lane_k = thread_position_in_grid.y % REDUCTION_TILE;",
+            "uint local_col = thread_position_in_grid.x % OUT_TILE;",
+            "uint input_base = row * IN_DIM;",
+            "threadgroup float partial[REDUCTION_TILE][OUT_TILE];",
+            "float acc = 0.0f;",
+            "if (fused_col < OUT_DIM) {",
+            " bool first = fused_col < FIRST_OUT_DIM;",
+            " uint out_col = first ? fused_col : fused_col - FIRST_OUT_DIM;",
+            " for (uint k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
+            "  uint8_t raw = first ? first_weight[out_col * IN_DIM + k] : second_weight[out_col * IN_DIM + k];",
+            "  float x = fp8_e4m3_to_float(input[input_base + k]);",
+            "  uint scale_col = k / SCALE_BLOCK;",
+            "  float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
+            "  float ws = first ? float(first_scale[(out_col / SCALE_BLOCK) * SCALE_COLS + scale_col]) : float(second_scale[(out_col / SCALE_BLOCK) * SCALE_COLS + scale_col]);",
+            "  acc += x * fp8_e4m3_to_float(raw) * xs * ws;",
+            " }",
+            "}",
+            "partial[lane_k][local_col] = acc;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "if (lane_k == 0 && fused_col < OUT_DIM) {",
+            " float sum = 0.0f;",
+            " for (uint lane = 0; lane < REDUCTION_TILE; ++lane) sum += partial[lane][local_col];",
+            " out[row * OUT_DIM + fused_col] = sum;",
+            "}"
+        ),
+        METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
 fn linear_scalar_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "block_fp8_linear_scalar",
@@ -549,6 +960,44 @@ fn linear_scalar_kernel() -> Result<MetalKernel, Exception> {
             " float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
             " float ws = float(scale[scale_row * SCALE_COLS + scale_col]);",
             " acc += fp8_e4m3_to_float(input[input_base + k]) * w * xs * ws;",
+            "}",
+            "out[elem] = acc;"
+        ),
+        METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+fn linear_pair_scalar_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "block_fp8_linear_pair_scalar",
+        [
+            "input",
+            "input_scale",
+            "first_weight",
+            "first_scale",
+            "second_weight",
+            "second_scale",
+        ],
+        ["out"],
+        concat!(
+            "uint elem = thread_position_in_grid.x;",
+            "uint fused_col = elem % OUT_DIM;",
+            "uint row = elem / OUT_DIM;",
+            "bool first = fused_col < FIRST_OUT_DIM;",
+            "uint out_col = first ? fused_col : fused_col - FIRST_OUT_DIM;",
+            "float acc = 0.0f;",
+            "uint weight_base = out_col * IN_DIM;",
+            "uint input_base = row * IN_DIM;",
+            "uint scale_row = out_col / SCALE_BLOCK;",
+            "for (uint k = 0; k < IN_DIM; ++k) {",
+            " uint8_t raw = first ? first_weight[weight_base + k] : second_weight[weight_base + k];",
+            " uint scale_col = k / SCALE_BLOCK;",
+            " float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
+            " float ws = first ? float(first_scale[scale_row * SCALE_COLS + scale_col]) : float(second_scale[scale_row * SCALE_COLS + scale_col]);",
+            " acc += fp8_e4m3_to_float(input[input_base + k]) * fp8_e4m3_to_float(raw) * xs * ws;",
             "}",
             "out[elem] = acc;"
         ),
@@ -1178,7 +1627,8 @@ const CUDA_HEADER: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::{
-        grouped_linear, linear, quantize_activations, segmented_linear, segmented_transposed_linear,
+        grouped_linear, linear, linear_pair, quantize_activations, segmented_linear,
+        segmented_transposed_linear, ACTIVATION_QUANTIZATION_CALLS,
     };
     use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype, ExecutionContext};
 
@@ -1304,6 +1754,75 @@ mod tests {
     #[test]
     fn block_fp8_cpu_reference_projections() {
         assert_block_fp8_dense_and_grouped_projections(DeviceType::Cpu);
+    }
+
+    #[test]
+    fn paired_linear_reuses_dynamic_activation_quantization() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let input = Array::from_slice(&[1.0f32; 128], &[1, 128]);
+        let first_weight = Array::from_slice(&[0x38u8; 128 * 128], &[128, 128]);
+        let first_scale = Array::from_slice(&[1.0f32], &[1, 1]);
+        let second_weight = Array::from_slice(&[0x38u8; 256 * 128], &[256, 128]);
+        let second_scale = Array::from_slice(&[2.0f32, 2.0], &[2, 1]);
+
+        ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.set(0));
+        let (first, second) = linear_pair(
+            &input,
+            &first_weight,
+            &first_scale,
+            &second_weight,
+            &second_scale,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .try_index_device((0, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            128.0
+        );
+        assert_eq!(
+            second
+                .try_index_device((0, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            256.0
+        );
+        assert_eq!(ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.get()), 1);
+
+        let prefill_input = Array::from_slice(&[1.0f32; 9 * 128], &[9, 128]);
+        ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.set(0));
+        let (prefill_first, prefill_second) = linear_pair(
+            &prefill_input,
+            &first_weight,
+            &first_scale,
+            &second_weight,
+            &second_scale,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(
+            prefill_first
+                .try_index_device((8, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            128.0
+        );
+        assert_eq!(
+            prefill_second
+                .try_index_device((8, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            256.0
+        );
+        assert_eq!(ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.get()), 1);
+
+        ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.set(0));
+        let _ = linear(&input, &first_weight, &first_scale, stream).unwrap();
+        let _ = linear(&input, &second_weight, &second_scale, stream).unwrap();
+        assert_eq!(ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.get()), 2);
     }
 
     #[test]

@@ -3045,7 +3045,7 @@ fn expert_cache_base_plan(
 ) -> PlacementPlan {
     let mut plan = PlacementPlan::replicated(topology);
     for key in store.keys() {
-        if is_routed_expert_key(kind, &key) {
+        if is_routed_expert_key(kind, &key) || is_auxiliary_checkpoint_key(kind, &key) {
             plan.insert(key, TensorPlacement::Omit);
         }
     }
@@ -3058,6 +3058,14 @@ fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
         ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
         ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),
         _ => key.contains(".mlp.experts."),
+    }
+}
+
+fn is_auxiliary_checkpoint_key(kind: ModelKind, key: &str) -> bool {
+    match kind {
+        ModelKind::Inkling => key.starts_with("model.mtp."),
+        ModelKind::Qwen3Next => key.starts_with("mtp.") || key.starts_with("model.mtp."),
+        _ => false,
     }
 }
 
@@ -3169,14 +3177,7 @@ fn load_additional_cached_ep(
         model_dir,
         expert_options.non_expert.max_mapped_shards,
     )?);
-    let mut plan = expert_cache_base_plan(store.as_ref(), topology, kind);
-    if kind == ModelKind::Inkling {
-        for key in store.keys() {
-            if key.starts_with("model.mtp.") {
-                plan.insert(key, TensorPlacement::Omit);
-            }
-        }
-    }
+    let plan = expert_cache_base_plan(store.as_ref(), topology, kind);
     let partition = load_safetensors_partition_from_store_on_streams(
         store.as_ref(),
         &plan,
@@ -3361,11 +3362,8 @@ fn load_additional_cached_ep(
                     kind.model_type_name()
                 )));
             }
-            if kind == ModelKind::Qwen3Next && args.uses_fp8() {
-                return Err(Error::UnsupportedArchitecture(
-                    "native FP8 Qwen3-Next checkpoints with fused qkvz/ba projections are unsupported"
-                        .into(),
-                ));
+            if let Some(config) = &args.quantization_config {
+                config.validate_supported()?;
             }
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -3707,6 +3705,30 @@ mod tests {
             assert!(timing_profiling_enabled());
         }
         assert!(!timing_profiling_enabled());
+    }
+
+    #[test]
+    fn auxiliary_checkpoint_keys_are_omitted_by_family() {
+        assert!(is_auxiliary_checkpoint_key(
+            ModelKind::Qwen3Next,
+            "mtp.fc.weight"
+        ));
+        assert!(is_auxiliary_checkpoint_key(
+            ModelKind::Qwen3Next,
+            "model.mtp.fc.weight"
+        ));
+        assert!(!is_auxiliary_checkpoint_key(
+            ModelKind::Qwen35Moe,
+            "mtp.fc.weight"
+        ));
+        assert!(is_auxiliary_checkpoint_key(
+            ModelKind::Inkling,
+            "model.mtp.fc.weight"
+        ));
+        assert!(!is_auxiliary_checkpoint_key(
+            ModelKind::Inkling,
+            "mtp.fc.weight"
+        ));
     }
 
     fn save_zero_checkpoint(model: &impl ModuleParameters, directory: &Path, stream: &Stream) {

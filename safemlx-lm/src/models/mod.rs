@@ -1974,7 +1974,7 @@ fn load_gguf_model_data(
             )?;
             (Model::Qwen3Vl(loaded.model), loaded.eos_token_ids)
         }
-        "qwen35" | "qwen35moe" => {
+        "qwen35" | "qwen35moe" | "qwen3next" => {
             let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_checkpoint(
                 &checkpoint,
                 metadata,
@@ -1982,10 +1982,15 @@ fn load_gguf_model_data(
                 stream,
                 weights_stream,
             )?;
-            (Model::Qwen35Moe(loaded.model), loaded.eos_token_ids)
+            let model = if architecture == "qwen3next" {
+                Model::Qwen3Next(loaded.model)
+            } else {
+                Model::Qwen35Moe(loaded.model)
+            };
+            (model, loaded.eos_token_ids)
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, and qwen35moe"
+            "GGUF architecture {other:?}; supported GGUF architectures are deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
         ))),
     };
     Ok(LoadedGgufModel {

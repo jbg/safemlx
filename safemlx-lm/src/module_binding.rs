@@ -126,7 +126,7 @@ where
                 });
             }
             let expected_dtype = RecipeDtype::from(parameter.dtype());
-            if metadata.dtype() != &expected_dtype {
+            if !recipe_dtype_matches(&expected_dtype, metadata.dtype()) {
                 return Err(ModuleBindingError::RecipeDtypeMismatch {
                     parameter: qualify(prefix, &local_name),
                     expected: expected_dtype,
@@ -282,6 +282,10 @@ fn qualify(prefix: &str, name: &str) -> String {
     }
 }
 
+fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
+    expected == actual || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
+}
+
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
@@ -402,6 +406,19 @@ mod tests {
 
     fn cpu() -> ExecutionContext {
         ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
+    }
+
+    #[test]
+    fn packed_e4m3_recipe_matches_u8_runtime_storage_only() {
+        assert!(recipe_dtype_matches(&RecipeDtype::U8, &RecipeDtype::F8E4M3));
+        assert!(!recipe_dtype_matches(
+            &RecipeDtype::U8,
+            &RecipeDtype::F8E5M2
+        ));
+        assert!(!recipe_dtype_matches(
+            &RecipeDtype::F32,
+            &RecipeDtype::F8E4M3
+        ));
     }
 
     #[test]

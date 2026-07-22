@@ -13,7 +13,7 @@ use safemlx::{
 };
 
 use crate::weight_store::{
-    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightStore,
+    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightStore, WeightStoreError,
 };
 
 /// Scalar encoding produced by a derived-weight recipe.
@@ -280,7 +280,10 @@ impl DerivedWeightRecipe {
 
     /// Materializes this recipe on the host source stream.
     ///
-    /// All source leases remain live until the derived output has been evaluated.
+    /// Source leases remain live until their dependent output has been
+    /// evaluated. If a multi-input join reaches the mapping bound, completed
+    /// children are detached before retrying so cross-shard recipes can honor
+    /// a one-mapping limit without serializing the normal batched path.
     pub fn materialize(
         &self,
         store: &dyn WeightStore,
@@ -410,10 +413,58 @@ fn materialize_inputs(
     stream: &Stream,
     sources: &mut Vec<PendingWeightMaterialization>,
 ) -> Result<Vec<Array>, WeightRecipeError> {
-    inputs
-        .iter()
-        .map(|input| input.materialize_inner(store, stream, sources))
-        .collect()
+    let mut pending =
+        Vec::<(Array, Vec<PendingWeightMaterialization>)>::with_capacity(inputs.len());
+    let mut detach_remaining = false;
+    for input in inputs {
+        loop {
+            let mut input_sources = Vec::new();
+            match input.materialize_inner(store, stream, &mut input_sources) {
+                Ok(array) => {
+                    if detach_remaining && !input_sources.is_empty() {
+                        eval([&array])?;
+                        for source in input_sources.drain(..) {
+                            source.complete();
+                        }
+                    }
+                    pending.push((array, input_sources));
+                    break;
+                }
+                Err(error)
+                    if !detach_remaining
+                        && !pending.is_empty()
+                        && matches!(
+                            &error,
+                            WeightRecipeError::WeightStore(
+                                WeightStoreError::CapacityExhausted { .. }
+                            )
+                        ) =>
+                {
+                    // The current child could not acquire another shard while
+                    // earlier children pinned the mapping cache. Their arrays
+                    // are sufficient evaluation roots, so detach them and retry.
+                    drop(input_sources);
+                    for (array, child_sources) in &mut pending {
+                        if child_sources.is_empty() {
+                            continue;
+                        }
+                        eval([&*array])?;
+                        for source in child_sources.drain(..) {
+                            source.complete();
+                        }
+                    }
+                    detach_remaining = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let mut arrays = Vec::with_capacity(pending.len());
+    for (array, input_sources) in pending {
+        arrays.push(array);
+        sources.extend(input_sources);
+    }
+    Ok(arrays)
 }
 
 fn infer_source(
@@ -676,6 +727,50 @@ mod tests {
         (dir, store)
     }
 
+    fn one_mapping_cross_shard_fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let left = [1i32, 2, 3, 4]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let right = [5i32, 6, 7, 8]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            [(
+                "left",
+                TensorView::new(SafeDtype::I32, vec![2, 2], &left).unwrap(),
+            )],
+            None,
+            &dir.path().join("model-00001-of-00002.safetensors"),
+        )
+        .unwrap();
+        serialize_to_file(
+            [(
+                "right",
+                TensorView::new(SafeDtype::I32, vec![2, 2], &right).unwrap(),
+            )],
+            None,
+            &dir.path().join("model-00002-of-00002.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "left": "model-00001-of-00002.safetensors",
+                    "right": "model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store =
+            Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap());
+        (dir, store)
+    }
+
     fn source(key: &str) -> DerivedWeightRecipe {
         DerivedWeightRecipe::source(key, TensorSelection::Full)
     }
@@ -730,6 +825,29 @@ mod tests {
             output.evaluated().unwrap().as_slice::<i32>(),
             &[5, 6, 7, 8, 1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn materializes_cross_shard_join_with_one_mapping() {
+        let (_dir, store) = one_mapping_cross_shard_fixture();
+        let recipe = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![source("left"), source("right")],
+            }],
+        };
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let output = recipe.materialize(store.as_ref(), &stream).unwrap();
+        assert_eq!(output.shape(), &[1, 4, 2]);
+        assert_eq!(
+            output.evaluated().unwrap().as_slice::<i32>(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.currently_mapped_shards, 1);
+        assert_eq!(diagnostics.touched_shard_paths.len(), 2);
+        assert!(diagnostics.evictions >= 1);
     }
 
     #[test]

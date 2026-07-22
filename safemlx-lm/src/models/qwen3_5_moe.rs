@@ -14,9 +14,8 @@ use safemlx::{
         broadcast_to, concatenate_axis, conv1d, dequantize, exp, gather_grouped_rows,
         grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        matmul, quantized_matmul_with_mode, quantized_packed_dimension, sigmoid, stack_axis,
-        sum_axis, topk_route_plan, zeros, GgufCheckpoint, GgufMetadataValue, GgufTensor,
-        QuantizationMode,
+        matmul, quantized_matmul_with_mode, quantized_packed_dimension, sigmoid, sum_axis,
+        topk_route_plan, zeros, GgufCheckpoint, GgufMetadataValue, GgufTensor, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -320,7 +319,7 @@ pub struct QwenFp8QuantizationConfig {
 }
 
 impl QwenFp8QuantizationConfig {
-    fn validate_supported(&self) -> Result<(), Error> {
+    pub(crate) fn validate_supported(&self) -> Result<(), Error> {
         if self.quant_method != "fp8" {
             return Err(Error::UnsupportedArchitecture(format!(
                 "unsupported Qwen3.5-MoE quantization method '{}'",
@@ -662,6 +661,24 @@ impl QwenLinear {
         })
     }
 
+    fn new_dense_with_weight_dtype(
+        input_dims: i32,
+        output_dims: i32,
+        bias: bool,
+        weight_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut linear = Self::new(
+            input_dims,
+            output_dims,
+            bias,
+            QwenWeightFormat::Dense,
+            stream,
+        )?;
+        linear.weight = Param::<Array>::unloaded(&[output_dims, input_dims], weight_dtype, stream)?;
+        Ok(linear)
+    }
+
     pub(crate) fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         let mut output = if let Some(scales) = self.scales.as_ref() {
             quantized_matmul_with_mode(
@@ -684,6 +701,40 @@ impl QwenLinear {
             output = output.add(bias, stream)?;
         }
         Ok(output)
+    }
+
+    fn forward_pair(
+        first: &mut Self,
+        second: &mut Self,
+        input: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        if first.scales.as_ref().is_none() && second.scales.as_ref().is_none() {
+            if let (Some(first_scale), Some(second_scale)) = (
+                first.weight_scale_inv.as_ref(),
+                second.weight_scale_inv.as_ref(),
+            ) {
+                let (mut first_output, mut second_output) = common::block_fp8::linear_pair(
+                    input,
+                    first.weight.as_ref(),
+                    first_scale,
+                    second.weight.as_ref(),
+                    second_scale,
+                    stream,
+                )?;
+                if let Some(bias) = first.bias.as_ref() {
+                    first_output = first_output.add(bias, stream)?;
+                }
+                if let Some(bias) = second.bias.as_ref() {
+                    second_output = second_output.add(bias, stream)?;
+                }
+                return Ok((first_output, second_output));
+            }
+        }
+        Ok((
+            first.forward(input, stream)?,
+            second.forward(input, stream)?,
+        ))
     }
 
     fn training_mode(&mut self, _mode: bool) {}
@@ -1254,6 +1305,15 @@ impl LinearAttention {
         let value_dim = head_v_dim * num_v_heads;
         let conv_dim = key_dim * 2 + value_dim;
         let projection_size_qkv = key_dim * 2 + value_dim;
+        // Official native-FP8 Qwen3-Next checkpoints deliberately keep the
+        // fused BA projection dense BF16. Its layerwise recipes split that
+        // tensor without casting, so the unloaded destinations must advertise
+        // the checkpoint dtype rather than the generic dense F32 default.
+        let ba_weight_dtype = if format == QwenWeightFormat::Fp8 {
+            Dtype::Bfloat16
+        } else {
+            Dtype::Float32
+        };
         Ok(Self {
             num_v_heads,
             num_k_heads,
@@ -1272,18 +1332,18 @@ impl LinearAttention {
                 stream,
             )?,
             in_proj_z: QwenLinear::new(args.hidden_size, value_dim, false, format, stream)?,
-            in_proj_b: QwenLinear::new(
+            in_proj_b: QwenLinear::new_dense_with_weight_dtype(
                 args.hidden_size,
                 num_v_heads,
                 false,
-                QwenWeightFormat::Dense,
+                ba_weight_dtype,
                 stream,
             )?,
-            in_proj_a: QwenLinear::new(
+            in_proj_a: QwenLinear::new_dense_with_weight_dtype(
                 args.hidden_size,
                 num_v_heads,
                 false,
-                QwenWeightFormat::Dense,
+                ba_weight_dtype,
                 stream,
             )?,
             dt_bias: Param::new(Array::from_slice(
@@ -1699,11 +1759,9 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
         let shape = x.shape();
         let B = shape[0];
         let L = shape[1];
-        let mixed_qkv = self.in_proj_qkv.forward(x, stream)?;
-        let z = self
-            .in_proj_z
-            .forward(x, stream)?
-            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        let (mixed_qkv, z) =
+            QwenLinear::forward_pair(&mut self.in_proj_qkv, &mut self.in_proj_z, x, stream)?;
+        let z = z.reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
         let b = self.in_proj_b.forward(x, stream)?;
         let a = self.in_proj_a.forward(x, stream)?;
         let mixed_qkv = self.depthwise_causal_conv(&mixed_qkv, cache.as_deref_mut(), stream)?;
@@ -1780,12 +1838,10 @@ impl LinearAttention {
         let shape = x.shape();
         let B = shape[0];
         let L = shape[1];
-        let mixed_qkv = self.in_proj_qkv.forward(x, stream)?;
+        let (mixed_qkv, z) =
+            QwenLinear::forward_pair(&mut self.in_proj_qkv, &mut self.in_proj_z, x, stream)?;
         observer.observe(&format!("{prefix}.in_proj_qkv"), &mixed_qkv)?;
-        let z = self
-            .in_proj_z
-            .forward(x, stream)?
-            .reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
+        let z = z.reshape(&[B, L, self.num_v_heads, self.head_v_dim], stream)?;
         observer.observe(&format!("{prefix}.z_proj"), &z)?;
         let b = self.in_proj_b.forward(x, stream)?;
         observer.observe(&format!("{prefix}.beta_proj"), &b)?;
@@ -3692,15 +3748,15 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     weights_stream: &Stream,
 ) -> Result<LoadedQwen35Gguf, Error> {
     let architecture = qwen35_gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe") {
+    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe" | "qwen3next") {
         return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports qwen35 and qwen35moe"
+            "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
-    let is_moe = architecture == "qwen35moe";
+    let is_moe = matches!(architecture.as_str(), "qwen35moe" | "qwen3next");
     if checkpoint.any_gguf_tensor(|name| name.starts_with("v.") || name.starts_with("mm.")) {
         return Err(Error::UnsupportedArchitecture(
-            "multimodal Qwen3.5 GGUF checkpoints are not supported; load a text-only qwen35 or qwen35moe checkpoint"
+            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported; load a text-only qwen3next, qwen35, or qwen35moe checkpoint"
                 .into(),
         ));
     }
@@ -3781,14 +3837,26 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
         for (name, value) in arrays {
             let (name, value) =
                 qwen35_translate_gguf_weight(name, value, &model.args, weights_stream)?;
-            load_named_array_strict(
-                &mut model,
-                name,
-                value,
-                quantization.map(|value| (value, stream)),
-                &config,
-                &mut report,
-            )?;
+            let values = if model.args.model_type == "qwen3_next" {
+                super::qwen3_next::split_fused_projection(
+                    &name,
+                    value,
+                    &model.args,
+                    weights_stream,
+                )?
+            } else {
+                vec![(name, value)]
+            };
+            for (name, value) in values {
+                load_named_array_strict(
+                    &mut model,
+                    name,
+                    value,
+                    quantization.map(|value| (value, stream)),
+                    &config,
+                    &mut report,
+                )?;
+            }
         }
     }
     if is_moe {
@@ -3810,16 +3878,17 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
             {
                 let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
                 let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-                let gate = gate.get(&gate_name).ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "Qwen3.5 GGUF is missing routed expert tensor {gate_name:?}"
-                    ))
-                })?;
-                let up = up.get(&up_name).ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "Qwen3.5 GGUF is missing routed expert tensor {up_name:?}"
-                    ))
-                })?;
+                let (gate, up) = match (gate.get(&gate_name), up.get(&up_name)) {
+                    (Some(gate), Some(up)) => (gate, up),
+                    (None, None) if source_suffix != "weight" => continue,
+                    (gate, up) => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Qwen3.5 GGUF has mismatched routed expert components {gate_name:?} ({}) and {up_name:?} ({})",
+                            if gate.is_some() { "present" } else { "missing" },
+                            if up.is_some() { "present" } else { "missing" },
+                        )));
+                    }
+                };
                 let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
                 load_named_array_strict(
                     &mut model,
@@ -3853,7 +3922,7 @@ fn qwen35_args_from_gguf(
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let is_moe = architecture == "qwen35moe";
+    let is_moe = matches!(architecture, "qwen35moe" | "qwen3next");
     let hidden_size = qwen35_gguf_i32(metadata, &key("embedding_length"), stream)?;
     let num_attention_heads = qwen35_gguf_i32(metadata, &key("attention.head_count"), stream)?;
     let num_key_value_heads = qwen35_gguf_i32(metadata, &key("attention.head_count_kv"), stream)?;
@@ -3901,7 +3970,9 @@ fn qwen35_args_from_gguf(
     );
 
     Ok(ModelArgs {
-        model_type: if is_moe {
+        model_type: if architecture == "qwen3next" {
+            "qwen3_next".into()
+        } else if is_moe {
             "qwen3_5_moe_text".into()
         } else {
             "qwen3_5_text".into()
@@ -3986,7 +4057,12 @@ fn qwen35_translate_gguf_weight(
     args: &ModelArgs,
     stream: &Stream,
 ) -> Result<(String, Array), Error> {
-    if name.ends_with(".attn_qkv.weight") {
+    // llama.cpp only converts Qwen3.5 value heads from grouped-by-key-head
+    // order to tiled broadcast order. Qwen3-Next GGUF retains the original
+    // grouped layout, so applying the inverse permutation there corrupts every
+    // recurrent projection that contains value-head channels.
+    let restore_v_head_order = args.model_type != "qwen3_next";
+    if restore_v_head_order && name.ends_with(".attn_qkv.weight") {
         value = qwen35_restore_v_tail(
             value,
             2 * args.linear_num_key_heads * args.linear_key_head_dim,
@@ -3995,26 +4071,30 @@ fn qwen35_translate_gguf_weight(
             stream,
         )?;
     } else if name.ends_with(".ssm_conv1d.weight") {
-        value = qwen35_restore_v_tail(
-            value,
-            2 * args.linear_num_key_heads * args.linear_key_head_dim,
-            0,
-            args,
-            stream,
-        )?;
+        if restore_v_head_order {
+            value = qwen35_restore_v_tail(
+                value,
+                2 * args.linear_num_key_heads * args.linear_key_head_dim,
+                0,
+                args,
+                stream,
+            )?;
+        }
         value = value.reshape(&[value.dim(0), 1, value.dim(1)], stream)?;
-    } else if name.ends_with(".attn_gate.weight") {
+    } else if restore_v_head_order && name.ends_with(".attn_gate.weight") {
         value = qwen35_restore_v_head_order(value, 0, args.linear_value_head_dim, args, stream)?;
-    } else if name.ends_with(".ssm_alpha.weight")
-        || name.ends_with(".ssm_beta.weight")
-        || name.ends_with(".ssm_dt.bias")
+    } else if restore_v_head_order
+        && (name.ends_with(".ssm_alpha.weight")
+            || name.ends_with(".ssm_beta.weight")
+            || name.ends_with(".ssm_dt.bias"))
     {
         value = qwen35_restore_v_head_order(value, 0, 1, args, stream)?;
     } else if name.ends_with(".ssm_a") {
-        value = qwen35_restore_v_head_order(value, 0, 1, args, stream)?
-            .multiply(Array::from_f32(-1.0), stream)?
-            .log(stream)?;
-    } else if name.ends_with(".ssm_out.weight") {
+        if restore_v_head_order {
+            value = qwen35_restore_v_head_order(value, 0, 1, args, stream)?;
+        }
+        value = value.multiply(Array::from_f32(-1.0), stream)?.log(stream)?;
+    } else if restore_v_head_order && name.ends_with(".ssm_out.weight") {
         value = qwen35_restore_v_head_order(value, 1, args.linear_value_head_dim, args, stream)?;
     } else if name.ends_with(".ffn_gate_inp_shexp.weight") && value.ndim() == 1 {
         value = value.reshape(&[1, value.dim(0)], stream)?;
@@ -4108,7 +4188,7 @@ fn qwen35_translate_gguf_weight_name(name: &str) -> String {
     let Some((layer, parameter)) = rest.split_once('.') else {
         return name.to_string();
     };
-    const PARAMETERS: [(&str, &str); 29] = [
+    const PARAMETERS: [(&str, &str); 30] = [
         ("attn_norm", "input_layernorm"),
         ("post_attention_norm", "post_attention_layernorm"),
         ("attn_q_norm", "self_attn.q_norm"),
@@ -4121,6 +4201,7 @@ fn qwen35_translate_gguf_weight_name(name: &str) -> String {
         ("attn_gate", "linear_attn.in_proj_z"),
         ("ssm_beta", "linear_attn.in_proj_b"),
         ("ssm_alpha", "linear_attn.in_proj_a"),
+        ("ssm_ba", "linear_attn.in_proj_ba"),
         ("ssm_conv1d", "linear_attn.conv1d"),
         ("ssm_dt.bias", "linear_attn.dt_bias"),
         ("ssm_a", "linear_attn.A_log"),
@@ -4399,16 +4480,28 @@ pub fn load_qwen3_5_moe_model(
     let mut model = Model::new(args, image_token_id, video_token_id, vision_config, stream)?;
     let config = qwen3_5_moe_strict_load_config(load_visual);
     let mut report = StrictLoadReport::default();
-    for weight_file in safetensors_files(model_dir)? {
-        load_qwen3_5_moe_safetensors_strict(
+    if uses_fp8 {
+        let num_experts = model.args.num_experts;
+        load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
-            weight_file,
+            model_dir,
             weights_stream,
             stream,
             &config,
             &mut report,
-            uses_fp8,
+            num_experts,
+            |key, value| Ok(vec![(key, value)]),
         )?;
+    } else {
+        for weight_file in safetensors_files(model_dir)? {
+            load_safetensors_strict(
+                &mut model,
+                weight_file,
+                weights_stream,
+                &config,
+                &mut report,
+            )?;
+        }
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -4524,30 +4617,6 @@ fn load_qwen3_5_moe_affine_safetensors_strict(
     })
 }
 
-fn load_qwen3_5_moe_safetensors_strict(
-    model: &mut Model,
-    path: impl AsRef<Path>,
-    weights_stream: &Stream,
-    transform_stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-    uses_fp8: bool,
-) -> Result<(), Error> {
-    let path = path.as_ref();
-    if !uses_fp8 {
-        return load_safetensors_strict(model, path, weights_stream, config, report);
-    }
-
-    load_qwen3_5_moe_fp8_safetensors_strict(
-        model,
-        path,
-        weights_stream,
-        transform_stream,
-        config,
-        report,
-    )
-}
-
 #[derive(Default)]
 struct Fp8ExpertParts {
     gate: Option<Array>,
@@ -4558,44 +4627,80 @@ struct Fp8ExpertParts {
     down_scale: Option<Array>,
 }
 
-fn load_qwen3_5_moe_fp8_safetensors_strict(
+impl Fp8ExpertParts {
+    fn is_complete(&self) -> bool {
+        self.gate.is_some()
+            && self.gate_scale.is_some()
+            && self.up.is_some()
+            && self.up_scale.is_some()
+            && self.down.is_some()
+            && self.down_scale.is_some()
+    }
+}
+
+/// Strict-loads a sharded Qwen FP8 directory while preserving split expert
+/// weights and their inverse-scale companions in packed expert-major banks.
+///
+/// The transform is applied to every non-packed checkpoint tensor before
+/// expert detection, which lets architecture adapters split fused FP8 weights
+/// and block-scale tensors without dequantizing them. Expert state spans shard
+/// boundaries, and a complete layer is packed immediately to bound residency.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_qwen_fp8_safetensors_dir_strict_with_transform<F>(
     model: &mut Model,
-    path: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
     weights_stream: &Stream,
     transform_stream: &Stream,
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let num_experts = model.args.num_experts;
+    num_experts: i32,
+    transform: F,
+) -> Result<(), Error>
+where
+    F: Fn(String, Array) -> Result<Vec<(String, Array)>, Error>,
+{
     let mut expert_parts: HashMap<(String, i32), Fp8ExpertParts> = HashMap::new();
+    let mut complete_experts = HashMap::<String, i32>::new();
     let mut params = model.parameters_mut().flatten();
 
-    for_each_safetensor_array(path, weights_stream, |key, value| {
-        if let Some((prefix, expert, projection)) = parse_fp8_expert_projection_key(&key) {
-            let parts = expert_parts.entry((prefix, expert)).or_default();
-            set_fp8_expert_part(parts, projection, value, false);
-        } else if let Some((prefix, expert, projection)) = parse_fp8_expert_scale_key(&key) {
-            let parts = expert_parts.entry((prefix, expert)).or_default();
-            set_fp8_expert_part(parts, projection, value, true);
-        } else {
-            load_array_strict(&mut params, key, value, config, report);
-        }
-        Ok(())
-    })?;
+    for path in safetensors_files(model_dir)? {
+        for_each_safetensor_array(path, weights_stream, |key, value| {
+            for (key, value) in transform(key, value)? {
+                let expert_part = parse_fp8_expert_projection_key(&key)
+                    .map(|(prefix, expert, projection)| (prefix, expert, projection, false))
+                    .or_else(|| {
+                        parse_fp8_expert_scale_key(&key)
+                            .map(|(prefix, expert, projection)| (prefix, expert, projection, true))
+                    });
+                if let Some((prefix, expert, projection, is_scale)) = expert_part {
+                    let parts = expert_parts.entry((prefix.clone(), expert)).or_default();
+                    let was_complete = parts.is_complete();
+                    set_fp8_expert_part(parts, projection, value, is_scale);
+                    if !was_complete && parts.is_complete() {
+                        let completed = complete_experts.entry(prefix.clone()).or_default();
+                        *completed += 1;
+                        if *completed == num_experts {
+                            for (key, value) in pack_fp8_expert_prefix(
+                                &mut expert_parts,
+                                &prefix,
+                                num_experts,
+                                transform_stream,
+                            )? {
+                                load_array_strict(&mut params, key, value, config, report);
+                            }
+                            complete_experts.remove(&prefix);
+                        }
+                    }
+                } else {
+                    load_array_strict(&mut params, key, value, config, report);
+                }
+            }
+            Ok(())
+        })?;
+    }
 
-    let mut layer_prefixes = expert_parts
-        .keys()
-        .map(|(prefix, _)| prefix.clone())
-        .collect::<Vec<_>>();
-    layer_prefixes.sort();
-    layer_prefixes.dedup();
-
-    for prefix in layer_prefixes {
-        for (key, value) in
-            pack_fp8_expert_prefix(&mut expert_parts, &prefix, num_experts, transform_stream)?
-        {
-            load_array_strict(&mut params, key, value, config, report);
-        }
+    if let Some((prefix, _)) = expert_parts.keys().next().cloned() {
+        pack_fp8_expert_prefix(&mut expert_parts, &prefix, num_experts, transform_stream)?;
     }
 
     Ok(())
@@ -4623,10 +4728,21 @@ fn pack_fp8_expert_prefix(
     num_experts: i32,
     stream: &Stream,
 ) -> Result<HashMap<String, Array>, Error> {
-    let mut gate_up = Vec::with_capacity(num_experts as usize);
-    let mut gate_up_scale = Vec::with_capacity(num_experts as usize);
+    if num_experts <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen FP8 expert prefix '{prefix}' has invalid expert count {num_experts}"
+        )));
+    }
+    let mut gate_up_parts = Vec::with_capacity(2 * num_experts as usize);
+    let mut gate_up_scale_parts = Vec::with_capacity(2 * num_experts as usize);
     let mut down = Vec::with_capacity(num_experts as usize);
     let mut down_scale = Vec::with_capacity(num_experts as usize);
+    let mut gate_shape = None;
+    let mut gate_scale_shape = None;
+    let mut up_shape = None;
+    let mut up_scale_shape = None;
+    let mut down_shape = None;
+    let mut down_scale_shape = None;
     for expert in 0..num_experts {
         let parts = expert_parts
             .remove(&(prefix.to_string(), expert))
@@ -4665,18 +4781,77 @@ fn pack_fp8_expert_prefix(
                 "Qwen3.5-MoE FP8 checkpoint is missing {prefix}.{expert}.down_proj.weight_scale_inv"
             ))
         })?;
-        let gate_up_proj = concatenate_axis(&[gate, up], 0, stream)?;
-        let gate_up_proj_scale = concatenate_axis(&[gate_scale, up_scale], 0, stream)?;
-        gate_up.push(gate_up_proj);
-        gate_up_scale.push(gate_up_proj_scale);
+        record_fp8_expert_part_shape(&mut gate_shape, &gate, prefix, expert, "gate_proj.weight")?;
+        record_fp8_expert_part_shape(
+            &mut gate_scale_shape,
+            &gate_scale,
+            prefix,
+            expert,
+            "gate_proj.weight_scale_inv",
+        )?;
+        record_fp8_expert_part_shape(&mut up_shape, &up, prefix, expert, "up_proj.weight")?;
+        record_fp8_expert_part_shape(
+            &mut up_scale_shape,
+            &up_scale,
+            prefix,
+            expert,
+            "up_proj.weight_scale_inv",
+        )?;
+        record_fp8_expert_part_shape(
+            &mut down_shape,
+            &down_proj,
+            prefix,
+            expert,
+            "down_proj.weight",
+        )?;
+        record_fp8_expert_part_shape(
+            &mut down_scale_shape,
+            &down_proj_scale,
+            prefix,
+            expert,
+            "down_proj.weight_scale_inv",
+        )?;
+        gate_up_parts.extend([gate, up]);
+        gate_up_scale_parts.extend([gate_scale, up_scale]);
         down.push(down_proj);
         down_scale.push(down_proj_scale);
     }
 
-    let gate_up_proj = stack_axis(&gate_up, 0, stream)?;
-    let gate_up_proj_scale = stack_axis(&gate_up_scale, 0, stream)?;
-    let down_proj = stack_axis(&down, 0, stream)?;
-    let down_proj_scale = stack_axis(&down_scale, 0, stream)?;
+    let gate_shape = gate_shape.expect("positive expert count records a gate shape");
+    let gate_scale_shape =
+        gate_scale_shape.expect("positive expert count records a gate scale shape");
+    let up_shape = up_shape.expect("positive expert count records an up shape");
+    let up_scale_shape = up_scale_shape.expect("positive expert count records an up scale shape");
+    let down_shape = down_shape.expect("positive expert count records a down shape");
+    let down_scale_shape =
+        down_scale_shape.expect("positive expert count records a down scale shape");
+    if gate_shape[1] != up_shape[1] || gate_scale_shape[1] != up_scale_shape[1] {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen FP8 expert prefix '{prefix}' has incompatible gate/up shapes {:?}/{:?} and scale shapes {:?}/{:?}",
+            gate_shape, up_shape, gate_scale_shape, up_scale_shape
+        )));
+    }
+
+    // Concatenating all source tensors directly into each destination bank avoids
+    // materializing one gate/up intermediate per expert before stacking the bank.
+    let gate_up_proj = concatenate_axis(&gate_up_parts, 0, stream)?.reshape(
+        &[num_experts, gate_shape[0] + up_shape[0], gate_shape[1]],
+        stream,
+    )?;
+    let gate_up_proj_scale = concatenate_axis(&gate_up_scale_parts, 0, stream)?.reshape(
+        &[
+            num_experts,
+            gate_scale_shape[0] + up_scale_shape[0],
+            gate_scale_shape[1],
+        ],
+        stream,
+    )?;
+    let down_proj = concatenate_axis(&down, 0, stream)?
+        .reshape(&[num_experts, down_shape[0], down_shape[1]], stream)?;
+    let down_proj_scale = concatenate_axis(&down_scale, 0, stream)?.reshape(
+        &[num_experts, down_scale_shape[0], down_scale_shape[1]],
+        stream,
+    )?;
     eval([
         &gate_up_proj,
         &gate_up_proj_scale,
@@ -4692,6 +4867,33 @@ fn pack_fp8_expert_prefix(
         (format!("{prefix}.down_proj"), down_proj),
         (format!("{prefix}.down_proj_scale_inv"), down_proj_scale),
     ]))
+}
+
+fn record_fp8_expert_part_shape(
+    expected: &mut Option<[i32; 2]>,
+    value: &Array,
+    prefix: &str,
+    expert: i32,
+    component: &str,
+) -> Result<(), Error> {
+    if value.ndim() != 2 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen FP8 expert tensor {prefix}.{expert}.{component} has rank {}; expected rank 2",
+            value.ndim()
+        )));
+    }
+    let shape = [value.dim(0), value.dim(1)];
+    if let Some(expected) = expected {
+        if *expected != shape {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen FP8 expert tensor {prefix}.{expert}.{component} has shape {:?}; expected {:?}",
+                value.shape(), expected
+            )));
+        }
+    } else {
+        *expected = Some(shape);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4953,10 +5155,11 @@ mod tests {
         default_layer_type, get_qwen3_5_moe_model_args, load_qwen3_5_gguf, load_qwen3_5_moe_model,
         load_qwen3_5_moe_tokenizer, parse_fp8_expert_projection_key,
         qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
-        qwen35_restore_v_head_order, qwen35_translate_gguf_weight_name,
-        qwen3_5_moe_strict_load_config, reverse_permutation, vision_window_index, FeedForward,
-        Fp8ExpertProjection, FullAttention, FullAttentionInput, LayerType, LinearAttention,
-        LinearAttentionInput, Model, ModelArgs, SparseMoeBlock, VisionConfig,
+        qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
+        qwen35_translate_gguf_weight_name, qwen3_5_moe_strict_load_config, reverse_permutation,
+        vision_window_index, FeedForward, Fp8ExpertProjection, FullAttention, FullAttentionInput,
+        LayerType, LinearAttention, LinearAttentionInput, Model, ModelArgs, SparseMoeBlock,
+        VisionConfig,
     };
     #[cfg(feature = "image-processing")]
     use crate::processor::{load_processor, MediaInput, ProcessorInput, RgbImageView};
@@ -5213,6 +5416,10 @@ mod tests {
             "model.layers.7.linear_attn.in_proj_qkv.weight"
         );
         assert_eq!(
+            qwen35_translate_gguf_weight_name("blk.7.ssm_ba.weight"),
+            "model.layers.7.linear_attn.in_proj_ba.weight"
+        );
+        assert_eq!(
             qwen35_translate_gguf_weight_name("blk.3.ffn_gate_exps.scales"),
             "model.layers.3.mlp.experts.gate_proj_scales"
         );
@@ -5251,6 +5458,32 @@ mod tests {
         assert_eq!(
             restored.evaluated().unwrap().as_slice::<i32>(),
             &[0, 1, 2, 3]
+        );
+
+        let qwen35 = qwen35_translate_gguf_weight(
+            "blk.0.ssm_dt.bias".into(),
+            Array::from_slice(&[0i32, 2, 1, 3], &[4]),
+            &args,
+            stream,
+        )
+        .unwrap()
+        .1;
+        eval([&qwen35]).unwrap();
+        assert_eq!(qwen35.evaluated().unwrap().as_slice::<i32>(), &[0, 1, 2, 3]);
+
+        args.model_type = "qwen3_next".into();
+        let qwen3_next = qwen35_translate_gguf_weight(
+            "blk.0.ssm_dt.bias".into(),
+            Array::from_slice(&[0i32, 2, 1, 3], &[4]),
+            &args,
+            stream,
+        )
+        .unwrap()
+        .1;
+        eval([&qwen3_next]).unwrap();
+        assert_eq!(
+            qwen3_next.evaluated().unwrap().as_slice::<i32>(),
+            &[0, 2, 1, 3]
         );
     }
 

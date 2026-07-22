@@ -15,7 +15,10 @@ use std::{
 
 use memmap2::{Mmap, MmapOptions};
 use safemlx::{ops::indexing::TryIndexOp, transforms::eval, Array, Stream};
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{
+    tensor::{Dtype, Metadata, TensorInfo, TensorView},
+    SafeTensors,
+};
 use serde::{de::MapAccess, Deserialize, Deserializer};
 
 /// Default maximum number of simultaneously mapped payload shards.
@@ -298,6 +301,8 @@ pub trait WeightStore {
 struct MappedShard {
     path: PathBuf,
     mmap: Mmap,
+    metadata: Metadata,
+    payload_offset: usize,
 }
 
 #[derive(Debug)]
@@ -362,7 +367,7 @@ impl SafetensorsWeightStore {
 
         if path.is_dir() {
             let root = path.to_path_buf();
-            let canonical_root = canonicalize(path)?;
+            let canonical_root = canonical_checkpoint_access_root(path)?;
             let index_path = root.join("model.safetensors.index.json");
             if index_path.exists() {
                 let raw = std::fs::read_to_string(&index_path).map_err(|source| {
@@ -522,15 +527,23 @@ impl SafetensorsWeightStore {
                 path: entry.shard.clone(),
                 source,
             })?;
-        SafeTensors::deserialize(&mmap).map_err(|error| {
+        let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|error| {
             WeightStoreError::MalformedSafetensors {
                 path: entry.shard.clone(),
                 message: error.to_string(),
             }
         })?;
+        let payload_offset =
+            8usize
+                .checked_add(header_len)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("payload offset for shard {}", entry.shard.display()),
+                })?;
         let shard = Arc::new(MappedShard {
             path: entry.shard.clone(),
             mmap,
+            metadata,
+            payload_offset,
         });
         cache.touched.insert(entry.shard.clone());
         cache.entries.insert(
@@ -573,13 +586,7 @@ impl SafetensorsWeightStore {
         {
             return Ok(metadata);
         }
-        let checkpoint = SafeTensors::deserialize(&shard.mmap).map_err(|error| {
-            WeightStoreError::MalformedSafetensors {
-                path: shard.path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let view = checkpoint.tensor(key).map_err(|_| {
+        shard.metadata.info(key).ok_or_else(|| {
             if entry.indexed {
                 WeightStoreError::ContradictoryIndexMapping {
                     key: key.to_string(),
@@ -591,11 +598,35 @@ impl SafetensorsWeightStore {
                 }
             }
         })?;
-        let metadata = metadata_for_view(key, &shard.path, &view)?;
+
+        // Safetensors metadata is one JSON header for the whole shard. Large
+        // split-expert checkpoints may ask for thousands of tensor records;
+        // reparsing that header once per tensor dominates layerwise startup.
+        // Cache every index-confirmed tensor from this parse in one pass.
+        let mut discovered = BTreeMap::new();
+        for name in shard.metadata.offset_keys() {
+            if self
+                .catalog
+                .get(&name)
+                .is_some_and(|candidate| candidate.shard == shard.path)
+            {
+                let info = shard
+                    .metadata
+                    .info(&name)
+                    .expect("name came from the same safetensors metadata");
+                discovered.insert(name.clone(), metadata_for_info(&name, &shard.path, info)?);
+            }
+        }
+        let metadata = discovered.get(key).cloned().ok_or_else(|| {
+            WeightStoreError::ContradictoryIndexMapping {
+                key: key.to_string(),
+                path: shard.path.clone(),
+            }
+        })?;
         self.metadata
             .lock()
             .map_err(|_| WeightStoreError::CachePoisoned)?
-            .insert(key.to_string(), metadata.clone());
+            .extend(discovered);
         Ok(metadata)
     }
 }
@@ -726,24 +757,45 @@ impl WeightLease {
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
-        let checkpoint = SafeTensors::deserialize(&self.shard.mmap).map_err(|error| {
-            WeightStoreError::MalformedSafetensors {
-                path: self.shard.path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let view = checkpoint.tensor(&self.key).map_err(|_| {
+        let info = self.shard.metadata.info(&self.key).ok_or_else(|| {
             WeightStoreError::ContradictoryIndexMapping {
                 key: self.key.clone(),
                 path: self.shard.path.clone(),
             }
         })?;
-        if !is_supported_execution_dtype(view.dtype()) {
+        if !is_supported_execution_dtype(info.dtype) {
             return Err(WeightStoreError::UnsupportedStoredDtype {
                 key: self.key.clone(),
-                dtype: view.dtype().into(),
+                dtype: info.dtype.into(),
             });
         }
+
+        let start = self
+            .shard
+            .payload_offset
+            .checked_add(info.data_offsets.0)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("payload start for tensor {:?}", self.key),
+            })?;
+        let end = self
+            .shard
+            .payload_offset
+            .checked_add(info.data_offsets.1)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("payload end for tensor {:?}", self.key),
+            })?;
+        let data = self.shard.mmap.get(start..end).ok_or_else(|| {
+            WeightStoreError::MalformedSafetensors {
+                path: self.shard.path.clone(),
+                message: format!("tensor {:?} payload is outside the mapped shard", self.key),
+            }
+        })?;
+        let view = TensorView::new(info.dtype, info.shape.clone(), data).map_err(|error| {
+            WeightStoreError::MalformedSafetensors {
+                path: self.shard.path.clone(),
+                message: format!("tensor {:?}: {error}", self.key),
+            }
+        })?;
 
         // This mmap-derived array never leaves this method. The lease pins the
         // mmap until selection, copy, evaluation, and synchronization finish.
@@ -922,6 +974,28 @@ fn canonicalize(path: &Path) -> Result<PathBuf, WeightStoreError> {
     })
 }
 
+fn canonical_checkpoint_access_root(path: &Path) -> Result<PathBuf, WeightStoreError> {
+    let canonical_root = canonicalize(path)?;
+    let Some(snapshots) = canonical_root.parent() else {
+        return Ok(canonical_root);
+    };
+    if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
+        return Ok(canonical_root);
+    }
+    let Some(repository_root) = snapshots.parent() else {
+        return Ok(canonical_root);
+    };
+    if !repository_root.join("blobs").is_dir() {
+        return Ok(canonical_root);
+    }
+
+    // Hugging Face snapshots store ordinary relative shard names in the index,
+    // but materialize those names as symlinks into the repository-local blobs
+    // directory. Treat that repository cache directory as the containment
+    // boundary while preserving the model-directory boundary elsewhere.
+    canonicalize(repository_root)
+}
+
 fn inspect_file(path: &Path) -> Result<BTreeMap<String, WeightMetadata>, WeightStoreError> {
     let file = File::open(path).map_err(|source| WeightStoreError::Io {
         path: path.to_path_buf(),
@@ -952,7 +1026,33 @@ fn metadata_for_view(
     path: &Path,
     view: &safetensors::tensor::TensorView<'_>,
 ) -> Result<WeightMetadata, WeightStoreError> {
-    let elements = view.shape().iter().try_fold(1usize, |count, dimension| {
+    metadata_for_parts(key, path, view.dtype(), view.shape(), view.data().len())
+}
+
+fn metadata_for_info(
+    key: &str,
+    path: &Path,
+    info: &TensorInfo,
+) -> Result<WeightMetadata, WeightStoreError> {
+    let payload_len = info
+        .data_offsets
+        .1
+        .checked_sub(info.data_offsets.0)
+        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: format!("tensor {key:?} has descending payload offsets"),
+        })?;
+    metadata_for_parts(key, path, info.dtype, &info.shape, payload_len)
+}
+
+fn metadata_for_parts(
+    key: &str,
+    path: &Path,
+    dtype: Dtype,
+    shape: &[usize],
+    payload_len: usize,
+) -> Result<WeightMetadata, WeightStoreError> {
+    let elements = shape.iter().try_fold(1usize, |count, dimension| {
         count
             .checked_mul(*dimension)
             .ok_or_else(|| WeightStoreError::Overflow {
@@ -960,7 +1060,7 @@ fn metadata_for_view(
             })
     })?;
     let bits = elements
-        .checked_mul(view.dtype().bitsize())
+        .checked_mul(dtype.bitsize())
         .ok_or_else(|| WeightStoreError::Overflow {
             context: format!("encoded bit length for tensor {key:?}"),
         })?;
@@ -971,7 +1071,7 @@ fn metadata_for_view(
         });
     }
     let logical_byte_len = bits / 8;
-    if logical_byte_len != view.data().len() {
+    if logical_byte_len != payload_len {
         return Err(WeightStoreError::MalformedSafetensors {
             path: path.to_path_buf(),
             message: format!("tensor {key:?} payload length contradicts its shape and dtype"),
@@ -979,8 +1079,8 @@ fn metadata_for_view(
     }
     Ok(WeightMetadata {
         name: key.to_string(),
-        shape: view.shape().to_vec(),
-        stored_dtype: view.dtype().into(),
+        shape: shape.to_vec(),
+        stored_dtype: dtype.into(),
         logical_byte_len,
         backing_shard: Some(path.to_path_buf()),
     })
@@ -1322,6 +1422,21 @@ mod tests {
     }
 
     #[test]
+    fn one_metadata_lookup_caches_the_complete_shard_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        write_two_i32(&path);
+        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
+
+        store.metadata("a_tensor").unwrap();
+
+        let cached = store.metadata.lock().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert!(cached.contains_key("a_tensor"));
+        assert!(cached.contains_key("z_tensor"));
+    }
+
+    #[test]
     fn rejects_malformed_indexes_and_unsafe_shard_paths() {
         let malformed = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1645,6 +1760,34 @@ mod tests {
             store.acquire("weight", TensorSelection::Full),
             Err(WeightStoreError::UnsafeShardPath { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_hugging_face_snapshot_symlinks_into_repository_blobs() {
+        let cache = tempfile::tempdir().unwrap();
+        let repository = cache.path().join("models--owner--model");
+        let snapshot = repository.join("snapshots/revision");
+        let blobs = repository.join("blobs");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        write_i32(&blobs.join("payload"), "weight", &[7], vec![1]);
+        std::os::unix::fs::symlink(
+            "../../blobs/payload",
+            snapshot.join("model-00001-of-00001.safetensors"),
+        )
+        .unwrap();
+        write_index(&snapshot, &[("weight", "model-00001-of-00001.safetensors")]);
+
+        let store = SafetensorsWeightStore::open(&snapshot).unwrap();
+        let stream = cpu_stream();
+        let materialized = store
+            .acquire("weight", TensorSelection::Full)
+            .unwrap()
+            .materialize(&stream, &stream)
+            .unwrap();
+        let value = materialized.evaluated().unwrap();
+        assert_eq!(value.as_slice::<i32>(), &[7]);
     }
 
     #[test]

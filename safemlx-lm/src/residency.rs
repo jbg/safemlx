@@ -1609,32 +1609,65 @@ fn ensure_many_resident(
                 continue;
             }
             let bindings = state.units[id].definition.bindings.clone();
-            let item = match tier {
-                MemoryTier::Host => prepare_from_disk(
-                    store,
-                    &bindings,
-                    &state.source_stream,
-                    &state.source_stream,
-                    TransferDirection::DiskToHost,
-                )?,
-                MemoryTier::Device => {
-                    if let Some(host) = state.units[id]
-                        .host
-                        .as_ref()
-                        .map(|copy| Arc::clone(&copy.arrays))
-                    {
-                        prepare_copy_to_device(id, host, &state.device_stream)?
-                    } else {
-                        prepare_from_disk(
-                            store,
-                            &bindings,
-                            &state.source_stream,
-                            &state.device_stream,
-                            TransferDirection::DiskToDevice,
-                        )?
+            let item = loop {
+                let item = match tier {
+                    MemoryTier::Host => prepare_from_disk(
+                        store,
+                        &bindings,
+                        &state.source_stream,
+                        &state.source_stream,
+                        TransferDirection::DiskToHost,
+                    ),
+                    MemoryTier::Device => {
+                        if let Some(host) = state.units[id]
+                            .host
+                            .as_ref()
+                            .map(|copy| Arc::clone(&copy.arrays))
+                        {
+                            prepare_copy_to_device(id, host, &state.device_stream)
+                        } else {
+                            prepare_from_disk(
+                                store,
+                                &bindings,
+                                &state.source_stream,
+                                &state.device_stream,
+                                TransferDirection::DiskToDevice,
+                            )
+                        }
                     }
+                    MemoryTier::Disk => unreachable!("validated above"),
+                };
+                match item {
+                    Ok(item) => break item,
+                    Err(error)
+                        if is_mapping_capacity_error(&error)
+                            && prepared.iter().any(
+                                |(_, item): &(OffloadUnitId, PreparedResidentArrays)| {
+                                    !item.pending_sources.is_empty()
+                                },
+                            ) =>
+                    {
+                        // Earlier units in this batch can pin the only mapped
+                        // shard while a later cross-shard expert is prepared.
+                        // Their output arrays are complete evaluation roots, so
+                        // detach those mappings and retry the current unit.
+                        eval(prepared.iter().flat_map(|(_, item)| item.arrays.values())).map_err(
+                            |source| ResidencyError::Mlx {
+                                id: internal_id(),
+                                operation: "mapping-capacity batch evaluation",
+                                source,
+                            },
+                        )?;
+                        for (_, item) in &mut prepared {
+                            for source in item.pending_sources.drain(..) {
+                                source.complete();
+                            }
+                            item.retained_arrays.clear();
+                            item.retained_host = None;
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
-                MemoryTier::Disk => unreachable!("validated above"),
             };
             prepared.push((id.clone(), item));
         }
@@ -1817,38 +1850,63 @@ fn prepare_from_disk(
     let mut pending_sources = Vec::new();
     let mut retained_arrays = Vec::new();
     for binding in bindings {
-        let output = match &binding.recipe {
-            Some(recipe) => {
-                let pending = recipe
-                    .prepare_materialization(store, source_stream)
-                    .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name.clone(),
-                        source,
-                    })?;
-                let (host, sources) = pending.into_parts();
-                pending_sources.extend(sources);
-                if execution_stream == source_stream {
-                    host
-                } else {
-                    let output =
-                        host.copy(execution_stream)
-                            .map_err(|source| ResidencyError::Recipe {
+        let mut retried_after_capacity = false;
+        loop {
+            let prepared = (|| match &binding.recipe {
+                Some(recipe) => {
+                    let pending = recipe
+                        .prepare_materialization(store, source_stream)
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: binding.name.clone(),
+                            source,
+                        })?;
+                    let (host, sources) = pending.into_parts();
+                    if execution_stream == source_stream {
+                        Ok((host, sources, None))
+                    } else {
+                        let output = host.copy(execution_stream).map_err(|source| {
+                            ResidencyError::Recipe {
                                 binding: binding.name.clone(),
                                 source: WeightRecipeError::Mlx(source),
-                            })?;
-                    retained_arrays.push(host);
-                    output
+                            }
+                        })?;
+                        Ok((output, sources, Some(host)))
+                    }
                 }
+                None => {
+                    let lease =
+                        store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
+                    let pending = lease.prepare_materialization(source_stream, execution_stream)?;
+                    let output = pending.output().clone();
+                    Ok((output, vec![pending], None))
+                }
+            })();
+            match prepared {
+                Ok((output, sources, retained)) => {
+                    pending_sources.extend(sources);
+                    retained_arrays.extend(retained);
+                    arrays.insert(binding.name.clone(), output);
+                    break;
+                }
+                Err(error)
+                    if !retried_after_capacity
+                        && !pending_sources.is_empty()
+                        && is_mapping_capacity_error(&error) =>
+                {
+                    eval(arrays.values()).map_err(|source| ResidencyError::Mlx {
+                        id: internal_id(),
+                        operation: "mapping-capacity residency evaluation",
+                        source,
+                    })?;
+                    for source in pending_sources.drain(..) {
+                        source.complete();
+                    }
+                    retained_arrays.clear();
+                    retried_after_capacity = true;
+                }
+                Err(error) => return Err(error),
             }
-            None => {
-                let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
-                let pending = lease.prepare_materialization(source_stream, execution_stream)?;
-                let output = pending.output().clone();
-                pending_sources.push(pending);
-                output
-            }
-        };
-        arrays.insert(binding.name.clone(), output);
+        }
     }
     Ok(PreparedResidentArrays {
         arrays,
@@ -1857,6 +1915,17 @@ fn prepare_from_disk(
         retained_host: None,
         direction,
     })
+}
+
+fn is_mapping_capacity_error(error: &ResidencyError) -> bool {
+    matches!(
+        error,
+        ResidencyError::WeightStore(WeightStoreError::CapacityExhausted { .. })
+            | ResidencyError::Recipe {
+                source: WeightRecipeError::WeightStore(WeightStoreError::CapacityExhausted { .. }),
+                ..
+            }
+    )
 }
 
 fn prepare_copy_to_device(
@@ -2119,6 +2188,39 @@ mod tests {
         (dir, store)
     }
 
+    fn cross_shard_store() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, key, values) in [
+            ("model-00001-of-00002.safetensors", "left", [1i32, 2]),
+            ("model-00002-of-00002.safetensors", "right", [3i32, 4]),
+        ] {
+            let bytes = values
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>();
+            serialize_to_file(
+                [(key, TensorView::new(Dtype::I32, vec![2], &bytes).unwrap())],
+                None,
+                &dir.path().join(file),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "left": "model-00001-of-00002.safetensors",
+                    "right": "model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store =
+            Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap());
+        (dir, store)
+    }
+
     fn id(value: &str) -> OffloadUnitId {
         OffloadUnitId::new(value).unwrap()
     }
@@ -2225,6 +2327,47 @@ mod tests {
 
         let lease = manager.acquire(&id("a"), MemoryTier::Device).unwrap();
         assert_eq!(lease.array("weight").unwrap().shape(), &[2]);
+    }
+
+    #[test]
+    fn batched_units_detach_prior_shards_at_mapping_capacity() {
+        let (_dir, store) = cross_shard_store();
+        let manager = manager(
+            Arc::clone(&store),
+            OffloadConfig::new(None, None, 1).unwrap(),
+            [
+                spec("left", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+                spec("right", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+            ],
+            [single("left", "left"), single("right", "right")],
+        );
+        manager.initialize().unwrap();
+
+        let leases = manager
+            .acquire_many_with_demand(&[(id("left"), 1), (id("right"), 1)], MemoryTier::Host)
+            .unwrap();
+
+        assert_eq!(
+            leases[0]
+                .array("weight")
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[1, 2]
+        );
+        assert_eq!(
+            leases[1]
+                .array("weight")
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[3, 4]
+        );
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.currently_mapped_shards, 1);
+        assert!(diagnostics.evictions >= 1);
     }
 
     #[test]

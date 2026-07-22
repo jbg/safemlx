@@ -47,6 +47,7 @@ values:
 - `lfm2` and `lfm2moe`
 - `nemotron_h` and `nemotron_h_moe`
 - `qwen3` and `qwen3moe`
+- `qwen3next`
 - `qwen3vl` (with its companion vision projection checkpoint)
 - `qwen35` and `qwen35moe`
 
@@ -66,6 +67,13 @@ use host-backed layer windows or experimental dense disk streaming. Supported
 MoE families can cache routed experts independently; the registered families
 are DeepSeek-V3/R1, GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next,
 Qwen3-VL-MoE, and Qwen3.5-MoE.
+
+Qwen3-Next supports the official native fine-grained E4M3 checkpoint format
+(`fp8`, dynamic activations, 128 x 128 weight blocks) with fully resident,
+layerwise, sparse expert-cache, and pure expert-parallel loading. Fused QKVZ
+weights and inverse scales are split without dequantization, dense BF16 BA is
+preserved, and routed expert weights remain checkpoint-backed at expert
+granularity for sparse-cache and expert-parallel execution.
 
 Important boundaries:
 

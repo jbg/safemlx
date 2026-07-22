@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         .get(3)
         .is_some_and(|value| matches!(value.as_str(), "profile" | "true" | "1"))
         || std::env::var_os("QWEN35_MOE_BENCH_PROFILE").is_some();
+    let print_ids = std::env::var_os("QWEN35_MOE_BENCH_IDS").is_some();
 
     println!("model_dir={}", model_dir.display());
     println!("decode_tokens={decode_tokens}");
@@ -110,6 +111,17 @@ fn main() -> anyhow::Result<()> {
             result.first_id,
             result.last_id
         );
+        if print_ids {
+            println!(
+                "ids,{name},{}",
+                result
+                    .ids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         if let Some(stats) = &result.prefill_profile {
             print_profile(name, "prefill", result.prefill_s, stats);
         }
@@ -130,6 +142,7 @@ struct BenchResult {
     decode_tok_s: f64,
     first_id: u32,
     last_id: u32,
+    ids: Vec<u32>,
     prefill_profile: Option<qwen3_5_moe::PerfStats>,
     decode_profile: Option<qwen3_5_moe::PerfStats>,
 }
@@ -182,14 +195,17 @@ fn run_case(
         decode_count as f64 / decode_s
     };
 
+    let first_id = ids[0];
+    let last_id = *ids.last().expect("first token was pushed");
     Ok(BenchResult {
         prompt_tokens: prompt_ids.len(),
         prefill_s,
         generated_tokens: ids.len(),
         decode_s,
         decode_tok_s,
-        first_id: ids[0],
-        last_id: *ids.last().expect("first token was pushed"),
+        first_id,
+        last_id,
+        ids,
         prefill_profile,
         decode_profile,
     })

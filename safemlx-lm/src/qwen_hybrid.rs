@@ -150,10 +150,8 @@ pub fn load_qwen3_next_layerwise_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
-    if args.quantization_config.is_some() {
-        return Err(Error::UnsupportedArchitecture(
-            "native FP8 Qwen3-Next checkpoints with fused projections are unsupported by both resident and layerwise loaders".into(),
-        ));
+    if let Some(config) = &args.quantization_config {
+        config.validate_supported()?;
     }
     load_qwen_hybrid_layerwise_model(
         model_dir,
@@ -197,6 +195,9 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
+    if let Some(config) = &args.quantization_config {
+        config.validate_supported()?;
+    }
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Qwen3-Next MoE checkpoint".into(),
@@ -226,6 +227,9 @@ pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
+    if let Some(config) = &args.quantization_config {
+        config.validate_supported()?;
+    }
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Qwen3-Next MoE checkpoint".into(),
@@ -550,15 +554,7 @@ fn add_fused_projection_recipes(
     args: &ModelArgs,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}.linear_attn");
-    let value_per_key =
-        args.linear_num_value_heads * args.linear_value_head_dim / args.linear_num_key_heads;
-    let qkvz_widths = [
-        args.linear_key_head_dim,
-        args.linear_key_head_dim,
-        value_per_key,
-        value_per_key,
-    ];
-    let ba_width = args.linear_num_value_heads / args.linear_num_key_heads;
+    let (qkvz_widths, ba_width) = qwen3_next::fused_projection_widths(args)?;
     for suffix in ["weight", "scales", "biases"] {
         let qkvz_runtime = format!("{prefix}.in_proj_qkvz.{suffix}");
         if let Some(raw) = normalized.get(&qkvz_runtime) {
@@ -603,6 +599,43 @@ fn add_fused_projection_recipes(
                     ),
                 );
             }
+        }
+    }
+    if args.uses_fp8() {
+        let block_widths = qwen3_next::fp8_block_row_widths(&qkvz_widths)?;
+        let qkvz_runtime = format!("{prefix}.in_proj_qkvz.weight_scale_inv");
+        if let Some(raw) = normalized.get(&qkvz_runtime) {
+            for (local, components) in [
+                (
+                    "linear_attn.in_proj_qkv.weight_scale_inv".to_string(),
+                    vec![0, 1, 2],
+                ),
+                (
+                    "linear_attn.in_proj_z.weight_scale_inv".to_string(),
+                    vec![3],
+                ),
+            ] {
+                recipes.insert(
+                    local,
+                    DerivedWeightRecipe::source(
+                        raw.clone(),
+                        TensorSelection::Indices {
+                            axis: 0,
+                            indices: grouped_component_indices(
+                                usize_from_i32(args.linear_num_key_heads)?,
+                                &block_widths,
+                                &components,
+                            )?,
+                        },
+                    ),
+                );
+            }
+        }
+        if normalized.contains_key(&format!("{prefix}.in_proj_ba.weight_scale_inv")) {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3-Next in_proj_ba must remain dense BF16 and cannot carry FP8 inverse scales"
+                    .into(),
+            ));
         }
     }
     Ok(())
@@ -1719,6 +1752,11 @@ mod tests {
             arrays.push((
                 "model.layers.0.linear_attn.in_proj_ba.weight".into(),
                 Array::zeros::<f32>(&[ba_rows, model.args.hidden_size], stream).unwrap(),
+            ));
+            arrays.push((
+                "mtp.fc.weight".into(),
+                Array::zeros::<f32>(&[model.args.hidden_size, model.args.hidden_size], stream)
+                    .unwrap(),
             ));
         }
         Array::save_safetensors(

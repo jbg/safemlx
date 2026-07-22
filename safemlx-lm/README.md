@@ -256,8 +256,11 @@ rewrite used by eager loading, and split ReLU2 experts are stacked per layer.
 
 Qwen3-Next and Qwen3.5 share one adapter for recurrent linear attention
 and full attention. Qwen3-Next fused QKVZ/BA tensors are selected into runtime
-projections without materializing the complete checkpoint, and public split
-SwiGLU experts are packed per layer. Qwen3.5 dense and packed-MoE checkpoints use
+projections without materializing the complete checkpoint, including 128-row
+block-space selection for native FP8 QKVZ inverse scales, and public split
+SwiGLU experts are packed per layer. The official dynamic E4M3 128 x 128 format
+is supported by resident, layerwise, sparse expert-cache, and pure
+expert-parallel Qwen3-Next loading. Qwen3.5 dense and packed-MoE checkpoints use
 the same block loop. Multimodal checkpoints add an independent Qwen vision-block
 group and reuse the resident patch, position, and merger math around that group.
 
@@ -330,7 +333,7 @@ tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
 `gemma4`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
-architectures, plus dense `qwen3vl` with its separate vision projector. For
+architectures, plus `qwen3next` and dense `qwen3vl` with its separate vision projector. For
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
@@ -564,7 +567,7 @@ checkpoint metadata is an error.
 | Inkling | yes | no | capability error | `LoadedModel` | Alternating local/global relative-bias attention, four short-convolution states per layer, routed plus shared experts, and native hMLP/dMel towers; MTP draft layers are skipped |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
-| Qwen3-Next | yes | MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Reuses the hybrid Gated DeltaNet/full-attention runtime and shared-expert MoE implementation; fused checkpoint projections are split while streaming |
+| Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
 | Moshi | yes | MLX affine/MXFP4 | yes / yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |
 | PersonaPlex | yes, transformed PyTorch layout | MLX affine/MXFP4 | yes / yes | realtime loader | Preserves per-depth checkpoint transformation; no codec dependency |
 
