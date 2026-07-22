@@ -11,6 +11,7 @@ use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
     ops::{GgufCheckpoint, GgufMetadata, GgufMetadataValue},
+    random::RandomState,
     Array, Stream,
 };
 use safemlx_lm_utils::tokenizer::{
@@ -28,7 +29,7 @@ use crate::parallel::ParallelTopology;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::WeightQuantization;
-use crate::sampler::{DefaultSampler, Sampler};
+use crate::sampler::{DefaultSampler, Sampler, SpeculativeSampler};
 use crate::{
     cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
@@ -38,6 +39,10 @@ use crate::{
     },
     error::Error,
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
+    mtp::{
+        LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
+        MtpStats,
+    },
 };
 
 /// Shared building blocks used by multiple decoder-only model families.
@@ -46,8 +51,7 @@ pub mod common;
 pub mod deepseek_v3;
 /// Gemma 4 text model support.
 pub mod gemma4;
-/// Gemma 4 assistant draft-model support.
-pub mod gemma4_assistant;
+pub(crate) mod gemma4_assistant;
 pub(crate) mod gemma4_audio;
 pub(crate) mod gemma4_multimodal;
 pub(crate) mod gemma4_vision;
@@ -440,6 +444,99 @@ pub enum Model {
 }
 
 impl Model {
+    /// Reports how this model architecture exposes MTP weights.
+    pub fn mtp_capability(&self) -> MtpCapability {
+        match self {
+            Self::Gemma4(_) | Self::Gemma4Layerwise(_) => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Separate,
+            },
+            Self::DeepSeekV3(model) if model.args.num_nextn_predict_layers > 0 => {
+                MtpCapability::Unsupported {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                    architecture: "deepseek_v3".into(),
+                }
+            }
+            Self::DeepSeekV3Layerwise(model) if model.args().num_nextn_predict_layers > 0 => {
+                MtpCapability::Unsupported {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                    architecture: "deepseek_v3".into(),
+                }
+            }
+            Self::Inkling(_) | Self::InklingLayerwise(_) => MtpCapability::Unsupported {
+                checkpoint: MtpCheckpointKind::Embedded,
+                architecture: "inkling".into(),
+            },
+            Self::Qwen3Next(_) | Self::Qwen3NextLayerwise(_) => MtpCapability::Unsupported {
+                checkpoint: MtpCheckpointKind::Embedded,
+                architecture: "qwen3_next".into(),
+            },
+            Self::Qwen35Moe(_) | Self::Qwen35MoeLayerwise(_) => MtpCapability::Unsupported {
+                checkpoint: MtpCheckpointKind::Embedded,
+                architecture: "qwen3_5".into(),
+            },
+            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => MtpCapability::Unsupported {
+                checkpoint: MtpCheckpointKind::Embedded,
+                architecture: "nemotron_h".into(),
+            },
+            _ => MtpCapability::Unavailable,
+        }
+    }
+
+    /// Generates with MTP using the default lossless sampling policy.
+    pub fn generate_mtp_input(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_mtp_input_with_sampler(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            &DefaultSampler,
+            stream,
+        )
+    }
+
+    /// Generates with MTP using a caller-provided lossless sampling policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        let assistant = drafter.gemma4_mut();
+        match (self, cache) {
+            (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
+                validate_gemma4_drafter(&target.args, assistant)?;
+                crate::gemma4_mtp::generate(
+                    target, assistant, cache, input, config, prng_key, sampler, stream,
+                )
+            }
+            (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
+                validate_gemma4_drafter(target.args(), assistant)?;
+                crate::gemma4_mtp::generate(
+                    target, assistant, cache, input, config, prng_key, sampler, stream,
+                )
+            }
+            (model, _) => Err(Exception::custom(format!(
+                "MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
+    }
+
     /// Returns residency telemetry when this model uses bounded layer execution.
     pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
         match self {
@@ -1250,6 +1347,36 @@ pub enum ModelCache {
     Qwen3Next(qwen3_next::Cache),
 }
 
+fn validate_gemma4_drafter(
+    target: &gemma4::ModelArgs,
+    assistant: &gemma4_assistant::Gemma4AssistantDraftModel,
+) -> Result<(), Exception> {
+    if assistant.config.model_type != "gemma4_assistant" {
+        return Err(Exception::custom(format!(
+            "expected a gemma4_assistant checkpoint, got {:?}",
+            assistant.config.model_type
+        )));
+    }
+    if assistant.config.backbone_hidden_size != target.hidden_size {
+        return Err(Exception::custom(format!(
+            "Gemma 4 assistant backbone hidden size {} does not match target hidden size {}",
+            assistant.config.backbone_hidden_size, target.hidden_size
+        )));
+    }
+    if assistant.config.text_config.vocab_size != target.vocab_size {
+        return Err(Exception::custom(format!(
+            "Gemma 4 assistant vocabulary size {} does not match target vocabulary size {}",
+            assistant.config.text_config.vocab_size, target.vocab_size
+        )));
+    }
+    if assistant.block_size() <= 1 {
+        return Err(Exception::custom(
+            "Gemma 4 assistant block_size must permit at least one draft token",
+        ));
+    }
+    Ok(())
+}
+
 impl ModelCache {
     /// Returns aggregate cache-residency telemetry when paging is active.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -1430,6 +1557,143 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// Reports whether and how this target can perform MTP generation.
+    pub fn mtp_capability(&self) -> MtpCapability {
+        self.model.mtp_capability()
+    }
+
+    /// Creates independent target caches for an MTP text batch.
+    pub fn new_mtp_cache(&self, batch_size: usize) -> MtpCache {
+        MtpCache::new((0..batch_size).map(|_| self.new_cache()).collect())
+    }
+
+    /// Generates through the architecture-independent MTP path.
+    pub fn generate_mtp_input(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_mtp_input_with_sampler(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            &DefaultSampler,
+            stream,
+        )
+    }
+
+    /// Generates through MTP with a caller-provided speculative sampling policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
+        }
+        self.model.generate_mtp_input_with_sampler(
+            drafter, cache, input, &config, prng_key, sampler, stream,
+        )
+    }
+
+    /// Generates an independently accepting and stopping batch of text prompts.
+    ///
+    /// Each lane owns a separate cache so rejection lengths and EOS positions
+    /// may diverge without padding rejected state back into another sequence.
+    pub fn generate_mtp_text_batch<S: SpeculativeSampler>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        prompt_tokens: &Array,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<MtpBatchOutput, Exception> {
+        let batch_size = if prompt_tokens.ndim() == 2 {
+            prompt_tokens.dim(0) as usize
+        } else {
+            0
+        };
+        let mut cache = self.new_mtp_cache(batch_size);
+        self.generate_mtp_text_batch_with_cache(
+            drafter,
+            &mut cache,
+            prompt_tokens,
+            config,
+            prng_key,
+            sampler,
+            stream,
+        )
+    }
+
+    /// Generates a text batch using reusable independent per-lane caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_text_batch_with_cache<S: SpeculativeSampler>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut MtpCache,
+        prompt_tokens: &Array,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<MtpBatchOutput, Exception> {
+        if prompt_tokens.ndim() != 2 || prompt_tokens.dim(1) == 0 {
+            return Err(Exception::custom(format!(
+                "MTP text batch must be shaped [batch, nonzero sequence], got {:?}",
+                prompt_tokens.shape()
+            )));
+        }
+        if cache.len() != prompt_tokens.dim(0) as usize {
+            return Err(Exception::custom(format!(
+                "MTP cache has {} lanes but text input has batch size {}",
+                cache.len(),
+                prompt_tokens.dim(0)
+            )));
+        }
+        if config.temperature != 0.0 && prng_key.is_none() {
+            return Err(Exception::custom(
+                "random operations require an explicit PRNG key",
+            ));
+        }
+        let mut batch_prng = prng_key.map(RandomState::from_key);
+        let mut output = MtpBatchOutput::default();
+        for lane in 0..prompt_tokens.dim(0) {
+            let row = prompt_tokens.try_index_device((lane, NewAxis, ..), stream)?;
+            let lane_key = batch_prng
+                .as_mut()
+                .map(|state| state.next_key(stream))
+                .transpose()?;
+            let parts = [input::InputPart::text_token_ids(&row)];
+            let input = input::ModelInput::new(&parts);
+            let (tokens, stats) = self.generate_mtp_input_with_sampler(
+                drafter,
+                &mut cache.lanes[lane as usize],
+                input,
+                config,
+                lane_key,
+                sampler,
+                stream,
+            )?;
+            output.token_ids.push(tokens);
+            output.stats.push(stats);
+        }
+        Ok(output)
+    }
+
     /// Returns residency telemetry when bounded layer execution was selected.
     pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
         self.model.residency_report()

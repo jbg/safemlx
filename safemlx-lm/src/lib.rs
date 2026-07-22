@@ -37,8 +37,7 @@ pub mod expert_cache;
 pub mod expert_parallel;
 /// Multimodal bounded layer execution for Gemma 4.
 pub mod gemma4;
-/// Gemma 4 multi-token prediction generation helpers.
-pub mod gemma4_mtp;
+mod gemma4_mtp;
 mod gguf_tokenizer;
 /// Unified fully resident and bounded layer execution for GPT-OSS.
 pub mod gpt_oss;
@@ -63,6 +62,8 @@ pub mod offload;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;
+/// Architecture-independent multi-token prediction and speculative decoding.
+pub mod mtp;
 /// Runtime parallel topology, tensor placement plans, and selective checkpoint loading.
 pub mod parallel;
 /// Executable pure pipeline-parallel model loading and inference.

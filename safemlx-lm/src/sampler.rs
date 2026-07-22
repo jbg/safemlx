@@ -5,6 +5,43 @@ use safemlx::{
     Array, Stream,
 };
 
+/// Sampling policy suitable for lossless speculative decoding.
+///
+/// Unlike [`Sampler`], this interface separates logits processing, sampling,
+/// and history commitment.  A speculative decoder can therefore inspect the
+/// exact target and draft distributions without recording rejected tokens.
+pub trait SpeculativeSampler {
+    /// Applies penalties, filters, and temperature using the supplied logical
+    /// token history, returning canonical-vocabulary logits.
+    fn process_logits(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception>;
+
+    /// Samples from logits returned by [`SpeculativeSampler::process_logits`].
+    fn sample_processed(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match temperature {
+            0.0 => argmax_axis!(logits, -1, stream = stream),
+            _ => {
+                let prng_state = prng_state.ok_or_else(|| {
+                    Exception::custom("random operations require an explicit PRNG key")
+                })?;
+                let key = prng_state.next_key(stream)?;
+                random::categorical(logits, None, None, &key, stream)
+            }
+        }
+    }
+}
+
 /// Strategy for choosing a token from model logits.
 pub trait Sampler {
     /// Samples one token id from `logits`.
@@ -26,6 +63,22 @@ pub trait Sampler {
 /// A temperature of `0.0` uses greedy argmax sampling. Non-zero temperatures
 /// sample from a categorical distribution and require a PRNG key.
 pub struct DefaultSampler;
+
+impl SpeculativeSampler for DefaultSampler {
+    fn process_logits(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        _history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if temperature == 0.0 {
+            Ok(logits.clone())
+        } else {
+            logits.multiply(array!(1.0 / temperature), stream)
+        }
+    }
+}
 
 impl Sampler for DefaultSampler {
     fn sample(
@@ -161,8 +214,13 @@ impl GenerationSampler {
         self.generated_tokens.clear();
     }
 
-    fn apply_penalties(&self, logits: &Array, stream: &Stream) -> Result<Array, Exception> {
-        if self.generated_tokens.is_empty()
+    fn apply_penalties_for(
+        &self,
+        logits: &Array,
+        generated_tokens: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if generated_tokens.is_empty()
             || (self.repeat_penalty == 1.0
                 && self.frequency_penalty == 0.0
                 && self.presence_penalty == 0.0)
@@ -181,12 +239,12 @@ impl GenerationSampler {
         let start = if self.repeat_last_n < 0 {
             0
         } else {
-            self.generated_tokens
+            generated_tokens
                 .len()
                 .saturating_sub(self.repeat_last_n as usize)
         };
         let mut counts = std::collections::HashMap::<u32, usize>::new();
-        for &token_id in &self.generated_tokens[start..] {
+        for &token_id in &generated_tokens[start..] {
             *counts.entry(token_id).or_default() += 1;
         }
 
@@ -221,6 +279,10 @@ impl GenerationSampler {
         }
 
         Ok(adjusted)
+    }
+
+    fn apply_penalties(&self, logits: &Array, stream: &Stream) -> Result<Array, Exception> {
+        self.apply_penalties_for(logits, &self.generated_tokens, stream)
     }
 
     fn apply_top_k(&self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
@@ -301,6 +363,51 @@ impl GenerationSampler {
             *last = token.clone().item::<u32>(stream);
         }
         Ok(token)
+    }
+}
+
+impl SpeculativeSampler for GenerationSampler {
+    fn process_logits(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let logits = self.apply_penalties_for(logits, history, stream)?;
+        let logits = self.apply_top_k(logits, stream)?;
+        let logits = if self.top_p >= 1.0 {
+            self.apply_min_p(logits, stream)?
+        } else {
+            let descending_indices =
+                safemlx::ops::argsort_axis(logits.negative(stream)?, -1, stream)?;
+            let sorted_logits =
+                safemlx::ops::indexing::take_along_axis(&logits, &descending_indices, -1, stream)?;
+            let probabilities = safemlx::ops::softmax_axis(&sorted_logits, -1, true, stream)?;
+            let cumulative = probabilities.cumsum(-1, None, None, stream)?;
+            let before = cumulative.subtract(probabilities, stream)?;
+            let mask = before.gt(Array::from_f32(self.top_p.max(0.0)), stream)?;
+            let sorted_logits = mask_logits(mask, sorted_logits, stream)?;
+            let sorted_logits = self.apply_min_p(sorted_logits, stream)?;
+            let fill = Array::full::<f32>(
+                logits.shape(),
+                Array::from_f32(logits.dtype().finfo_min()? as f32),
+                stream,
+            )?
+            .as_dtype(logits.dtype(), stream)?;
+            safemlx::ops::indexing::put_along_axis(
+                &fill,
+                &descending_indices,
+                &sorted_logits,
+                -1,
+                stream,
+            )?
+        };
+        if temperature == 0.0 {
+            Ok(logits)
+        } else {
+            logits.multiply(array!(1.0 / temperature), stream)
+        }
     }
 }
 

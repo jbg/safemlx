@@ -1,214 +1,291 @@
-use std::time::{Duration, Instant};
+//! Gemma 4 adapter for the architecture-independent MTP engine.
 
-use safemlx::{
-    ops::{concatenate_axis, indexing::TryIndexOp},
-    random::RandomState,
-    transforms::eval,
-    Array, Stream,
-};
+use std::collections::HashMap;
+
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
-    error::Error,
+    gemma4::Gemma4LayerwiseModel,
     models::{
-        gemma4::{sample, Model as Gemma4Model, ModelInput},
+        gemma4::{Cache, Gemma4StepOutput, LayerType, Model as Gemma4Model},
         gemma4_assistant::Gemma4AssistantDraftModel,
+        input::ModelInput as RuntimeInput,
     },
+    mtp::{self, MtpBackend, MtpCommit, MtpConfig, MtpPrefill},
+    sampler::SpeculativeSampler,
 };
 
-/// Statistics collected during Gemma 4 multi-token prediction generation.
-#[derive(Debug, Clone, Default)]
-pub struct MtpStats {
-    /// Number of target-model tokens evaluated.
-    pub target_tokens: usize,
-    /// Number of assistant draft tokens proposed.
-    pub draft_tokens: usize,
-    /// Number of draft tokens accepted by the target model.
-    pub accepted_tokens: usize,
-    /// Number of speculative verification rounds.
-    pub rounds: usize,
-    /// Accepted draft-token count for each verification round.
-    pub accept_lens: Vec<usize>,
-    /// Wall-clock time spent in generation.
-    pub elapsed: Duration,
+pub(crate) struct Gemma4TargetState {
+    hidden: Array,
+    shared_kv: HashMap<LayerType, (Array, Array)>,
+    cache_len: usize,
 }
 
-impl MtpStats {
-    /// Returns `accepted_tokens / draft_tokens`, or `0.0` when no draft tokens were proposed.
-    pub fn accept_rate(&self) -> f64 {
-        if self.draft_tokens == 0 {
-            0.0
-        } else {
-            self.accepted_tokens as f64 / self.draft_tokens as f64
-        }
+pub(crate) struct Gemma4DraftState {
+    hidden: Array,
+}
+
+pub(crate) struct Gemma4Verification {
+    output: Gemma4StepOutput,
+    inputs: Array,
+}
+
+pub(crate) trait Gemma4MtpTarget {
+    fn prefill_mtp_target(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception>;
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception>;
+    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception>;
+}
+
+impl Gemma4MtpTarget for Gemma4Model {
+    fn prefill_mtp_target(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        self.prefill_mtp(input, cache, stream)
+    }
+
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        self.verify_mtp(tokens, cache, stream)
+    }
+
+    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
+        self.mtp_token_embedding(token, stream)
     }
 }
 
-/// Generates tokens with a Gemma 4 target model and Gemma 4 assistant drafter.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_gemma4_mtp(
-    target: &mut Gemma4Model,
-    assistant: &mut Gemma4AssistantDraftModel,
-    prompt_tokens: &Array,
-    eos_token_ids: &[u32],
-    max_tokens: usize,
-    temp: f32,
-    prng_key: Option<Array>,
-    stream: &Stream,
-) -> Result<(Vec<u32>, MtpStats), Error> {
-    let start = Instant::now();
-    let mut prng_state = prng_key.map(RandomState::from_key);
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut generated = Vec::new();
-    let mut stats = MtpStats::default();
-
-    let prompt_len = prompt_tokens.shape()[1];
-    if prompt_len > 1 {
-        let prefix = prompt_tokens.try_index_device((.., ..prompt_len - 1), stream)?;
-        target.forward_with_state(
-            ModelInput {
-                inputs: &prefix,
-                inputs_embeds: None,
-                per_layer_input_ids: None,
-                mask: None,
-                sliding_mask: None,
-                cache: &mut cache,
-            },
-            stream,
-        )?;
+impl Gemma4MtpTarget for Gemma4LayerwiseModel {
+    fn prefill_mtp_target(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        self.prefill_mtp(input, cache, stream)
     }
 
-    let last = prompt_tokens.try_index_device((.., prompt_len - 1..), stream)?;
-    let first_out = target.forward_with_state(
-        ModelInput {
-            inputs: &last,
-            inputs_embeds: None,
-            per_layer_input_ids: None,
-            mask: None,
-            sliding_mask: None,
-            cache: &mut cache,
-        },
-        stream,
-    )?;
-    let first_logits = first_out.logits.try_index_device((.., -1, ..), stream)?;
-    let first_token = sample(&first_logits, temp, prng_state.as_mut(), stream)?;
-    eval([&first_token])?;
-    let mut bonus = first_token.item::<u32>(&stream);
-    stats.target_tokens += 1;
-    if eos_token_ids.contains(&bonus) || max_tokens == 0 {
-        stats.elapsed = start.elapsed();
-        return Ok((generated, stats));
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        self.verify_mtp(tokens, cache, stream)
     }
 
-    generated.push(bonus);
-    let mut hidden = first_out.hidden.try_index_device((.., -1.., ..), stream)?;
-    let mut shared_kv = first_out.shared_kv_states;
-    assistant.reset();
-    let mut emitted = 1usize;
+    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
+        self.mtp_token_embedding(token, stream)
+    }
+}
 
-    while emitted < max_tokens {
-        let block = assistant.block_size().min(max_tokens - emitted + 1);
-        if block <= 1 {
-            break;
-        }
+/// Gemma 4 target plus an external Gemma assistant.
+pub(crate) struct Gemma4MtpBackend<'a, T> {
+    target: &'a mut T,
+    assistant: &'a mut Gemma4AssistantDraftModel,
+}
 
-        let kv_offset = cache
-            .iter()
-            .flatten()
-            .next()
-            .map(KeyValueCache::offset)
-            .unwrap_or(0);
-        assistant.set_shared_kv(shared_kv.clone(), kv_offset);
-        let draft = assistant.draft_block(
-            target,
-            bonus,
-            &hidden,
-            block,
-            temp,
-            prng_state.as_mut(),
-            stream,
-        )?;
-        eval([&draft])?;
+impl<'a, T> Gemma4MtpBackend<'a, T> {
+    pub(crate) fn new(target: &'a mut T, assistant: &'a mut Gemma4AssistantDraftModel) -> Self {
+        Self { target, assistant }
+    }
 
-        let verify_input = concatenate_axis(
-            &[Array::from_slice(&[bonus], &[1, 1]), draft.clone()],
-            1,
-            stream,
-        )?;
-        let verify_out = target.forward_with_state(
-            ModelInput {
-                inputs: &verify_input,
-                inputs_embeds: None,
-                per_layer_input_ids: None,
-                mask: None,
-                sliding_mask: None,
-                cache: &mut cache,
-            },
-            stream,
-        )?;
-        let target_tokens = sample(&verify_out.logits, temp, prng_state.as_mut(), stream)?;
-        eval([&target_tokens])?;
-        stats.target_tokens += verify_input.shape()[1] as usize;
-
-        let draft_ids = array_to_ids(&draft, stream);
-        let target_ids = array_to_ids(&target_tokens, stream);
-        stats.draft_tokens += draft_ids.len();
-
-        let mut accepted = 0usize;
-        while accepted < draft_ids.len()
-            && accepted < target_ids.len()
-            && draft_ids[accepted] == target_ids[accepted]
-            && emitted + accepted < max_tokens
-        {
-            accepted += 1;
-        }
-        stats.accepted_tokens += accepted;
-        stats.accept_lens.push(accepted);
-        stats.rounds += 1;
-
-        let mut new_tokens = draft_ids[..accepted].to_vec();
-        if emitted + new_tokens.len() < max_tokens {
-            if let Some(id) = target_ids.get(accepted).copied() {
-                new_tokens.push(id);
-            }
-        }
-
-        for id in new_tokens.iter().copied() {
-            if eos_token_ids.contains(&id) {
-                emitted = max_tokens;
-                break;
-            }
-            generated.push(id);
-            emitted += 1;
-        }
-        if emitted >= max_tokens {
-            break;
-        }
-
-        let block_size = draft_ids.len() + 1;
-        if accepted < draft_ids.len() {
-            target.rollback_speculative_cache(&mut cache, accepted, block_size, stream)?;
-        }
-
-        hidden = verify_out
+    fn state_at(
+        output: &Gemma4StepOutput,
+        row: i32,
+        cache_len: usize,
+        stream: &Stream,
+    ) -> Result<Gemma4TargetState, Exception> {
+        let hidden = output
             .hidden
-            .try_index_device((.., accepted as i32..accepted as i32 + 1, ..), stream)?;
-        shared_kv = verify_out.shared_kv_states;
-        if let Some(last) = generated.last().copied() {
-            bonus = last;
+            .try_index_device((.., row..row + 1, ..), stream)?;
+        let retained = i32::try_from(cache_len)
+            .map_err(|_| Exception::custom("Gemma 4 MTP state length exceeds i32"))?;
+        let mut shared_kv = HashMap::with_capacity(output.shared_kv_states.len());
+        for (kind, (keys, values)) in &output.shared_kv_states {
+            let key_len = keys.dim(-2).min(retained);
+            let value_len = values.dim(-2).min(retained);
+            shared_kv.insert(
+                *kind,
+                (
+                    keys.try_index_device((.., .., ..key_len, ..), stream)?,
+                    values.try_index_device((.., .., ..value_len, ..), stream)?,
+                ),
+            );
         }
+        Ok(Gemma4TargetState {
+            hidden,
+            shared_kv,
+            cache_len,
+        })
     }
-
-    stats.elapsed = start.elapsed();
-    Ok((generated, stats))
 }
 
-fn array_to_ids(array: &Array, stream: &Stream) -> Vec<u32> {
-    array
-        .flatten(None, None, stream)
-        .expect("flatten token array")
-        .into_evaluated()
-        .expect("evaluate token array")
-        .as_slice::<u32>()
-        .to_vec()
+impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
+    type Cache = Cache;
+    type TargetState = Gemma4TargetState;
+    type DraftState = Gemma4DraftState;
+    type CacheCheckpoint = Cache;
+    type Verification = Gemma4Verification;
+
+    fn max_draft_tokens(&self) -> usize {
+        self.assistant.block_size().saturating_sub(1)
+    }
+
+    fn prefill(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
+        let output = self.target.prefill_mtp_target(input, cache, stream)?;
+        let sequence = output.logits.dim(-2);
+        if sequence == 0 {
+            return Err(Exception::custom(
+                "MTP input must contain at least one token",
+            ));
+        }
+        let logits = output
+            .logits
+            .try_index_device((.., sequence - 1, ..), stream)?;
+        let state = Self::state_at(&output, sequence - 1, cache.mtp_len(), stream)?;
+        Ok(MtpPrefill {
+            logits,
+            state,
+            evaluated_tokens: sequence as usize,
+        })
+    }
+
+    fn begin_draft(
+        &mut self,
+        state: &Self::TargetState,
+        _last_token: u32,
+        _stream: &Stream,
+    ) -> Result<Self::DraftState, Exception> {
+        let offset = i32::try_from(state.cache_len)
+            .map_err(|_| Exception::custom("Gemma 4 MTP cache offset exceeds i32"))?;
+        let hidden = self
+            .assistant
+            .begin_round(state.shared_kv.clone(), offset, &state.hidden);
+        Ok(Gemma4DraftState { hidden })
+    }
+
+    fn draft_logits(
+        &mut self,
+        state: &mut Self::DraftState,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embedding = self.target.mtp_embedding(last_token, stream)?;
+        self.assistant
+            .draft_step(&embedding, &mut state.hidden, stream)
+    }
+
+    fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
+        cache.clone()
+    }
+
+    fn verify(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<Self::Verification, Exception> {
+        Ok(Gemma4Verification {
+            output: self.target.verify_mtp_target(input_tokens, cache, stream)?,
+            inputs: input_tokens.clone(),
+        })
+    }
+
+    fn verification_logits(output: &Self::Verification) -> &Array {
+        &output.output.logits
+    }
+
+    fn commit_verification(
+        &mut self,
+        output: Self::Verification,
+        cache: &mut Self::Cache,
+        checkpoint: Self::CacheCheckpoint,
+        verified_inputs: usize,
+        stream: &Stream,
+    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        let input_len = output.inputs.dim(1) as usize;
+        if verified_inputs > input_len {
+            return Err(Exception::custom(format!(
+                "cannot commit {verified_inputs} verified inputs from a block of {input_len}"
+            )));
+        }
+        if verified_inputs == input_len {
+            let state = Self::state_at(
+                &output.output,
+                verified_inputs.saturating_sub(1) as i32,
+                cache.mtp_len(),
+                stream,
+            )?;
+            return Ok(MtpCommit {
+                state,
+                replayed_tokens: 0,
+            });
+        }
+
+        *cache = checkpoint;
+        let retained_inputs = output
+            .inputs
+            .try_index_device((.., ..verified_inputs as i32), stream)?;
+        let replayed = self
+            .target
+            .verify_mtp_target(&retained_inputs, cache, stream)?;
+        let state = Self::state_at(
+            &replayed,
+            verified_inputs.saturating_sub(1) as i32,
+            cache.mtp_len(),
+            stream,
+        )?;
+        Ok(MtpCommit {
+            state,
+            replayed_tokens: verified_inputs,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate<T, S>(
+    target: &mut T,
+    assistant: &mut Gemma4AssistantDraftModel,
+    cache: &mut Cache,
+    input: RuntimeInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &S,
+    stream: &Stream,
+) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
+where
+    T: Gemma4MtpTarget,
+    S: SpeculativeSampler,
+{
+    let mut backend = Gemma4MtpBackend::new(target, assistant);
+    mtp::generate(
+        &mut backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        stream,
+    )
 }

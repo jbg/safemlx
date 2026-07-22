@@ -12,8 +12,8 @@ use safemlx::{
         indexing::{put_along_axis, NewAxis, TryIndexOp},
         lt, matmul, which,
     },
+    ops::{GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    random::RandomState,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -23,13 +23,13 @@ use crate::{
     error::Error,
     models::{
         common,
-        gemma4::{sample, Gemma4Embedding, LayerType, Model, ModelArgs, TransformerBlock},
+        gemma4::{Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
     quantization::WeightQuantization,
     weights::{
-        load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
-        StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
+        load_safetensors_strict, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -237,7 +237,6 @@ pub struct Gemma4AssistantDraftModel {
     pub masked_embedding: Option<MaskedEmbedder>,
     shared_kv: Option<HashMap<LayerType, (Array, Array)>>,
     kv_offset: i32,
-    accept_lens: Vec<usize>,
 }
 
 impl Gemma4AssistantDraftModel {
@@ -302,7 +301,6 @@ impl Gemma4AssistantDraftModel {
             masked_embedding,
             shared_kv: None,
             kv_offset: 0,
-            accept_lens: Vec::new(),
         })
     }
 
@@ -311,17 +309,31 @@ impl Gemma4AssistantDraftModel {
         self.config.block_size
     }
 
-    /// Clears cached shared key/value state and acceptance history.
-    pub fn reset(&mut self) {
-        self.shared_kv = None;
-        self.kv_offset = 0;
-        self.accept_lens.clear();
-    }
-
-    /// Sets target-model key/value state shared with the assistant.
-    pub fn set_shared_kv(&mut self, shared_kv: HashMap<LayerType, (Array, Array)>, kv_offset: i32) {
+    /// Begins one generalized speculative round from committed target state.
+    pub(crate) fn begin_round(
+        &mut self,
+        shared_kv: HashMap<LayerType, (Array, Array)>,
+        kv_offset: i32,
+        hidden: &Array,
+    ) -> Array {
         self.shared_kv = Some(shared_kv);
         self.kv_offset = kv_offset;
+        hidden.clone()
+    }
+
+    /// Produces one draft distribution and advances the round's hidden state.
+    pub(crate) fn draft_step(
+        &mut self,
+        token_embedding: &Array,
+        previous_hidden: &mut Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let inputs_embeds =
+            safemlx::ops::concatenate_axis(&[token_embedding, &*previous_hidden], -1, stream)?;
+        let (next_hidden, logits) = self.forward(&inputs_embeds, stream)?;
+        *previous_hidden = next_hidden;
+        self.kv_offset = self.kv_offset.saturating_add(1);
+        Ok(logits)
     }
 
     fn forward(
@@ -379,47 +391,6 @@ impl Gemma4AssistantDraftModel {
         };
         Ok((last_hidden, logits))
     }
-
-    /// Drafts up to `block_size - 1` speculative tokens.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draft_block(
-        &mut self,
-        target_model: &mut Model,
-        last_bonus: u32,
-        hidden: &Array,
-        block_size: usize,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let mut token = Array::from_slice(&[last_bonus], &[1, 1]);
-        let mut h_prev = hidden.clone();
-        let mut tokens = Vec::new();
-        let mut prng_state = prng_state;
-
-        for _ in 0..block_size.saturating_sub(1) {
-            let token_embed = target_model
-                .model
-                .language_model
-                .embed_tokens
-                .forward(&token, stream)?
-                .multiply(
-                    Array::from_f32((target_model.args.hidden_size as f32).sqrt()),
-                    stream,
-                )?;
-            let inputs_embeds = safemlx::ops::concatenate_axis(&[token_embed, h_prev], -1, stream)?;
-            let (next_hidden, logits) = self.forward(&inputs_embeds, stream)?;
-            token = sample(&logits, temp, prng_state.as_deref_mut(), stream)?;
-            tokens.push(token.clone());
-            h_prev = next_hidden;
-        }
-
-        if tokens.is_empty() {
-            Ok(Array::from_slice::<u32>(&[], &[1, 0]))
-        } else {
-            safemlx::ops::concatenate_axis(&tokens, 1, stream)
-        }
-    }
 }
 
 fn drafter_mask(
@@ -465,22 +436,8 @@ struct WeightMap {
     weight_map: HashMap<String, String>,
 }
 
-/// Loads a Gemma 4 assistant draft model from a model directory.
-pub fn load_gemma4_assistant_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4AssistantDraftModel, Error> {
-    load_gemma4_assistant_model_with_options(
-        model_dir,
-        ModelLoadOptions::default(),
-        stream,
-        weights_stream,
-    )
-}
-
 /// Loads a Gemma 4 assistant draft model using shared model-load options.
-pub fn load_gemma4_assistant_model_with_options(
+pub(crate) fn load_gemma4_assistant_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
     stream: &Stream,
@@ -561,6 +518,126 @@ pub fn load_gemma4_assistant_model_with_options(
     Ok(model)
 }
 
+/// Loads a Gemma 4 assistant from a GGUF file.
+///
+/// GGUF tensors may use standard llama.cpp Gemma assistant names or the
+/// assistant module's canonical parameter names. Packed affine checkpoints
+/// must use one common bit width and group size, matching the assistant's
+/// existing uniform quantization contract. The model config is read from the
+/// `safemlx.mtp.config` JSON metadata string when present, with a sibling
+/// `config.json` as the fallback.
+pub(crate) fn load_gemma4_assistant_gguf_with_options(
+    gguf_file: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4AssistantDraftModel, Error> {
+    if !matches!(
+        options.weight_residency,
+        crate::layerwise::WeightResidency::FullyResident
+    ) {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 assistant GGUF loading supports fully resident weights only".into(),
+        ));
+    }
+    let gguf_file = gguf_file.as_ref();
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    match metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) if architecture == "gemma4_assistant" => {}
+        Some(GgufMetadataValue::String(architecture)) => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF architecture {architecture:?}; expected gemma4_assistant"
+            )))
+        }
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF general.architecture must be a string".into(),
+            ))
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 assistant GGUF is missing general.architecture".into(),
+            ))
+        }
+    }
+    let mut config: Gemma4AssistantConfig = match metadata.get("safemlx.mtp.config") {
+        Some(GgufMetadataValue::String(config)) => serde_json::from_str(config)?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF safemlx.mtp.config must be a JSON string".into(),
+            ))
+        }
+        None => {
+            let config_file = gguf_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("config.json");
+            serde_json::from_reader(std::fs::File::open(&config_file)?)?
+        }
+    };
+    crate::models::validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
+    let packed = gguf_affine_configs(&checkpoint, translate_gguf_weight_name)?;
+    if let Some(first) = packed.values().next().copied() {
+        if packed.values().any(|config| *config != first) {
+            return Err(Error::Quantization(
+                "Gemma 4 assistant GGUF requires one affine configuration for all packed tensors"
+                    .into(),
+            ));
+        }
+        config.quantization = Some(first.into());
+    } else if let Some(requested) = options.quantization {
+        if config.use_ordered_embeddings {
+            return Err(Error::Quantization(
+                "Gemma 4 assistant affine quantization does not support ordered masked embeddings"
+                    .into(),
+            ));
+        }
+        config.quantization = Some(requested);
+    }
+    let mut model = Gemma4AssistantDraftModel::new(config, stream)?;
+    let load_config = StrictLoadConfig::default()
+        .allow_missing_suffix(".bias")
+        .allow_missing_contains(".self_attn.k_proj.")
+        .allow_missing_contains(".self_attn.v_proj.")
+        .allow_missing_suffix(".self_attn.k_norm.weight")
+        .allow_unused_prefix("rope_freqs.");
+    let mut report = StrictLoadReport::default();
+    load_gguf_strict(
+        &mut model,
+        &checkpoint,
+        (packed.is_empty())
+            .then_some(options.quantization)
+            .flatten()
+            .map(|quantization| (quantization, stream)),
+        &load_config,
+        &mut report,
+        |name, value| Ok((translate_gguf_weight_name(&name), value)),
+    )?;
+    report.finish(&model, &load_config)?;
+    model.copy_to_stream(stream)?;
+    let _ = weights_stream;
+    Ok(model)
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    let assistant = match name {
+        "mtp.pre_projection.weight" => Some("pre_projection.weight"),
+        "mtp.post_projection.weight" => Some("post_projection.weight"),
+        "mtp.centroids.weight" => Some("masked_embedding.centroids.weight"),
+        "mtp.token_ordering.weight" => Some("masked_embedding.token_ordering"),
+        _ => None,
+    };
+    if let Some(assistant) = assistant {
+        return assistant.to_string();
+    }
+
+    let target = crate::models::gemma4::translate_gguf_weight_name(name);
+    target
+        .strip_prefix("model.language_model.")
+        .map_or(target.clone(), |parameter| format!("model.{parameter}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -586,6 +663,30 @@ mod tests {
         "attention_k_eq_v":false,"layer_types":["full_attention"]
       }
     }"#;
+
+    #[test]
+    fn translates_published_gguf_names() {
+        let cases = [
+            ("token_embd.weight", "model.embed_tokens.weight"),
+            (
+                "blk.2.attn_output.weight",
+                "model.layers.2.self_attn.o_proj.weight",
+            ),
+            (
+                "blk.2.layer_output_scale.weight",
+                "model.layers.2.layer_scalar",
+            ),
+            ("output_norm.weight", "model.norm.weight"),
+            ("mtp.pre_projection.weight", "pre_projection.weight"),
+            (
+                "mtp.token_ordering.weight",
+                "masked_embedding.token_ordering",
+            ),
+        ];
+        for (gguf, model) in cases {
+            assert_eq!(super::translate_gguf_weight_name(gguf), model);
+        }
+    }
 
     #[test]
     fn tiny_assistant_quantizes_through_shared_options() {

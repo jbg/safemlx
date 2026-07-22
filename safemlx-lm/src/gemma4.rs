@@ -97,6 +97,54 @@ impl Gemma4LayerwiseModel {
             .forward(Gemma4Input::Decode(inputs), cache, stream)
     }
 
+    pub(crate) fn prefill_mtp(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<resident::Gemma4StepOutput, Exception> {
+        self.forward_mtp(Gemma4Input::Prefill(input), cache, stream)
+    }
+
+    pub(crate) fn verify_mtp(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<resident::Gemma4StepOutput, Exception> {
+        self.forward_mtp(Gemma4Input::Decode(tokens), cache, stream)
+    }
+
+    fn forward_mtp(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<resident::Gemma4StepOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_with_context_hook(input, cache, stream, |_, _, _| Ok(()))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("Gemma 4 layerwise pass did not retain target draft state")
+        })?;
+        Ok(resident::Gemma4StepOutput {
+            logits,
+            hidden,
+            shared_kv_states: context.shared_kv,
+        })
+    }
+
+    pub(crate) fn mtp_token_embedding(
+        &mut self,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.execution
+            .adapter_mut()
+            .mtp_token_embedding(token, stream)
+    }
+
     /// Clears temporary media and decoder blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_all_device_groups()
@@ -236,7 +284,7 @@ impl Gemma4LayerwiseAdapter {
                     config.output_proj_dims,
                     args.hidden_size,
                     config.rms_norm_eps,
-                    true,
+                    false,
                     args.weight_quantization(),
                     stream,
                 )
@@ -268,6 +316,15 @@ impl Gemma4LayerwiseAdapter {
         &self.args
     }
 
+    fn mtp_token_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
+        self.embedding
+            .forward(&Array::from_slice(&[token], &[1, 1]), stream)?
+            .multiply(
+                Array::from_f32((self.args.hidden_size as f32).sqrt()),
+                stream,
+            )
+    }
+
     fn recipes_for(
         &self,
         module: &impl ModuleParameters,
@@ -289,7 +346,18 @@ impl Gemma4LayerwiseAdapter {
                 normalized.get(&canonical).map(|raw| {
                     (
                         local_name.to_string(),
-                        DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+                        DerivedWeightRecipe::Cast {
+                            input: Box::new(DerivedWeightRecipe::source(
+                                raw.clone(),
+                                TensorSelection::Full,
+                            )),
+                            dtype: module
+                                .parameters()
+                                .flatten()
+                                .get(local_name)
+                                .expect("parameter came from the same flattened tree")
+                                .dtype(),
+                        },
                     )
                 })
             })
@@ -519,6 +587,7 @@ pub struct Gemma4ForwardContext {
     audio_jobs: Vec<Gemma4AudioJob>,
     tokens: Option<Array>,
     needs_assembly: bool,
+    draft_hidden: Option<Array>,
 }
 
 impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
@@ -818,6 +887,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                         audio_jobs,
                         tokens: Some(tokens),
                         needs_assembly: false,
+                        draft_hidden: None,
                     },
                 });
             }
@@ -845,6 +915,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                     audio_jobs,
                     tokens: None,
                     needs_assembly: true,
+                    draft_hidden: None,
                 },
             });
         }
@@ -882,6 +953,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                 audio_jobs: Vec::new(),
                 tokens: Some(tokens.clone()),
                 needs_assembly: false,
+                draft_hidden: None,
             },
         })
     }
@@ -1082,6 +1154,9 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         if !context.needs_assembly || group + 1 != self.execution_group_count() - 1 {
+            if group + 1 == self.execution_group_count() {
+                context.draft_hidden = Some(hidden.clone());
+            }
             return Ok(hidden.clone());
         }
         if let (Some(vision), Some(embedder)) = (&self.vision, &mut self.embed_vision) {

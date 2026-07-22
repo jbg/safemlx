@@ -1,18 +1,12 @@
 use std::{path::PathBuf, time::Instant};
 
-use safemlx::{
-    ops::indexing::{NewAxis, TryIndexOp},
-    transforms::eval,
-    Array, ExecutionContext, Stream,
-};
+use safemlx::{transforms::eval, ExecutionContext, Stream};
 use safemlx_lm::{
-    gemma4_mtp::generate_gemma4_mtp,
     models::{
-        gemma4::load_gemma4_model,
-        gemma4_assistant::load_gemma4_assistant_model,
         input::{InputPart, ModelInput},
         LoadedModel,
     },
+    mtp::{LoadedDrafter, MtpConfig},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -149,24 +143,27 @@ fn run_mtp(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let tokenizer_holder = LoadedModel::load(target_dir, stream, weights_stream)?;
-    let prompt_ids = tokenizer_holder.encode(prompt, false)?;
-    let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
-
-    let mut target = load_gemma4_model(target_dir, stream, weights_stream)?;
-    let mut assistant = load_gemma4_assistant_model(assistant_dir, stream, weights_stream)?;
-    let (generated, stats) = generate_gemma4_mtp(
-        &mut target,
-        &mut assistant,
-        &prompt_tokens,
-        tokenizer_holder.eos_token_ids(),
+    let mut target = LoadedModel::load(target_dir, stream, weights_stream)?;
+    let mut assistant = LoadedDrafter::load(assistant_dir, stream, weights_stream)?;
+    let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
+    let mut cache = target.new_cache();
+    let parts = [InputPart::text_token_ids(&prompt_tokens)];
+    let input = ModelInput::new(&parts);
+    let config = MtpConfig {
         max_tokens,
-        0.0,
-        None,
-        stream,
-    )?;
-
-    let text = tokenizer_holder.decode(&generated, true)?;
+        max_draft_tokens: 3,
+        temperature: 0.0,
+        eos_token_ids: target.eos_token_ids().to_vec(),
+    };
+    let (mut generated, stats) =
+        target.generate_mtp_input(&mut assistant, &mut cache, input, &config, None, stream)?;
+    if generated
+        .last()
+        .is_some_and(|token| config.eos_token_ids.contains(token))
+    {
+        generated.pop();
+    }
+    let text = target.decode(&generated, true)?;
     Ok(ProbeResult {
         token_ids: generated,
         text,

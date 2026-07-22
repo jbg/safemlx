@@ -21,9 +21,10 @@ use safemlx_lm::{
         input::{InputPart, ModelInput},
         LoadedModel, ModelLoadOptions,
     },
+    mtp::{LoadedDrafter, MtpConfig, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
-    sampler::{DefaultSampler, GenerationSampler, Sampler},
+    sampler::{DefaultSampler, GenerationSampler, Sampler, SpeculativeSampler},
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -61,6 +62,23 @@ impl Sampler for CliSampler {
     }
 }
 
+impl SpeculativeSampler for CliSampler {
+    fn process_logits(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Greedy(sampler) => sampler.process_logits(logits, temperature, history, stream),
+            Self::Configured(sampler) => {
+                sampler.process_logits(logits, temperature, history, stream)
+            }
+        }
+    }
+}
+
 /// Generate text with a model supported by safemlx-lm.
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -68,6 +86,14 @@ struct Cli {
     /// Model directory, GGUF file, or Hugging Face model identifier.
     #[arg(short, long, value_name = "PATH_OR_ID")]
     model: String,
+
+    /// Explicit Gemma assistant directory, GGUF file, or Hugging Face identifier.
+    #[arg(long, value_name = "PATH_OR_ID")]
+    draft_model: Option<String>,
+
+    /// Maximum speculative tokens proposed before each target verification.
+    #[arg(long, default_value_t = 3, value_name = "TOKENS")]
+    mtp_draft_tokens: usize,
 
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
@@ -184,9 +210,17 @@ fn main() -> Result<()> {
     validate_args(&args)?;
     let prompt = read_prompt(args.prompt.as_deref())?;
     let model_path = resolve_model(&args.model, args.revision.as_deref())?;
+    let draft_model_path = args
+        .draft_model
+        .as_deref()
+        .map(|source| resolve_model(source, args.revision.as_deref()))
+        .transpose()?;
 
     if args.verbose {
         eprintln!("model: {}", model_path.display());
+        if let Some(path) = &draft_model_path {
+            eprintln!("draft_model: {}", path.display());
+        }
     }
 
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -244,6 +278,33 @@ fn main() -> Result<()> {
     let mut model =
         LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
             .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    if draft_model_path.is_some()
+        && !matches!(
+            model.mtp_capability(),
+            safemlx_lm::mtp::MtpCapability::Ready {
+                checkpoint: safemlx_lm::mtp::MtpCheckpointKind::Separate
+            }
+        )
+    {
+        bail!(
+            "--draft-model cannot be used with target capability {:?}",
+            model.mtp_capability()
+        );
+    }
+    let mut drafter = draft_model_path
+        .as_ref()
+        .map(|path| {
+            let options = match args.quantize {
+                Some(bits) => ModelLoadOptions::with_quantization(AffineQuantization::new(
+                    args.quantization_group_size,
+                    bits,
+                )?),
+                None => ModelLoadOptions::default(),
+            };
+            LoadedDrafter::load_with_options(path, options, stream, weights.stream())
+                .with_context(|| format!("failed to load draft model from {}", path.display()))
+        })
+        .transpose()?;
     stream.synchronize()?;
     let load_elapsed = load_started.elapsed();
 
@@ -300,8 +361,29 @@ fn main() -> Result<()> {
     let mut output_ids = Vec::with_capacity(args.max_tokens);
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
+    let mut mtp_stats: Option<MtpStats> = None;
 
-    {
+    if let Some(drafter) = drafter.as_mut() {
+        let parts = [InputPart::text_token_ids(&tokens)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: args.max_tokens,
+            max_draft_tokens: args.mtp_draft_tokens,
+            temperature: args.temperature,
+            eos_token_ids: eos_token_ids.clone(),
+        };
+        let (tokens, stats) = model.generate_mtp_input_with_sampler(
+            drafter, &mut cache, input, &config, prng_key, &sampler, stream,
+        )?;
+        output_ids = tokens;
+        if output_ids
+            .last()
+            .is_some_and(|token| eos_token_ids.contains(token))
+        {
+            output_ids.pop();
+        }
+        mtp_stats = Some(stats);
+    } else {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
         let mut generator = model.generate_input_with_cache_sampler(
@@ -369,6 +451,16 @@ fn main() -> Result<()> {
         );
         eprintln!("load_time: {:.3} s", load_elapsed.as_secs_f64());
         eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
+        if let Some(stats) = &mtp_stats {
+            eprintln!(
+                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}",
+                stats.rounds,
+                stats.draft_tokens,
+                stats.accepted_tokens,
+                stats.accept_rate(),
+            );
+            eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
+        }
         match time_to_first_token {
             Some(elapsed) => {
                 eprintln!("time_to_first_token: {:.3} s", elapsed.as_secs_f64());
@@ -537,7 +629,7 @@ fn run_expert_cache_benchmark(
     let before_cold = expert_benchmark_snapshot(model)?;
     let mut cold_cache = model.new_cache();
     let started = Instant::now();
-    let logits = model.prefill_input_with_cache(input.clone(), &mut cold_cache, stream)?;
+    let logits = model.prefill_input_with_cache(input, &mut cold_cache, stream)?;
     eval([&logits])?;
     stream.synchronize()?;
     let cold_elapsed = started.elapsed();
@@ -589,6 +681,9 @@ fn run_expert_cache_benchmark(
 fn validate_args(args: &Cli) -> Result<()> {
     if args.max_tokens == 0 {
         bail!("--max-tokens must be greater than zero");
+    }
+    if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
+        bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
     }
     if !args.temperature.is_finite() || args.temperature < 0.0 {
         bail!("--temperature must be a finite, non-negative number");

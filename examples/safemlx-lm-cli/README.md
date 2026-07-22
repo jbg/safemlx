@@ -31,6 +31,25 @@ cargo run --release -p safemlx-lm-cli -- \
   "Tell me a short story."
 ```
 
+Gemma 4 can use an explicit external assistant through the generalized MTP
+engine. The target may be fully resident or use `--layerwise-host`; the
+assistant is loaded independently and remains fully resident:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/gemma4 \
+  --draft-model /path/to/gemma4-assistant \
+  --mtp-draft-tokens 3 --temperature 0.7 \
+  "Explain speculative decoding."
+```
+
+The assistant may be a safetensors directory or a GGUF file with
+`general.architecture = "gemma4_assistant"`. GGUF config is read from a
+`safemlx.mtp.config` JSON metadata string or a sibling `config.json`.
+Stochastic MTP uses lossless probability-ratio acceptance and supports the
+same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
+generation. Under `--verbose`, the CLI reports proposal and acceptance counts.
+
 Dense checkpoints can be quantized while loading. For example, 4-bit affine
 weights substantially reduce decode-time weight traffic and memory use:
 

@@ -2207,7 +2207,7 @@ impl Gemma4ForConditionalGeneration {
                     config.output_proj_dims,
                     args.hidden_size,
                     config.rms_norm_eps,
-                    true,
+                    false,
                     args.weight_quantization(),
                     stream,
                 )
@@ -2706,9 +2706,12 @@ fn gemma4_args_from_gguf(
     }
 
     let num_hidden_layers = gguf_i32(metadata, "gemma4.block_count", stream)?;
-    let layer_pattern =
-        gguf_optional_i64_values(metadata, "gemma4.attention.sliding_window_pattern", stream)?
-            .unwrap_or_else(|| vec![0; num_hidden_layers as usize]);
+    let layer_pattern = gguf_optional_sliding_window_pattern(
+        metadata,
+        "gemma4.attention.sliding_window_pattern",
+        stream,
+    )?
+    .unwrap_or_else(|| vec![0; num_hidden_layers as usize]);
     if layer_pattern.len() != num_hidden_layers as usize {
         return Err(Error::UnsupportedArchitecture(format!(
             "Gemma 4 sliding-window pattern has {} entries for {num_hidden_layers} layers",
@@ -2926,7 +2929,7 @@ fn expand_layer_values(
         .collect()
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     const ROOTS: [(&str, &str); 6] = [
         (
             "per_layer_token_embd",
@@ -3058,6 +3061,19 @@ fn gguf_optional_i64_values(
             Error::UnsupportedArchitecture(format!("GGUF metadata key {key:?} has the wrong type"))
         }),
         None => Ok(None),
+    }
+}
+
+fn gguf_optional_sliding_window_pattern(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    stream: &Stream,
+) -> Result<Option<Vec<i64>>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(values))) => {
+            Ok(Some(values.iter().map(|&value| i64::from(value)).collect()))
+        }
+        _ => gguf_optional_i64_values(metadata, key, stream),
     }
 }
 
@@ -3303,7 +3319,7 @@ fn load_gemma4_weights(
 
 impl Model {
     /// Runs a Gemma 4 forward pass and returns logits plus assistant-drafting state.
-    pub fn forward_with_state(
+    pub(crate) fn forward_with_state(
         &mut self,
         input: ModelInput<'_, ConcatKeyValueCache>,
         stream: &Stream,
@@ -3320,28 +3336,100 @@ impl Model {
         })
     }
 
-    /// Rolls back speculative tokens that were rejected by target-model verification.
-    pub fn rollback_speculative_cache(
+    /// Prefills typed input while retaining the state required by an external drafter.
+    pub(crate) fn prefill_mtp(
         &mut self,
-        cache: &mut [Option<ConcatKeyValueCache>],
-        accepted: usize,
-        block_size: usize,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<(), Exception> {
-        let rejected = block_size.saturating_sub(accepted + 1) as i32;
-        if rejected == 0 {
-            return Ok(());
+    ) -> Result<Gemma4StepOutput, Exception> {
+        match self.prepare_typed_prefill(input, stream)? {
+            input::PreparedPrefill::Text(prompt_tokens) => {
+                cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
+                cache.prefix_embeddings = None;
+                cache.prefix_len = 0;
+                cache.kv.clear();
+                self.forward_with_state(
+                    ModelInput {
+                        inputs: &prompt_tokens,
+                        inputs_embeds: None,
+                        per_layer_input_ids: None,
+                        mask: None,
+                        sliding_mask: None,
+                        cache: &mut cache.kv,
+                    },
+                    stream,
+                )
+            }
+            input::PreparedPrefill::Embeddings { tokens, embeddings } => {
+                cache.token_ids = token_ids_from_array(&tokens, stream)?;
+                cache.prefix_len = cache.token_ids.len();
+                cache.prefix_embeddings = Some(embeddings.clone());
+                cache.kv.clear();
+                let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
+                let masks = multimodal_attention_masks(
+                    &cache.token_ids,
+                    self.image_token_id.map(|id| id as u32),
+                    self.video_token_id.map(|id| id as u32),
+                    self.args.sliding_window,
+                );
+                self.forward_with_state(
+                    ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: Some(&embeddings),
+                        per_layer_input_ids: Some(&per_layer_ids),
+                        mask: Some(&masks.full),
+                        sliding_mask: Some(&masks.sliding),
+                        cache: &mut cache.kv,
+                    },
+                    stream,
+                )
+            }
         }
-        for cache in cache.iter_mut().flatten() {
-            let new_len = cache.offset().saturating_sub(rejected);
-            cache.truncate(new_len, stream)?;
-        }
-        Ok(())
+    }
+
+    /// Verifies one speculative block without rebuilding the committed prefix.
+    pub(crate) fn verify_mtp(
+        &mut self,
+        input_tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        cache
+            .token_ids
+            .extend(token_ids_from_array(input_tokens, stream)?);
+        self.forward_with_state(
+            ModelInput {
+                inputs: input_tokens,
+                inputs_embeds: None,
+                per_layer_input_ids: None,
+                mask: None,
+                sliding_mask: None,
+                cache: &mut cache.kv,
+            },
+            stream,
+        )
+    }
+
+    /// Embeds one generated token for the external assistant.
+    pub(crate) fn mtp_token_embedding(
+        &mut self,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.model
+            .language_model
+            .embed_tokens
+            .forward(&Array::from_slice(&[token], &[1, 1]), stream)?
+            .multiply(
+                Array::from_f32((self.args.hidden_size as f32).sqrt()),
+                stream,
+            )
     }
 }
 
 /// Output for a Gemma 4 target-model step used by assistant drafting.
-pub struct Gemma4StepOutput {
+pub(crate) struct Gemma4StepOutput {
     /// Logits for the step.
     pub logits: Array,
     /// Pre-final-normalization hidden states.
@@ -3403,6 +3491,13 @@ pub struct Cache {
     pub(crate) token_ids: Vec<u32>,
     prefix_embeddings: Option<Array>,
     prefix_len: usize,
+}
+
+impl Cache {
+    /// Returns the committed logical sequence length.
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.token_ids.len()
+    }
 }
 
 pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
@@ -3860,7 +3955,7 @@ mod tests {
             ),
             (
                 "gemma4.attention.sliding_window_pattern".into(),
-                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 0])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![true, false])),
             ),
             (
                 "gemma4.attention.shared_kv_layers".into(),

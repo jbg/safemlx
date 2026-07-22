@@ -551,6 +551,21 @@ recognize matching pre-quantized checkpoints and load them directly rather
 than quantizing them again. A requested format that differs from existing
 checkpoint metadata is an error.
 
+### Multi-token prediction
+
+The `mtp` module provides lossless greedy or stochastic speculative decoding
+through architecture-neutral backend, cache-transaction, and sampling-policy
+contracts. `LoadedModel::mtp_capability` reports whether drafting weights are
+external, embedded but not yet implemented, or unavailable. Gemma 4 is the
+first complete adapter: resident and bounded-layer targets accept typed
+multimodal prefill and an explicit safetensors or GGUF `LoadedDrafter`.
+Gemma assistant GGUF files may embed their JSON config in the
+`safemlx.mtp.config` metadata string or provide a sibling `config.json`.
+Text batches use independent caches, so acceptance lengths and EOS positions
+may diverge safely. DeepSeek-V3/R1, Inkling, Qwen3-Next, Qwen3.5/3.6, and
+Nemotron-H currently report their embedded-checkpoint capability without
+executing the skipped MTP weights.
+
 ### Quantized loading coverage
 
 | Architecture | Dense | Existing quantized | Affine / MXFP4 on load | High-level dispatch | Special policy |
@@ -562,7 +577,7 @@ checkpoint metadata is an error.
 | Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
 | Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL DeepStack/MRoPE and Qwen3 packed expert-major SwiGLU execution; the vision tower remains dense |
 | Gemma 4 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Currently eligible language and modality-bridge projections are quantized; specialized vision/audio components remain dense |
-| Gemma 4 assistant | yes | MLX affine/MXFP4 | yes / yes | assistant loader with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
+| Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts | no / yes | `LoadedModel` | Native experts stay unchanged; attention projections, embeddings, and LM head can be MXFP4, while the router stays dense |
 | Inkling | yes | no | capability error | `LoadedModel` | Alternating local/global relative-bias attention, four short-convolution states per layer, routed plus shared experts, and native hMLP/dMel towers; MTP draft layers are skipped |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
