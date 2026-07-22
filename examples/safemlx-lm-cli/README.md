@@ -50,6 +50,11 @@ Stochastic MTP uses lossless probability-ratio acceptance and supports the
 same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
 generation. Under `--verbose`, the CLI reports proposal and acceptance counts.
 
+Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints with native MTP weights use
+those embedded weights automatically; no `--draft-model` is needed. Their
+native head proposes one token per verification round, so larger
+`--mtp-draft-tokens` values are safely capped by the model.
+
 Dense checkpoints can be quantized while loading. For example, 4-bit affine
 weights substantially reduce decode-time weight traffic and memory use:
 

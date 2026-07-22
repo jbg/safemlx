@@ -59,6 +59,7 @@ pub mod moshi;
 pub mod nemotron_h;
 /// Planning contracts and telemetry for weight residency management.
 pub mod offload;
+mod qwen_mtp;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;

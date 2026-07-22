@@ -312,7 +312,8 @@ mod tests {
     fn fp8_config() -> serde_json::Value {
         serde_json::json!({
             "model_type":"qwen3_next","vocab_size":32,"hidden_size":128,
-            "num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,
+            "num_hidden_layers":1,"num_nextn_predict_layers":1,
+            "num_attention_heads":1,"num_key_value_heads":1,
             "head_dim":128,"max_position_embeddings":128,"intermediate_size":256,
             "moe_intermediate_size":128,"shared_expert_intermediate_size":128,
             "num_experts_per_tok":1,"num_experts":2,"tie_word_embeddings":false,
@@ -328,6 +329,11 @@ mod tests {
 
     fn fp8_args() -> super::ModelArgs {
         serde_json::from_value(fp8_config()).unwrap()
+    }
+
+    #[test]
+    fn parses_native_mtp_layer_count_alias() {
+        assert_eq!(fp8_args().mtp_num_hidden_layers, 1);
     }
 
     #[test]

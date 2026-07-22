@@ -466,13 +466,17 @@ impl Model {
                 checkpoint: MtpCheckpointKind::Embedded,
                 architecture: "inkling".into(),
             },
-            Self::Qwen3Next(_) | Self::Qwen3NextLayerwise(_) => MtpCapability::Unsupported {
+            Self::Qwen3Next(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
-                architecture: "qwen3_next".into(),
             },
-            Self::Qwen35Moe(_) | Self::Qwen35MoeLayerwise(_) => MtpCapability::Unsupported {
+            Self::Qwen3NextLayerwise(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
-                architecture: "qwen3_5".into(),
+            },
+            Self::Qwen35Moe(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
+            Self::Qwen35MoeLayerwise(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
             },
             Self::NemotronH(_) | Self::NemotronHLayerwise(_) => MtpCapability::Unsupported {
                 checkpoint: MtpCheckpointKind::Embedded,
@@ -531,6 +535,53 @@ impl Model {
             }
             (model, _) => Err(Exception::custom(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
+    }
+
+    /// Generates with MTP weights embedded in the target checkpoint.
+    pub fn generate_embedded_mtp_input(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_embedded_mtp_input_with_sampler(
+            cache,
+            input,
+            config,
+            prng_key,
+            &DefaultSampler,
+            stream,
+        )
+    }
+
+    /// Generates with embedded MTP weights and a caller-provided sampler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
+                crate::qwen_mtp::generate(target, cache, input, config, prng_key, sampler, stream)
+            }
+            (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
+                crate::qwen_mtp::generate(target, cache, input, config, prng_key, sampler, stream)
+            }
+            (model, _) => Err(Exception::custom(format!(
+                "embedded MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
             ))),
@@ -1609,6 +1660,45 @@ impl LoadedModel {
         )
     }
 
+    /// Generates through MTP weights embedded in the target checkpoint.
+    pub fn generate_embedded_mtp_input(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_embedded_mtp_input_with_sampler(
+            cache,
+            input,
+            config,
+            prng_key,
+            &DefaultSampler,
+            stream,
+        )
+    }
+
+    /// Generates through embedded MTP weights with a caller-provided sampler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
+        }
+        self.model.generate_embedded_mtp_input_with_sampler(
+            cache, input, &config, prng_key, sampler, stream,
+        )
+    }
+
     /// Generates an independently accepting and stopping batch of text prompts.
     ///
     /// Each lane owns a separate cache so rejection lengths and EOS positions
@@ -1681,6 +1771,84 @@ impl LoadedModel {
             let input = input::ModelInput::new(&parts);
             let (tokens, stats) = self.generate_mtp_input_with_sampler(
                 drafter,
+                &mut cache.lanes[lane as usize],
+                input,
+                config,
+                lane_key,
+                sampler,
+                stream,
+            )?;
+            output.token_ids.push(tokens);
+            output.stats.push(stats);
+        }
+        Ok(output)
+    }
+
+    /// Generates an independently accepting text batch with embedded MTP weights.
+    pub fn generate_embedded_mtp_text_batch<S: SpeculativeSampler>(
+        &mut self,
+        prompt_tokens: &Array,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<MtpBatchOutput, Exception> {
+        let batch_size = if prompt_tokens.ndim() == 2 {
+            prompt_tokens.dim(0) as usize
+        } else {
+            0
+        };
+        let mut cache = self.new_mtp_cache(batch_size);
+        self.generate_embedded_mtp_text_batch_with_cache(
+            &mut cache,
+            prompt_tokens,
+            config,
+            prng_key,
+            sampler,
+            stream,
+        )
+    }
+
+    /// Generates a text batch with embedded MTP weights and reusable lane caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_text_batch_with_cache<S: SpeculativeSampler>(
+        &mut self,
+        cache: &mut MtpCache,
+        prompt_tokens: &Array,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+    ) -> Result<MtpBatchOutput, Exception> {
+        if prompt_tokens.ndim() != 2 || prompt_tokens.dim(1) == 0 {
+            return Err(Exception::custom(format!(
+                "MTP text batch must be shaped [batch, nonzero sequence], got {:?}",
+                prompt_tokens.shape()
+            )));
+        }
+        if cache.len() != prompt_tokens.dim(0) as usize {
+            return Err(Exception::custom(format!(
+                "MTP cache has {} lanes but text input has batch size {}",
+                cache.len(),
+                prompt_tokens.dim(0)
+            )));
+        }
+        if config.temperature != 0.0 && prng_key.is_none() {
+            return Err(Exception::custom(
+                "random operations require an explicit PRNG key",
+            ));
+        }
+        let mut batch_prng = prng_key.map(RandomState::from_key);
+        let mut output = MtpBatchOutput::default();
+        for lane in 0..prompt_tokens.dim(0) {
+            let row = prompt_tokens.try_index_device((lane, NewAxis, ..), stream)?;
+            let lane_key = batch_prng
+                .as_mut()
+                .map(|state| state.next_key(stream))
+                .transpose()?;
+            let parts = [input::InputPart::text_token_ids(&row)];
+            let input = input::ModelInput::new(&parts);
+            let (tokens, stats) = self.generate_embedded_mtp_input_with_sampler(
                 &mut cache.lanes[lane as usize],
                 input,
                 config,

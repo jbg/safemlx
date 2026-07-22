@@ -27,7 +27,7 @@ use crate::{
         input,
         qwen3_5_moe::{
             self as resident, BlockInput, Cache, Experts, LayerCache, LayerType, ModelArgs,
-            Qwen3NextRmsNorm, TransformerBlock,
+            MtpModule, Qwen3NextRmsNorm, QwenMtpStepOutput, QwenWeightFormat, TransformerBlock,
         },
         qwen3_next,
         qwen_vl::{
@@ -49,6 +49,7 @@ const EMBEDDING_UNIT: &str = "qwen_hybrid.static.embedding";
 const NORM_UNIT: &str = "qwen_hybrid.static.norm";
 const HEAD_UNIT: &str = "qwen_hybrid.static.output";
 const VISION_STATIC_UNIT: &str = "qwen_hybrid.static.vision";
+const MTP_STATIC_UNIT: &str = "qwen_hybrid.static.mtp";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum QwenHybridFamily {
@@ -108,6 +109,61 @@ impl QwenHybridLayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution
             .forward(QwenHybridInput::Decode(inputs), cache, stream)
+    }
+
+    pub(crate) fn prefill_mtp(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        cache.reset();
+        self.forward_mtp(QwenHybridInput::Prefill(input), cache, stream)
+    }
+
+    pub(crate) fn verify_mtp(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        self.forward_mtp(QwenHybridInput::Decode(tokens), cache, stream)
+    }
+
+    fn forward_mtp(
+        &mut self,
+        input: QwenHybridInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_with_context_hook(input, cache, stream, |_, _, _| Ok(()))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("Qwen layerwise pass did not retain MTP hidden state")
+        })?;
+        Ok(QwenMtpStepOutput { logits, hidden })
+    }
+
+    pub(crate) fn forward_mtp_head(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.execution
+            .adapter_mut()
+            .forward_mtp_head(hidden, tokens, cache, stream)
+    }
+
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.execution
+            .adapter()
+            .mtp
+            .as_ref()
+            .map_or(0, MtpModule::len)
     }
 
     /// Clears temporary vision and decoder blocks from the execution device.
@@ -403,6 +459,7 @@ pub struct QwenHybridLayerwiseAdapter {
     embedding: MaybeQuantized<safemlx::nn::Embedding>,
     norm: Qwen3NextRmsNorm,
     lm_head: Option<MaybeQuantized<safemlx::nn::Linear>>,
+    mtp: Option<MtpModule>,
     vision: Option<QwenVisionLayerwiseStatic>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
@@ -438,6 +495,11 @@ impl QwenHybridLayerwiseAdapter {
                 )?,
             )
         };
+        let mtp = (args.mtp_num_hidden_layers > 0)
+            .then(|| {
+                MtpModule::new_with_format(&args, QwenWeightFormat::for_text(&args, None), stream)
+            })
+            .transpose()?;
         let vision = vision_config
             .map(|config| QwenVisionTransformer::new(config, stream))
             .transpose()?
@@ -448,6 +510,7 @@ impl QwenHybridLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            mtp,
             vision,
             image_token_id,
             video_token_id,
@@ -463,6 +526,22 @@ impl QwenHybridLayerwiseAdapter {
 
     fn new_cache(&self) -> Cache {
         Cache::new(&self.args)
+    }
+
+    fn forward_mtp_head(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embeddings = self.embedding.forward(tokens, stream)?;
+        let hidden = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?
+            .forward(hidden, &embeddings, cache, stream)?;
+        project_logits_maybe_quantized(&mut self.lm_head, &mut self.embedding, &hidden, stream)
     }
 
     fn recipes_for_module(
@@ -502,6 +581,53 @@ impl QwenHybridLayerwiseAdapter {
             } else {
                 format!("{prefix}.{local_name}")
             };
+            let canonical = canonical_checkpoint_name(&destination);
+            if keys.contains(&destination) || keys.contains(&canonical) {
+                continue;
+            }
+            let raw = normalized
+                .get(&destination)
+                .or_else(|| normalized.get(&canonical))
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Qwen hybrid checkpoint is missing runtime parameter {canonical}"
+                    ))
+                })?;
+            recipes.insert(
+                local_name.to_string(),
+                DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+            );
+        }
+        Ok(recipes)
+    }
+
+    fn mtp_recipes(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+        let mtp = self.mtp.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture("Qwen hybrid model has no MTP module".into())
+        })?;
+        let normalized = normalized_checkpoint_keys(store);
+        let keys = store.keys();
+        let mut recipes = BTreeMap::new();
+        if self.args.is_moe() {
+            for index in 0..self.args.mtp_num_hidden_layers as usize {
+                add_expert_recipes_for_prefix(
+                    &mut recipes,
+                    &normalized,
+                    &format!("mtp.layers.{index}.mlp.experts"),
+                    &format!("layers.{index}.mlp"),
+                    &self.args,
+                    self.args.uses_fp8(),
+                )?;
+            }
+        }
+        for local_name in mtp.parameters().flatten().keys() {
+            if recipes.contains_key(local_name.as_ref()) {
+                continue;
+            }
+            let destination = format!("mtp.{local_name}");
             let canonical = canonical_checkpoint_name(&destination);
             if keys.contains(&destination) || keys.contains(&canonical) {
                 continue;
@@ -691,6 +817,17 @@ fn add_expert_recipes(
     fp8: bool,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}.mlp.experts");
+    add_expert_recipes_for_prefix(recipes, normalized, &prefix, "mlp", args, fp8)
+}
+
+fn add_expert_recipes_for_prefix(
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+    normalized: &BTreeMap<String, String>,
+    prefix: &str,
+    local_prefix: &str,
+    args: &ModelArgs,
+    fp8: bool,
+) -> Result<(), Error> {
     if normalized.contains_key(&format!("{prefix}.gate_up_proj")) {
         return Ok(());
     }
@@ -699,11 +836,11 @@ fn add_expert_recipes(
     let mut gate_up_scale = Vec::new();
     let mut down_scale = Vec::new();
     for expert in 0..args.num_experts {
-        let gate = expert_source(normalized, &prefix, expert, &["gate_proj", "w1"], "weight")?;
-        let up = expert_source(normalized, &prefix, expert, &["up_proj", "w3"], "weight")?;
+        let gate = expert_source(normalized, prefix, expert, &["gate_proj", "w1"], "weight")?;
+        let up = expert_source(normalized, prefix, expert, &["up_proj", "w3"], "weight")?;
         down.push(expert_source(
             normalized,
-            &prefix,
+            prefix,
             expert,
             &["down_proj", "w2"],
             "weight",
@@ -715,25 +852,20 @@ fn add_expert_recipes(
         if fp8 {
             let gate_scale = expert_source(
                 normalized,
-                &prefix,
+                prefix,
                 expert,
                 &["gate_proj"],
                 "weight_scale_inv",
             )?;
-            let up_scale = expert_source(
-                normalized,
-                &prefix,
-                expert,
-                &["up_proj"],
-                "weight_scale_inv",
-            )?;
+            let up_scale =
+                expert_source(normalized, prefix, expert, &["up_proj"], "weight_scale_inv")?;
             gate_up_scale.push(DerivedWeightRecipe::Concatenate {
                 axis: 0,
                 inputs: vec![gate_scale, up_scale],
             });
             down_scale.push(expert_source(
                 normalized,
-                &prefix,
+                prefix,
                 expert,
                 &["down_proj"],
                 "weight_scale_inv",
@@ -741,14 +873,14 @@ fn add_expert_recipes(
         }
     }
     recipes.insert(
-        "mlp.experts.gate_up_proj".into(),
+        format!("{local_prefix}.experts.gate_up_proj"),
         DerivedWeightRecipe::Stack {
             axis: 0,
             inputs: gate_up,
         },
     );
     recipes.insert(
-        "mlp.experts.down_proj".into(),
+        format!("{local_prefix}.experts.down_proj"),
         DerivedWeightRecipe::Stack {
             axis: 0,
             inputs: down,
@@ -756,14 +888,14 @@ fn add_expert_recipes(
     );
     if fp8 {
         recipes.insert(
-            "mlp.experts.gate_up_proj_scale_inv".into(),
+            format!("{local_prefix}.experts.gate_up_proj_scale_inv"),
             DerivedWeightRecipe::Stack {
                 axis: 0,
                 inputs: gate_up_scale,
             },
         );
         recipes.insert(
-            "mlp.experts.down_proj_scale_inv".into(),
+            format!("{local_prefix}.experts.down_proj_scale_inv"),
             DerivedWeightRecipe::Stack {
                 axis: 0,
                 inputs: down_scale,
@@ -971,6 +1103,7 @@ pub struct QwenHybridForwardContext {
     parts: Vec<QwenHybridPreparedPart>,
     vision_jobs: Vec<QwenHybridVisionJob>,
     needs_assembly: bool,
+    draft_hidden: Option<Array>,
 }
 
 /// One leased vision or hybrid text block.
@@ -1098,6 +1231,12 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                 )?,
             )?);
         }
+        if let Some(mtp) = &self.mtp {
+            units.push(StaticUnitBindings::new(
+                MTP_STATIC_UNIT,
+                build_module_bindings_with_recipes(mtp, "mtp", store, self.mtp_recipes(store)?)?,
+            )?);
+        }
         if let Some(vision) = &self.vision {
             units.push(StaticUnitBindings::new(
                 VISION_STATIC_UNIT,
@@ -1113,7 +1252,10 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = 2 + usize::from(self.lm_head.is_some()) + usize::from(self.vision.is_some());
+        let expected = 2
+            + usize::from(self.lm_head.is_some())
+            + usize::from(self.mtp.is_some())
+            + usize::from(self.vision.is_some());
         if leases.len() != expected {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Qwen hybrid adapter received {} static leases, expected {expected}",
@@ -1122,11 +1264,16 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
         }
         populate_module_from_lease(&mut self.embedding, &leases[0])?;
         populate_module_from_lease(&mut self.norm, &leases[1])?;
+        let mut index = 2;
         if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[2])?;
+            populate_module_from_lease(head, &leases[index])?;
+            index += 1;
+        }
+        if let Some(mtp) = &mut self.mtp {
+            populate_module_from_lease(mtp, &leases[index])?;
+            index += 1;
         }
         if let Some(vision) = &mut self.vision {
-            let index = 2 + usize::from(self.lm_head.is_some());
             populate_module_from_lease(vision, &leases[index])?;
         }
         Ok(())
@@ -1278,6 +1425,7 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                 parts,
                 vision_jobs,
                 needs_assembly,
+                draft_hidden: None,
             },
         })
     }
@@ -1555,6 +1703,9 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         let group_id = self.execution_group_id(group)?;
+        if group + 1 == self.execution_group_count() {
+            context.draft_hidden = Some(hidden.clone());
+        }
         let should_assemble =
             context.needs_assembly && (group_id == "vision_encoder" || self.vision.is_none());
         if !should_assemble {
@@ -1610,12 +1761,11 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
     }
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        key.starts_with("mtp.")
-            || (self.vision.is_none()
-                && (key.starts_with("visual.")
-                    || key.starts_with("vision_tower.")
-                    || key.starts_with("model.visual.")
-                    || key.starts_with("model.vision_tower.")))
+        self.vision.is_none()
+            && (key.starts_with("visual.")
+                || key.starts_with("vision_tower.")
+                || key.starts_with("model.visual.")
+                || key.starts_with("model.vision_tower."))
     }
 }
 
@@ -1656,6 +1806,7 @@ mod tests {
             "vocab_size": 32,
             "hidden_size": 16,
             "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
             "num_attention_heads": 2,
             "num_key_value_heads": 1,
             "head_dim": 8,
@@ -1753,11 +1904,6 @@ mod tests {
                 "model.layers.0.linear_attn.in_proj_ba.weight".into(),
                 Array::zeros::<f32>(&[ba_rows, model.args.hidden_size], stream).unwrap(),
             ));
-            arrays.push((
-                "mtp.fc.weight".into(),
-                Array::zeros::<f32>(&[model.args.hidden_size, model.args.hidden_size], stream)
-                    .unwrap(),
-            ));
         }
         Array::save_safetensors(
             arrays.iter().map(|(name, value)| (name.as_str(), value)),
@@ -1802,7 +1948,10 @@ mod tests {
             load_qwen35_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap()
         };
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache { layers: Vec::new() };
+        let mut layerwise_cache = Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -1850,6 +1999,40 @@ mod tests {
                 .filter(|unit| unit.device_resident() && !layers.contains(unit))
                 .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
         }
+
+        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
+        let mtp_config = crate::mtp::MtpConfig {
+            max_tokens: 3,
+            max_draft_tokens: 1,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut resident_cache = resident.new_cache();
+        let (expected, expected_stats) = crate::qwen_mtp::generate(
+            &mut resident,
+            &mut resident_cache,
+            runtime_input::ModelInput::new(&parts),
+            &mtp_config,
+            None,
+            &crate::sampler::DefaultSampler,
+            gpu.stream(),
+        )
+        .unwrap();
+        let mut layerwise_cache = layerwise.new_cache();
+        let (actual, actual_stats) = crate::qwen_mtp::generate(
+            &mut layerwise,
+            &mut layerwise_cache,
+            runtime_input::ModelInput::new(&parts),
+            &mtp_config,
+            None,
+            &crate::sampler::DefaultSampler,
+            gpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual_stats.rounds, expected_stats.rounds);
+        assert_eq!(actual_stats.accepted_tokens, expected_stats.accepted_tokens);
     }
 
     #[test]
@@ -1896,7 +2079,10 @@ mod tests {
                 .unwrap()
         };
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache { layers: Vec::new() };
+        let mut cached_cache = Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),

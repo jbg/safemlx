@@ -219,6 +219,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     fn commit_verification(
         &mut self,
         output: Self::Verification,
+        _draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,

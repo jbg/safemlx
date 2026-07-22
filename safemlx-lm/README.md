@@ -556,15 +556,18 @@ checkpoint metadata is an error.
 The `mtp` module provides lossless greedy or stochastic speculative decoding
 through architecture-neutral backend, cache-transaction, and sampling-policy
 contracts. `LoadedModel::mtp_capability` reports whether drafting weights are
-external, embedded but not yet implemented, or unavailable. Gemma 4 is the
-first complete adapter: resident and bounded-layer targets accept typed
-multimodal prefill and an explicit safetensors or GGUF `LoadedDrafter`.
+external, embedded, pending an adapter, or unavailable. Gemma 4 resident and
+bounded-layer targets accept typed multimodal prefill and an explicit
+safetensors or GGUF `LoadedDrafter`.
 Gemma assistant GGUF files may embed their JSON config in the
 `safemlx.mtp.config` metadata string or provide a sibling `config.json`.
-Text batches use independent caches, so acceptance lengths and EOS positions
-may diverge safely. DeepSeek-V3/R1, Inkling, Qwen3-Next, Qwen3.5/3.6, and
-Nemotron-H currently report their embedded-checkpoint capability without
-executing the skipped MTP weights.
+Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
+head through `generate_embedded_mtp_input`; resident and bounded-layer loading
+are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text
+batches use independent backbone and MTP caches, so acceptance lengths and EOS
+positions may diverge safely. DeepSeek-V3/R1, Inkling, and Nemotron-H still
+report their embedded-checkpoint capability without executing the skipped MTP
+weights.
 
 ### Quantized loading coverage
 

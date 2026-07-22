@@ -363,6 +363,13 @@ fn main() -> Result<()> {
     let mut time_to_first_token = None;
     let mut mtp_stats: Option<MtpStats> = None;
 
+    let embedded_mtp = args.mtp_draft_tokens > 0
+        && matches!(
+            model.mtp_capability(),
+            safemlx_lm::mtp::MtpCapability::Ready {
+                checkpoint: safemlx_lm::mtp::MtpCheckpointKind::Embedded
+            }
+        );
     if let Some(drafter) = drafter.as_mut() {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
@@ -374,6 +381,26 @@ fn main() -> Result<()> {
         };
         let (tokens, stats) = model.generate_mtp_input_with_sampler(
             drafter, &mut cache, input, &config, prng_key, &sampler, stream,
+        )?;
+        output_ids = tokens;
+        if output_ids
+            .last()
+            .is_some_and(|token| eos_token_ids.contains(token))
+        {
+            output_ids.pop();
+        }
+        mtp_stats = Some(stats);
+    } else if embedded_mtp {
+        let parts = [InputPart::text_token_ids(&tokens)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: args.max_tokens,
+            max_draft_tokens: args.mtp_draft_tokens,
+            temperature: args.temperature,
+            eos_token_ids: eos_token_ids.clone(),
+        };
+        let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler(
+            &mut cache, input, &config, prng_key, &sampler, stream,
         )?;
         output_ids = tokens;
         if output_ids

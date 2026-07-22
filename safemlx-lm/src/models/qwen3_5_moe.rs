@@ -46,16 +46,17 @@ use crate::{
         },
         input as runtime_input,
     },
-    quantization::{AffineQuantization, QuantizedTensor, WeightQuantization},
+    quantization::{AffineQuantization, WeightQuantization},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_quantized_strict,
-        load_array_strict, load_named_array_strict, load_safetensors_strict, safetensors_files,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_strict,
+        load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
+        load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
+        StrictLoadReport,
     },
 };
 
@@ -227,6 +228,9 @@ pub struct ModelArgs {
     pub hidden_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
+    #[serde(default, alias = "num_nextn_predict_layers")]
+    /// Number of embedded multi-token-prediction layers.
+    pub mtp_num_hidden_layers: i32,
     /// Number of full-attention query heads.
     pub num_attention_heads: i32,
     /// Number of full-attention key/value heads.
@@ -548,7 +552,7 @@ pub(crate) enum QwenWeightFormat {
 }
 
 impl QwenWeightFormat {
-    fn for_text(args: &ModelArgs, affine: Option<WeightQuantization>) -> Self {
+    pub(crate) fn for_text(args: &ModelArgs, affine: Option<WeightQuantization>) -> Self {
         match affine.or(args.quantization) {
             Some(affine) => Self::Affine(affine),
             None if args.uses_fp8() => Self::Fp8,
@@ -771,6 +775,8 @@ fn default_layer_type(index: usize) -> LayerType {
 pub struct Cache {
     /// One cache entry per transformer layer.
     pub layers: Vec<LayerCache>,
+    /// Full-attention caches owned by the embedded MTP layers.
+    pub(crate) mtp_layers: Vec<LayerCache>,
 }
 
 impl Cache {
@@ -786,6 +792,9 @@ impl Cache {
                         LayerCache::LinearAttention(LinearAttentionCache::default())
                     }
                 })
+                .collect(),
+            mtp_layers: (0..args.mtp_num_hidden_layers)
+                .map(|_| LayerCache::FullAttention(ConcatKeyValueCache::new()))
                 .collect(),
         }
     }
@@ -806,6 +815,11 @@ impl Cache {
             match layer {
                 LayerCache::FullAttention(cache) => cache.clear(),
                 LayerCache::LinearAttention(cache) => *cache = LinearAttentionCache::default(),
+            }
+        }
+        for cache in &mut self.mtp_layers {
+            if let LayerCache::FullAttention(cache) = cache {
+                cache.clear();
             }
         }
     }
@@ -3002,6 +3016,26 @@ impl TransformerBlock {
             )?,
         })
     }
+
+    fn new_mtp_with_format(
+        args: &ModelArgs,
+        layer_idx: usize,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            layer_type: LayerType::FullAttention,
+            self_attn: Some(FullAttention::new_with_format(args, format, stream)?),
+            linear_attn: None,
+            mlp: FeedForward::new(args, layer_idx, format, stream)?,
+            input_layernorm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
+            post_attention_layernorm: Qwen3NextRmsNorm::new(
+                args.hidden_size,
+                args.rms_norm_eps,
+                stream,
+            )?,
+        })
+    }
 }
 
 /// Input for a Qwen3.5 transformer block.
@@ -3197,7 +3231,117 @@ impl TransformerBlock {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
+/// Embedded Qwen multi-token-prediction head.
+pub(crate) struct MtpModule {
+    #[param]
+    pre_fc_norm_hidden: Qwen3NextRmsNorm,
+    #[param]
+    pre_fc_norm_embedding: Qwen3NextRmsNorm,
+    #[param]
+    fc: QwenLinear,
+    #[param]
+    layers: Vec<TransformerBlock>,
+    #[param]
+    norm: Qwen3NextRmsNorm,
+}
+
+impl MtpModule {
+    pub(crate) fn new_with_format(
+        args: &ModelArgs,
+        format: QwenWeightFormat,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if args.mtp_num_hidden_layers < 0 {
+            return Err(Exception::custom(
+                "Qwen MTP layer count must be non-negative",
+            ));
+        }
+        Ok(Self {
+            pre_fc_norm_hidden: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
+            pre_fc_norm_embedding: Qwen3NextRmsNorm::new(
+                args.hidden_size,
+                args.rms_norm_eps,
+                stream,
+            )?,
+            fc: QwenLinear::new(
+                args.hidden_size * 2,
+                args.hidden_size,
+                false,
+                // Native Qwen MTP checkpoints keep this fusion projection dense,
+                // including when the decoder layer itself is FP8 or affine packed.
+                QwenWeightFormat::Dense,
+                stream,
+            )?,
+            layers: (0..args.mtp_num_hidden_layers)
+                .map(|index| {
+                    TransformerBlock::new_mtp_with_format(args, index as usize, format, stream)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            norm: Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?,
+        })
+    }
+
+    pub(crate) fn forward(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if cache.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "Qwen MTP cache has {} layers, expected {}",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+        let layer = self
+            .layers
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?;
+        let layer_cache = cache
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen MTP cache is empty"))?;
+        let embeddings = self.pre_fc_norm_embedding.forward(embeddings, stream)?;
+        let hidden = self.pre_fc_norm_hidden.forward(hidden, stream)?;
+        let fused = concatenate_axis(&[&embeddings, &hidden], -1, stream)?;
+        let mut fused = self.fc.forward(&fused, stream)?;
+        let mask = if fused.dim(1) > 1 {
+            let offset = match &*layer_cache {
+                LayerCache::FullAttention(cache) => cache.offset(),
+                LayerCache::LinearAttention(_) => 0,
+            };
+            match create_attention_mask(&fused, &offset_cache(offset), Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("Qwen MTP requires an array causal mask"));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        // Each checkpoint MTP layer corresponds to a speculative step rather
+        // than a sequential transformer stack. The generalized runtime currently
+        // requests one native Qwen proposal, so execute step zero only.
+        fused = layer.forward(
+            BlockInput {
+                x: &fused,
+                mask: mask.as_ref(),
+                cache: Some(layer_cache),
+            },
+            stream,
+        )?;
+        self.norm.forward(&fused, stream)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.layers.len()
+    }
+}
+
 /// Qwen3.5 MoE text transformer body without the language-model head.
+#[derive(Debug, Clone, ModuleParameters)]
 pub struct Qwen35MoeTextModel {
     /// Token vocabulary size.
     pub vocab_size: i32,
@@ -3392,15 +3536,12 @@ pub struct ModelInput<'a> {
     pub cache: Option<&'a mut Cache>,
 }
 
-impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(
+impl Qwen35MoeTextModel {
+    pub(crate) fn forward_hidden(
         &mut self,
         input: ModelInput<'_>,
         stream: &Stream,
-    ) -> Result<Self::Output, Self::Error> {
+    ) -> Result<Array, Exception> {
         let ModelInput {
             inputs,
             inputs_embeds,
@@ -3453,9 +3594,23 @@ impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
                 )?;
             }
         }
-        let h = self.norm.forward(&h, stream)?;
-        profile_array(PerfComponent::FinalNorm, &h)?;
         Ok(h)
+    }
+}
+
+impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(
+        &mut self,
+        input: ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Output, Self::Error> {
+        let hidden = self.forward_hidden(input, stream)?;
+        let hidden = self.norm.forward(&hidden, stream)?;
+        profile_array(PerfComponent::FinalNorm, &hidden)?;
+        Ok(hidden)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -3512,6 +3667,9 @@ pub struct Model {
     /// Text transformer body.
     pub model: Qwen35MoeTextModel,
     #[param]
+    /// Embedded multi-token-prediction head when present in the checkpoint.
+    pub(crate) mtp: Option<MtpModule>,
+    #[param]
     /// Optional untied language-model head.
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
@@ -3545,6 +3703,9 @@ impl Model {
     ) -> Result<Self, Exception> {
         let format = QwenWeightFormat::for_text(&args, affine);
         let model = Qwen35MoeTextModel::new_with_format(&args, format, stream)?;
+        let mtp = (args.mtp_num_hidden_layers > 0)
+            .then(|| MtpModule::new_with_format(&args, format, stream))
+            .transpose()?;
         let visual = vision_args
             .clone()
             .map(|vision_args| QwenVisionTransformer::new(vision_args, stream))
@@ -3568,6 +3729,7 @@ impl Model {
             video_token_id,
             visual,
             model,
+            mtp,
             lm_head,
         })
     }
@@ -3628,6 +3790,67 @@ impl Model {
         Ok(logits)
     }
 
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.mtp.as_ref().map_or(0, MtpModule::len)
+    }
+
+    pub(crate) fn prefill_mtp(
+        &mut self,
+        input: runtime_input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        let tokens = runtime_input::text_token_ids(input, stream)?;
+        cache.reset();
+        self.forward_mtp_tokens(&tokens, cache, stream)
+    }
+
+    pub(crate) fn verify_mtp(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        self.forward_mtp_tokens(tokens, cache, stream)
+    }
+
+    fn forward_mtp_tokens(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        self.reject_multimodal_tokens(tokens, false, stream)?;
+        let hidden = self.model.forward_hidden(
+            ModelInput {
+                inputs: tokens,
+                inputs_embeds: None,
+                mask: None,
+                cache: Some(cache),
+            },
+            stream,
+        )?;
+        let normalized = self.model.norm.forward(&hidden, stream)?;
+        let logits = self.project_logits(&normalized, stream)?;
+        Ok(QwenMtpStepOutput { logits, hidden })
+    }
+
+    pub(crate) fn forward_mtp_head(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embeddings = self.model.embed_tokens.forward(tokens, stream)?;
+        let hidden = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?
+            .forward(hidden, &embeddings, cache, stream)?;
+        self.project_logits(&hidden, stream)
+    }
+
     pub(crate) fn forward_logits(
         &mut self,
         input: ModelInput<'_>,
@@ -3682,6 +3905,11 @@ impl Model {
         observer.observe("lm_head.logits", &logits)?;
         Ok(logits)
     }
+}
+
+pub(crate) struct QwenMtpStepOutput {
+    pub(crate) logits: Array,
+    pub(crate) hidden: Array,
 }
 
 impl Module<ModelInput<'_>> for Model {
@@ -3980,6 +4208,7 @@ fn qwen35_args_from_gguf(
         vocab_size,
         hidden_size,
         num_hidden_layers,
+        mtp_num_hidden_layers: 0,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
@@ -4492,6 +4721,18 @@ pub fn load_qwen3_5_moe_model(
             num_experts,
             |key, value| Ok(vec![(key, value)]),
         )?;
+    } else if model.args.is_moe() {
+        let num_experts = model.args.num_experts;
+        load_safetensors_dir_strict_with_split_swiglu_experts(
+            &mut model,
+            model_dir,
+            weights_stream,
+            stream,
+            None,
+            &config,
+            &mut report,
+            num_experts,
+        )?;
     } else {
         for weight_file in safetensors_files(model_dir)? {
             load_safetensors_strict(
@@ -4543,78 +4784,29 @@ pub fn load_qwen3_5_moe_model_quantized(
     )?;
     let config = qwen3_5_moe_strict_load_config(load_visual);
     let mut report = StrictLoadReport::default();
-    for weight_file in safetensors_files(model_dir)? {
-        load_qwen3_5_moe_affine_safetensors_strict(
-            &mut model,
-            weight_file,
-            weights_stream,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    }
+    let num_experts = model.args.num_experts;
+    load_safetensors_dir_strict_with_split_swiglu_experts(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        Some(quantization),
+        &config,
+        &mut report,
+        num_experts,
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
 }
 
-fn is_packed_expert_weight(key: &str) -> bool {
-    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
-}
-
+#[cfg(test)]
 fn quantize_packed_expert_tensor(
     value: &Array,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<QuantizedTensor, Error> {
+) -> Result<crate::quantization::QuantizedTensor, Error> {
     common::moe::quantize_expert_bank(value, quantization, stream)
-}
-
-fn load_qwen3_5_moe_affine_safetensors_strict(
-    model: &mut Model,
-    path: impl AsRef<Path>,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-    for_each_safetensor_array(path, weights_stream, |key, value| {
-        if is_packed_expert_weight(&key) {
-            let quantized =
-                quantize_packed_expert_tensor(&value, quantization, quantization_stream)?;
-            let mut arrays = vec![&quantized.weight, &quantized.scales];
-            if let Some(biases) = &quantized.biases {
-                arrays.push(biases);
-            }
-            eval(arrays)?;
-            quantization_stream.synchronize()?;
-            load_array_strict(&mut params, key.clone(), quantized.weight, config, report);
-            load_array_strict(
-                &mut params,
-                format!("{key}_scales"),
-                quantized.scales,
-                config,
-                report,
-            );
-            if let Some(biases) = quantized.biases {
-                load_array_strict(&mut params, format!("{key}_biases"), biases, config, report);
-            }
-            Ok(())
-        } else {
-            load_array_quantized_strict(
-                &mut params,
-                key,
-                value,
-                quantization_stream,
-                quantization,
-                config,
-                report,
-            )
-        }
-    })
 }
 
 #[derive(Default)]
@@ -4941,8 +5133,7 @@ pub(crate) fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadCon
         .rewrite_prefix("model.visual.merger.mlp.0.", "visual.merger.mlp.fc1.")
         .rewrite_prefix("model.visual.merger.mlp.2.", "visual.merger.mlp.fc2.")
         .rewrite_prefix("model.vision_tower.merger.mlp.0.", "visual.merger.mlp.fc1.")
-        .rewrite_prefix("model.vision_tower.merger.mlp.2.", "visual.merger.mlp.fc2.")
-        .allow_unused_prefix("mtp.");
+        .rewrite_prefix("model.vision_tower.merger.mlp.2.", "visual.merger.mlp.fc2.");
     if load_visual {
         config
     } else {
@@ -5224,6 +5415,7 @@ mod tests {
             vocab_size: 128,
             hidden_size: 16,
             num_hidden_layers: layer_types.len() as i32,
+            mtp_num_hidden_layers: 0,
             num_attention_heads: 2,
             num_key_value_heads: 1,
             head_dim: 8,
@@ -5592,6 +5784,7 @@ mod tests {
               "vocab_size": 128,
               "hidden_size": 16,
               "num_hidden_layers": 1,
+              "mtp_num_hidden_layers": 1,
               "num_attention_heads": 2,
               "num_key_value_heads": 1,
               "max_position_embeddings": 128,
@@ -5600,6 +5793,7 @@ mod tests {
         );
         let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_moe_text");
+        assert_eq!(args.mtp_num_hidden_layers, 1);
         assert_eq!(args.layer_types, vec![LayerType::FullAttention]);
     }
 
@@ -5690,6 +5884,7 @@ mod tests {
                 "hidden_size": 32,
                 "intermediate_size": 32,
                 "num_hidden_layers": 1,
+                "mtp_num_hidden_layers": 1,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
                 "head_dim": 8,
@@ -5726,6 +5921,7 @@ mod tests {
         };
         assert_eq!(model.model_type(), "qwen3_5_text");
         assert_eq!(model.args.num_experts, 0);
+        assert_eq!(model.mtp_len(), 1);
         assert!(matches!(model.model.layers[0].mlp, FeedForward::Dense(_)));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
@@ -5739,6 +5935,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(logits.shape(), &[1, 32]);
+
+        let mtp_config = crate::mtp::MtpConfig {
+            max_tokens: 3,
+            max_draft_tokens: 1,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut mtp_cache = model.new_cache();
+        let (generated, stats) = crate::qwen_mtp::generate(
+            &mut model,
+            &mut mtp_cache,
+            runtime_input::ModelInput::new(&parts),
+            &mtp_config,
+            None,
+            &crate::sampler::DefaultSampler,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(generated, vec![0, 0, 0]);
+        assert_eq!(stats.rounds, 1);
+        assert_eq!(stats.accepted_tokens, 1);
 
         let quantized = crate::models::load_model_with_options(
             &dir,
@@ -5762,6 +5979,17 @@ mod tests {
         );
         assert!(params.contains_key("model.layers.0.mlp.gate_proj.scales"));
         assert!(params.contains_key("model.layers.0.mlp.gate_proj.biases"));
+        assert_eq!(
+            params.get("mtp.fc.weight").unwrap().dtype(),
+            safemlx::Dtype::Float32
+        );
+        assert_eq!(
+            params
+                .get("mtp.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .dtype(),
+            safemlx::Dtype::Uint32
+        );
         assert!(!params.keys().any(|key| key.contains("dense_mlp")));
         drop(params);
         let mut cache = quantized.new_cache();
@@ -5773,6 +6001,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(logits.shape(), &[1, 32]);
+
+        let mut mtp_cache = quantized.new_cache();
+        let (generated, stats) = crate::qwen_mtp::generate(
+            &mut quantized,
+            &mut mtp_cache,
+            runtime_input::ModelInput::new(&parts),
+            &mtp_config,
+            None,
+            &crate::sampler::DefaultSampler,
+            stream,
+        )
+        .unwrap();
+        assert_eq!(generated, vec![0, 0, 0]);
+        assert_eq!(stats.accepted_tokens, 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6055,7 +6297,8 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention, LayerType::FullAttention]);
+        let mut args = tiny_args(vec![LayerType::LinearAttention, LayerType::FullAttention]);
+        args.mtp_num_hidden_layers = 1;
         let model = Model::new(args, Some(248056), Some(248057), None, stream).unwrap();
         let params = model.parameters().flatten();
 
@@ -6077,6 +6320,14 @@ mod tests {
             "model.layers.1.self_attn.o_proj.weight",
             "model.layers.1.self_attn.q_norm.weight",
             "model.layers.1.self_attn.k_norm.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.fc.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.gate.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+            "mtp.norm.weight",
             "lm_head.weight",
         ] {
             assert!(params.contains_key(key), "missing parameter key {key}");
@@ -6649,7 +6900,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
-    fn strict_load_allows_unused_non_text_prefixes() {
+    fn strict_load_allows_unused_visual_prefixes() {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
@@ -6668,10 +6919,6 @@ mod tests {
                 ),
                 (
                     "model.vision_tower.extra.weight".to_string(),
-                    Array::zeros::<f32>(&[1], stream).unwrap(),
-                ),
-                (
-                    "mtp.extra.weight".to_string(),
                     Array::zeros::<f32>(&[1], stream).unwrap(),
                 ),
             ],

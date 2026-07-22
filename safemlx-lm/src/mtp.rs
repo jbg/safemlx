@@ -278,6 +278,7 @@ pub trait MtpBackend {
     fn commit_verification(
         &mut self,
         output: Self::Verification,
+        draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
@@ -454,6 +455,7 @@ where
         let verified_inputs = 1 + accepted;
         let commit = backend.commit_verification(
             verification,
+            draft_state,
             cache,
             checkpoint,
             verified_inputs,
@@ -655,6 +657,7 @@ mod tests {
         fn commit_verification(
             &mut self,
             _output: Self::Verification,
+            _draft_state: Self::DraftState,
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
