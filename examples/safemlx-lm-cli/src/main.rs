@@ -83,7 +83,8 @@ impl SpeculativeSampler for CliSampler {
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Model directory, GGUF file, or Hugging Face model identifier.
+    /// Model directory, GGUF file, or cached Hugging Face model identifier.
+    /// Append `:QUANT` to select a cached GGUF quantization.
     #[arg(short, long, value_name = "PATH_OR_ID")]
     model: String,
 
@@ -789,6 +790,8 @@ fn resolve_model(spec: &str, requested_revision: Option<&str>) -> Result<PathBuf
             .with_context(|| format!("failed to resolve model path {}", path.display()));
     }
 
+    let (repo_id, quantization) = split_hf_model_spec(spec)?;
+
     let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
     let cache = client
         .scan_cache()
@@ -797,17 +800,156 @@ fn resolve_model(spec: &str, requested_revision: Option<&str>) -> Result<PathBuf
     let repo = cache
         .repos
         .iter()
-        .find(|repo| repo.repo_type == "model" && repo.repo_id == spec)
+        .find(|repo| repo.repo_type == "model" && repo.repo_id == repo_id)
         .with_context(|| {
             format!(
-                "{spec:?} is not an existing path or a model in the local Hugging Face cache at {}",
+                "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
                 cache.cache_dir.display()
             )
         })?;
     let revision = select_revision(&repo.revisions, requested_revision).with_context(|| {
-        format!("could not select a cached revision for Hugging Face model {spec:?}")
+        format!("could not select a cached revision for Hugging Face model {repo_id:?}")
     })?;
-    Ok(revision.snapshot_path.clone())
+    match quantization {
+        Some(quantization) => select_cached_gguf(revision, quantization).with_context(|| {
+            format!(
+                "could not select GGUF quantization {quantization:?} for Hugging Face model {repo_id:?}"
+            )
+        }),
+        None => Ok(revision.snapshot_path.clone()),
+    }
+}
+
+fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
+    let Some((repo_id, quantization)) = spec.rsplit_once(':') else {
+        return Ok((spec, None));
+    };
+    if repo_id.is_empty() {
+        bail!("Hugging Face model identifier before ':' must not be empty");
+    }
+    if quantization.is_empty() {
+        bail!("GGUF quantization selector after ':' must not be empty");
+    }
+    Ok((repo_id, Some(quantization)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuantizationMatch {
+    Exact,
+    UnslothAlias,
+}
+
+fn select_cached_gguf(revision: &CachedRevisionInfo, quantization: &str) -> Result<PathBuf> {
+    let files = revision
+        .files
+        .iter()
+        .map(|file| file.file_path.as_path())
+        .collect::<Vec<_>>();
+    select_cached_gguf_path(&files, quantization)
+}
+
+fn select_cached_gguf_path(files: &[&Path], quantization: &str) -> Result<PathBuf> {
+    let selector = quantization.to_ascii_uppercase();
+    let unsloth_alias = (!selector.starts_with("UD-")).then(|| format!("UD-{selector}"));
+    let mut gguf_files = Vec::new();
+    let mut candidates = Vec::new();
+
+    for &path in files {
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            continue;
+        }
+        gguf_files.push(path);
+
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let (stem, first_shard) = strip_gguf_shard_suffix(stem);
+        if !first_shard {
+            continue;
+        }
+        let stem = stem.to_ascii_uppercase();
+        let matched = if quantization_suffix_matches(&stem, &selector) {
+            if unsloth_alias
+                .as_deref()
+                .is_some_and(|alias| quantization_suffix_matches(&stem, alias))
+            {
+                QuantizationMatch::UnslothAlias
+            } else {
+                QuantizationMatch::Exact
+            }
+        } else {
+            continue;
+        };
+        candidates.push((path, matched));
+    }
+
+    if candidates
+        .iter()
+        .any(|(_, matched)| *matched == QuantizationMatch::Exact)
+    {
+        candidates.retain(|(_, matched)| *matched == QuantizationMatch::Exact);
+    }
+    candidates.sort_unstable_by_key(|(path, _)| *path);
+
+    match candidates.as_slice() {
+        [(path, _)] => Ok((*path).to_owned()),
+        [] => {
+            let available = format_cached_paths(&gguf_files);
+            if available.is_empty() {
+                bail!("the selected cached revision contains no GGUF files");
+            }
+            bail!(
+                "no cached GGUF filename matches quantization {quantization:?}; available GGUF files: {available}"
+            )
+        }
+        _ => {
+            let paths = candidates.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+            bail!(
+                "quantization {quantization:?} matches multiple cached GGUF files: {}",
+                format_cached_paths(&paths)
+            )
+        }
+    }
+}
+
+fn quantization_suffix_matches(stem: &str, selector: &str) -> bool {
+    let Some(prefix) = stem.strip_suffix(selector) else {
+        return false;
+    };
+    prefix.is_empty()
+        || prefix
+            .chars()
+            .next_back()
+            .is_some_and(|separator| matches!(separator, '-' | '.' | '_'))
+}
+
+fn strip_gguf_shard_suffix(stem: &str) -> (&str, bool) {
+    let Some((prefix, count)) = stem.rsplit_once("-of-") else {
+        return (stem, true);
+    };
+    let Some((base, number)) = prefix.rsplit_once('-') else {
+        return (stem, true);
+    };
+    let canonical_number = number.len() == 5 && number.bytes().all(|byte| byte.is_ascii_digit());
+    let canonical_count = count.len() == 5 && count.bytes().all(|byte| byte.is_ascii_digit());
+    if canonical_number && canonical_count {
+        (base, number == "00001")
+    } else {
+        (stem, true)
+    }
+}
+
+fn format_cached_paths(paths: &[&Path]) -> String {
+    let mut paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.join(", ")
 }
 
 fn select_revision<'a>(
@@ -837,12 +979,18 @@ fn select_revision<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        path::Path,
+        time::{Duration, SystemTime},
+    };
 
     use clap::{CommandFactory, Parser};
     use hf_hub::cache::CachedRevisionInfo;
 
-    use super::{format_bytes, select_revision, validate_args, Cli};
+    use super::{
+        format_bytes, select_cached_gguf_path, select_revision, split_hf_model_spec, validate_args,
+        Cli,
+    };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
         CachedRevisionInfo {
@@ -924,6 +1072,55 @@ mod tests {
             select_revision(&revisions, None).unwrap().commit_hash,
             "newer"
         );
+    }
+
+    #[test]
+    fn parses_hugging_face_quantization_selector() {
+        assert_eq!(
+            split_hf_model_spec("unsloth/model-GGUF:UD-Q4_K_M").unwrap(),
+            ("unsloth/model-GGUF", Some("UD-Q4_K_M"))
+        );
+        assert_eq!(
+            split_hf_model_spec("unsloth/model-GGUF").unwrap(),
+            ("unsloth/model-GGUF", None)
+        );
+        assert!(split_hf_model_spec("unsloth/model-GGUF:").is_err());
+    }
+
+    #[test]
+    fn selects_exact_and_unsloth_aliased_quantizations() {
+        let q4 = Path::new("snapshot/model-Q4_K_M.gguf");
+        let ud_q4 = Path::new("snapshot/model-UD-Q4_K_M.gguf");
+        let files = [q4, ud_q4];
+
+        assert_eq!(select_cached_gguf_path(&files, "UD-Q4_K_M").unwrap(), ud_q4);
+        assert_eq!(select_cached_gguf_path(&files, "q4_k_m").unwrap(), q4);
+        assert_eq!(select_cached_gguf_path(&[ud_q4], "Q4_K_M").unwrap(), ud_q4);
+    }
+
+    #[test]
+    fn selects_first_shard_for_quantization() {
+        let first = Path::new("snapshot/model-Q4_K_M-00001-of-00002.gguf");
+        let second = Path::new("snapshot/model-Q4_K_M-00002-of-00002.gguf");
+        assert_eq!(
+            select_cached_gguf_path(&[second, first], "Q4_K_M").unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_missing_quantizations() {
+        let first = Path::new("snapshot/first-Q4_K_M.gguf");
+        let second = Path::new("snapshot/second-Q4_K_M.gguf");
+        let error = select_cached_gguf_path(&[first, second], "Q4_K_M")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("matches multiple cached GGUF files"));
+
+        let error = select_cached_gguf_path(&[first], "Q8_0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("available GGUF files"));
     }
 
     #[test]

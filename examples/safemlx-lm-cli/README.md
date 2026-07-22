@@ -22,6 +22,22 @@ The Hugging Face form never downloads files. It scans the cache selected by
 `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, or `HF_HOME` and uses the cached
 `main` revision. Use `--revision` to select another cached ref or commit.
 
+For a cached repository containing multiple GGUF files, append a
+case-insensitive quantization selector to the model identifier. The full
+quantization name and the llama.cpp-style alias are both accepted; for example,
+`UD-Q4_K_M` can also be selected with `Q4_K_M` when no exact `Q4_K_M` file is
+cached:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model unsloth/Qwen3-0.6B-GGUF:Q4_K_M \
+  "Explain imaginary numbers."
+```
+
+Selection is limited to files already present in the chosen cached revision.
+For sharded GGUF checkpoints, the CLI resolves the first canonical shard and
+the loader discovers the remaining shards.
+
 Local model paths use the same interface:
 
 ```sh
