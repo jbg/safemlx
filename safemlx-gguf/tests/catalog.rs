@@ -314,7 +314,7 @@ fn rejects_generated_logical_name_collisions_without_converting_payloads() {
 }
 
 #[test]
-fn plans_legacy_q5_as_dense_f16() {
+fn plans_legacy_q5_as_native_affine() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("legacy.gguf");
     let payload = [0u8; 22];
@@ -332,10 +332,14 @@ fn plans_legacy_q5_as_dense_f16() {
 
     let catalog = Checkpoint::open(path).unwrap();
     let tensor = &catalog.shards()[0].tensors()[0];
-    assert_eq!(tensor.affine(), None);
-    assert_eq!(tensor.outputs().len(), 1);
-    assert_eq!(tensor.outputs()[0].shape, [32]);
-    assert_eq!(tensor.outputs()[0].dtype, LogicalDtype::F16);
+    assert_eq!(tensor.affine(), Some((5, 32)));
+    assert_eq!(tensor.outputs().len(), 3);
+    assert_eq!(tensor.outputs()[0].shape, [5]);
+    assert_eq!(tensor.outputs()[0].dtype, LogicalDtype::U32);
+    assert_eq!(tensor.outputs()[1].shape, [1]);
+    assert_eq!(tensor.outputs()[1].dtype, LogicalDtype::F16);
+    assert_eq!(tensor.outputs()[2].shape, [1]);
+    assert_eq!(tensor.outputs()[2].dtype, LogicalDtype::F16);
 }
 
 #[test]

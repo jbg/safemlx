@@ -75,14 +75,11 @@ pub(crate) fn conversion_kind(ty: GgmlType) -> Result<ConversionKind> {
     if let Some(dtype) = dense_dtype(ty) {
         return Ok(ConversionKind::Dense(dtype));
     }
-    if matches!(ty, GgmlType::Q5_0 | GgmlType::Q5_1) {
-        return Ok(ConversionKind::Dense(DenseDtype::F16));
-    }
     let (bits, group_size) = match ty {
         GgmlType::Q2K => (2, 16),
         GgmlType::Q3K => (3, 16),
         GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4K => (4, 32),
-        GgmlType::Q5K => (5, 32),
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q5K => (5, 32),
         GgmlType::Q6K => (6, 16),
         GgmlType::Q8_0 => (8, 32),
         other => return Err(Error::UnsupportedTensorType(other.code())),
@@ -126,9 +123,6 @@ pub(crate) fn convert(
         ));
     }
     match conversion_kind(desc.ggml_type)? {
-        ConversionKind::Dense(_) if matches!(desc.ggml_type, GgmlType::Q5_0 | GgmlType::Q5_1) => {
-            return legacy_q5(desc, raw, endian).map(ConvertedTensor::Dense);
-        }
         ConversionKind::Dense(dtype) => {
             return Ok(ConvertedTensor::Dense(DenseTensor {
                 shape: desc.mlx_shape(),
@@ -224,6 +218,9 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
                 }
                 pack(&codes, 4, &mut out.weights);
             }
+        }
+        GgmlType::Q5_0 | GgmlType::Q5_1 => {
+            q5(raw, endian, desc.ggml_type == GgmlType::Q5_0, &mut out)
         }
         GgmlType::Q8_0 => {
             for b in raw.chunks_exact(34) {
@@ -392,42 +389,24 @@ fn q3k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
     }
 }
 
-fn legacy_q5(desc: &TensorDescriptor, raw: &[u8], e: Endian) -> Result<DenseTensor> {
-    let mut data = Vec::with_capacity(desc.element_count()? as usize * 2);
-    let size = if desc.ggml_type == GgmlType::Q5_0 {
-        22
-    } else {
-        24
-    };
+fn q5(raw: &[u8], e: Endian, is_q5_0: bool, out: &mut AffineTensor) {
+    let size = if is_q5_0 { 22 } else { 24 };
     for b in raw.chunks_exact(size) {
-        let d = f16::from_bits(half(b, e)).to_f32();
-        let m = if size == 24 {
-            f16::from_bits(half(&b[2..], e)).to_f32()
+        let d = half(b, e);
+        out.scales.push(d);
+        if is_q5_0 {
+            out.biases.push(hbits(-16.0 * f16::from_bits(d).to_f32()));
         } else {
-            0.0
-        };
-        let qh_off = if size == 22 { 2 } else { 4 };
-        let qs_off = if size == 22 { 6 } else { 8 };
+            out.biases.push(half(&b[2..], e));
+        }
+        let qh_off = if is_q5_0 { 2 } else { 4 };
+        let qs_off = if is_q5_0 { 6 } else { 8 };
         let qh = e.u32(b[qh_off..qh_off + 4].try_into().unwrap());
-        let mut values = [0i32; 32];
+        let mut codes = [0u8; 32];
         for j in 0..16 {
-            values[j] = ((b[qs_off + j] & 15) | ((((qh >> j) << 4) & 16) as u8)) as i32
-                - (if size == 22 { 16 } else { 0 });
-            values[j + 16] = ((b[qs_off + j] >> 4) | (((qh >> (j + 12)) & 16) as u8)) as i32
-                - (if size == 22 { 16 } else { 0 });
+            codes[j] = (b[qs_off + j] & 15) | (((qh >> j) as u8 & 1) << 4);
+            codes[j + 16] = (b[qs_off + j] >> 4) | (((qh >> (j + 16)) as u8 & 1) << 4);
         }
-        for q in values {
-            let value = if size == 22 {
-                q as f32 * d
-            } else {
-                q as f32 * d + m
-            };
-            data.extend_from_slice(&hbits(value).to_ne_bytes());
-        }
+        pack(&codes, 5, &mut out.weights);
     }
-    Ok(DenseTensor {
-        shape: desc.mlx_shape(),
-        dtype: DenseDtype::F16,
-        data,
-    })
 }

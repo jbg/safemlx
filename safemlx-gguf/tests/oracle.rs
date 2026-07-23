@@ -49,6 +49,27 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
         let converted = reader.read_tensor(&desc).unwrap();
         match converted {
             ConvertedTensor::Affine(a) => {
+                if matches!(ty, GgmlType::Q5_0 | GgmlType::Q5_1) {
+                    assert_eq!(fields.len(), 3, "format {code}");
+                    assert_eq!(a.bits, 5);
+                    assert_eq!(a.group_size, 32);
+                    let (name, dtype, data) = parse_field(fields[2]);
+                    assert_eq!(name, "oracle.weight:[2, 32]");
+                    assert_eq!(dtype, "Float16");
+                    let expected: Vec<f32> = unhex(data)
+                        .chunks_exact(2)
+                        .map(|b| {
+                            half::f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32()
+                        })
+                        .collect();
+                    for (i, (actual, expected)) in
+                        a.dequantize().into_iter().zip(expected).enumerate()
+                    {
+                        let actual = half::f16::from_f32(actual).to_f32();
+                        assert_eq!(actual, expected, "legacy Q5 dequant at index {i}");
+                    }
+                    continue;
+                }
                 assert_eq!(fields.len(), 6, "format {code}");
                 let (name, dtype, w) = parse_field(fields[2]);
                 assert!(name.starts_with("oracle.weight:[2, "));
@@ -94,6 +115,114 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
             }
         }
     }
+}
+
+fn q5_block(ty: GgmlType, scale: f32, bias: f32, codes: &[u8; 32]) -> Vec<u8> {
+    let is_q5_0 = ty == GgmlType::Q5_0;
+    let mut block = vec![0u8; if is_q5_0 { 22 } else { 24 }];
+    block[..2].copy_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+    if !is_q5_0 {
+        block[2..4].copy_from_slice(&half::f16::from_f32(bias).to_bits().to_le_bytes());
+    }
+    let qh_offset = if is_q5_0 { 2 } else { 4 };
+    let qs_offset = if is_q5_0 { 6 } else { 8 };
+    let mut qh = 0u32;
+    for j in 0..16 {
+        assert!(codes[j] < 32 && codes[j + 16] < 32);
+        qh |= u32::from(codes[j] >> 4) << j;
+        qh |= u32::from(codes[j + 16] >> 4) << (j + 16);
+        block[qs_offset + j] = (codes[j] & 15) | ((codes[j + 16] & 15) << 4);
+    }
+    block[qh_offset..qh_offset + 4].copy_from_slice(&qh.to_le_bytes());
+    block
+}
+
+fn read_q5(ty: GgmlType, blocks: &[Vec<u8>]) -> safemlx_gguf::AffineTensor {
+    let raw: Vec<u8> = blocks.iter().flatten().copied().collect();
+    let mut file = Cursor::new(Vec::new());
+    Writer::default()
+        .write(
+            &mut file,
+            &BTreeMap::new(),
+            &[TensorInput {
+                name: "q5.weight",
+                dimensions: &[32, blocks.len() as u64],
+                ggml_type: ty,
+                data: &raw,
+            }],
+        )
+        .unwrap();
+    let mut reader = Reader::new(Cursor::new(file.into_inner())).unwrap();
+    let descriptor = reader.tensors()[0].clone();
+    let ConvertedTensor::Affine(affine) = reader.read_tensor(&descriptor).unwrap() else {
+        panic!("Q5 tensors must remain packed affine tensors");
+    };
+    affine
+}
+
+fn unpack_codes(weights: &[u32], count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| {
+            let offset = index * 5;
+            let word = offset / 32;
+            let shift = offset % 32;
+            let mut code = weights[word] >> shift;
+            if shift + 5 > 32 {
+                code |= weights[word + 1] << (32 - shift);
+            }
+            (code & 31) as u8
+        })
+        .collect()
+}
+
+fn assert_q5_repacked(ty: GgmlType, scales: [f32; 2], biases: [f32; 2]) {
+    let codes0 = std::array::from_fn(|i| i as u8);
+    let codes1 = std::array::from_fn(|i| ((i * 13 + 7) & 31) as u8);
+    let codes = [codes0, codes1];
+    let blocks: Vec<_> = codes
+        .iter()
+        .enumerate()
+        .map(|(i, codes)| q5_block(ty, scales[i], biases[i], codes))
+        .collect();
+    let affine = read_q5(ty, &blocks);
+
+    assert_eq!(affine.bits, 5);
+    assert_eq!(affine.group_size, 32);
+    assert_eq!(affine.weight_shape, [2, 5]);
+    assert_eq!(affine.scale_shape, [2, 1]);
+    assert_eq!(affine.weights.len(), 10);
+    assert_eq!(affine.scales.len(), 2);
+    assert_eq!(affine.biases.len(), 2);
+    assert_eq!(
+        unpack_codes(&affine.weights, 64),
+        codes.into_iter().flatten().collect::<Vec<_>>()
+    );
+
+    let actual = affine.dequantize();
+    for block in 0..2 {
+        let d = half::f16::from_f32(scales[block]).to_f32();
+        let m = half::f16::from_f32(biases[block]).to_f32();
+        for index in 0..32 {
+            let code = i32::from(codes[block][index]);
+            let expected = if ty == GgmlType::Q5_0 {
+                d * (code - 16) as f32
+            } else {
+                d * code as f32 + m
+            };
+            let position = block * 32 + index;
+            assert_eq!(actual[position], expected, "block {block} code {index}");
+        }
+    }
+}
+
+#[test]
+fn q5_0_repacking_preserves_signed_values_and_gguf_bit_order() {
+    assert_q5_repacked(GgmlType::Q5_0, [0.5, -1.25], [0.0; 2]);
+}
+
+#[test]
+fn q5_1_repacking_preserves_bias_and_gguf_bit_order() {
+    assert_q5_repacked(GgmlType::Q5_1, [0.25, 1.75], [1.5, -0.75]);
 }
 
 #[test]

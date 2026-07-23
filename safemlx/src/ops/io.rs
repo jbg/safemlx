@@ -470,8 +470,8 @@ mod tests {
             ("q4_k.weight", safemlx_gguf::GgmlType::Q4K),
             ("q5_k.weight", safemlx_gguf::GgmlType::Q5K),
             ("q6_k.weight", safemlx_gguf::GgmlType::Q6K),
-            ("q5_0_legacy", safemlx_gguf::GgmlType::Q5_0),
-            ("q5_1_legacy", safemlx_gguf::GgmlType::Q5_1),
+            ("q5_0.weight", safemlx_gguf::GgmlType::Q5_0),
+            ("q5_1.weight", safemlx_gguf::GgmlType::Q5_1),
         ];
         let payloads = formats
             .iter()
@@ -502,7 +502,7 @@ mod tests {
             )
             .unwrap();
         let (arrays, _) = collect_gguf(&path);
-        for (name, _) in &formats[..8] {
+        for (name, _) in &formats {
             let prefix = name.strip_suffix(".weight").unwrap();
             assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint32);
             assert_eq!(
@@ -514,9 +514,22 @@ mod tests {
                 crate::Dtype::Float16
             );
         }
-        assert_eq!(arrays["q5_0_legacy"].dtype(), crate::Dtype::Float16);
-        assert_eq!(arrays["q5_1_legacy"].dtype(), crate::Dtype::Float16);
-        assert_eq!(arrays.len(), 26);
+        assert_eq!(arrays.len(), 30);
+
+        #[cfg(feature = "metal")]
+        if crate::metal::is_available().unwrap_or(false) {
+            let metal =
+                crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));
+            let copies = arrays
+                .values()
+                .map(|array| array.copy(&metal).unwrap())
+                .collect::<Vec<_>>();
+            crate::transforms::eval(&copies).unwrap();
+            for (source, copied) in arrays.values().zip(&copies) {
+                assert_eq!(copied.dtype(), source.dtype());
+                assert_eq!(copied.shape(), source.shape());
+            }
+        }
     }
 
     #[test]

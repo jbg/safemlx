@@ -22,10 +22,11 @@ checkpoint.for_each_converted_tensor(|tensor| {
 ```
 
 Dense support: F32, F16, BF16, F64, I8, I16, I32, and I64. Affine support:
-Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, and Q6_K. Legacy Q5_0 and Q5_1
-are decoded to F16 to preserve the previous patched-MLX behavior. The writer
-accepts the same dense types and preserves canonical raw bytes for every listed
-quantized type; it does not invent a lossy inverse from MLX affine triples.
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, and Q6_K. Q5_0 and
+Q5_1 are repacked directly into MLX's 5-bit, group-size-32 affine layout. The
+writer accepts the same dense types and preserves canonical raw bytes for every
+listed quantized type; it does not invent a lossy inverse from MLX affine
+triples.
 
 `Limits` bounds metadata counts, string/array sizes, tensor counts and ranks,
 nesting depth, and per-tensor allocation. Parsing uses checked arithmetic and
