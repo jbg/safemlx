@@ -15,7 +15,8 @@ mod writer;
 
 pub use catalog::{
     CatalogShard, CatalogTensor, Checkpoint, ConvertedCheckpointTensor, ConvertedTensorIter,
-    LogicalDtype, LogicalTensorLayout, TensorMaterializer, TranslatedTensorLayout,
+    LogicalDtype, LogicalTensorLayout, RawCheckpointTensor, TensorMaterializer,
+    TranslatedTensorLayout,
 };
 pub use convert::{AffineTensor, ConvertedTensor, DenseDtype, DenseTensor};
 pub use error::{Error, Result};

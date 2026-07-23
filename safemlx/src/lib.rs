@@ -312,6 +312,7 @@ pub mod memory;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod module;
+pub mod native_quantization;
 pub mod nested;
 pub mod nn;
 pub mod ops;

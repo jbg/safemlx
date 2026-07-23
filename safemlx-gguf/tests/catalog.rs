@@ -223,8 +223,10 @@ fn indexed_materializer_reuses_the_open_shard_reader() {
 
     let checkpoint = Checkpoint::open(&path).unwrap();
     let mut materializer = checkpoint.materializer();
-    let first_tensor = materializer.converted_tensor("first.weight").unwrap();
+    let first_tensor = materializer.raw_tensor("first.weight").unwrap();
     assert_eq!(first_tensor.tensor_index(), 0);
+    assert_eq!(first_tensor.descriptor().name, "first.weight");
+    assert_eq!(first_tensor.data(), first);
 
     // An open file remains readable after unlink on supported Unix targets.
     // This proves the second lookup reuses the reader instead of reopening and
@@ -243,6 +245,12 @@ fn indexed_materializer_reuses_the_open_shard_reader() {
         error,
         Error::InvalidTensor { ref tensor, .. } if tensor == "missing.weight"
     ));
+
+    // A materialized raw tensor owns its bytes independently of the reader and
+    // checkpoint, which is the safe lifetime boundary used by native backends.
+    drop(materializer);
+    drop(checkpoint);
+    assert_eq!(first_tensor.data(), first);
 }
 
 #[test]

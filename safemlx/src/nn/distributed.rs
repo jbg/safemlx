@@ -342,6 +342,7 @@ impl QuantizedAllToShardedLinear {
             group_size: linear.group_size,
             bits: linear.bits,
             mode: linear.mode,
+            native: None,
             scales: Param::new(shard_axis(
                 &linear.scales.value,
                 0,
@@ -489,6 +490,7 @@ impl QuantizedShardedToAllLinear {
             group_size: linear.group_size,
             bits: linear.bits,
             mode: linear.mode,
+            native: None,
             scales: Param::new(shard_axis(
                 &linear.scales.value,
                 1,

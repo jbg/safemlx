@@ -59,6 +59,32 @@ pub fn affine_grouped_linear_with_transpose(
     transpose: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    affine_grouped_linear_with_options(
+        input,
+        weight,
+        scales,
+        biases,
+        group_ids,
+        quantization,
+        transpose,
+        true,
+        stream,
+    )
+}
+
+/// Applies an affine packed grouped projection with explicit route-order metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_grouped_linear_with_options(
+    input: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    group_ids: &Array,
+    quantization: WeightQuantization,
+    transpose: bool,
+    sorted_indices: bool,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     let routes = input.dim(0);
     let out_features = if transpose {
         weight.dim(-2)
@@ -101,7 +127,7 @@ pub fn affine_grouped_linear_with_transpose(
         transpose,
         quantization.group_size(),
         quantization.bits(),
-        true,
+        sorted_indices,
         quantization.mode(),
         stream,
     )?

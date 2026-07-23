@@ -203,6 +203,13 @@ struct Cli {
     /// Print model resolution and generation statistics to stderr.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Synchronize Gemma 4 component boundaries and report component timings.
+    ///
+    /// This changes scheduling and should be used for diagnosis, not headline
+    /// throughput measurements.
+    #[arg(long)]
+    profile_components: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,6 +416,11 @@ fn main() -> Result<()> {
         .then(|| safemlx::random::key(args.seed))
         .transpose()?;
     let mut output_ids = Vec::with_capacity(args.max_tokens);
+    let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
+    if profile_gemma4 {
+        safemlx_lm::models::gemma4::set_perf_profiling(true);
+        safemlx_lm::models::gemma4::reset_perf_stats();
+    }
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
     let mut mtp_stats: Option<MtpStats> = None;
@@ -600,6 +612,38 @@ fn main() -> Result<()> {
         eprintln!("mlx_peak_memory: {}", format_bytes(peak_memory));
         eprintln!("mlx_active_memory: {}", format_bytes(active_memory));
         eprintln!("mlx_cache_memory: {}", format_bytes(cache_memory));
+        if let Some(stats) = model.native_quantization_stats() {
+            eprintln!(
+                "native_quantization: {} tensors / {}, fallback: {} tensors / {} checkpoint bytes",
+                stats.native_tensor_count,
+                format_bytes(stats.native_bytes as usize),
+                stats.fallback_tensor_count,
+                format_bytes(stats.fallback_checkpoint_bytes as usize),
+            );
+            eprintln!(
+                "native_quantization_formats: Q4_K={} tensors/{}, Q5_1={} tensors/{}",
+                stats.q4k_tensor_count,
+                format_bytes(stats.q4k_bytes as usize),
+                stats.q5_1_tensor_count,
+                format_bytes(stats.q5_1_bytes as usize),
+            );
+        }
+        if profile_gemma4 {
+            if let Some(stats) = safemlx_lm::models::gemma4::perf_stats() {
+                eprintln!(
+                    "gemma4_components_s: embed={:.6}, per_layer_inputs={:.6}, attention={:.6}, mlp={:.6}, per_layer_residual={:.6}, final_norm={:.6}, lm_head={:.6}, total={:.6}",
+                    stats.embed_s,
+                    stats.per_layer_inputs_s,
+                    stats.attention_s,
+                    stats.mlp_s,
+                    stats.per_layer_residual_s,
+                    stats.final_norm_s,
+                    stats.lm_head_s,
+                    stats.component_total_s(),
+                );
+            }
+            safemlx_lm::models::gemma4::set_perf_profiling(false);
+        }
         if let Some(report) = model.residency_report()? {
             let offload = report.offload();
             eprintln!(

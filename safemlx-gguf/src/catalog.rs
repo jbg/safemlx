@@ -132,6 +132,52 @@ pub struct ConvertedCheckpointTensor {
     converted: ConvertedTensor,
 }
 
+/// One physical GGUF tensor retained in its checkpoint-native byte encoding.
+///
+/// This is the ownership seam used by device backends which can consume GGUF
+/// blocks directly. The byte vector is intentionally not interpreted or
+/// repacked by this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawCheckpointTensor {
+    shard_index: usize,
+    tensor_index: usize,
+    endian: Endian,
+    descriptor: TensorDescriptor,
+    data: Vec<u8>,
+}
+
+impl RawCheckpointTensor {
+    /// Zero-based index of the shard containing this tensor.
+    pub fn shard_index(&self) -> usize {
+        self.shard_index
+    }
+
+    /// Zero-based tensor index within the containing shard.
+    pub fn tensor_index(&self) -> usize {
+        self.tensor_index
+    }
+
+    /// Endianness declared by the containing GGUF shard.
+    pub fn endian(&self) -> Endian {
+        self.endian
+    }
+
+    /// Physical GGUF tensor descriptor.
+    pub fn descriptor(&self) -> &TensorDescriptor {
+        &self.descriptor
+    }
+
+    /// Checkpoint-native tensor payload.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Consume this tensor and return its checkpoint-native payload.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
 impl ConvertedCheckpointTensor {
     /// Zero-based index of the shard containing this tensor.
     pub fn shard_index(&self) -> usize {
@@ -464,8 +510,10 @@ impl Checkpoint {
 }
 
 impl TensorMaterializer<'_> {
-    /// Materialize one physical tensor by its GGUF name.
-    pub fn converted_tensor(&mut self, name: &str) -> Result<ConvertedCheckpointTensor> {
+    fn location_and_reader(
+        &mut self,
+        name: &str,
+    ) -> Result<(TensorLocation, TensorDescriptor, Endian)> {
         let location = self
             .locations
             .get(name)
@@ -486,7 +534,16 @@ impl TensorMaterializer<'_> {
             )?;
             self.reader = Some((location.shard_index, reader));
         }
-        let descriptor = shard.tensors[location.tensor_index].descriptor.clone();
+        Ok((
+            location,
+            shard.tensors[location.tensor_index].descriptor.clone(),
+            shard.endian,
+        ))
+    }
+
+    /// Materialize one physical tensor by its GGUF name.
+    pub fn converted_tensor(&mut self, name: &str) -> Result<ConvertedCheckpointTensor> {
+        let (location, descriptor, _) = self.location_and_reader(name)?;
         let converted = self
             .reader
             .as_mut()
@@ -494,7 +551,7 @@ impl TensorMaterializer<'_> {
             .1
             .read_tensor(&descriptor)
             .map_err(|source| Error::Shard {
-                path: shard.path.clone(),
+                path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),
             })?;
         Ok(ConvertedCheckpointTensor {
@@ -502,6 +559,28 @@ impl TensorMaterializer<'_> {
             tensor_index: location.tensor_index,
             descriptor,
             converted,
+        })
+    }
+
+    /// Materialize one physical tensor without converting its native encoding.
+    pub fn raw_tensor(&mut self, name: &str) -> Result<RawCheckpointTensor> {
+        let (location, descriptor, endian) = self.location_and_reader(name)?;
+        let data = self
+            .reader
+            .as_mut()
+            .expect("requested shard reader opened above")
+            .1
+            .read_raw(&descriptor)
+            .map_err(|source| Error::Shard {
+                path: self.checkpoint.shards[location.shard_index].path.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(RawCheckpointTensor {
+            shard_index: location.shard_index,
+            tensor_index: location.tensor_index,
+            endian,
+            descriptor,
+            data,
         })
     }
 }

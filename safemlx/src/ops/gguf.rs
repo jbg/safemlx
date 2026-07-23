@@ -5,7 +5,10 @@ use std::io::{Cursor, Read};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-pub use safemlx_gguf::{MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue};
+pub use safemlx_gguf::{
+    Endian as GgufEndian, GgmlType as GgufType, MetadataArray as GgufMetadataArray,
+    MetadataValue as GgufMetadataValue,
+};
 
 /// A validated GGUF checkpoint that materializes one physical tensor at a time.
 #[derive(Debug, Clone)]
@@ -126,6 +129,34 @@ pub struct GgufMaterializer<'a> {
     inner: safemlx_gguf::TensorMaterializer<'a>,
 }
 
+/// One physical GGUF tensor retained in its checkpoint-native byte encoding.
+#[derive(Debug)]
+pub struct GgufRawTensor {
+    inner: safemlx_gguf::RawCheckpointTensor,
+}
+
+impl GgufRawTensor {
+    /// Endianness declared by the containing GGUF shard.
+    pub fn endian(&self) -> safemlx_gguf::Endian {
+        self.inner.endian()
+    }
+
+    /// Physical tensor descriptor.
+    pub fn descriptor(&self) -> &safemlx_gguf::TensorDescriptor {
+        self.inner.descriptor()
+    }
+
+    /// Checkpoint-native payload bytes.
+    pub fn data(&self) -> &[u8] {
+        self.inner.data()
+    }
+
+    /// Consume this tensor and return its checkpoint-native payload.
+    pub fn into_data(self) -> Vec<u8> {
+        self.inner.into_data()
+    }
+}
+
 impl std::fmt::Debug for GgufTensorIter<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -213,6 +244,13 @@ impl GgufMaterializer<'_> {
     /// Materialize one physical tensor by its GGUF name.
     pub fn converted_tensor(&mut self, name: &str) -> Result<GgufTensor, IoError> {
         convert_tensor(self.inner.converted_tensor(name)?)
+    }
+
+    /// Materialize one physical tensor without converting its GGUF blocks.
+    pub fn raw_tensor(&mut self, name: &str) -> Result<GgufRawTensor, IoError> {
+        Ok(GgufRawTensor {
+            inner: self.inner.raw_tensor(name)?,
+        })
     }
 }
 

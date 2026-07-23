@@ -3,6 +3,7 @@ use std::iter::once;
 use crate::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
+    native_quantization::NativeQuantizedTensor,
     ops::indexing::TryIndexOp,
     ops::{
         self, dequantize_with_mode, quantized_matmul_with_mode, quantized_packed_dimension,
@@ -67,6 +68,9 @@ pub struct QuantizedEmbedding {
 
     /// Quantized weight encoding.
     pub mode: QuantizationMode,
+
+    /// Optional checkpoint-native storage used instead of affine parameters.
+    pub native: Option<NativeQuantizedTensor>,
 
     /// Scales
     #[param]
@@ -155,6 +159,7 @@ fn build_quantized_embedding_inner(
         group_size,
         bits,
         mode,
+        native: None,
         scales: Param::new(arrays.scales),
         biases: Param::new(arrays.biases),
         inner,
@@ -238,6 +243,7 @@ impl QuantizedEmbedding {
             group_size,
             bits,
             mode,
+            native: None,
             scales: Param::<Array>::unloaded(
                 &[embedding_count, dimensions / group_size],
                 scale_dtype,
@@ -300,6 +306,9 @@ impl QuantizedEmbedding {
         x: impl AsRef<Array>,
         stream: &crate::Stream,
     ) -> Result<Array, Exception> {
+        if let Some(native) = &self.native {
+            return native.linear(x.as_ref(), true, stream);
+        }
         quantized_matmul_with_mode(
             x.as_ref(),
             &self.inner.weight,
@@ -319,6 +328,9 @@ impl Module<&Array> for QuantizedEmbedding {
     type Output = Array;
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+        if let Some(native) = &self.native {
+            return native.embedding(x, stream);
+        }
         let s = x.shape();
         let x = x.flatten(None, None, stream)?;
         let w = self.inner.weight.try_index_device(&x, stream)?;
@@ -451,6 +463,7 @@ fn build_quantized_linear_inner(
         group_size,
         bits,
         mode,
+        native: None,
         scales: Param::new(arrays.scales),
         biases: Param::new(arrays.biases),
         inner,
@@ -500,6 +513,9 @@ pub struct QuantizedLinear {
 
     /// Quantized weight encoding.
     pub mode: QuantizationMode,
+
+    /// Optional checkpoint-native storage used instead of affine parameters.
+    pub native: Option<NativeQuantizedTensor>,
 
     /// Scales
     #[param]
@@ -579,6 +595,7 @@ impl QuantizedLinear {
             group_size,
             bits,
             mode,
+            native: None,
             scales: Param::<Array>::unloaded(
                 &[output_dims, input_dims / group_size],
                 scale_dtype,
@@ -639,6 +656,13 @@ impl Module<&Array> for QuantizedLinear {
     type Output = Array;
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+        if let Some(native) = &self.native {
+            let mut output = native.linear(x, true, stream)?;
+            if let Some(bias) = &self.inner.bias.value {
+                output = output.add(bias, stream)?;
+            }
+            return Ok(output);
+        }
         let mut x = quantized_matmul_with_mode(
             x,
             &self.inner.weight,
