@@ -1012,7 +1012,7 @@ impl Model {
         match self {
             Self::DeepSeekV3(model) => ModelCache::DeepSeekV3(model.new_cache()),
             Self::DeepSeekV3Layerwise(model) => ModelCache::DeepSeekV3(model.new_cache()),
-            Self::Gemma4(_) => ModelCache::Gemma4(gemma4::Cache::default()),
+            Self::Gemma4(model) => ModelCache::Gemma4(model.new_cache()),
             Self::Gemma4Layerwise(model) => ModelCache::Gemma4(model.new_cache()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
             Self::GptOssLayerwise(model) => ModelCache::GptOss(model.new_cache()),

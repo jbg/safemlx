@@ -12,7 +12,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
+    cache::KeyValueCache,
     error::Error,
     layerwise::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
@@ -67,7 +67,7 @@ impl Gemma4LayerwiseModel {
 
     /// Creates an empty Gemma 4 generation cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::default()
+        Cache::new(self.args())
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -713,9 +713,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
 
     fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
         if cache.kv.is_empty() {
-            cache.kv = (0..self.args.num_hidden_layers)
-                .map(|_| Some(ConcatKeyValueCache::new()))
-                .collect();
+            cache.reset_kv(&self.args);
         }
         if cache.kv.len() != self.args.num_hidden_layers as usize {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -736,9 +734,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         if let Gemma4Input::Prefill(typed) = input {
             input::validate(typed)?;
             cache.token_ids.clear();
-            cache.kv = (0..self.args.num_hidden_layers)
-                .map(|_| Some(ConcatKeyValueCache::new()))
-                .collect();
+            cache.reset_kv(&self.args);
             let mut parts = Vec::with_capacity(typed.parts.len());
             let mut vision_jobs = Vec::new();
             let mut audio_jobs = Vec::new();
@@ -1267,6 +1263,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        cache::ConcatKeyValueCache,
         layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,

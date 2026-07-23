@@ -526,6 +526,15 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)
 }
 
+fn needs_generated_sliding_mask(
+    seq_len: i32,
+    position_offset: i32,
+    sliding_window: Option<i32>,
+) -> bool {
+    seq_len > 1
+        || sliding_window.is_some_and(|window| position_offset.saturating_add(seq_len) > window)
+}
+
 fn maybe_quantized_linear_with_config(
     input_dims: i32,
     output_dims: i32,
@@ -1890,7 +1899,7 @@ impl TransformerBlock {
             None
         } else if self.layer_type == LayerType::SlidingAttention {
             let seq_len = x.shape()[1];
-            if seq_len > 1 || self.sliding_window.is_some() {
+            if needs_generated_sliding_mask(seq_len, position_offset, self.sliding_window) {
                 Some(create_causal_mask(
                     seq_len,
                     Some(position_offset),
@@ -2048,7 +2057,7 @@ where
             None
         } else if self.layer_type == LayerType::SlidingAttention {
             let seq_len = x.shape()[1];
-            if seq_len > 1 || self.sliding_window.is_some() {
+            if needs_generated_sliding_mask(seq_len, position_offset, self.sliding_window) {
                 Some(create_causal_mask(
                     seq_len,
                     Some(position_offset),
@@ -2728,7 +2737,7 @@ impl Model {
                 cache.token_ids = token_ids_from_array(&tokens, stream)?;
                 cache.prefix_embeddings = None;
                 cache.prefix_len = 0;
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 self.forward_with_observer(
                     ModelInput {
                         inputs: &tokens,
@@ -2746,7 +2755,7 @@ impl Model {
                 cache.token_ids = token_ids_from_array(&tokens, stream)?;
                 cache.prefix_len = cache.token_ids.len();
                 cache.prefix_embeddings = Some(embeddings.clone());
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
@@ -3966,7 +3975,7 @@ impl Model {
                 cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
                 cache.prefix_embeddings = None;
                 cache.prefix_len = 0;
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 self.forward_with_state(
                     ModelInput {
                         inputs: &prompt_tokens,
@@ -3983,7 +3992,7 @@ impl Model {
                 cache.token_ids = token_ids_from_array(&tokens, stream)?;
                 cache.prefix_len = cache.token_ids.len();
                 cache.prefix_embeddings = Some(embeddings.clone());
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
@@ -4112,9 +4121,29 @@ pub struct Cache {
 }
 
 impl Cache {
+    const KV_GROWTH_STEP: i32 = 256;
+
+    pub(crate) fn new(args: &ModelArgs) -> Self {
+        let mut cache = Self::default();
+        cache.reset_kv(args);
+        cache
+    }
+
+    pub(crate) fn reset_kv(&mut self, args: &ModelArgs) {
+        self.kv = (0..args.num_hidden_layers)
+            .map(|_| Some(ConcatKeyValueCache::new_with_step(Self::KV_GROWTH_STEP)))
+            .collect();
+    }
+
     /// Returns the committed logical sequence length.
     pub(crate) fn mtp_len(&self) -> usize {
         self.token_ids.len()
+    }
+}
+
+impl Model {
+    pub(crate) fn new_cache(&self) -> Cache {
+        Cache::new(&self.args)
     }
 }
 
@@ -4202,7 +4231,7 @@ impl CausalLm<Cache> for Model {
                 cache.token_ids = token_ids_from_array(&prompt_tokens, stream)?;
                 cache.prefix_embeddings = None;
                 cache.prefix_len = 0;
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 self.forward_logits(
                     ModelInput {
                         inputs: &prompt_tokens,
@@ -4220,7 +4249,7 @@ impl CausalLm<Cache> for Model {
                 cache.token_ids = token_ids_from_array(&tokens, stream)?;
                 cache.prefix_len = cache.token_ids.len();
                 cache.prefix_embeddings = Some(embeddings.clone());
-                cache.kv.clear();
+                cache.reset_kv(&self.args);
                 let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
                 let masks = multimodal_attention_masks(
                     &cache.token_ids,
@@ -4253,7 +4282,25 @@ impl CausalLm<Cache> for Model {
         cache
             .token_ids
             .extend(token_ids_from_array(input_tokens, stream)?);
-        cache.kv.clear();
+        if cache.prefix_embeddings.is_none() {
+            return self.forward_logits(
+                ModelInput {
+                    inputs: input_tokens,
+                    inputs_embeds: None,
+                    per_layer_input_ids: None,
+                    mask: None,
+                    sliding_mask: None,
+                    cache: &mut cache.kv,
+                },
+                true,
+                stream,
+            );
+        }
+
+        // Media tokens use non-causal visibility within each media group. The
+        // ordinary KV cache cannot preserve that structured mask for appended
+        // text, so multimodal generation still replays the prepared prefix.
+        cache.reset_kv(&self.args);
         let tokens = array_from_token_ids(&cache.token_ids, stream)?;
         let generated_embeddings = cache
             .prefix_embeddings
@@ -4314,8 +4361,8 @@ mod tests {
     };
 
     use super::{
-        load_gemma4_model, partial_rotary_dims, Attention, Cache, FloatOrString, LayerType,
-        ModelArgs,
+        load_gemma4_model, needs_generated_sliding_mask, partial_rotary_dims, Attention, Cache,
+        FloatOrString, LayerType, ModelArgs,
     };
     use crate::models::{
         common::generation::CausalLm,
@@ -4505,6 +4552,14 @@ mod tests {
     #[test]
     fn rotary_dims_default_to_full_head() {
         assert_eq!(partial_rotary_dims(256, &None), 256);
+    }
+
+    #[test]
+    fn single_token_sliding_mask_starts_only_after_window_fills() {
+        assert!(!needs_generated_sliding_mask(1, 0, Some(1024)));
+        assert!(!needs_generated_sliding_mask(1, 1023, Some(1024)));
+        assert!(needs_generated_sliding_mask(1, 1024, Some(1024)));
+        assert!(needs_generated_sliding_mask(2, 0, Some(1024)));
     }
 
     #[test]
