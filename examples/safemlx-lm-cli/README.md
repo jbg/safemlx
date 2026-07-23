@@ -49,6 +49,22 @@ cargo run --release -p safemlx-lm-cli -- \
   "Tell me a short story."
 ```
 
+Mirostat V2 adaptively targets a desired surprise instead of using fixed
+top-k, top-p, and min-p cutoffs. Set a nonzero temperature and optionally tune
+the target (`tau`, in bits) and adaptation rate (`eta`):
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/model \
+  --mirostat-v2 --temperature 1.0 \
+  --mirostat-tau 5.0 --mirostat-eta 0.1 \
+  "Tell me a strange but coherent short story."
+```
+
+Repetition, frequency, and presence penalties are applied before Mirostat
+truncation. Mirostat V2 supports embedded and external MTP; its adaptive state
+advances only for tokens committed from the target distribution.
+
 Gemma 4 can use an explicit external assistant through the generalized MTP
 engine. The target may be fully resident or use `--layerwise-host`; the
 assistant is loaded independently and remains fully resident:

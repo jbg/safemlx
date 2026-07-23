@@ -502,7 +502,7 @@ impl Model {
             input,
             config,
             prng_key,
-            &DefaultSampler,
+            &mut DefaultSampler,
             stream,
         )
     }
@@ -516,7 +516,7 @@ impl Model {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_mtp_input_with_sampler_callback(
@@ -539,7 +539,7 @@ impl Model {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
@@ -583,7 +583,7 @@ impl Model {
             input,
             config,
             prng_key,
-            &DefaultSampler,
+            &mut DefaultSampler,
             stream,
         )
     }
@@ -596,7 +596,7 @@ impl Model {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_embedded_mtp_input_with_sampler_callback(
@@ -617,7 +617,7 @@ impl Model {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
@@ -1740,7 +1740,7 @@ impl LoadedModel {
             input,
             config,
             prng_key,
-            &DefaultSampler,
+            &mut DefaultSampler,
             stream,
         )
     }
@@ -1754,7 +1754,7 @@ impl LoadedModel {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let mut config = config.clone();
@@ -1775,7 +1775,7 @@ impl LoadedModel {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
@@ -1806,7 +1806,7 @@ impl LoadedModel {
             input,
             config,
             prng_key,
-            &DefaultSampler,
+            &mut DefaultSampler,
             stream,
         )
     }
@@ -1819,7 +1819,7 @@ impl LoadedModel {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let mut config = config.clone();
@@ -1839,7 +1839,7 @@ impl LoadedModel {
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
-        sampler: &S,
+        sampler: &mut S,
         stream: &Stream,
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
@@ -1861,7 +1861,7 @@ impl LoadedModel {
     ///
     /// Each lane owns a separate cache so rejection lengths and EOS positions
     /// may diverge without padding rejected state back into another sequence.
-    pub fn generate_mtp_text_batch<S: SpeculativeSampler>(
+    pub fn generate_mtp_text_batch<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
         prompt_tokens: &Array,
@@ -1889,7 +1889,7 @@ impl LoadedModel {
 
     /// Generates a text batch using reusable independent per-lane caches.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_mtp_text_batch_with_cache<S: SpeculativeSampler>(
+    pub fn generate_mtp_text_batch_with_cache<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
         cache: &mut MtpCache,
@@ -1927,13 +1927,14 @@ impl LoadedModel {
                 .transpose()?;
             let parts = [input::InputPart::text_token_ids(&row)];
             let input = input::ModelInput::new(&parts);
+            let mut lane_sampler = sampler.clone();
             let (tokens, stats) = self.generate_mtp_input_with_sampler(
                 drafter,
                 &mut cache.lanes[lane as usize],
                 input,
                 config,
                 lane_key,
-                sampler,
+                &mut lane_sampler,
                 stream,
             )?;
             output.token_ids.push(tokens);
@@ -1943,7 +1944,7 @@ impl LoadedModel {
     }
 
     /// Generates an independently accepting text batch with embedded MTP weights.
-    pub fn generate_embedded_mtp_text_batch<S: SpeculativeSampler>(
+    pub fn generate_embedded_mtp_text_batch<S: SpeculativeSampler + Clone>(
         &mut self,
         prompt_tokens: &Array,
         config: &MtpConfig,
@@ -1969,7 +1970,7 @@ impl LoadedModel {
 
     /// Generates a text batch with embedded MTP weights and reusable lane caches.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_text_batch_with_cache<S: SpeculativeSampler>(
+    pub fn generate_embedded_mtp_text_batch_with_cache<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut MtpCache,
         prompt_tokens: &Array,
@@ -2006,12 +2007,13 @@ impl LoadedModel {
                 .transpose()?;
             let parts = [input::InputPart::text_token_ids(&row)];
             let input = input::ModelInput::new(&parts);
+            let mut lane_sampler = sampler.clone();
             let (tokens, stats) = self.generate_embedded_mtp_input_with_sampler(
                 &mut cache.lanes[lane as usize],
                 input,
                 config,
                 lane_key,
-                sampler,
+                &mut lane_sampler,
                 stream,
             )?;
             output.token_ids.push(tokens);

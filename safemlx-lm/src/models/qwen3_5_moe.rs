@@ -6676,7 +6676,7 @@ mod tests {
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &crate::sampler::DefaultSampler,
+            &mut crate::sampler::DefaultSampler,
             stream,
         )
         .unwrap();
@@ -6736,7 +6736,7 @@ mod tests {
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &crate::sampler::DefaultSampler,
+            &mut crate::sampler::DefaultSampler,
             stream,
         )
         .unwrap();

@@ -272,7 +272,7 @@ pub(crate) fn generate_with_callback<T, S, F>(
     input: RuntimeInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
-    sampler: &S,
+    sampler: &mut S,
     stream: &Stream,
     on_token: F,
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception>

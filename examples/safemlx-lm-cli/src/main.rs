@@ -25,7 +25,7 @@ use safemlx_lm::{
     mtp::{LoadedDrafter, MtpConfig, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
-    sampler::{DefaultSampler, GenerationSampler, Sampler, SpeculativeSampler},
+    sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler},
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -46,6 +46,7 @@ impl From<ExpertCacheEviction> for CacheEvictionPolicy {
 enum CliSampler {
     Greedy(DefaultSampler),
     Configured(GenerationSampler),
+    MirostatV2(MirostatV2Sampler),
 }
 
 impl Sampler for CliSampler {
@@ -59,13 +60,14 @@ impl Sampler for CliSampler {
         match self {
             Self::Greedy(sampler) => sampler.sample(logits, temp, prng_state, stream),
             Self::Configured(sampler) => sampler.sample(logits, temp, prng_state, stream),
+            Self::MirostatV2(sampler) => sampler.sample(logits, temp, prng_state, stream),
         }
     }
 }
 
 impl SpeculativeSampler for CliSampler {
     fn process_logits(
-        &self,
+        &mut self,
         logits: &Array,
         temperature: f32,
         history: &[u32],
@@ -76,6 +78,22 @@ impl SpeculativeSampler for CliSampler {
             Self::Configured(sampler) => {
                 sampler.process_logits(logits, temperature, history, stream)
             }
+            Self::MirostatV2(sampler) => {
+                sampler.process_logits(logits, temperature, history, stream)
+            }
+        }
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Greedy(sampler) => sampler.commit_token(processed_logits, token, stream),
+            Self::Configured(sampler) => sampler.commit_token(processed_logits, token, stream),
+            Self::MirostatV2(sampler) => sampler.commit_token(processed_logits, token, stream),
         }
     }
 }
@@ -124,6 +142,18 @@ struct Cli {
     /// Remove tokens below this fraction of the most likely token's probability.
     #[arg(long, default_value_t = 0.05, value_name = "FLOAT")]
     min_p: f32,
+
+    /// Use adaptive Mirostat V2 sampling instead of top-k, top-p, and min-p.
+    #[arg(long)]
+    mirostat_v2: bool,
+
+    /// Target Mirostat V2 surprise in bits.
+    #[arg(long, default_value_t = 5.0, value_name = "FLOAT")]
+    mirostat_tau: f32,
+
+    /// Mirostat V2 adaptation rate.
+    #[arg(long, default_value_t = 0.1, value_name = "FLOAT")]
+    mirostat_eta: f32,
 
     /// Penalty for repeating a token. One disables the penalty.
     #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
@@ -412,7 +442,16 @@ fn main() -> Result<()> {
     // when no repetition/frequency/presence penalty is active.
     let penalties_active =
         args.repeat_penalty != 1.0 || args.frequency_penalty != 0.0 || args.presence_penalty != 0.0;
-    let sampler = if args.temperature == 0.0 && !penalties_active {
+    let mut sampler = if args.mirostat_v2 {
+        CliSampler::MirostatV2(
+            MirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?.penalties(
+                args.repeat_penalty,
+                args.repeat_last_n,
+                args.frequency_penalty,
+                args.presence_penalty,
+            ),
+        )
+    } else if args.temperature == 0.0 && !penalties_active {
         CliSampler::Greedy(DefaultSampler)
     } else {
         CliSampler::Configured(configured_sampler)
@@ -460,7 +499,7 @@ fn main() -> Result<()> {
             input,
             &config,
             prng_key,
-            &sampler,
+            &mut sampler,
             stream,
             |token_id| {
                 if time_to_first_token.is_none() {
@@ -490,7 +529,7 @@ fn main() -> Result<()> {
             input,
             &config,
             prng_key,
-            &sampler,
+            &mut sampler,
             stream,
             |token_id| {
                 if time_to_first_token.is_none() {
@@ -870,6 +909,15 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if !args.min_p.is_finite() || !(0.0..=1.0).contains(&args.min_p) {
         bail!("--min-p must be between zero and one");
+    }
+    if args.mirostat_v2 && args.temperature == 0.0 {
+        bail!("--mirostat-v2 requires --temperature greater than zero");
+    }
+    if !args.mirostat_tau.is_finite() || args.mirostat_tau <= 0.0 {
+        bail!("--mirostat-tau must be a finite number greater than zero");
+    }
+    if !args.mirostat_eta.is_finite() || args.mirostat_eta <= 0.0 {
+        bail!("--mirostat-eta must be a finite number greater than zero");
     }
     if !args.repeat_penalty.is_finite() || args.repeat_penalty <= 0.0 {
         bail!("--repeat-penalty must be a finite number greater than zero");
@@ -1278,6 +1326,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("bits must be one of"));
+    }
+
+    #[test]
+    fn validates_mirostat_v2_arguments() {
+        let valid = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--mirostat-v2",
+            "--temperature",
+            "1.0",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&valid).unwrap();
+
+        let zero_temperature = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--mirostat-v2",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&zero_temperature)
+            .unwrap_err()
+            .to_string()
+            .contains("--temperature greater than zero"));
+
+        let speculative = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--draft-model",
+            "draft-id",
+            "--mirostat-v2",
+            "--temperature",
+            "1.0",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&speculative).unwrap();
     }
 
     #[test]

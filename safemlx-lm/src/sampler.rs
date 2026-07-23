@@ -1,6 +1,7 @@
 use safemlx::{
     argmax_axis, array,
     error::Exception,
+    ops::indexing::TryIndexOp,
     random::{self, RandomState},
     Array, Stream,
 };
@@ -14,7 +15,7 @@ pub trait SpeculativeSampler {
     /// Applies penalties, filters, and temperature using the supplied logical
     /// token history, returning canonical-vocabulary logits.
     fn process_logits(
-        &self,
+        &mut self,
         logits: &Array,
         temperature: f32,
         history: &[u32],
@@ -40,6 +41,20 @@ pub trait SpeculativeSampler {
             }
         }
     }
+
+    /// Commits an emitted token from a processed target distribution.
+    ///
+    /// Stateless policies may use the default no-op. Adaptive policies update
+    /// state here only after speculative verification accepts a proposal or
+    /// chooses its replacement.
+    fn commit_token(
+        &mut self,
+        _processed_logits: &Array,
+        _token: u32,
+        _stream: &Stream,
+    ) -> Result<(), Exception> {
+        Ok(())
+    }
 }
 
 /// Strategy for choosing a token from model logits.
@@ -62,11 +77,12 @@ pub trait Sampler {
 ///
 /// A temperature of `0.0` uses greedy argmax sampling. Non-zero temperatures
 /// sample from a categorical distribution and require a PRNG key.
+#[derive(Debug, Clone, Copy)]
 pub struct DefaultSampler;
 
 impl SpeculativeSampler for DefaultSampler {
     fn process_logits(
-        &self,
+        &mut self,
         logits: &Array,
         temperature: f32,
         _history: &[u32],
@@ -99,6 +115,233 @@ impl Sampler for DefaultSampler {
                 random::categorical(&logits, None, None, &key, stream)
             }
         }
+    }
+}
+
+/// Adaptive Mirostat V2 sampler for single-sequence text generation.
+///
+/// Mirostat V2 targets a configurable surprise value instead of applying a
+/// fixed top-k or top-p cutoff. On each step it:
+///
+/// 1. applies repetition, frequency, and presence penalties;
+/// 2. computes the temperature-scaled token probabilities;
+/// 3. retains tokens with surprise no greater than the adaptive value `mu`;
+/// 4. samples from the retained tokens; and
+/// 5. adjusts `mu` toward the target surprise `tau` using learning rate `eta`.
+///
+/// The initial `mu` is `2 * tau`, as in the reference algorithm. This sampler
+/// is stateful and currently supports one sequence at a time. Under
+/// [`SpeculativeSampler`], `mu` advances only from committed target
+/// distributions; rejected draft tokens never update adaptive state.
+#[derive(Debug, Clone)]
+pub struct MirostatV2Sampler {
+    tau: f32,
+    eta: f32,
+    mu: f32,
+    penalties: GenerationSampler,
+}
+
+impl Default for MirostatV2Sampler {
+    fn default() -> Self {
+        Self {
+            tau: 5.0,
+            eta: 0.1,
+            mu: 10.0,
+            penalties: GenerationSampler::new().top_k(0).top_p(1.0).min_p(0.0),
+        }
+    }
+}
+
+impl MirostatV2Sampler {
+    /// Creates a Mirostat V2 sampler with initial adaptive value `2 * tau`.
+    ///
+    /// `tau` is the target surprise in bits and `eta` is the adaptation rate.
+    /// Both values must be finite and greater than zero.
+    pub fn new(tau: f32, eta: f32) -> Result<Self, Exception> {
+        validate_positive_finite("Mirostat V2 tau", tau)?;
+        validate_positive_finite("Mirostat V2 eta", eta)?;
+        Ok(Self {
+            tau,
+            eta,
+            mu: 2.0 * tau,
+            penalties: GenerationSampler::new().top_k(0).top_p(1.0).min_p(0.0),
+        })
+    }
+
+    /// Sets repetition, frequency, and presence penalties applied before
+    /// Mirostat truncation.
+    pub fn penalties(
+        mut self,
+        repeat_penalty: f32,
+        repeat_last_n: i32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) -> Self {
+        self.penalties = self.penalties.penalties(
+            repeat_penalty,
+            repeat_last_n,
+            frequency_penalty,
+            presence_penalty,
+        );
+        self
+    }
+
+    /// Returns the target surprise in bits.
+    pub const fn tau(&self) -> f32 {
+        self.tau
+    }
+
+    /// Returns the adaptation rate.
+    pub const fn eta(&self) -> f32 {
+        self.eta
+    }
+
+    /// Returns the current adaptive surprise limit.
+    pub const fn mu(&self) -> f32 {
+        self.mu
+    }
+
+    /// Returns generated token ids already accepted by this sampler.
+    pub fn generated_tokens(&self) -> &[u32] {
+        self.penalties.generated_tokens()
+    }
+
+    /// Records a token accepted outside this sampler and updates adaptive state.
+    ///
+    /// `probability` must be the token's probability after Mirostat truncation
+    /// and renormalization.
+    pub fn accept_token(&mut self, token_id: u32, probability: f32) -> Result<(), Exception> {
+        if !probability.is_finite() || probability <= 0.0 || probability > 1.0 {
+            return Err(Exception::custom(
+                "accepted Mirostat V2 token probability must be finite and in (0, 1]",
+            ));
+        }
+        self.update_mu(-probability.log2());
+        self.penalties.accept_token(token_id);
+        Ok(())
+    }
+
+    /// Resets adaptive state and accepted-token history.
+    pub fn reset(&mut self) {
+        self.mu = 2.0 * self.tau;
+        self.penalties.clear_generated_tokens();
+    }
+
+    fn update_mu(&mut self, observed_surprise: f32) {
+        self.mu -= self.eta * (observed_surprise - self.tau);
+    }
+
+    fn process_logits_for(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(Exception::custom(
+                "Mirostat V2 requires a finite temperature greater than zero",
+            ));
+        }
+        let vocab_size = logits.dim(-1) as usize;
+        if vocab_size == 0 || logits.size() / vocab_size != 1 {
+            return Err(Exception::custom(
+                "Mirostat V2 currently requires logits for exactly one sequence",
+            ));
+        }
+
+        let logits = self
+            .penalties
+            .apply_penalties_for(logits, history, stream)?;
+        let scaled_logits = logits.multiply(array!(1.0 / temperature), stream)?;
+        let probabilities = safemlx::ops::softmax_axis(&scaled_logits, -1, true, stream)?;
+
+        // A token's surprise is -log2(p), so surprise <= mu is equivalent to
+        // p >= 2^-mu. If mu is temporarily below every surprise, retain only
+        // the first argmax token, matching the reference algorithm's fallback.
+        let cutoff_probability = Array::from_f32((-self.mu).exp2());
+        let maximum_probability = probabilities.max_axis(-1, true, stream)?;
+        let cutoff_mask = probabilities.lt(&cutoff_probability, stream)?;
+        let best_token =
+            argmax_axis!(&probabilities, -1, stream = stream)?.expand_dims_axes(&[-1], stream)?;
+        let fallback_mask = Array::full::<bool>(logits.shape(), Array::from_bool(true), stream)?;
+        let keep_best = Array::full::<bool>(best_token.shape(), Array::from_bool(false), stream)?;
+        let fallback_mask = safemlx::ops::indexing::put_along_axis(
+            &fallback_mask,
+            &best_token,
+            &keep_best,
+            -1,
+            stream,
+        )?;
+        let needs_fallback = cutoff_probability.gt(maximum_probability, stream)?;
+        let mask = safemlx::ops::r#where(needs_fallback, fallback_mask, cutoff_mask, stream)?;
+        mask_logits(mask, scaled_logits, stream)
+    }
+
+    fn commit_processed_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let vocab_size = processed_logits.dim(-1) as usize;
+        if token as usize >= vocab_size {
+            return Err(Exception::custom(format!(
+                "sampled token {token} exceeds vocabulary size {vocab_size}"
+            )));
+        }
+        let probabilities = safemlx::ops::softmax_axis(processed_logits, -1, true, stream)?;
+        let selected = match probabilities.ndim() {
+            1 => probabilities.try_index_device(token as i32, stream)?,
+            2 => probabilities.try_index_device((0, token as i32), stream)?,
+            3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
+            rank => {
+                return Err(Exception::custom(format!(
+                    "Mirostat V2 processed logits must have rank 1, 2, or 3, got rank {rank}"
+                )))
+            }
+        };
+        self.accept_token(token, selected.item::<f32>(stream))
+    }
+}
+
+impl Sampler for MirostatV2Sampler {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let processed_logits =
+            self.process_logits_for(logits, temp, self.penalties.generated_tokens(), stream)?;
+        let prng_state = prng_state
+            .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))?;
+        let key = prng_state.next_key(stream)?;
+        let token = random::categorical(&processed_logits, None, None, &key, stream)?;
+        self.commit_processed_token(&processed_logits, token.clone().item::<u32>(stream), stream)?;
+        Ok(token)
+    }
+}
+
+impl SpeculativeSampler for MirostatV2Sampler {
+    fn process_logits(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.process_logits_for(logits, temperature, history, stream)
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        self.commit_processed_token(processed_logits, token, stream)
     }
 }
 
@@ -368,7 +611,7 @@ impl GenerationSampler {
 
 impl SpeculativeSampler for GenerationSampler {
     fn process_logits(
-        &self,
+        &mut self,
         logits: &Array,
         temperature: f32,
         history: &[u32],
@@ -430,9 +673,19 @@ fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exc
     safemlx::ops::r#where(mask, min_value, logits, stream)
 }
 
+fn validate_positive_finite(name: &str, value: f32) -> Result<(), Exception> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(Exception::custom(format!(
+            "{name} must be finite and greater than zero"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::GenerationSampler;
+    use super::{GenerationSampler, MirostatV2Sampler};
 
     #[test]
     fn generation_sampler_accepts_external_token_history() {
@@ -447,5 +700,56 @@ mod tests {
 
         sampler.clear_generated_tokens();
         assert!(sampler.generated_tokens().is_empty());
+    }
+
+    #[test]
+    fn mirostat_v2_defaults_and_reset_restore_adaptive_state() {
+        let mut sampler = MirostatV2Sampler::default();
+        assert_eq!(sampler.tau(), 5.0);
+        assert_eq!(sampler.eta(), 0.1);
+        assert_eq!(sampler.mu(), 10.0);
+
+        sampler.accept_token(42, 2.0f32.powi(-7)).unwrap();
+        assert!((sampler.mu() - 9.8).abs() < 1e-6);
+        assert_eq!(sampler.generated_tokens(), &[42]);
+
+        sampler.reset();
+        assert_eq!(sampler.mu(), 10.0);
+        assert!(sampler.generated_tokens().is_empty());
+    }
+
+    #[test]
+    fn mirostat_v2_validates_configuration() {
+        assert!(MirostatV2Sampler::new(3.0, 0.2).is_ok());
+        assert!(MirostatV2Sampler::new(0.0, 0.2).is_err());
+        assert!(MirostatV2Sampler::new(3.0, f32::NAN).is_err());
+
+        let mut sampler = MirostatV2Sampler::default();
+        assert!(sampler.accept_token(0, 0.0).is_err());
+        assert!(sampler.accept_token(0, 1.1).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mirostat_v2_samples_and_updates_mu() {
+        use super::Sampler;
+        use safemlx::{
+            random::{self, RandomState},
+            Array, Device, DeviceType, ExecutionContext,
+        };
+
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let logits = Array::from_slice(&[0.0f32, -100.0, -100.0], &[1, 3]);
+        let mut state = RandomState::from_key(random::key(0).unwrap());
+        let mut sampler = MirostatV2Sampler::new(5.0, 0.1).unwrap();
+
+        let token = sampler
+            .sample(&logits, 1.0, Some(&mut state), stream)
+            .unwrap();
+
+        assert_eq!(token.item::<u32>(stream), 0);
+        assert!(sampler.mu() > 10.0);
+        assert_eq!(sampler.generated_tokens(), &[0]);
     }
 }

@@ -293,7 +293,7 @@ pub fn generate<B, S>(
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
-    sampler: &S,
+    sampler: &mut S,
     stream: &Stream,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
@@ -325,7 +325,7 @@ pub fn generate_with_callback<B, S, F>(
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
-    sampler: &S,
+    sampler: &mut S,
     stream: &Stream,
     mut on_token: F,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
@@ -371,6 +371,7 @@ where
     )?;
     eval([&first])?;
     let first = first.item::<u32>(stream);
+    sampler.commit_token(&first_logits, first, stream)?;
     let mut output = vec![first];
     stats.emitted_tokens = 1;
     on_token(first)?;
@@ -435,9 +436,11 @@ where
                     .sample_processed(&target, 0.0, None, stream)?
                     .item::<u32>(stream);
                 if chosen == token {
+                    sampler.commit_token(&target, token, stream)?;
                     accepted += 1;
                     continue;
                 }
+                sampler.commit_token(&target, chosen, stream)?;
                 replacement = Some(chosen);
                 break;
             }
@@ -452,10 +455,11 @@ where
                 (p_token / q_token).min(1.0)
             };
             if uniform(prng_state.as_mut(), stream)? <= acceptance {
+                sampler.commit_token(&target, token, stream)?;
                 accepted += 1;
                 continue;
             }
-            replacement = Some(sample_residual(
+            let chosen = sample_residual(
                 &p,
                 &q,
                 &target,
@@ -463,7 +467,9 @@ where
                 config.temperature,
                 prng_state.as_mut(),
                 stream,
-            )?);
+            )?;
+            sampler.commit_token(&target, chosen, stream)?;
+            replacement = Some(chosen);
             break;
         }
 
@@ -477,11 +483,11 @@ where
             let mut history = output.clone();
             history.extend(proposed.iter().copied());
             let target = sampler.process_logits(&raw, config.temperature, &history, stream)?;
-            replacement = Some(
-                sampler
-                    .sample_processed(&target, config.temperature, prng_state.as_mut(), stream)?
-                    .item::<u32>(stream),
-            );
+            let chosen = sampler
+                .sample_processed(&target, config.temperature, prng_state.as_mut(), stream)?
+                .item::<u32>(stream);
+            sampler.commit_token(&target, chosen, stream)?;
+            replacement = Some(chosen);
         }
 
         stats.accepted_tokens += accepted;
@@ -590,7 +596,7 @@ fn sample_residual<S: SpeculativeSampler>(
     target_probabilities: &Array,
     draft_probabilities: &Array,
     target_logits: &Array,
-    sampler: &S,
+    sampler: &mut S,
     temperature: f32,
     prng_state: Option<&mut RandomState>,
     stream: &Stream,
@@ -616,9 +622,15 @@ mod tests {
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     use super::*;
-    use crate::{models::input::InputPart, sampler::DefaultSampler};
+    use crate::{
+        models::input::InputPart,
+        sampler::{DefaultSampler, MirostatV2Sampler},
+    };
 
-    struct ScriptedBackend;
+    struct ScriptedBackend {
+        reject_first: bool,
+        accept_second: bool,
+    }
 
     impl MtpBackend for ScriptedBackend {
         type Cache = usize;
@@ -626,6 +638,10 @@ mod tests {
         type DraftState = usize;
         type CacheCheckpoint = usize;
         type Verification = Array;
+
+        fn max_draft_tokens(&self) -> usize {
+            2
+        }
 
         fn prefill(
             &mut self,
@@ -676,11 +692,19 @@ mod tests {
             _stream: &Stream,
         ) -> Result<Self::Verification, Exception> {
             *cache += input_tokens.dim(1) as usize;
+            let first = if self.reject_first {
+                [0.0f32, 10.0, 0.0]
+            } else {
+                [0.0f32, 0.0, 10.0]
+            };
+            let second = if self.accept_second {
+                [10.0f32, 0.0, 0.0]
+            } else {
+                [0.0f32, 10.0, 0.0]
+            };
             Ok(Array::from_slice(
                 &[
-                    0.0f32, 0.0, 10.0, // accept draft token 2
-                    0.0, 10.0, 0.0, // reject draft token 0 with replacement 1
-                    10.0, 0.0, 0.0,
+                    first[0], first[1], first[2], second[0], second[1], second[2], 10.0, 0.0, 0.0,
                 ],
                 &[1, 3, 3],
             ))
@@ -724,12 +748,15 @@ mod tests {
         let mut cache = 0;
         let mut emitted = Vec::new();
         let (tokens, stats) = generate_with_callback(
-            &mut ScriptedBackend,
+            &mut ScriptedBackend {
+                reject_first: false,
+                accept_second: false,
+            },
             &mut cache,
             input,
             &config,
             None,
-            &DefaultSampler,
+            &mut DefaultSampler,
             stream,
             |token| {
                 emitted.push(token);
@@ -743,6 +770,84 @@ mod tests {
         assert_eq!(stats.accept_lens, vec![1]);
         assert_eq!(stats.accepted_tokens, 1);
         assert_eq!(cache, 3);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn mirostat_v2_mtp_commits_accepted_target_distributions() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: 4,
+            max_draft_tokens: 4,
+            temperature: 1.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut sampler = MirostatV2Sampler::default();
+        let key = safemlx::random::key(7).unwrap();
+
+        let (tokens, stats) = generate(
+            &mut ScriptedBackend {
+                reject_first: false,
+                accept_second: true,
+            },
+            &mut cache,
+            input,
+            &config,
+            Some(key),
+            &mut sampler,
+            stream,
+        )
+        .unwrap();
+
+        assert_eq!(tokens, vec![1, 2, 0, 0]);
+        assert_eq!(stats.draft_tokens, 2);
+        assert_eq!(stats.accepted_tokens, 2);
+        assert_eq!(sampler.generated_tokens(), tokens);
+        assert!((sampler.mu() - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn mirostat_v2_mtp_commits_replacement_not_rejected_draft() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: 2,
+            max_draft_tokens: 4,
+            temperature: 1.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut sampler = MirostatV2Sampler::default();
+        let key = safemlx::random::key(11).unwrap();
+
+        let (tokens, stats) = generate(
+            &mut ScriptedBackend {
+                reject_first: true,
+                accept_second: false,
+            },
+            &mut cache,
+            input,
+            &config,
+            Some(key),
+            &mut sampler,
+            stream,
+        )
+        .unwrap();
+
+        assert_eq!(tokens, vec![1, 1]);
+        assert_eq!(stats.draft_tokens, 1);
+        assert_eq!(stats.accepted_tokens, 0);
+        assert_eq!(sampler.generated_tokens(), tokens);
+        assert!((sampler.mu() - 11.0).abs() < 1e-4);
     }
 
     #[test]
