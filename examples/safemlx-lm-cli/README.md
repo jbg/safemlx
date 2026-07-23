@@ -19,8 +19,10 @@ cargo run --release -p safemlx-lm-cli --features cuda -- \
 ```
 
 The Hugging Face form never downloads files. It scans the cache selected by
-`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, or `HF_HOME` and uses the cached
-`main` revision. Use `--revision` to select another cached ref or commit.
+`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, or `HF_HOME`. Model directories use
+the cached `main` revision by default. GGUF selectors prefer `main`, then search
+other cached snapshots when `main` does not contain the requested
+quantization. Use `--revision` to limit selection to a cached ref or commit.
 
 For a cached repository containing multiple GGUF files, append a
 case-insensitive quantization selector to the model identifier. The full
@@ -34,7 +36,7 @@ cargo run --release -p safemlx-lm-cli -- \
   "Explain imaginary numbers."
 ```
 
-Selection is limited to files already present in the chosen cached revision.
+Selection is limited to files already present in the cache.
 For sharded GGUF checkpoints, the CLI resolves the first canonical shard and
 the loader discovers the remaining shards.
 
@@ -63,6 +65,19 @@ The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published
 `"gemma4-assistant"` spelling. GGUF config is read from a
 `safemlx.mtp.config` JSON metadata string or a sibling `config.json`.
+Cached target and assistant GGUFs can use independent quantization selectors,
+even when individual downloads placed them in separate commit snapshots. The
+CLI distinguishes standardized `mtp-` sidecar filenames from target-model
+GGUFs, so target and assistant files may use the same quantization:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M \
+  --draft-model unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0 \
+  --mtp-draft-tokens 3 \
+  "Explain speculative decoding."
+```
+
 Stochastic MTP uses lossless probability-ratio acceptance and supports the
 same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
 generation. Under `--verbose`, the CLI reports proposal and acceptance counts.

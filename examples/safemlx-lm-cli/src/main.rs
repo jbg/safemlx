@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
@@ -265,11 +266,15 @@ fn main() -> Result<()> {
     let args = Cli::parse();
     validate_args(&args)?;
     let prompt = read_prompt(args.prompt.as_deref())?;
-    let model_path = resolve_model(&args.model, args.revision.as_deref())?;
+    let model_path = resolve_model(
+        &args.model,
+        args.revision.as_deref(),
+        CachedGgufRole::Target,
+    )?;
     let draft_model_path = args
         .draft_model
         .as_deref()
-        .map(|source| resolve_model(source, args.revision.as_deref()))
+        .map(|source| resolve_model(source, args.revision.as_deref(), CachedGgufRole::MtpDraft))
         .transpose()?;
 
     if args.verbose {
@@ -923,7 +928,11 @@ fn read_prompt(argument: Option<&str>) -> Result<String> {
     Ok(prompt)
 }
 
-fn resolve_model(spec: &str, requested_revision: Option<&str>) -> Result<PathBuf> {
+fn resolve_model(
+    spec: &str,
+    requested_revision: Option<&str>,
+    gguf_role: CachedGgufRole,
+) -> Result<PathBuf> {
     let path = Path::new(spec);
     if path.exists() {
         return path
@@ -948,16 +957,29 @@ fn resolve_model(spec: &str, requested_revision: Option<&str>) -> Result<PathBuf
                 cache.cache_dir.display()
             )
         })?;
-    let revision = select_revision(&repo.revisions, requested_revision).with_context(|| {
-        format!("could not select a cached revision for Hugging Face model {repo_id:?}")
-    })?;
     match quantization {
-        Some(quantization) => select_cached_gguf(revision, quantization).with_context(|| {
-            format!(
-                "could not select GGUF quantization {quantization:?} for Hugging Face model {repo_id:?}"
+        Some(quantization) => {
+            select_cached_gguf_from_revisions(
+                &repo.revisions,
+                requested_revision,
+                quantization,
+                gguf_role,
             )
-        }),
-        None => Ok(revision.snapshot_path.clone()),
+            .with_context(|| {
+                format!(
+                    "could not select GGUF quantization {quantization:?} for Hugging Face model {repo_id:?}"
+                )
+            })
+        }
+        None => {
+            let revision =
+                select_revision(&repo.revisions, requested_revision).with_context(|| {
+                    format!(
+                        "could not select a cached revision for Hugging Face model {repo_id:?}"
+                    )
+                })?;
+            Ok(revision.snapshot_path.clone())
+        }
     }
 }
 
@@ -980,16 +1002,58 @@ enum QuantizationMatch {
     UnslothAlias,
 }
 
-fn select_cached_gguf(revision: &CachedRevisionInfo, quantization: &str) -> Result<PathBuf> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedGgufRole {
+    Target,
+    MtpDraft,
+}
+
+fn select_cached_gguf(
+    revision: &CachedRevisionInfo,
+    quantization: &str,
+    role: CachedGgufRole,
+) -> Result<PathBuf> {
     let files = revision
         .files
         .iter()
         .map(|file| file.file_path.as_path())
         .collect::<Vec<_>>();
-    select_cached_gguf_path(&files, quantization)
+    select_cached_gguf_path(&files, quantization, role)
 }
 
-fn select_cached_gguf_path(files: &[&Path], quantization: &str) -> Result<PathBuf> {
+fn select_cached_gguf_from_revisions(
+    revisions: &[CachedRevisionInfo],
+    requested_revision: Option<&str>,
+    quantization: &str,
+    role: CachedGgufRole,
+) -> Result<PathBuf> {
+    let preferred = select_revision(revisions, requested_revision)?;
+    if requested_revision.is_some() {
+        return select_cached_gguf(preferred, quantization, role);
+    }
+    if let Ok(path) = select_cached_gguf(preferred, quantization, role) {
+        return Ok(path);
+    }
+
+    // Individual `hf_hub_download` calls can leave files from one repository
+    // in separate commit snapshots. Search all cached snapshots when `main`
+    // does not contain the requested quantization, while treating repeated
+    // pointers to the same content-addressed blob as one candidate.
+    let mut seen_blobs = HashSet::new();
+    let files = revisions
+        .iter()
+        .flat_map(|revision| &revision.files)
+        .filter(|file| seen_blobs.insert(&file.blob_path))
+        .map(|file| file.file_path.as_path())
+        .collect::<Vec<_>>();
+    select_cached_gguf_path(&files, quantization, role)
+}
+
+fn select_cached_gguf_path(
+    files: &[&Path],
+    quantization: &str,
+    role: CachedGgufRole,
+) -> Result<PathBuf> {
     let selector = quantization.to_ascii_uppercase();
     let unsloth_alias = (!selector.starts_with("UD-")).then(|| format!("UD-{selector}"));
     let mut gguf_files = Vec::new();
@@ -1009,7 +1073,7 @@ fn select_cached_gguf_path(files: &[&Path], quantization: &str) -> Result<PathBu
             continue;
         };
         let (stem, first_shard) = strip_gguf_shard_suffix(stem);
-        if !first_shard {
+        if !first_shard || !gguf_role_matches(stem, role) {
             continue;
         }
         let stem = stem.to_ascii_uppercase();
@@ -1054,6 +1118,15 @@ fn select_cached_gguf_path(files: &[&Path], quantization: &str) -> Result<PathBu
                 format_cached_paths(&paths)
             )
         }
+    }
+}
+
+fn gguf_role_matches(stem: &str, role: CachedGgufRole) -> bool {
+    let stem = stem.to_ascii_lowercase();
+    let mtp_sidecar = stem.starts_with("mtp-");
+    match role {
+        CachedGgufRole::Target => !mtp_sidecar && !stem.starts_with("mmproj-"),
+        CachedGgufRole::MtpDraft => mtp_sidecar,
     }
 }
 
@@ -1126,11 +1199,12 @@ mod tests {
     };
 
     use clap::{CommandFactory, Parser};
-    use hf_hub::cache::CachedRevisionInfo;
+    use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        format_bytes, select_cached_gguf_path, select_revision, should_report_stop_reason,
-        split_hf_model_spec, stop_reason, validate_args, Cli, StopReason,
+        format_bytes, select_cached_gguf_from_revisions, select_cached_gguf_path, select_revision,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, validate_args, CachedGgufRole,
+        Cli, StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1141,6 +1215,17 @@ mod tests {
             size_on_disk: 0,
             refs: refs.iter().map(|value| (*value).to_owned()).collect(),
             last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified),
+        }
+    }
+
+    fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {
+        CachedFileInfo {
+            file_name: file_path.to_owned(),
+            file_path: file_path.into(),
+            blob_path: blob_path.into(),
+            size_on_disk: 0,
+            blob_last_accessed: SystemTime::UNIX_EPOCH,
+            blob_last_modified: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -1252,9 +1337,96 @@ mod tests {
         let ud_q4 = Path::new("snapshot/model-UD-Q4_K_M.gguf");
         let files = [q4, ud_q4];
 
-        assert_eq!(select_cached_gguf_path(&files, "UD-Q4_K_M").unwrap(), ud_q4);
-        assert_eq!(select_cached_gguf_path(&files, "q4_k_m").unwrap(), q4);
-        assert_eq!(select_cached_gguf_path(&[ud_q4], "Q4_K_M").unwrap(), ud_q4);
+        assert_eq!(
+            select_cached_gguf_path(&files, "UD-Q4_K_M", CachedGgufRole::Target).unwrap(),
+            ud_q4
+        );
+        assert_eq!(
+            select_cached_gguf_path(&files, "q4_k_m", CachedGgufRole::Target).unwrap(),
+            q4
+        );
+        assert_eq!(
+            select_cached_gguf_path(&[ud_q4], "Q4_K_M", CachedGgufRole::Target).unwrap(),
+            ud_q4
+        );
+    }
+
+    #[test]
+    fn distinguishes_target_and_mtp_sidecar_at_same_quantization() {
+        let target = Path::new("snapshot/gemma-4-26B-A4B-it-Q8_0.gguf");
+        let draft = Path::new("snapshot/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf");
+        let files = [target, draft];
+
+        assert_eq!(
+            select_cached_gguf_path(&files, "Q8_0", CachedGgufRole::Target).unwrap(),
+            target
+        );
+        assert_eq!(
+            select_cached_gguf_path(&files, "Q8_0", CachedGgufRole::MtpDraft).unwrap(),
+            draft
+        );
+    }
+
+    #[test]
+    fn finds_quantizations_across_separate_cached_snapshots() {
+        let mut target = revision("target", &[], 1);
+        target.files = vec![cached_file(
+            "target/model-UD-Q4_K_M.gguf",
+            "blobs/target-q4",
+        )];
+        let mut main = revision("assistant", &["main"], 2);
+        main.files = vec![cached_file(
+            "assistant/MTP/mtp-assistant-Q8_0.gguf",
+            "blobs/assistant-q8",
+        )];
+        let revisions = [target, main];
+
+        assert_eq!(
+            select_cached_gguf_from_revisions(&revisions, None, "Q4_K_M", CachedGgufRole::Target,)
+                .unwrap(),
+            Path::new("target/model-UD-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            select_cached_gguf_from_revisions(&revisions, None, "Q8_0", CachedGgufRole::MtpDraft,)
+                .unwrap(),
+            Path::new("assistant/MTP/mtp-assistant-Q8_0.gguf")
+        );
+    }
+
+    #[test]
+    fn explicit_revision_limits_quantization_selection() {
+        let mut target = revision("target", &[], 1);
+        target.files = vec![cached_file(
+            "target/model-UD-Q4_K_M.gguf",
+            "blobs/target-q4",
+        )];
+        let main = revision("assistant", &["main"], 2);
+        let revisions = [target, main];
+
+        assert!(select_cached_gguf_from_revisions(
+            &revisions,
+            Some("main"),
+            "Q4_K_M",
+            CachedGgufRole::Target,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shared_blobs_are_not_ambiguous_across_snapshots() {
+        let mut older = revision("older", &[], 1);
+        older.files = vec![cached_file("older/model-Q4_K_M.gguf", "blobs/shared-q4")];
+        let mut main = revision("main", &["main"], 2);
+        main.files = vec![cached_file("main/other-Q8_0.gguf", "blobs/other-q8")];
+        let mut newer = revision("newer", &[], 3);
+        newer.files = vec![cached_file("newer/model-Q4_K_M.gguf", "blobs/shared-q4")];
+        let revisions = [older, main, newer];
+
+        assert_eq!(
+            select_cached_gguf_from_revisions(&revisions, None, "Q4_K_M", CachedGgufRole::Target,)
+                .unwrap(),
+            Path::new("older/model-Q4_K_M.gguf")
+        );
     }
 
     #[test]
@@ -1262,7 +1434,7 @@ mod tests {
         let first = Path::new("snapshot/model-Q4_K_M-00001-of-00002.gguf");
         let second = Path::new("snapshot/model-Q4_K_M-00002-of-00002.gguf");
         assert_eq!(
-            select_cached_gguf_path(&[second, first], "Q4_K_M").unwrap(),
+            select_cached_gguf_path(&[second, first], "Q4_K_M", CachedGgufRole::Target,).unwrap(),
             first
         );
     }
@@ -1271,12 +1443,12 @@ mod tests {
     fn rejects_ambiguous_or_missing_quantizations() {
         let first = Path::new("snapshot/first-Q4_K_M.gguf");
         let second = Path::new("snapshot/second-Q4_K_M.gguf");
-        let error = select_cached_gguf_path(&[first, second], "Q4_K_M")
+        let error = select_cached_gguf_path(&[first, second], "Q4_K_M", CachedGgufRole::Target)
             .unwrap_err()
             .to_string();
         assert!(error.contains("matches multiple cached GGUF files"));
 
-        let error = select_cached_gguf_path(&[first], "Q8_0")
+        let error = select_cached_gguf_path(&[first], "Q8_0", CachedGgufRole::Target)
             .unwrap_err()
             .to_string();
         assert!(error.contains("available GGUF files"));
