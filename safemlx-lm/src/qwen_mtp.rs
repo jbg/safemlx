@@ -305,6 +305,7 @@ impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Used directly by device-gated backend parity tests.
 pub(crate) fn generate<T: QwenMtpTarget, S: SpeculativeSampler>(
     target: &mut T,
     cache: &mut Cache,
@@ -314,8 +315,36 @@ pub(crate) fn generate<T: QwenMtpTarget, S: SpeculativeSampler>(
     sampler: &S,
     stream: &Stream,
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception> {
+    generate_with_callback(
+        target,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        stream,
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_callback<T, S, F>(
+    target: &mut T,
+    cache: &mut Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &S,
+    stream: &Stream,
+    on_token: F,
+) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
+where
+    T: QwenMtpTarget,
+    S: SpeculativeSampler,
+    F: FnMut(u32) -> Result<(), Exception>,
+{
     let mut backend = QwenMtpBackend::new(target);
-    mtp::generate(
+    mtp::generate_with_callback(
         &mut backend,
         cache,
         input,
@@ -323,5 +352,6 @@ pub(crate) fn generate<T: QwenMtpTarget, S: SpeculativeSampler>(
         prng_key,
         sampler,
         stream,
+        on_token,
     )
 }

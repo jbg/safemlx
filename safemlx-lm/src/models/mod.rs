@@ -519,18 +519,46 @@ impl Model {
         sampler: &S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_mtp_input_with_sampler_callback(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            stream,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_mtp_input_with_sampler_callback<S, F>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+        on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
         let assistant = drafter.gemma4_mut();
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                crate::gemma4_mtp::generate(
-                    target, assistant, cache, input, config, prng_key, sampler, stream,
+                crate::gemma4_mtp::generate_with_callback(
+                    target, assistant, cache, input, config, prng_key, sampler, stream, on_token,
                 )
             }
             (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::gemma4_mtp::generate(
-                    target, assistant, cache, input, config, prng_key, sampler, stream,
+                crate::gemma4_mtp::generate_with_callback(
+                    target, assistant, cache, input, config, prng_key, sampler, stream, on_token,
                 )
             }
             (model, _) => Err(Exception::custom(format!(
@@ -571,14 +599,44 @@ impl Model {
         sampler: &S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_embedded_mtp_input_with_sampler_callback(
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            stream,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+        on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
         match (self, cache) {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate(target, cache, input, config, prng_key, sampler, stream)
+                crate::qwen_mtp::generate_with_callback(
+                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
             }
             (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate(target, cache, input, config, prng_key, sampler, stream)
+                crate::qwen_mtp::generate_with_callback(
+                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
             }
             (model, _) => Err(Exception::custom(format!(
                 "embedded MTP runtime adapter is unavailable for model type {} ({:?})",
@@ -1592,6 +1650,33 @@ where
     }
 }
 
+/// Stateful tokenizer decoder for incrementally generated token ids.
+///
+/// Unlike decoding each token independently, this preserves tokenizer context
+/// and buffers incomplete byte-fallback sequences until they form valid text.
+pub struct TextDecoder {
+    tokenizer: Tokenizer,
+    skip_special_tokens: bool,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
+impl TextDecoder {
+    /// Decodes one token, returning text only when the token completes a chunk.
+    pub fn step(&mut self, id: u32) -> Result<Option<String>, Error> {
+        tokenizers::tokenizer::step_decode_stream(
+            &self.tokenizer,
+            vec![id],
+            self.skip_special_tokens,
+            &mut self.ids,
+            &mut self.prefix,
+            &mut self.prefix_index,
+        )
+        .map_err(Into::into)
+    }
+}
+
 /// A model directory or GGUF file loaded together with its tokenizer and chat template.
 ///
 /// This is the most convenient entry point for text generation: it owns the
@@ -1608,6 +1693,17 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// Creates an independent stateful decoder for streaming generated tokens.
+    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
+        TextDecoder {
+            tokenizer: (*self.tokenizer).clone(),
+            skip_special_tokens,
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
     /// Reports whether and how this target can perform MTP generation.
     pub fn mtp_capability(&self) -> MtpCapability {
         self.model.mtp_capability()
@@ -1660,6 +1756,32 @@ impl LoadedModel {
         )
     }
 
+    /// Generates through MTP and reports each committed token as it becomes available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_input_with_sampler_callback<S, F>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+        on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
+        }
+        self.model.generate_mtp_input_with_sampler_callback(
+            drafter, cache, input, &config, prng_key, sampler, stream, on_token,
+        )
+    }
+
     /// Generates through MTP weights embedded in the target checkpoint.
     pub fn generate_embedded_mtp_input(
         &mut self,
@@ -1697,6 +1819,32 @@ impl LoadedModel {
         self.model.generate_embedded_mtp_input_with_sampler(
             cache, input, &config, prng_key, sampler, stream,
         )
+    }
+
+    /// Generates through embedded MTP and reports each committed token as it becomes available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        stream: &Stream,
+        on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
+        }
+        self.model
+            .generate_embedded_mtp_input_with_sampler_callback(
+                cache, input, &config, prng_key, sampler, stream, on_token,
+            )
     }
 
     /// Generates an independently accepting and stopping batch of text prompts.

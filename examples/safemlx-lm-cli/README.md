@@ -140,15 +140,19 @@ expert-routing locality. Mapped-shard and logical-transfer counters do not
 measure exact physical disk I/O. Checkpoint-native packed formats are preserved;
 load-time conversion and unsupported model families fail explicitly.
 
-When the positional prompt is omitted, the binary reads it from stdin. Only
-the generated text is written to stdout, making it convenient to pipe or
-capture; `--verbose` writes model details, separate load and generation times,
+When the positional prompt is omitted, the binary reads it from stdin. Generated
+text is decoded and flushed to stdout incrementally, including when MTP is in
+use. Once generation ends, `stop_reason` is written to stderr as `eos`,
+`max_tokens`, or `generator_exhausted`. This keeps stdout convenient to pipe or
+capture. `--verbose` writes model details, separate load and generation times,
 time to first token, decode-only and overall generated-token rates, total
 execution time, and MLX peak/current/cache unified-memory statistics to stderr.
-Generation time includes prompt prefill, and `token_rate` is generated tokens
-divided by that generation time. `decode_token_rate` excludes time to first
-token and the first generated token. The memory values cover allocations
-managed by MLX, not total process resident memory or memory-mapped files.
+It also prints explicit diagnostics/content section markers so the two streams
+remain visually distinct in a terminal. Generation time includes prompt
+prefill, and `token_rate` is generated tokens divided by that generation time.
+`decode_token_rate` excludes time to first token and the first generated token.
+The memory values cover allocations managed by MLX, not total process resident
+memory or memory-mapped files.
 
 ```sh
 printf 'Summarize the purpose of MLX.' | \

@@ -300,6 +300,40 @@ where
     B: MtpBackend,
     S: SpeculativeSampler,
 {
+    generate_with_callback(
+        backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        stream,
+        |_| Ok(()),
+    )
+}
+
+/// Runs one batch-one speculative sequence and reports each committed token.
+///
+/// The callback is invoked as soon as a token is committed to the target
+/// sequence, including a terminal EOS token. Tokens are reported in generation
+/// order and before this function returns, allowing callers to stream decoded
+/// text while speculative generation is still in progress.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_callback<B, S, F>(
+    backend: &mut B,
+    cache: &mut B::Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &S,
+    stream: &Stream,
+    mut on_token: F,
+) -> Result<(Vec<u32>, MtpStats), Exception>
+where
+    B: MtpBackend,
+    S: SpeculativeSampler,
+    F: FnMut(u32) -> Result<(), Exception>,
+{
     let started = Instant::now();
     let mut stats = MtpStats::default();
     if config.max_tokens == 0 {
@@ -339,6 +373,7 @@ where
     let first = first.item::<u32>(stream);
     let mut output = vec![first];
     stats.emitted_tokens = 1;
+    on_token(first)?;
     let mut target_state = prefill.state;
     if config.eos_token_ids.contains(&first) {
         stats.elapsed = started.elapsed();
@@ -474,6 +509,7 @@ where
         for token in emitted {
             output.push(token);
             stats.emitted_tokens += 1;
+            on_token(token)?;
             if config.eos_token_ids.contains(&token) || output.len() == config.max_tokens {
                 stopped = true;
                 break;
@@ -686,7 +722,8 @@ mod tests {
             eos_token_ids: Vec::new(),
         };
         let mut cache = 0;
-        let (tokens, stats) = generate(
+        let mut emitted = Vec::new();
+        let (tokens, stats) = generate_with_callback(
             &mut ScriptedBackend,
             &mut cache,
             input,
@@ -694,10 +731,15 @@ mod tests {
             None,
             &DefaultSampler,
             stream,
+            |token| {
+                emitted.push(token);
+                Ok(())
+            },
         )
         .unwrap();
 
         assert_eq!(tokens, vec![1, 2, 1]);
+        assert_eq!(emitted, tokens);
         assert_eq!(stats.accept_lens, vec![1]);
         assert_eq!(stats.accepted_tokens, 1);
         assert_eq!(cache, 3);

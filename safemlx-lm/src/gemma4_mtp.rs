@@ -265,7 +265,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate<T, S>(
+pub(crate) fn generate_with_callback<T, S, F>(
     target: &mut T,
     assistant: &mut Gemma4AssistantDraftModel,
     cache: &mut Cache,
@@ -274,13 +274,15 @@ pub(crate) fn generate<T, S>(
     prng_key: Option<Array>,
     sampler: &S,
     stream: &Stream,
+    on_token: F,
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
 where
     T: Gemma4MtpTarget,
     S: SpeculativeSampler,
+    F: FnMut(u32) -> Result<(), Exception>,
 {
     let mut backend = Gemma4MtpBackend::new(target, assistant);
-    mtp::generate(
+    mtp::generate_with_callback(
         &mut backend,
         cache,
         input,
@@ -288,5 +290,6 @@ where
         prng_key,
         sampler,
         stream,
+        on_token,
     )
 }

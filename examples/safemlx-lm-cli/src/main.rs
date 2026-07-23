@@ -19,7 +19,7 @@ use safemlx_lm::{
     layerwise::{LayerwiseLoadOptions, WeightResidency},
     models::{
         input::{InputPart, ModelInput},
-        LoadedModel, ModelLoadOptions,
+        LoadedModel, ModelLoadOptions, TextDecoder,
     },
     mtp::{LoadedDrafter, MtpConfig, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
@@ -205,6 +205,50 @@ struct Cli {
     verbose: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopReason {
+    Eos,
+    MaxTokens,
+    GeneratorExhausted,
+}
+
+impl StopReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Eos => "eos",
+            Self::MaxTokens => "max_tokens",
+            Self::GeneratorExhausted => "generator_exhausted",
+        }
+    }
+}
+
+fn stop_reason(output_ids: &[u32], eos_token_ids: &[u32], max_tokens: usize) -> StopReason {
+    if output_ids
+        .last()
+        .is_some_and(|token| eos_token_ids.contains(token))
+    {
+        StopReason::Eos
+    } else if output_ids.len() >= max_tokens {
+        StopReason::MaxTokens
+    } else {
+        StopReason::GeneratorExhausted
+    }
+}
+
+fn write_streamed_token(
+    decoder: &mut TextDecoder,
+    stdout: &mut impl Write,
+    streamed_text: &mut String,
+    token_id: u32,
+) -> Result<()> {
+    if let Some(text) = decoder.step(token_id)? {
+        stdout.write_all(text.as_bytes())?;
+        stdout.flush()?;
+        streamed_text.push_str(&text);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let args = Cli::parse();
@@ -218,6 +262,7 @@ fn main() -> Result<()> {
         .transpose()?;
 
     if args.verbose {
+        eprintln!("--- safemlx diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
         if let Some(path) = &draft_model_path {
             eprintln!("draft_model: {}", path.display());
@@ -363,6 +408,14 @@ fn main() -> Result<()> {
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
     let mut mtp_stats: Option<MtpStats> = None;
+    let mut decoder = model.text_decoder(true);
+    let mut streamed_text = String::new();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    if args.verbose {
+        eprintln!("--- generated content (stdout) ---");
+    }
 
     let embedded_mtp = args.mtp_draft_tokens > 0
         && matches!(
@@ -380,16 +433,27 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
-        let (tokens, stats) = model.generate_mtp_input_with_sampler(
-            drafter, &mut cache, input, &config, prng_key, &sampler, stream,
+        let (tokens, stats) = model.generate_mtp_input_with_sampler_callback(
+            drafter,
+            &mut cache,
+            input,
+            &config,
+            prng_key,
+            &sampler,
+            stream,
+            |token_id| {
+                if time_to_first_token.is_none() {
+                    time_to_first_token = Some(generation_started.elapsed());
+                }
+                if eos_token_ids.contains(&token_id) {
+                    Ok(())
+                } else {
+                    write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)
+                        .map_err(|error| Exception::custom(error.to_string()))
+                }
+            },
         )?;
         output_ids = tokens;
-        if output_ids
-            .last()
-            .is_some_and(|token| eos_token_ids.contains(token))
-        {
-            output_ids.pop();
-        }
         mtp_stats = Some(stats);
     } else if embedded_mtp {
         let parts = [InputPart::text_token_ids(&tokens)];
@@ -400,16 +464,26 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
-        let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler(
-            &mut cache, input, &config, prng_key, &sampler, stream,
+        let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler_callback(
+            &mut cache,
+            input,
+            &config,
+            prng_key,
+            &sampler,
+            stream,
+            |token_id| {
+                if time_to_first_token.is_none() {
+                    time_to_first_token = Some(generation_started.elapsed());
+                }
+                if eos_token_ids.contains(&token_id) {
+                    Ok(())
+                } else {
+                    write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)
+                        .map_err(|error| Exception::custom(error.to_string()))
+                }
+            },
         )?;
         output_ids = tokens;
-        if output_ids
-            .last()
-            .is_some_and(|token| eos_token_ids.contains(token))
-        {
-            output_ids.pop();
-        }
         mtp_stats = Some(stats);
     } else {
         let parts = [InputPart::text_token_ids(&tokens)];
@@ -447,18 +521,30 @@ fn main() -> Result<()> {
             if eos_token_ids.contains(&token_id) {
                 break;
             }
+            write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
             current = next.transpose()?;
         }
     }
     let generation_elapsed = generation_started.elapsed();
+    let stop_reason = stop_reason(&output_ids, &eos_token_ids, args.max_tokens);
+    if stop_reason == StopReason::Eos {
+        output_ids.pop();
+    }
 
     let output = model.decode(&output_ids, true)?;
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    write!(stdout, "{output}")?;
+    let remaining = output
+        .strip_prefix(&streamed_text)
+        .with_context(|| "incremental tokenizer output did not match the final decoded response")?;
+    stdout.write_all(remaining.as_bytes())?;
     if !output.ends_with('\n') {
         writeln!(stdout)?;
     }
+    stdout.flush()?;
+
+    if args.verbose {
+        eprintln!("--- safemlx diagnostics (stderr) ---");
+    }
+    eprintln!("stop_reason: {}", stop_reason.label());
 
     if args.verbose {
         stream.synchronize()?;
@@ -549,11 +635,16 @@ fn main() -> Result<()> {
         }
         if eos_token_ids.is_empty() {
             eprintln!("warning: the model config contains no EOS token id");
-        } else if !output_ids
-            .last()
-            .is_some_and(|token| eos_token_ids.contains(token))
-        {
-            eprintln!("warning: generation reached --max-tokens before EOS");
+        } else {
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    eprintln!("warning: generation reached --max-tokens before EOS");
+                }
+                StopReason::GeneratorExhausted => {
+                    eprintln!("warning: the token generator ended before EOS");
+                }
+                StopReason::Eos => {}
+            }
         }
     }
 
@@ -988,8 +1079,8 @@ mod tests {
     use hf_hub::cache::CachedRevisionInfo;
 
     use super::{
-        format_bytes, select_cached_gguf_path, select_revision, split_hf_model_spec, validate_args,
-        Cli,
+        format_bytes, select_cached_gguf_path, select_revision, split_hf_model_spec, stop_reason,
+        validate_args, Cli, StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1006,6 +1097,13 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn classifies_generation_stop_reason() {
+        assert_eq!(stop_reason(&[4, 2], &[2], 10), StopReason::Eos);
+        assert_eq!(stop_reason(&[4, 5], &[2], 2), StopReason::MaxTokens);
+        assert_eq!(stop_reason(&[4], &[2], 2), StopReason::GeneratorExhausted);
     }
 
     #[test]
