@@ -187,7 +187,10 @@ fn build_gemma(
         .map(|(token, score)| {
             let token = if token == "<0x09>" {
                 "\t".to_string()
-            } else if !token.is_empty() && token.chars().all(char::is_whitespace) {
+            // Gemma GGUF vocabularies may contain literal newline tokens. Only
+            // ordinary spaces use SentencePiece's metaspace representation;
+            // converting every whitespace character would flatten line breaks.
+            } else if !token.is_empty() && token.chars().all(|character| character == ' ') {
                 "▁".repeat(token.chars().count())
             } else {
                 token.clone()
@@ -641,6 +644,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gemma_decoder_preserves_literal_newlines() {
+        let metadata = sentencepiece_metadata("gemma4");
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+
+        assert_eq!(
+            tokenizer.decode(&[5, 6, 4, 7, 4], false).unwrap(),
+            "hi\nhi\n\nhi"
+        );
+        assert_eq!(tokenizer.decode(&[5, 6, 5], false).unwrap(), "hi\n hi");
+        assert_eq!(tokenizer.decode(&[5, 6, 1, 5], false).unwrap(), "hi\n  hi");
+        let encoding = tokenizer.encode("hi\nhi", false).unwrap();
+        assert_eq!(
+            tokenizer.decode(encoding.get_ids(), false).unwrap(),
+            "hi\nhi"
+        );
+    }
+
     fn sentencepiece_metadata(architecture: &str) -> HashMap<String, GgufMetadataValue> {
         HashMap::from([
             (
@@ -660,12 +681,14 @@ mod tests {
                     "i".into(),
                     "hi".into(),
                     "▁hi".into(),
+                    "\n".into(),
+                    "\n\n".into(),
                 ])),
             ),
             (
                 "tokenizer.ggml.scores".into(),
                 GgufMetadataValue::Array(GgufMetadataArray::Float32(vec![
-                    0.0, 1.0, 2.0, 2.0, 3.0, 10.0,
+                    0.0, 1.0, 2.0, 2.0, 3.0, 10.0, 1.0, 1.0,
                 ])),
             ),
             (
