@@ -310,19 +310,6 @@ impl GgmlType {
             Self::Unknown(v) => Err(Error::UnsupportedTensorType(v)),
         }
     }
-    pub fn is_affine(self) -> bool {
-        matches!(
-            self,
-            Self::Q4_0
-                | Self::Q4_1
-                | Self::Q8_0
-                | Self::Q2K
-                | Self::Q3K
-                | Self::Q4K
-                | Self::Q5K
-                | Self::Q6K
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
