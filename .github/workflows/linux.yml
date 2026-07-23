@@ -6,9 +6,11 @@ on:
       - ".github/workflows/linux.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "safemlx/**"
       - "safemlx-sys/**"
       - "safemlx-lm/**"
+      - "safemlx-lm-utils/**"
       - "safemlx-codec/**"
       - "safemlx-tests/**"
       - "examples/safemlx-lm-cli/**"
@@ -17,6 +19,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  msrv:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install MLX CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
+          python3 -m pip install --user "cmake>=3.25"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check language-model crates with default features
+        run: cargo check --locked -p safemlx-lm-utils -p safemlx-lm
+
   cpu:
     runs-on: ubuntu-22.04
     steps:

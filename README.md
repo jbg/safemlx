@@ -46,7 +46,7 @@ which parts of the workspace were derived.
 
 ## Getting started
 
-The minimum supported Rust version is 1.85. Add the core crate to a project:
+The minimum supported Rust version is 1.88. Add the core crate to a project:
 
 ```toml
 [dependencies]
@@ -91,6 +91,22 @@ SafeMLX is under active development and its pre-1.0 APIs may still change.
 Model support is architecture-specific rather than a promise that every
 checkpoint using a related name will load; `safemlx-lm` exposes config-checking
 APIs and returns explicit errors for unsupported configurations.
+
+Normal development uses the latest stable Rust release. Update it before
+working on the workspace:
+
+```sh
+rustup update stable
+```
+
+The committed lockfile makes CI and local compatibility checks reproducible.
+To verify the language-model crates and their default features against the
+minimum supported Rust version, install Rust 1.88.0 and run:
+
+```sh
+rustup toolchain install 1.88.0
+cargo +1.88.0 check --locked -p safemlx-lm-utils -p safemlx-lm
+```
 
 The macOS CI suite runs the workspace tests as follows, keeping tests that
 exercise concurrent MLX use on a single test thread:

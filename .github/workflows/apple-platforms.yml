@@ -6,6 +6,7 @@ on:
       - ".github/workflows/apple-platforms.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "safemlx-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
@@ -46,6 +47,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Test Apple target mapping
         run: |
           rustc --edition 2021 --test safemlx-sys/build_support.rs -o /tmp/safemlx-build-support-tests
@@ -65,6 +67,7 @@ jobs:
           - aarch64-apple-visionos-sim
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
       - name: Install Metal toolchain when required
