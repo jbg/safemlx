@@ -8,8 +8,8 @@ use safemlx::{
         arange, argpartition_axis, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode,
         gather_route_values, grouped_matmul,
         indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, quantized_packed_dimension, r#where, sigmoid, softmax_axis, sum_axis,
-        topk_route_plan, zeros_dtype, GroupedRoutePlan,
+        matmul, quantized_matmul_with_mode, quantized_packed_dimension, r#where, sigmoid,
+        softmax_axis, sum_axis, topk_route_plan, zeros_dtype, GroupedRoutePlan, QuantizationMode,
     },
     Array, Dtype, Stream,
 };
@@ -65,6 +65,31 @@ pub fn affine_grouped_linear_with_transpose(
     } else {
         weight.dim(-1) * 32 / quantization.bits()
     };
+    if quantization.group_size() == 16 {
+        if !transpose {
+            return Err(Exception::custom(
+                "group-16 affine expert projections require transposed packed weights",
+            ));
+        }
+        let selected_weight = weight.take_axis(group_ids, 0, stream)?;
+        let selected_scales = scales.take_axis(group_ids, 0, stream)?;
+        let selected_biases = biases
+            .map(|biases| biases.take_axis(group_ids, 0, stream))
+            .transpose()?;
+        return quantized_matmul_with_mode(
+            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+            &selected_weight,
+            &selected_scales,
+            selected_biases.as_ref(),
+            true,
+            quantization.group_size(),
+            quantization.bits(),
+            quantization.mode(),
+            stream,
+        )?
+        .reshape(&[routes, out_features], stream);
+    }
+
     let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
     gather_qmm_with_mode(
         input.reshape(&[routes, 1, input.dim(-1)], stream)?,
@@ -185,8 +210,20 @@ pub struct TopKRouter {
     /// Router projection weight.
     pub weight: Param<Array>,
     #[param]
+    /// Optional affine scales for a packed router projection.
+    pub scales: Param<Option<Array>>,
+    #[param]
+    /// Optional affine biases for a packed router projection.
+    pub biases: Param<Option<Array>>,
+    #[param]
     /// Optional score correction bias used only when choosing experts.
     pub e_score_correction_bias: Param<Option<Array>>,
+    /// Affine group size, or zero for a dense router.
+    pub group_size: i32,
+    /// Affine bit width, or zero for a dense router.
+    pub bits: i32,
+    /// Packed quantization encoding.
+    pub mode: QuantizationMode,
 }
 
 /// Selected expert ids plus the score and weight arrays produced by a top-k router.
@@ -216,6 +253,24 @@ pub fn top_k_softmax_routing(
 impl TopKRouter {
     /// Creates an unloaded router.
     pub fn new(config: TopKRouterConfig, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_quantization(config, None, stream)
+    }
+
+    /// Creates an unloaded dense or affine-packed router.
+    pub fn new_with_quantization(
+        config: TopKRouterConfig,
+        quantization: Option<WeightQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if let Some(quantization) = quantization {
+            if config.hidden_size <= 0 || config.hidden_size % quantization.group_size() != 0 {
+                return Err(Exception::custom(format!(
+                    "affine router hidden dimension {} is not divisible by group size {}",
+                    config.hidden_size,
+                    quantization.group_size()
+                )));
+            }
+        }
         Ok(Self {
             top_k: config.top_k,
             num_experts: config.num_experts,
@@ -225,11 +280,46 @@ impl TopKRouter {
             routed_scaling_factor: config.routed_scaling_factor,
             n_group: config.n_group,
             topk_group: config.topk_group,
-            weight: Param::<Array>::unloaded(
-                &[config.num_experts, config.hidden_size],
-                Dtype::Float32,
-                stream,
-            )?,
+            weight: if let Some(quantization) = quantization {
+                Param::<Array>::unloaded(
+                    &[
+                        config.num_experts,
+                        quantized_packed_dimension(config.hidden_size, quantization.bits()),
+                    ],
+                    Dtype::Uint32,
+                    stream,
+                )?
+            } else {
+                Param::<Array>::unloaded(
+                    &[config.num_experts, config.hidden_size],
+                    Dtype::Float32,
+                    stream,
+                )?
+            },
+            scales: if let Some(quantization) = quantization {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        config.num_experts,
+                        config.hidden_size / quantization.group_size(),
+                    ],
+                    Dtype::Float16,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
+            biases: if let Some(quantization) = quantization.filter(|q| q.has_biases()) {
+                Param::<Option<Array>>::unloaded_some(
+                    &[
+                        config.num_experts,
+                        config.hidden_size / quantization.group_size(),
+                    ],
+                    Dtype::Float16,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             e_score_correction_bias: if config.score_correction_bias {
                 Param::<Option<Array>>::unloaded_some(
                     &[config.num_experts],
@@ -239,6 +329,9 @@ impl TopKRouter {
             } else {
                 Param::new(None)
             },
+            group_size: quantization.map_or(0, WeightQuantization::group_size),
+            bits: quantization.map_or(0, WeightQuantization::bits),
+            mode: quantization.map_or(QuantizationMode::Affine, WeightQuantization::mode),
         })
     }
 
@@ -261,7 +354,24 @@ impl TopKRouter {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+        let logits = if let Some(scales) = self.scales.as_ref() {
+            let input = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+                flat.as_dtype(Dtype::Float32, stream)?
+            } else {
+                flat
+            };
+            quantized_matmul_with_mode(
+                &input,
+                self.weight.as_ref(),
+                scales,
+                self.biases.as_ref().as_ref(),
+                true,
+                self.group_size,
+                self.bits,
+                self.mode,
+                stream,
+            )?
+        } else if self.score_function == TopKRouterScoreFunction::Sigmoid {
             matmul(
                 &flat.as_dtype(Dtype::Float32, stream)?,
                 &self

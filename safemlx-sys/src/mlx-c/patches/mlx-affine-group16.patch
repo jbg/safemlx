@@ -1,0 +1,92 @@
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -365,6 +365,10 @@ void _qmm_dispatch_group(
+     int group_size,
+     bool transposed_w) {
+   switch (group_size) {
++    case 16:
++      _qmm_dispatch_transpose<T, bits, 16>(
++          result, x, w, scales, biases, M, N, K, transposed_w);
++      break;
+     case 32:
+       _qmm_dispatch_transpose<T, bits, 32>(
+           result, x, w, scales, biases, M, N, K, transposed_w);
+@@ -380,6 +384,6 @@ void _qmm_dispatch_group(
+       break;
+     default:
+       throw std::invalid_argument(
+-          "Quantization group size must be 32, 64 or 128.");
++          "Quantization group size must be 16, 32, 64 or 128.");
+   }
+ }
+diff --git a/mlx/backend/metal/kernels/quantized.metal b/mlx/backend/metal/kernels/quantized.metal
+--- a/mlx/backend/metal/kernels/quantized.metal
++++ b/mlx/backend/metal/kernels/quantized.metal
+@@ -168,14 +168,30 @@
+ #define instantiate_quantized_groups(bits) \
+   instantiate_quantized_types(128, bits)   \
+   instantiate_quantized_types(64, bits)    \
+   instantiate_quantized_types(32, bits)
+ 
++// GGUF Q2_K, Q3_K, and Q6_K use 16-value affine groups. MLX's
++// affine vector-matmul/dequantize kernels support that layout, while the
++// matrix-matmul and quantize kernels use 32-column tiles.
++#define instantiate_quantized_group16(type, bits) \
++  instantiate_quantized(affine_dequantize, type, 16, bits) \
++  instantiate_quantized_batched_wrap(affine_qmv_fast, type, 16, bits) \
++  instantiate_quantized_batched_wrap(affine_qmv, type, 16, bits)
++
++#define instantiate_quantized_group16_types(bits) \
++  instantiate_quantized_group16(float, bits) \
++  instantiate_quantized_group16(float16_t, bits) \
++  instantiate_quantized_group16(bfloat16_t, bits)
++
+ #define instantiate_quantized_all() \
+   instantiate_quantized_groups(2) \
+   instantiate_quantized_groups(3) \
+   instantiate_quantized_groups(4) \
+   instantiate_quantized_groups(5) \
+   instantiate_quantized_groups(6) \
+-  instantiate_quantized_groups(8)
++  instantiate_quantized_groups(8) \
++  instantiate_quantized_group16_types(2) \
++  instantiate_quantized_group16_types(3) \
++  instantiate_quantized_group16_types(6)
+ 
+ instantiate_quantized_all() // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1507,5 +1507,31 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+ 
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
++  // GGUF Q2_K, Q3_K, and Q6_K use 16-value groups. The packed qmv
++  // kernels support those groups, while the tiled qmm kernels require at
++  // least 32 columns per group. qmv supports arbitrary row counts, so use it
++  // for both prefill and decode without materializing dense weights.
++  if (group_size_ == 16) {
++    if (!transpose_) {
++      throw std::runtime_error(
++          "[QuantizedMatmul] Group-size-16 affine weights require the "
++          "transposed vector-matrix layout on Metal.");
++    }
++    qmv(
++        x,
++        w,
++        scales,
++        biases,
++        out,
++        group_size_,
++        bits_,
++        M,
++        N,
++        K,
++        d,
++        s,
++        mode);
++    return;
++  }
+   // It is a matrix matrix product.
+   if (M >= vector_limit) {

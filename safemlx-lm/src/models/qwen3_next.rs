@@ -8,15 +8,15 @@ use std::path::Path;
 
 use safemlx::{
     module::ModuleParametersExt,
-    ops::{concatenate_axis, indexing::TryIndexOp},
+    ops::{concatenate_axis, indexing::TryIndexOp, quantized_packed_dimension},
     transforms::eval,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 use tokenizers::Tokenizer;
 
 use crate::{
     error::Error,
-    quantization::WeightQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
     weights::{
         load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadReport,
     },
@@ -127,6 +127,16 @@ pub(crate) fn split_fused_projection(
     args: &ModelArgs,
     stream: &Stream,
 ) -> Result<Vec<(String, Array)>, Error> {
+    split_fused_projection_with_affine(key, value, None, args, stream)
+}
+
+pub(crate) fn split_fused_projection_with_affine(
+    key: &str,
+    value: Array,
+    affine: Option<AffineQuantization>,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<Vec<(String, Array)>, Error> {
     let (qkvz_widths, ba_width) = fused_projection_widths(args)?;
 
     let qkvz_scale_suffix = "linear_attn.in_proj_qkvz.weight_scale_inv";
@@ -159,6 +169,9 @@ pub(crate) fn split_fused_projection(
             if suffix == "weight" && args.uses_fp8() {
                 fp8_block_row_widths(&qkvz_widths)?;
             }
+            if let Some(affine) = affine {
+                validate_affine_fused_component(key, &value, suffix, affine, args.hidden_size)?;
+            }
             let parts = split_grouped_rows(value, args.linear_num_key_heads, &qkvz_widths, stream)?;
             let qkv = concatenate_axis(&parts[..3], 0, stream)?;
             return evaluate_fused_projection_outputs(vec![
@@ -172,6 +185,9 @@ pub(crate) fn split_fused_projection(
 
         let ba_suffix = format!("linear_attn.in_proj_ba.{suffix}");
         if let Some(prefix) = key.strip_suffix(&ba_suffix) {
+            if let Some(affine) = affine {
+                validate_affine_fused_component(key, &value, suffix, affine, args.hidden_size)?;
+            }
             let parts = split_grouped_rows(
                 value,
                 args.linear_num_key_heads,
@@ -191,6 +207,88 @@ pub(crate) fn split_fused_projection(
         }
     }
     Ok(vec![(key.to_string(), value)])
+}
+
+fn validate_affine_fused_component(
+    key: &str,
+    value: &Array,
+    component: &str,
+    affine: AffineQuantization,
+    input_dims: i32,
+) -> Result<(), Error> {
+    if input_dims <= 0 || input_dims % affine.group_size != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3-Next affine fused projection {key:?} has input dimension {input_dims}, which is not divisible by group size {}",
+            affine.group_size
+        )));
+    }
+    let (expected_trailing, expected_dtype) = match component {
+        "weight" => (
+            quantized_packed_dimension(input_dims, affine.bits),
+            Dtype::Uint32,
+        ),
+        "scales" | "biases" => (input_dims / affine.group_size, Dtype::Float16),
+        other => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "unsupported Qwen3-Next affine fused projection component {other:?}"
+            )))
+        }
+    };
+    if value.ndim() != 2 || value.dim(1) != expected_trailing || value.dtype() != expected_dtype {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3-Next affine fused projection {key:?} has shape {:?} and dtype {:?}; expected rank-2 trailing dimension {expected_trailing} and dtype {expected_dtype:?} for {}-bit groups of {}",
+            value.shape(),
+            value.dtype(),
+            affine.bits,
+            affine.group_size
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn split_fused_projection_configs(
+    configs: &mut std::collections::HashMap<String, AffineQuantization>,
+) -> Result<(), Error> {
+    let fused = configs
+        .keys()
+        .filter_map(|key| {
+            [
+                (
+                    "linear_attn.in_proj_qkvz.weight",
+                    [
+                        "linear_attn.in_proj_qkv.weight",
+                        "linear_attn.in_proj_z.weight",
+                    ],
+                ),
+                (
+                    "linear_attn.in_proj_ba.weight",
+                    [
+                        "linear_attn.in_proj_b.weight",
+                        "linear_attn.in_proj_a.weight",
+                    ],
+                ),
+            ]
+            .into_iter()
+            .find_map(|(suffix, outputs)| {
+                key.strip_suffix(suffix)
+                    .map(|prefix| (key.clone(), prefix.to_string(), outputs))
+            })
+        })
+        .collect::<Vec<_>>();
+    for (source, prefix, outputs) in fused {
+        let config = configs
+            .remove(&source)
+            .expect("fused affine config key was collected from this map");
+        for output in outputs {
+            let output = format!("{prefix}{output}");
+            if configs.insert(output.clone(), config).is_some() {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3-Next affine projection {source:?} collides with {output:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_fused_projection_outputs(
@@ -306,7 +404,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use safemlx::{
-        module::ModuleParameters, transforms::eval, Array, Device, DeviceType, ExecutionContext,
+        module::ModuleParameters, transforms::eval, Array, Device, DeviceType, Dtype,
+        ExecutionContext,
     };
 
     fn fp8_config() -> serde_json::Value {
@@ -394,6 +493,113 @@ mod tests {
     fn rejects_non_block_aligned_fp8_components() {
         let error = super::fp8_block_row_widths(&[128, 64, 256]).unwrap_err();
         assert!(error.to_string().contains("not divisible by 128"));
+    }
+
+    #[test]
+    fn splits_mixed_affine_fused_projection_configs() {
+        let q3 = crate::quantization::AffineQuantization::new(16, 3).unwrap();
+        let q5 = crate::quantization::AffineQuantization::new(32, 5).unwrap();
+        let mut configs = HashMap::from([
+            ("model.layers.0.linear_attn.in_proj_qkvz.weight".into(), q3),
+            ("model.layers.0.linear_attn.in_proj_ba.weight".into(), q5),
+        ]);
+        super::split_fused_projection_configs(&mut configs).unwrap();
+        assert_eq!(configs["model.layers.0.linear_attn.in_proj_qkv.weight"], q3);
+        assert_eq!(configs["model.layers.0.linear_attn.in_proj_z.weight"], q3);
+        assert_eq!(configs["model.layers.0.linear_attn.in_proj_b.weight"], q5);
+        assert_eq!(configs["model.layers.0.linear_attn.in_proj_a.weight"], q5);
+        assert!(!configs
+            .keys()
+            .any(|key| key.contains("in_proj_qkvz") || key.contains("in_proj_ba")));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn affine_fused_projection_split_matches_explicit_dequantization() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut args = fp8_args();
+        args.quantization_config = None;
+        let affine = crate::quantization::AffineQuantization::new(32, 5).unwrap();
+        let (widths, _) = super::fused_projection_widths(&args).unwrap();
+        let rows = args.linear_num_key_heads * widths.iter().sum::<i32>();
+        let values = (0..rows * args.hidden_size)
+            .map(|index| ((index % 101) as f32 - 50.0) / 61.0)
+            .collect::<Vec<_>>();
+        let dense = Array::from_slice(&values, &[rows, args.hidden_size]);
+        let quantized = crate::quantization::quantize_tensor(&dense, affine, stream).unwrap();
+        let scales = quantized.scales.as_dtype(Dtype::Float16, stream).unwrap();
+        let biases = quantized
+            .biases
+            .unwrap()
+            .as_dtype(Dtype::Float16, stream)
+            .unwrap();
+        let reference = safemlx::ops::dequantize(
+            &quantized.weight,
+            &scales,
+            &biases,
+            affine.group_size,
+            affine.bits,
+            stream,
+        )
+        .unwrap();
+        let reference = super::split_fused_projection(
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            reference,
+            &args,
+            stream,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let weights = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            quantized.weight,
+            Some(affine),
+            &args,
+            stream,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let scales = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.scales",
+            scales,
+            Some(affine),
+            &args,
+            stream,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let biases = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.biases",
+            biases,
+            Some(affine),
+            &args,
+            stream,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        for projection in ["in_proj_qkv", "in_proj_z"] {
+            let prefix = format!("model.layers.0.linear_attn.{projection}");
+            let restored = safemlx::ops::dequantize(
+                &weights[&format!("{prefix}.weight")],
+                &scales[&format!("{prefix}.scales")],
+                &biases[&format!("{prefix}.biases")],
+                affine.group_size,
+                affine.bits,
+                stream,
+            )
+            .unwrap();
+            assert!(reference[&format!("{prefix}.weight")]
+                .all_close(&restored, 1e-3, 1e-3, None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+        }
     }
 
     #[test]
@@ -649,6 +855,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("must remain dense BF16"));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn rejects_malformed_affine_fused_projection_components() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let args = fp8_args();
+        let affine = crate::quantization::AffineQuantization::new(32, 5).unwrap();
+        let rows = args.linear_num_key_heads
+            * (2 * args.linear_key_head_dim
+                + 2 * args.linear_num_value_heads * args.linear_value_head_dim
+                    / args.linear_num_key_heads);
+        let malformed_codes = Array::from_slice(&vec![0u32; (rows * 19) as usize], &[rows, 19]);
+        let error = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            malformed_codes,
+            Some(affine),
+            &args,
+            stream,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("trailing dimension 20"));
+
+        let malformed_scales = Array::from_slice(&vec![0f32; (rows * 4) as usize], &[rows, 4]);
+        let error = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.scales",
+            malformed_scales,
+            Some(affine),
+            &args,
+            stream,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("dtype Float32"));
+        assert!(error.to_string().contains("dtype Float16"));
+
+        let unaligned = crate::quantization::AffineQuantization::new(32, 4).unwrap();
+        let mut unaligned_args = args;
+        unaligned_args.hidden_size = 130;
+        let codes = Array::from_slice(&vec![0u32; (rows * 17) as usize], &[rows, 17]);
+        let error = super::split_fused_projection_with_affine(
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            codes,
+            Some(unaligned),
+            &unaligned_args,
+            stream,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not divisible by group size"));
     }
 
     #[test]
