@@ -235,6 +235,10 @@ fn stop_reason(output_ids: &[u32], eos_token_ids: &[u32], max_tokens: usize) -> 
     }
 }
 
+fn should_report_stop_reason(stop_reason: StopReason, verbose: bool) -> bool {
+    verbose || stop_reason == StopReason::MaxTokens
+}
+
 fn write_streamed_token(
     decoder: &mut TextDecoder,
     stdout: &mut impl Write,
@@ -544,7 +548,9 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
     }
-    eprintln!("stop_reason: {}", stop_reason.label());
+    if should_report_stop_reason(stop_reason, args.verbose) {
+        eprintln!("stop_reason: {}", stop_reason.label());
+    }
 
     if args.verbose {
         stream.synchronize()?;
@@ -1079,8 +1085,8 @@ mod tests {
     use hf_hub::cache::CachedRevisionInfo;
 
     use super::{
-        format_bytes, select_cached_gguf_path, select_revision, split_hf_model_spec, stop_reason,
-        validate_args, Cli, StopReason,
+        format_bytes, select_cached_gguf_path, select_revision, should_report_stop_reason,
+        split_hf_model_spec, stop_reason, validate_args, Cli, StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1104,6 +1110,17 @@ mod tests {
         assert_eq!(stop_reason(&[4, 2], &[2], 10), StopReason::Eos);
         assert_eq!(stop_reason(&[4, 5], &[2], 2), StopReason::MaxTokens);
         assert_eq!(stop_reason(&[4], &[2], 2), StopReason::GeneratorExhausted);
+    }
+
+    #[test]
+    fn reports_only_max_tokens_without_verbose_output() {
+        assert!(should_report_stop_reason(StopReason::MaxTokens, false));
+        assert!(!should_report_stop_reason(StopReason::Eos, false));
+        assert!(!should_report_stop_reason(
+            StopReason::GeneratorExhausted,
+            false
+        ));
+        assert!(should_report_stop_reason(StopReason::Eos, true));
     }
 
     #[test]
