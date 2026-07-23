@@ -16,7 +16,7 @@ The standard loader accepts Hugging Face-style directories containing
 checkpoint. The current architecture dispatch covers:
 
 - DeepSeek-V3 and DeepSeek-R1
-- Gemma 4 text and multimodal models
+- Gemma 4 dense and MoE text and multimodal models
 - GPT-OSS
 - Thinking Machines Lab Inkling
 - Llama and Mistral

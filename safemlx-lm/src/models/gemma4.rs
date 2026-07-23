@@ -15,10 +15,10 @@ use safemlx::{
     module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
-        concatenate_axis, dequantize_with_mode,
+        concatenate_axis, dequantize_with_mode, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt, tanh,
-        GgufCheckpoint, GgufMetadataValue, QuantizationMode,
+        topk_route_plan, GgufCheckpoint, GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -46,6 +46,7 @@ use crate::{
                 attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
             },
             generation::CausalLm,
+            moe::{affine_grouped_linear, top_k_softmax_routing, weighted_route_sum},
         },
         input,
     },
@@ -55,8 +56,9 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
-        load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_named_array_strict,
+        load_safetensors_quantized_strict, load_safetensors_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -335,7 +337,7 @@ pub struct ModelArgs {
     #[serde(default)]
     /// Number of selected experts when MoE is present.
     pub top_k_experts: Option<i32>,
-    #[serde(default)]
+    #[serde(default, alias = "expert_intermediate_size")]
     /// MoE intermediate size when MoE is present.
     pub moe_intermediate_size: Option<i32>,
     #[serde(default)]
@@ -848,10 +850,8 @@ where
             if let Some(cache) = cache.as_mut() {
                 (keys, values) = cache.update_and_fetch(keys, values, stream)?;
             }
-            if self.store_full_length_kv {
-                if let Some(shared_kv) = shared_kv.as_mut() {
-                    shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
-                }
+            if let Some(shared_kv) = shared_kv.as_mut() {
+                shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
             }
             (keys, values)
         };
@@ -1010,12 +1010,10 @@ impl Attention {
             }
             observer.observe(&format!("{prefix}.keys_cache"), &keys)?;
             observer.observe(&format!("{prefix}.values_cache"), &values)?;
-            if self.store_full_length_kv {
-                if let Some(shared_kv) = shared_kv.as_mut() {
-                    shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
-                    observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
-                    observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
-                }
+            if let Some(shared_kv) = shared_kv.as_mut() {
+                shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
+                observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
+                observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
             }
             (keys, values)
         };
@@ -1178,6 +1176,333 @@ impl Mlp {
         let output = self.down_proj.forward(&down_proj_input, stream)?;
         observer.observe(&format!("{prefix}.down_proj"), &output)?;
         Ok(output)
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
+/// Gemma 4 MoE router with learned input and per-expert scales.
+pub struct MoeRouter {
+    /// Hidden dimension routed by this module.
+    pub hidden_size: i32,
+    /// Number of experts selected for each token.
+    pub top_k: i32,
+    /// RMS normalization epsilon.
+    pub eps: f32,
+    #[quantizable]
+    #[param]
+    /// Projection from normalized hidden states to expert logits.
+    pub proj: MaybeQuantized<nn::Linear>,
+    #[param]
+    /// Learned scale applied to normalized router inputs.
+    pub scale: Param<Array>,
+    #[param]
+    /// Learned multiplicative scale applied after top-k normalization.
+    pub per_expert_scale: Param<Array>,
+}
+
+impl MoeRouter {
+    fn new(
+        args: &ModelArgs,
+        layer_idx: usize,
+        num_experts: i32,
+        top_k: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let prefix = format!("model.language_model.layers.{layer_idx}.router");
+        Ok(Self {
+            hidden_size: args.hidden_size,
+            top_k,
+            eps: args.rms_norm_eps,
+            proj: maybe_quantized_linear_with_config(
+                args.hidden_size,
+                num_experts,
+                args.quantization_for(&format!("{prefix}.proj.weight")),
+                stream,
+            )?,
+            scale: Param::<Array>::unloaded(&[args.hidden_size], Dtype::Float32, stream)?,
+            per_expert_scale: Param::<Array>::unloaded(&[num_experts], Dtype::Float32, stream)?,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let normalized = rms_norm_without_scale(hidden_states, self.eps, stream)?;
+        let scaled = normalized.multiply(self.scale.as_ref(), stream)?.multiply(
+            Array::from_f32((self.hidden_size as f32).sqrt().recip()),
+            stream,
+        )?;
+        let logits = self.proj.forward(&scaled, stream)?;
+        let (indices, weights) = top_k_softmax_routing(&logits, self.top_k, stream)?;
+        let expert_scales = self
+            .per_expert_scale
+            .as_ref()
+            .take_axis(&indices, 0, stream)?;
+        Ok((indices, weights.multiply(expert_scales, stream)?))
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.proj.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// One expert-major projection with optional affine or MXFP4 storage.
+pub struct ExpertProjection {
+    /// Quantization encoding, when packed.
+    pub quantization: Option<WeightQuantization>,
+    #[param]
+    /// Projection weights shaped `[experts, output, input]`.
+    pub weight: Param<Array>,
+    #[param]
+    /// Per-group scales for packed weights.
+    pub scales: Param<Option<Array>>,
+    #[param]
+    /// Per-group biases for affine packed weights.
+    pub biases: Param<Option<Array>>,
+}
+
+impl ExpertProjection {
+    fn new(
+        num_experts: i32,
+        output_dim: i32,
+        input_dim: i32,
+        quantization: Option<WeightQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if let Some(quantization) = quantization {
+            Ok(Self {
+                quantization: Some(quantization),
+                weight: Param::<Array>::unloaded(
+                    &[
+                        num_experts,
+                        output_dim,
+                        quantized_packed_dimension(input_dim, quantization.bits()),
+                    ],
+                    Dtype::Uint32,
+                    stream,
+                )?,
+                scales: Param::<Option<Array>>::unloaded_some(
+                    &[
+                        num_experts,
+                        output_dim,
+                        input_dim / quantization.group_size(),
+                    ],
+                    if quantization == WeightQuantization::MxFp4 {
+                        Dtype::Uint8
+                    } else {
+                        Dtype::Float16
+                    },
+                    stream,
+                )?,
+                biases: if quantization.has_biases() {
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            num_experts,
+                            output_dim,
+                            input_dim / quantization.group_size(),
+                        ],
+                        Dtype::Float16,
+                        stream,
+                    )?
+                } else {
+                    Param::new(None)
+                },
+            })
+        } else {
+            Ok(Self {
+                quantization: None,
+                weight: Param::<Array>::unloaded(
+                    &[num_experts, output_dim, input_dim],
+                    Dtype::Float32,
+                    stream,
+                )?,
+                scales: Param::new(None),
+                biases: Param::new(None),
+            })
+        }
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &Array,
+        group_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if let Some(quantization) = self.quantization {
+            affine_grouped_linear(
+                hidden_states,
+                self.weight.as_ref(),
+                self.scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("quantized Gemma 4 expert scales"),
+                self.biases.as_ref().as_ref(),
+                group_ids,
+                quantization,
+                stream,
+            )
+        } else {
+            grouped_matmul(
+                hidden_states,
+                &self.weight.as_ref().swap_axes(-1, -2, stream)?,
+                group_ids,
+                true,
+                stream,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Published Gemma 4 SwitchGLU expert projection tree.
+pub struct SwitchGluExperts {
+    #[param]
+    /// GELU gate projections.
+    pub gate_proj: ExpertProjection,
+    #[param]
+    /// Multiplicative up projections.
+    pub up_proj: ExpertProjection,
+    #[param]
+    /// Down projections back to model width.
+    pub down_proj: ExpertProjection,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Routed Gemma 4 gated-GELU experts.
+pub struct GemmaExperts {
+    /// Number of routed experts.
+    pub num_experts: i32,
+    /// Model hidden dimension.
+    pub hidden_dim: i32,
+    #[param]
+    /// SwitchGLU projection bank.
+    pub switch_glu: SwitchGluExperts,
+}
+
+impl GemmaExperts {
+    fn new(
+        args: &ModelArgs,
+        layer_idx: usize,
+        num_experts: i32,
+        intermediate_dim: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let prefix = format!("model.language_model.layers.{layer_idx}.experts.switch_glu");
+        Ok(Self {
+            num_experts,
+            hidden_dim: args.hidden_size,
+            switch_glu: SwitchGluExperts {
+                gate_proj: ExpertProjection::new(
+                    num_experts,
+                    intermediate_dim,
+                    args.hidden_size,
+                    args.quantization_for(&format!("{prefix}.gate_proj.weight")),
+                    stream,
+                )?,
+                up_proj: ExpertProjection::new(
+                    num_experts,
+                    intermediate_dim,
+                    args.hidden_size,
+                    args.quantization_for(&format!("{prefix}.up_proj.weight")),
+                    stream,
+                )?,
+                down_proj: ExpertProjection::new(
+                    num_experts,
+                    args.hidden_size,
+                    intermediate_dim,
+                    args.quantization_for(&format!("{prefix}.down_proj.weight")),
+                    stream,
+                )?,
+            },
+        })
+    }
+
+    fn forward_chunk(
+        &self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate = self
+            .switch_glu
+            .gate_proj
+            .forward(&hidden, &plan.sorted_group_ids, stream)?;
+        let up = self
+            .switch_glu
+            .up_proj
+            .forward(&hidden, &plan.sorted_group_ids, stream)?;
+        let activated = nn::gelu_approximate(gate, stream)?.multiply(up, stream)?;
+        let output =
+            self.switch_glu
+                .down_proj
+                .forward(&activated, &plan.sorted_group_ids, stream)?;
+        weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        const CHUNK_THRESHOLD: i32 = 64;
+        const CHUNK_TOKENS: i32 = 32;
+
+        let num_tokens = hidden_states.dim(0);
+        if num_tokens <= CHUNK_THRESHOLD {
+            return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
+        }
+        let mut outputs = Vec::new();
+        let mut start = 0;
+        while start < num_tokens {
+            let end = (start + CHUNK_TOKENS).min(num_tokens);
+            outputs.push(self.forward_chunk(
+                &hidden_states.try_index_device((start..end, ..), stream)?,
+                &top_k_index.try_index_device((start..end, ..), stream)?,
+                &top_k_weights.try_index_device((start..end, ..), stream)?,
+                stream,
+            )?);
+            start = end;
+        }
+        concatenate_axis(&outputs, 0, stream)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+struct Moe {
+    router: MoeRouter,
+    experts: GemmaExperts,
+}
+
+impl Moe {
+    fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        let num_experts = args
+            .num_experts
+            .ok_or_else(|| Exception::custom("Gemma 4 MoE config is missing num_experts"))?;
+        let top_k = args
+            .top_k_experts
+            .ok_or_else(|| Exception::custom("Gemma 4 MoE config is missing top_k_experts"))?;
+        let intermediate_dim = args.moe_intermediate_size.ok_or_else(|| {
+            Exception::custom("Gemma 4 MoE config is missing moe_intermediate_size")
+        })?;
+        if num_experts <= 0 || top_k <= 0 || top_k > num_experts || intermediate_dim <= 0 {
+            return Err(Exception::custom(
+                "Gemma 4 MoE expert count, top-k, and intermediate size must be positive and top-k cannot exceed the expert count",
+            ));
+        }
+        Ok(Self {
+            router: MoeRouter::new(args, layer_idx, num_experts, top_k, stream)?,
+            experts: GemmaExperts::new(args, layer_idx, num_experts, intermediate_dim, stream)?,
+        })
     }
 }
 
@@ -1384,6 +1709,13 @@ pub struct TransformerBlock {
     pub mlp: Mlp,
     #[quantizable]
     #[param]
+    /// Optional MoE router.
+    pub router: Option<MoeRouter>,
+    #[param]
+    /// Optional packed routed expert bank.
+    pub experts: Option<GemmaExperts>,
+    #[quantizable]
+    #[param]
     /// Optional gate for per-layer input embeddings.
     pub per_layer_input_gate: Option<MaybeQuantized<nn::Linear>>,
     #[quantizable]
@@ -1405,6 +1737,15 @@ pub struct TransformerBlock {
     #[param]
     /// Post-MLP RMSNorm.
     pub post_feedforward_layernorm: nn::RmsNorm,
+    #[param]
+    /// Dense-branch norm used before combining dense and routed outputs.
+    pub post_feedforward_layernorm_1: Option<nn::RmsNorm>,
+    #[param]
+    /// Routed-branch input norm.
+    pub pre_feedforward_layernorm_2: Option<nn::RmsNorm>,
+    #[param]
+    /// Routed-branch output norm.
+    pub post_feedforward_layernorm_2: Option<nn::RmsNorm>,
     #[param]
     /// Learned scalar applied to the block output.
     pub layer_scalar: Param<Array>,
@@ -1439,6 +1780,32 @@ impl TransformerBlock {
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let post_feedforward_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let moe = args
+            .enable_moe_block
+            .then(|| Moe::new(args, layer_idx, stream))
+            .transpose()?;
+        let (router, experts) = match moe {
+            Some(moe) => (Some(moe.router), Some(moe.experts)),
+            None => (None, None),
+        };
+        let post_feedforward_layernorm_1 = args
+            .enable_moe_block
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
+        let pre_feedforward_layernorm_2 = args
+            .enable_moe_block
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
+        let post_feedforward_layernorm_2 = args
+            .enable_moe_block
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
         let per_layer_input_gate = if args.hidden_size_per_layer_input > 0 {
             Some(maybe_quantized_linear_with_config(
                 args.hidden_size,
@@ -1477,6 +1844,8 @@ impl TransformerBlock {
             layer_scalar: Param::new(Array::from_slice(&[1.0f32], &[1])),
             self_attn,
             mlp,
+            router,
+            experts,
             per_layer_input_gate,
             per_layer_projection,
             post_per_layer_input_norm,
@@ -1484,6 +1853,9 @@ impl TransformerBlock {
             post_attention_layernorm,
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
+            post_feedforward_layernorm_1,
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_2,
         })
     }
 }
@@ -1570,9 +1942,45 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.residual_before_mlp"), &h)?;
         let pre_ff = self.pre_feedforward_layernorm.forward(&h, stream)?;
         observer.observe(&format!("{prefix}.pre_feedforward_layernorm"), &pre_ff)?;
-        let r =
+        let dense =
             self.mlp
                 .forward_with_observer(&pre_ff, stream, &format!("{prefix}.mlp"), observer)?;
+        let r = if let (Some(router), Some(experts)) = (self.router.as_mut(), self.experts.as_mut())
+        {
+            let dense = self
+                .post_feedforward_layernorm_1
+                .as_mut()
+                .expect("MoE dense output norm")
+                .forward(&dense, stream)?;
+            observer.observe(&format!("{prefix}.post_feedforward_layernorm_1"), &dense)?;
+            let shape = h.shape().to_vec();
+            let routed_input = self
+                .pre_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed input norm")
+                .forward(&h.reshape(&[-1, self.hidden_size], stream)?, stream)?;
+            observer.observe(
+                &format!("{prefix}.pre_feedforward_layernorm_2"),
+                &routed_input,
+            )?;
+            let (indices, weights) =
+                router.forward(&h.reshape(&[-1, self.hidden_size], stream)?, stream)?;
+            observer.observe(&format!("{prefix}.router.top_k_experts"), &indices)?;
+            observer.observe(&format!("{prefix}.router.top_k_weights"), &weights)?;
+            let routed = experts
+                .forward(&routed_input, &indices, &weights, stream)?
+                .reshape(&shape, stream)?;
+            observer.observe(&format!("{prefix}.experts.output"), &routed)?;
+            let routed = self
+                .post_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed output norm")
+                .forward(&routed, stream)?;
+            observer.observe(&format!("{prefix}.post_feedforward_layernorm_2"), &routed)?;
+            dense.add(routed, stream)?
+        } else {
+            dense
+        };
         profile_array(PerfComponent::Mlp, &r)?;
         observer.observe(&format!("{prefix}.mlp_output"), &r)?;
         let r = self.post_feedforward_layernorm.forward(&r, stream)?;
@@ -1671,7 +2079,34 @@ where
         let r = self.post_attention_layernorm.forward(&r, stream)?;
         let h = x.add(r, stream)?;
         let pre_ff = self.pre_feedforward_layernorm.forward(&h, stream)?;
-        let r = self.mlp.forward(&pre_ff, stream)?;
+        let dense = self.mlp.forward(&pre_ff, stream)?;
+        let r = if let (Some(router), Some(experts)) = (self.router.as_mut(), self.experts.as_mut())
+        {
+            let dense = self
+                .post_feedforward_layernorm_1
+                .as_mut()
+                .expect("MoE dense output norm")
+                .forward(&dense, stream)?;
+            let shape = h.shape().to_vec();
+            let routed_input = self
+                .pre_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed input norm")
+                .forward(&h.reshape(&[-1, self.hidden_size], stream)?, stream)?;
+            let (indices, weights) =
+                router.forward(&h.reshape(&[-1, self.hidden_size], stream)?, stream)?;
+            let routed = experts
+                .forward(&routed_input, &indices, &weights, stream)?
+                .reshape(&shape, stream)?;
+            let routed = self
+                .post_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed output norm")
+                .forward(&routed, stream)?;
+            dense.add(routed, stream)?
+        } else {
+            dense
+        };
         profile_array(PerfComponent::Mlp, &r)?;
         let r = self.post_feedforward_layernorm.forward(&r, stream)?;
         let mut h = h.add(r, stream)?;
@@ -1695,6 +2130,12 @@ where
     fn training_mode(&mut self, mode: bool) {
         <Attention as Module<AttentionInput<'_, C>>>::training_mode(&mut self.self_attn, mode);
         self.mlp.training_mode(mode);
+        if let Some(router) = &mut self.router {
+            router.training_mode(mode);
+        }
+        if let Some(experts) = &mut self.experts {
+            experts.training_mode(mode);
+        }
         if let Some(layer) = &mut self.per_layer_input_gate {
             layer.training_mode(mode);
         }
@@ -1708,6 +2149,15 @@ where
         self.post_attention_layernorm.training_mode(mode);
         self.pre_feedforward_layernorm.training_mode(mode);
         self.post_feedforward_layernorm.training_mode(mode);
+        if let Some(norm) = &mut self.post_feedforward_layernorm_1 {
+            norm.training_mode(mode);
+        }
+        if let Some(norm) = &mut self.pre_feedforward_layernorm_2 {
+            norm.training_mode(mode);
+        }
+        if let Some(norm) = &mut self.post_feedforward_layernorm_2 {
+            norm.training_mode(mode);
+        }
     }
 }
 
@@ -2595,9 +3045,9 @@ pub(crate) struct LoadedGemma4Gguf {
 
 /// Loads the text model from a Gemma 4 GGUF checkpoint.
 ///
-/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
-/// supported. Vision, audio, MoE, assistant-drafter, and separate multimodal
-/// projector GGUF files are intentionally outside this first text-only adapter.
+/// Dense tensors and every GGUF quantization supported by the shared backend are
+/// accepted for both dense and MoE text checkpoints. Vision, audio, assistant-drafter,
+/// and separate multimodal projector GGUF files use their dedicated loaders.
 pub fn load_gemma4_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -2635,7 +3085,18 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
 
     let mut args = gemma4_args_from_gguf(checkpoint, &metadata, weights_stream)?;
-    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let mut quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    if args.enable_moe_block {
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
+            if let Some(config) =
+                quantized_weight_configs.remove(&format!("{prefix}.gate_up_proj.weight"))
+            {
+                quantized_weight_configs.insert(format!("{prefix}.gate_proj.weight"), config);
+                quantized_weight_configs.insert(format!("{prefix}.up_proj.weight"), config);
+            }
+        }
+    }
     let quantized_weights = quantized_weight_configs
         .keys()
         .cloned()
@@ -2670,14 +3131,26 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
             .allow_unused_prefix(format!("{prefix}.k_norm."));
     }
     let mut report = StrictLoadReport::default();
-    load_gguf_strict(
-        &mut model,
-        checkpoint,
-        quantization.map(|value| (value, stream)),
-        &config,
-        &mut report,
-        |name, value| Ok((translate_gguf_weight_name(&name), value)),
-    )?;
+    if !model.args.enable_moe_block {
+        load_gguf_strict(
+            &mut model,
+            checkpoint,
+            quantization.map(|value| (value, stream)),
+            &config,
+            &mut report,
+            |name, value| Ok((translate_gguf_weight_name(&name), value)),
+        )?;
+    } else {
+        load_gemma4_moe_gguf_weights(
+            &mut model,
+            checkpoint,
+            quantization,
+            stream,
+            weights_stream,
+            &config,
+            &mut report,
+        )?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
@@ -2692,16 +3165,133 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     })
 }
 
+fn load_gemma4_moe_gguf_weights(
+    model: &mut Model,
+    checkpoint: &GgufCheckpoint,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    for layer in 0..model.args.num_hidden_layers {
+        let prefix = format!("blk.{layer}");
+        let fused = checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_gate_up_exps.weight"));
+        let gate = checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_gate_exps.weight"));
+        let up = checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_up_exps.weight"));
+        if fused && (gate || up) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 GGUF layer {layer} mixes fused and separate gate/up expert tensors"
+            )));
+        }
+        if !fused && (!gate || !up) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 GGUF layer {layer} has incomplete gate/up expert tensors"
+            )));
+        }
+    }
+
+    let mut materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let physical_name = &tensor.descriptor().name;
+        if physical_name.contains(".ffn_gate_up_exps.") {
+            continue;
+        }
+        for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
+            load_named_array_strict(
+                model,
+                translate_gguf_weight_name(&name),
+                value,
+                quantization.map(|value| (value, stream)),
+                config,
+                report,
+            )?;
+        }
+    }
+
+    for layer in 0..model.args.num_hidden_layers {
+        let source_prefix = format!("blk.{layer}");
+        let fused_name = format!("{source_prefix}.ffn_gate_up_exps.weight");
+        if !checkpoint.contains_gguf_tensor(&fused_name) {
+            continue;
+        }
+        let target_prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
+        let fused = materializer
+            .converted_tensor(&fused_name)?
+            .into_arrays()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        for suffix in ["weight", "scales", "biases"] {
+            let source_name = format!("{source_prefix}.ffn_gate_up_exps.{suffix}");
+            let Some(value) = fused.get(&source_name) else {
+                if suffix == "weight" {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 GGUF is missing fused gate/up expert weights in layer {layer}"
+                    )));
+                }
+                continue;
+            };
+            let shape = value.shape();
+            let intermediate = model.args.moe_intermediate_size.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Gemma 4 MoE config is missing moe_intermediate_size".into(),
+                )
+            })?;
+            if shape.len() != 3 || shape[1] != 2 * intermediate {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 GGUF fused expert {suffix} in layer {layer} has shape {shape:?}; expected output dimension {}",
+                    2 * intermediate
+                )));
+            }
+            let gate = value.try_index_device((.., ..intermediate, ..), weights_stream)?;
+            let up = value.try_index_device((.., intermediate.., ..), weights_stream)?;
+            for (projection, value) in [("gate_proj", gate), ("up_proj", up)] {
+                load_named_array_strict(
+                    model,
+                    format!("{target_prefix}.{projection}.{suffix}"),
+                    value,
+                    quantization.map(|value| (value, stream)),
+                    config,
+                    report,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn gemma4_args_from_gguf(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     stream: &Stream,
 ) -> Result<ModelArgs, Error> {
-    if gguf_optional_i64(metadata, "gemma4.expert_count", stream)?.unwrap_or(0) > 0
-        || arrays.any_gguf_tensor(|name| name.contains("_exps."))
+    let expert_count = gguf_optional_i64(metadata, "gemma4.expert_count", stream)?.unwrap_or(0);
+    let enable_moe_block = expert_count > 0
+        || arrays.any_gguf_tensor(|name| {
+            name.contains("ffn_gate_up_exps.")
+                || name.contains("ffn_gate_exps.")
+                || name.contains("ffn_down_exps.")
+        });
+    let num_experts = enable_moe_block
+        .then(|| {
+            i32::try_from(expert_count).map_err(|_| {
+                Error::UnsupportedArchitecture("Gemma 4 expert count exceeds i32".into())
+            })
+        })
+        .transpose()?;
+    let top_k_experts = enable_moe_block
+        .then(|| gguf_i32(metadata, "gemma4.expert_used_count", stream))
+        .transpose()?;
+    let moe_intermediate_size = enable_moe_block
+        .then(|| gguf_i32(metadata, "gemma4.expert_feed_forward_length", stream))
+        .transpose()?;
+    if enable_moe_block
+        && (num_experts.is_none_or(|value| value <= 0)
+            || top_k_experts.is_none_or(|value| value <= 0)
+            || moe_intermediate_size.is_none_or(|value| value <= 0))
     {
         return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 MoE GGUF checkpoints are not supported yet".into(),
+            "Gemma 4 GGUF has incomplete or invalid MoE metadata".into(),
         ));
     }
 
@@ -2895,16 +3485,16 @@ fn gemma4_args_from_gguf(
             "gemma4.final_logit_softcapping",
             stream,
         )?,
-        enable_moe_block: false,
-        num_experts: None,
-        top_k_experts: None,
-        moe_intermediate_size: None,
+        enable_moe_block,
+        num_experts,
+        top_k_experts,
+        moe_intermediate_size,
         rope_scaling: None,
         rope_parameters,
     })
 }
 
-fn expand_layer_values(
+pub(super) fn expand_layer_values(
     key: &str,
     values: Vec<i64>,
     num_hidden_layers: i32,
@@ -2959,10 +3549,28 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     let Some((layer, parameter)) = rest.split_once('.') else {
         return name.to_string();
     };
+    if parameter == "ffn_gate_inp.scale" {
+        return format!("model.language_model.layers.{layer}.router.scale");
+    }
+    if parameter == "ffn_down_exps.scale" {
+        return format!("model.language_model.layers.{layer}.router.per_expert_scale");
+    }
+    const EXPERT_PARAMETERS: [(&str, &str); 4] = [
+        ("ffn_gate_up_exps", "experts.switch_glu.gate_up_proj"),
+        ("ffn_gate_exps", "experts.switch_glu.gate_proj"),
+        ("ffn_up_exps", "experts.switch_glu.up_proj"),
+        ("ffn_down_exps", "experts.switch_glu.down_proj"),
+    ];
+    for (source, target) in EXPERT_PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let suffix = parameter.strip_prefix(source).unwrap_or_default();
+            return format!("model.language_model.layers.{layer}.{target}{suffix}");
+        }
+    }
     if parameter == "layer_output_scale.weight" {
         return format!("model.language_model.layers.{layer}.layer_scalar");
     }
-    const BLOCK_PARAMETERS: [(&str, &str); 18] = [
+    const BLOCK_PARAMETERS: [(&str, &str); 22] = [
         ("attn_q_norm", "self_attn.q_norm"),
         ("attn_k_norm", "self_attn.k_norm"),
         ("attn_q", "self_attn.q_proj"),
@@ -2976,6 +3584,10 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
         ("ffn_gate", "mlp.gate_proj"),
         ("ffn_down", "mlp.down_proj"),
         ("ffn_up", "mlp.up_proj"),
+        ("ffn_gate_inp", "router.proj"),
+        ("pre_ffw_norm_2", "pre_feedforward_layernorm_2"),
+        ("post_ffw_norm_1", "post_feedforward_layernorm_1"),
+        ("post_ffw_norm_2", "post_feedforward_layernorm_2"),
         ("inp_gate", "per_layer_input_gate"),
         ("proj", "per_layer_projection"),
         ("post_norm", "post_per_layer_input_norm"),
@@ -3005,7 +3617,7 @@ fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Resu
     }
 }
 
-fn gguf_i32(
+pub(super) fn gguf_i32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -3025,7 +3637,7 @@ fn gguf_i64(
     })
 }
 
-fn gguf_optional_i64(
+pub(super) fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -3041,7 +3653,7 @@ fn gguf_optional_i64(
     Ok(values.into_iter().next())
 }
 
-fn gguf_i64_values(
+pub(super) fn gguf_i64_values(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -3064,7 +3676,7 @@ fn gguf_optional_i64_values(
     }
 }
 
-fn gguf_optional_sliding_window_pattern(
+pub(super) fn gguf_optional_sliding_window_pattern(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -3077,7 +3689,7 @@ fn gguf_optional_sliding_window_pattern(
     }
 }
 
-fn gguf_f32(
+pub(super) fn gguf_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     stream: &Stream,
@@ -3087,7 +3699,7 @@ fn gguf_f32(
     })
 }
 
-fn gguf_optional_f32(
+pub(super) fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     _stream: &Stream,
@@ -3128,11 +3740,7 @@ pub(crate) type Gemma4ModelConfigParts = (
 pub(crate) fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelConfigParts, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     let mut config: Gemma4Config = serde_json::from_reader(file)?;
-    if config.text_config.enable_moe_block {
-        return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 MoE models are not supported yet".to_string(),
-        ));
-    }
+    validate_moe_args(&config.text_config)?;
     config.text_config.model_type = "gemma4".to_string();
     config.text_config.quantized = config.quantization.is_some();
     config.text_config.weight_quantization = config
@@ -3158,9 +3766,19 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     let config: Gemma4Config = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Gemma 4 config: {error}"))
     })?;
-    if config.text_config.enable_moe_block {
+    validate_moe_args(&config.text_config)
+}
+
+fn validate_moe_args(args: &ModelArgs) -> Result<(), Error> {
+    if !args.enable_moe_block {
+        return Ok(());
+    }
+    let num_experts = args.num_experts.unwrap_or(0);
+    let top_k = args.top_k_experts.unwrap_or(0);
+    let intermediate = args.moe_intermediate_size.unwrap_or(0);
+    if num_experts <= 0 || top_k <= 0 || top_k > num_experts || intermediate <= 0 {
         return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 MoE models are not supported yet".to_string(),
+            "Gemma 4 MoE requires positive num_experts, top_k_experts, and moe_intermediate_size, with top_k_experts no greater than num_experts".into(),
         ));
     }
     Ok(())
@@ -3209,7 +3827,7 @@ pub fn load_gemma4_model(
     Ok(model)
 }
 
-/// Loads a dense Gemma 4 checkpoint while affine-quantizing supported weights.
+/// Loads a Gemma 4 checkpoint while affine-quantizing supported weights.
 ///
 /// Transformer weights and modality bridge projections use affine storage.
 /// Vision and audio towers remain dense because their convolutional and
@@ -3690,8 +4308,9 @@ mod tests {
     use std::collections::HashMap;
 
     use safemlx::{
-        module::ModuleParameters, ops::GgufMetadataValue, Array, Device, DeviceType,
-        ExecutionContext, Stream,
+        module::ModuleParameters,
+        ops::{zeros_dtype, GgufMetadataValue},
+        Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
     use super::{
@@ -3702,6 +4321,7 @@ mod tests {
         common::generation::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
     };
+    use crate::weights::{load_arrays_strict, StrictLoadConfig, StrictLoadReport};
 
     fn test_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -3888,6 +4508,84 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn moe_parameter_tree_matches_published_safetensors_layout() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = model_args(true);
+        args.enable_moe_block = true;
+        args.num_experts = Some(4);
+        args.top_k_experts = Some(2);
+        args.moe_intermediate_size = Some(8);
+        let model = super::Model::new(args, context.stream()).unwrap();
+        let params = model.parameters().flatten();
+        let prefix = "model.language_model.layers.0";
+
+        for key in [
+            format!("{prefix}.router.proj.weight"),
+            format!("{prefix}.router.scale"),
+            format!("{prefix}.router.per_expert_scale"),
+            format!("{prefix}.experts.switch_glu.gate_proj.weight"),
+            format!("{prefix}.experts.switch_glu.up_proj.weight"),
+            format!("{prefix}.experts.switch_glu.down_proj.weight"),
+            format!("{prefix}.post_feedforward_layernorm_1.weight"),
+            format!("{prefix}.pre_feedforward_layernorm_2.weight"),
+            format!("{prefix}.post_feedforward_layernorm_2.weight"),
+        ] {
+            assert!(params.contains_key(key.as_str()), "missing {key}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Metal"]
+    fn tiny_moe_prefill_and_decode() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut args = model_args(true);
+        args.enable_moe_block = true;
+        args.num_experts = Some(4);
+        args.top_k_experts = Some(2);
+        args.moe_intermediate_size = Some(8);
+        let mut model = super::Model::new(args, stream).unwrap();
+        let arrays = model
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.to_string(),
+                    zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let config = StrictLoadConfig::default();
+        let mut report = StrictLoadReport::default();
+        load_arrays_strict(&mut model, arrays, &config, &mut report).unwrap();
+        report.finish(&model, &config).unwrap();
+
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [InputPart::text_token_ids(&tokens)];
+        let mut cache = Cache::default();
+        let logits = model
+            .prefill_input_logits(ModelInput::new(&parts), &mut cache, stream)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 32]);
+        logits.evaluated().unwrap();
+
+        let decode = Array::from_slice(&[3u32], &[1, 1]);
+        let logits = model.decode_logits(&decode, &mut cache, stream).unwrap();
+        assert_eq!(logits.shape(), &[1, 32]);
+        logits.evaluated().unwrap();
+
+        let mut mtp_cache = Cache::default();
+        let state = model
+            .prefill_mtp(ModelInput::new(&parts), &mut mtp_cache, stream)
+            .unwrap();
+        assert!(state
+            .shared_kv_states
+            .contains_key(&LayerType::FullAttention));
+    }
+
+    #[test]
     fn translates_gguf_gemma4_weight_names() {
         let cases = [
             (
@@ -3913,6 +4611,38 @@ mod tests {
             (
                 "blk.20.layer_output_scale.weight",
                 "model.language_model.layers.20.layer_scalar",
+            ),
+            (
+                "blk.3.ffn_gate_inp.weight",
+                "model.language_model.layers.3.router.proj.weight",
+            ),
+            (
+                "blk.3.ffn_gate_inp.scale",
+                "model.language_model.layers.3.router.scale",
+            ),
+            (
+                "blk.3.ffn_gate_up_exps.scales",
+                "model.language_model.layers.3.experts.switch_glu.gate_up_proj.scales",
+            ),
+            (
+                "blk.3.ffn_down_exps.scale",
+                "model.language_model.layers.3.router.per_expert_scale",
+            ),
+            (
+                "blk.3.ffn_down_exps.biases",
+                "model.language_model.layers.3.experts.switch_glu.down_proj.biases",
+            ),
+            (
+                "blk.3.pre_ffw_norm_2.weight",
+                "model.language_model.layers.3.pre_feedforward_layernorm_2.weight",
+            ),
+            (
+                "blk.3.post_ffw_norm_1.weight",
+                "model.language_model.layers.3.post_feedforward_layernorm_1.weight",
+            ),
+            (
+                "blk.3.post_ffw_norm_2.weight",
+                "model.language_model.layers.3.post_feedforward_layernorm_2.weight",
             ),
         ];
 
@@ -3999,6 +4729,64 @@ mod tests {
         assert_eq!(args.num_global_key_value_heads, Some(2));
         assert_eq!(args.num_kv_shared_layers, 1);
         assert_eq!(args.vocab_size, 32);
+    }
+
+    #[test]
+    fn parses_gemma4_moe_gguf_metadata() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut metadata = HashMap::from([
+            (
+                "gemma4.embedding_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            ("gemma4.block_count".into(), GgufMetadataValue::Uint32(1)),
+            (
+                "gemma4.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "gemma4.attention.head_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "gemma4.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "gemma4.attention.key_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "gemma4.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "gemma4.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            ("gemma4.vocab_size".into(), GgufMetadataValue::Uint32(32)),
+            ("gemma4.expert_count".into(), GgufMetadataValue::Uint32(8)),
+            (
+                "gemma4.expert_used_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "gemma4.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+        ]);
+        metadata.insert(
+            "gemma4.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![false])),
+        );
+        let arrays = HashMap::<String, Array>::new();
+
+        let args = super::gemma4_args_from_gguf(&arrays, &metadata, stream).unwrap();
+        assert!(args.enable_moe_block);
+        assert_eq!(args.num_experts, Some(8));
+        assert_eq!(args.top_k_experts, Some(2));
+        assert_eq!(args.moe_intermediate_size, Some(16));
     }
 
     #[test]

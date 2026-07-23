@@ -23,13 +23,14 @@ use crate::{
     error::Error,
     models::{
         common,
-        gemma4::{Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
+        gemma4::{self, Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
     quantization::WeightQuantization,
+    utils::rope::FloatOrString,
     weights::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
-        load_safetensors_strict, StrictLoadConfig, StrictLoadReport,
+        load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -544,10 +545,14 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
     match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(architecture)) if architecture == "gemma4_assistant" => {}
+        Some(GgufMetadataValue::String(architecture))
+            if matches!(
+                architecture.as_str(),
+                "gemma4_assistant" | "gemma4-assistant"
+            ) => {}
         Some(GgufMetadataValue::String(architecture)) => {
             return Err(Error::UnsupportedArchitecture(format!(
-                "GGUF architecture {architecture:?}; expected gemma4_assistant"
+                "GGUF architecture {architecture:?}; expected gemma4_assistant or gemma4-assistant"
             )))
         }
         Some(_) => {
@@ -567,6 +572,9 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
             return Err(Error::UnsupportedArchitecture(
                 "GGUF safemlx.mtp.config must be a JSON string".into(),
             ))
+        }
+        None if metadata.contains_key("gemma4-assistant.embedding_length") => {
+            gemma4_assistant_config_from_gguf(&checkpoint, &metadata, weights_stream)?
         }
         None => {
             let config_file = gguf_file
@@ -616,20 +624,251 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
     )?;
     report.finish(&model, &load_config)?;
     model.copy_to_stream(stream)?;
-    let _ = weights_stream;
     Ok(model)
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
-    let assistant = match name {
-        "mtp.pre_projection.weight" => Some("pre_projection.weight"),
-        "mtp.post_projection.weight" => Some("post_projection.weight"),
-        "mtp.centroids.weight" => Some("masked_embedding.centroids.weight"),
-        "mtp.token_ordering.weight" => Some("masked_embedding.token_ordering"),
-        _ => None,
+fn gemma4_assistant_config_from_gguf(
+    checkpoint: &impl GgufTensorNames,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<Gemma4AssistantConfig, Error> {
+    const PREFIX: &str = "gemma4-assistant";
+    let key = |suffix: &str| format!("{PREFIX}.{suffix}");
+    let num_hidden_layers = gemma4::gguf_i32(metadata, &key("block_count"), stream)?;
+    let layer_pattern = gemma4::gguf_optional_sliding_window_pattern(
+        metadata,
+        &key("attention.sliding_window_pattern"),
+        stream,
+    )?
+    .unwrap_or_else(|| vec![0; num_hidden_layers as usize]);
+    if layer_pattern.len() != num_hidden_layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Gemma 4 assistant sliding-window pattern has {} entries for {num_hidden_layers} layers",
+            layer_pattern.len()
+        )));
+    }
+    let layer_types = layer_pattern
+        .into_iter()
+        .map(|sliding| {
+            if sliding != 0 {
+                LayerType::SlidingAttention
+            } else {
+                LayerType::FullAttention
+            }
+        })
+        .collect::<Vec<_>>();
+    let feed_forward_lengths = gemma4::expand_layer_values(
+        &key("feed_forward_length"),
+        gemma4::gguf_i64_values(metadata, &key("feed_forward_length"), stream)?,
+        num_hidden_layers,
+    )?;
+    let intermediate_size = feed_forward_lengths[0];
+    let kv_heads = gemma4::expand_layer_values(
+        &key("attention.head_count_kv"),
+        gemma4::gguf_i64_values(metadata, &key("attention.head_count_kv"), stream)?,
+        num_hidden_layers,
+    )?;
+    let sliding_kv_heads = layer_types
+        .iter()
+        .zip(&kv_heads)
+        .find_map(|(kind, value)| (*kind == LayerType::SlidingAttention).then_some(*value))
+        .unwrap_or(kv_heads[0]);
+    let full_kv_heads = layer_types
+        .iter()
+        .zip(&kv_heads)
+        .find_map(|(kind, value)| (*kind == LayerType::FullAttention).then_some(*value))
+        .unwrap_or(sliding_kv_heads);
+    for (kind, value) in layer_types.iter().zip(&kv_heads) {
+        let expected = if *kind == LayerType::FullAttention {
+            full_kv_heads
+        } else {
+            sliding_kv_heads
+        };
+        if *value != expected {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 assistant uses non-uniform KV-head counts within one attention type"
+                    .into(),
+            ));
+        }
+    }
+
+    let global_head_dim = gemma4::gguf_i32(metadata, &key("attention.key_length"), stream)?;
+    let head_dim = gemma4::gguf_optional_i64(metadata, &key("attention.key_length_swa"), stream)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::UnsupportedArchitecture("Gemma 4 assistant SWA head size exceeds i32".into())
+        })?
+        .unwrap_or(global_head_dim);
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture(
+                "Gemma 4 assistant tokenizer vocabulary exceeds i32".into(),
+            )
+        })?,
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 assistant tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 assistant GGUF is missing tokenizer.ggml.tokens".into(),
+            ));
+        }
     };
-    if let Some(assistant) = assistant {
-        return assistant.to_string();
+    let full_rope_theta =
+        gemma4::gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?.unwrap_or(1_000_000.0);
+    let sliding_rope_theta =
+        gemma4::gguf_optional_f32(metadata, &key("rope.freq_base_swa"), stream)?
+            .unwrap_or(10_000.0);
+    let rope_parameters = Some(HashMap::from([
+        (
+            "full_attention".into(),
+            HashMap::from([
+                (
+                    "rope_type".into(),
+                    FloatOrString::String("proportional".into()),
+                ),
+                ("partial_rotary_factor".into(), FloatOrString::Float(0.25)),
+                ("rope_theta".into(), FloatOrString::Float(full_rope_theta)),
+            ]),
+        ),
+        (
+            "sliding_attention".into(),
+            HashMap::from([
+                ("rope_type".into(), FloatOrString::String("default".into())),
+                (
+                    "rope_theta".into(),
+                    FloatOrString::Float(sliding_rope_theta),
+                ),
+            ]),
+        ),
+    ]));
+    let num_kv_shared_layers =
+        gemma4::gguf_optional_i64(metadata, &key("attention.shared_kv_layers"), stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture(
+                    "Gemma 4 assistant shared-KV count exceeds i32".into(),
+                )
+            })?
+            .unwrap_or(num_hidden_layers);
+    let hidden_size_per_layer_input =
+        gemma4::gguf_optional_i64(metadata, &key("embedding_length_per_layer_input"), stream)?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture(
+                    "Gemma 4 assistant per-layer input size exceeds i32".into(),
+                )
+            })?
+            .unwrap_or(0);
+    let draft_tokens = gemma4::gguf_optional_i64(metadata, &key("nextn_predict_layers"), stream)?
+        .unwrap_or(3)
+        .checked_add(1)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture("Gemma 4 assistant draft block size is invalid".into())
+        })?;
+
+    Ok(Gemma4AssistantConfig {
+        model_type: default_model_type(),
+        backbone_hidden_size: gemma4::gguf_i32(metadata, &key("embedding_length_out"), stream)?,
+        use_ordered_embeddings: checkpoint.contains_gguf_tensor("nextn.centroids.weight")
+            || checkpoint.contains_gguf_tensor("mtp.centroids.weight"),
+        num_centroids: default_num_centroids(),
+        centroid_intermediate_top_k: default_centroid_top_k(),
+        tie_word_embeddings: !checkpoint.contains_gguf_tensor("output.weight"),
+        block_size: draft_tokens,
+        text_config: ModelArgs {
+            model_type: "gemma4".into(),
+            hidden_size: gemma4::gguf_i32(metadata, &key("embedding_length"), stream)?,
+            num_hidden_layers,
+            intermediate_size,
+            use_double_wide_mlp: false,
+            feed_forward_lengths: Some(feed_forward_lengths),
+            num_attention_heads: gemma4::gguf_i32(metadata, &key("attention.head_count"), stream)?,
+            rms_norm_eps: gemma4::gguf_f32(
+                metadata,
+                &key("attention.layer_norm_rms_epsilon"),
+                stream,
+            )?,
+            vocab_size,
+            pad_token_id: gemma4::gguf_optional_i64(
+                metadata,
+                "tokenizer.ggml.padding_token_id",
+                stream,
+            )?
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0),
+            num_key_value_heads: sliding_kv_heads,
+            num_global_key_value_heads: (full_kv_heads != sliding_kv_heads)
+                .then_some(full_kv_heads),
+            max_position_embeddings: gemma4::gguf_i32(metadata, &key("context_length"), stream)?,
+            rope_theta: sliding_rope_theta,
+            head_dim,
+            global_head_dim: (global_head_dim != head_dim).then_some(global_head_dim),
+            tie_word_embeddings: !checkpoint.contains_gguf_tensor("output.weight"),
+            attention_bias: false,
+            attention_k_eq_v: false,
+            quantized: false,
+            weight_quantization: None,
+            quantized_weights: None,
+            quantized_weight_configs: None,
+            quantization_group_size: 64,
+            quantization_bits: 4,
+            hidden_size_per_layer_input,
+            vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
+            num_kv_shared_layers,
+            layer_types,
+            sliding_window: gemma4::gguf_optional_i64(
+                metadata,
+                &key("attention.sliding_window"),
+                stream,
+            )?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| {
+                Error::UnsupportedArchitecture(
+                    "Gemma 4 assistant sliding window exceeds i32".into(),
+                )
+            })?,
+            final_logit_softcapping: None,
+            enable_moe_block: false,
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            rope_scaling: None,
+            rope_parameters,
+        },
+        quantization: None,
+    })
+}
+
+fn translate_gguf_weight_name(name: &str) -> String {
+    if matches!(
+        name,
+        "mtp.token_ordering.weight" | "nextn.token_ordering.weight"
+    ) {
+        return "masked_embedding.token_ordering".into();
+    }
+    const ASSISTANT_PARAMETERS: [(&str, &str); 6] = [
+        ("mtp.pre_projection", "pre_projection"),
+        ("nextn.pre_projection", "pre_projection"),
+        ("mtp.post_projection", "post_projection"),
+        ("nextn.post_projection", "post_projection"),
+        ("mtp.centroids", "masked_embedding.centroids"),
+        ("nextn.centroids", "masked_embedding.centroids"),
+    ];
+    for (source, target) in ASSISTANT_PARAMETERS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
     }
 
     let target = crate::models::gemma4::translate_gguf_weight_name(name);
@@ -640,9 +879,16 @@ fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext};
+    use safemlx::{
+        module::ModuleParameters,
+        ops::{GgufMetadataArray, GgufMetadataValue},
+        Array, Device, DeviceType, ExecutionContext,
+    };
 
     use crate::{
         models::ModelLoadOptions,
@@ -678,6 +924,8 @@ mod tests {
             ),
             ("output_norm.weight", "model.norm.weight"),
             ("mtp.pre_projection.weight", "pre_projection.weight"),
+            ("nextn.pre_projection.scales", "pre_projection.scales"),
+            ("nextn.post_projection.biases", "post_projection.biases"),
             (
                 "mtp.token_ordering.weight",
                 "masked_embedding.token_ordering",
@@ -686,6 +934,98 @@ mod tests {
         for (gguf, model) in cases {
             assert_eq!(super::translate_gguf_weight_name(gguf), model);
         }
+    }
+
+    #[test]
+    fn derives_published_assistant_config_from_gguf_metadata() {
+        let metadata = HashMap::from([
+            (
+                "gemma4-assistant.block_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "gemma4-assistant.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true, true, true, false])),
+            ),
+            (
+                "gemma4-assistant.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(8192),
+            ),
+            (
+                "gemma4-assistant.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Int32(vec![8, 8, 8, 2])),
+            ),
+            (
+                "gemma4-assistant.attention.key_length".into(),
+                GgufMetadataValue::Uint32(512),
+            ),
+            (
+                "gemma4-assistant.attention.key_length_swa".into(),
+                GgufMetadataValue::Uint32(256),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec!["token".into(); 32])),
+            ),
+            (
+                "gemma4-assistant.rope.freq_base".into(),
+                GgufMetadataValue::Float32(1_000_000.0),
+            ),
+            (
+                "gemma4-assistant.rope.freq_base_swa".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+            (
+                "gemma4-assistant.attention.shared_kv_layers".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "gemma4-assistant.embedding_length_per_layer_input".into(),
+                GgufMetadataValue::Uint32(0),
+            ),
+            (
+                "gemma4-assistant.nextn_predict_layers".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "gemma4-assistant.embedding_length_out".into(),
+                GgufMetadataValue::Uint32(2816),
+            ),
+            (
+                "gemma4-assistant.embedding_length".into(),
+                GgufMetadataValue::Uint32(1024),
+            ),
+            (
+                "gemma4-assistant.attention.head_count".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "gemma4-assistant.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "gemma4-assistant.context_length".into(),
+                GgufMetadataValue::Uint32(262144),
+            ),
+            (
+                "gemma4-assistant.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(1024),
+            ),
+        ]);
+        let arrays = HashMap::<String, Array>::new();
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config =
+            super::gemma4_assistant_config_from_gguf(&arrays, &metadata, context.stream()).unwrap();
+
+        assert_eq!(config.backbone_hidden_size, 2816);
+        assert_eq!(config.block_size, 5);
+        assert_eq!(config.text_config.hidden_size, 1024);
+        assert_eq!(config.text_config.num_hidden_layers, 4);
+        assert_eq!(config.text_config.num_key_value_heads, 8);
+        assert_eq!(config.text_config.num_global_key_value_heads, Some(2));
+        assert_eq!(config.text_config.head_dim, 256);
+        assert_eq!(config.text_config.global_head_dim, Some(512));
+        assert_eq!(config.text_config.vocab_size, 32);
     }
 
     #[test]

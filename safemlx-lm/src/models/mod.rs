@@ -4276,7 +4276,7 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
     }
 
     #[test]
-    fn check_model_config_reports_gemma4_moe_unsupported() {
+    fn check_model_config_reports_supported_gemma4_moe() {
         let support = check_model_config(&json!({
             "model_type": "gemma4",
             "text_config": {
@@ -4290,14 +4290,20 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 "num_key_value_heads": 2,
                 "max_position_embeddings": 128,
                 "head_dim": 4,
-                "enable_moe_block": true
+                "enable_moe_block": true,
+                "num_experts": 4,
+                "top_k_experts": 2,
+                "moe_intermediate_size": 8
             }
         }));
 
-        assert!(!support.is_supported());
         assert_eq!(
-            support.unsupported_reason(),
-            Some("unsupported model architecture: Gemma 4 MoE models are not supported yet")
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Gemma4,
+                model_type: "gemma4".to_string(),
+                effective_model_type: "gemma4_text".to_string(),
+            })
         );
     }
 
@@ -4331,7 +4337,7 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
     }
 
     #[test]
-    fn check_model_config_reports_gemma4_unified_moe_unsupported() {
+    fn check_model_config_reports_supported_gemma4_unified_moe() {
         let support = check_model_config(&json!({
             "model_type": "gemma4_unified",
             "text_config": {
@@ -4345,14 +4351,20 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
                 "num_key_value_heads": 2,
                 "max_position_embeddings": 128,
                 "head_dim": 4,
-                "enable_moe_block": true
+                "enable_moe_block": true,
+                "num_experts": 4,
+                "top_k_experts": 2,
+                "expert_intermediate_size": 8
             }
         }));
 
-        assert!(!support.is_supported());
         assert_eq!(
-            support.unsupported_reason(),
-            Some("unsupported model architecture: Gemma 4 MoE models are not supported yet")
+            support,
+            super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+                kind: super::ModelKind::Gemma4,
+                model_type: "gemma4_unified".to_string(),
+                effective_model_type: "gemma4_unified_text".to_string(),
+            })
         );
     }
 

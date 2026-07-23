@@ -344,9 +344,9 @@ uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6
 settings. Dense Qwen3.5 uses the hybrid linear/full-attention runtime with
 conventional SwiGLU layers; Qwen3.5 MoE keeps its
 Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 routed expert banks packed while loading mixed
-quantization types. Gemma 4
-multimodal projectors, MoE, and assistant-drafter files are separate formats
-and are not handled by the initial Gemma 4 adapter. Nemotron-H latent-space MoE and
+quantization types. Gemma 4 dense and MoE text weights support fused or separate
+GGUF expert projections, native packed affine execution, and external MTP assistant
+files. Multimodal projector files remain separate formats. Nemotron-H latent-space MoE and
 Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
 GGUFs retain their supported packed affine weights while the vision projector
 remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
@@ -579,7 +579,7 @@ weights.
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
 | Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL DeepStack/MRoPE and Qwen3 packed expert-major SwiGLU execution; the vision tower remains dense |
-| Gemma 4 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Currently eligible language and modality-bridge projections are quantized; specialized vision/audio components remain dense |
+| Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts | no / yes | `LoadedModel` | Native experts stay unchanged; attention projections, embeddings, and LM head can be MXFP4, while the router stays dense |
 | Inkling | yes | no | capability error | `LoadedModel` | Alternating local/global relative-bias attention, four short-convolution states per layer, routed plus shared experts, and native hMLP/dMel towers; MTP draft layers are skipped |

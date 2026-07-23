@@ -60,7 +60,8 @@ cargo run --release -p safemlx-lm-cli -- \
 ```
 
 The assistant may be a safetensors directory or a GGUF file with
-`general.architecture = "gemma4_assistant"`. GGUF config is read from a
+`general.architecture = "gemma4_assistant"` or the published
+`"gemma4-assistant"` spelling. GGUF config is read from a
 `safemlx.mtp.config` JSON metadata string or a sibling `config.json`.
 Stochastic MTP uses lossless probability-ratio acceptance and supports the
 same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
