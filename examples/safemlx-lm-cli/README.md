@@ -194,5 +194,18 @@ printf 'Summarize the purpose of MLX.' | \
 ```
 
 Chat templates are applied automatically when supplied by the model. Pass
-`--raw` to tokenize the prompt directly. Run with `--help` for all sampling
-and repetition-penalty options.
+`--thinking on` or `--thinking off` to override thinking/reasoning when the
+template exposes the standard `enable_thinking` switch:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model mlx-community/Qwen3-0.6B-4bit \
+  --thinking off \
+  "Answer in one sentence."
+```
+
+The default, `--thinking auto`, leaves the template's model-specific behavior
+unchanged. An explicit mode fails with a clear error when the template does not
+support the switch. Pass `--raw` to tokenize the prompt directly; raw prompts
+cannot use an explicit thinking mode. Run with `--help` for all sampling and
+repetition-penalty options.

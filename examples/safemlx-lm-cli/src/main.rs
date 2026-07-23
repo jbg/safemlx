@@ -34,6 +34,34 @@ enum ExpertCacheEviction {
     Lfu,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum ThinkingMode {
+    /// Preserve the model chat template's default.
+    Auto,
+    /// Ask a compatible chat template to enable thinking/reasoning.
+    On,
+    /// Ask a compatible chat template to disable thinking/reasoning.
+    Off,
+}
+
+impl ThinkingMode {
+    const fn enabled(self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 impl From<ExpertCacheEviction> for CacheEvictionPolicy {
     fn from(value: ExpertCacheEviction) -> Self {
         match value {
@@ -231,6 +259,13 @@ struct Cli {
     #[arg(long)]
     raw: bool,
 
+    /// Control thinking/reasoning in chat templates that support `enable_thinking`.
+    ///
+    /// `auto` preserves the model's default. Explicit `on` or `off` fails when
+    /// the model's chat template does not expose a compatible switch.
+    #[arg(long, value_enum, default_value_t = ThinkingMode::Auto)]
+    thinking: ThinkingMode,
+
     /// Print model resolution and generation statistics to stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -403,13 +438,19 @@ fn main() -> Result<()> {
     let (rendered_prompt, add_special_tokens) = if args.raw {
         (prompt, true)
     } else {
-        match model.apply_chat_template_json(
+        let thinking_template_kwargs = if args.thinking == ThinkingMode::Auto {
+            None
+        } else {
+            thinking_template_kwargs(args.thinking, &model.chat_template_kwargs()?)?
+        };
+        match model.apply_chat_template_json_with_kwargs(
             vec![vec![serde_json::json!({
                 "role": "user",
                 "content": prompt,
             })]],
             None,
             true,
+            thinking_template_kwargs.as_ref(),
         )? {
             Some(rendered) => (rendered, false),
             None => (prompt, true),
@@ -957,7 +998,31 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.revision.is_some() && Path::new(&args.model).exists() {
         bail!("--revision can only be used with a Hugging Face model identifier");
     }
+    if args.raw && args.thinking != ThinkingMode::Auto {
+        bail!("--thinking on/off cannot be used with --raw because raw prompts bypass the chat template");
+    }
     Ok(())
+}
+
+fn thinking_template_kwargs(
+    mode: ThinkingMode,
+    available_kwargs: &[String],
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let Some(enabled) = mode.enabled() else {
+        return Ok(None);
+    };
+    const KWARG: &str = "enable_thinking";
+    if !available_kwargs.iter().any(|name| name == KWARG) {
+        bail!(
+            "--thinking {} is not supported by this model's chat template (it does not expose {KWARG:?})",
+            mode.label(),
+        );
+    }
+
+    Ok(Some(serde_json::Map::from_iter([(
+        KWARG.to_owned(),
+        serde_json::Value::Bool(enabled),
+    )])))
 }
 
 fn read_prompt(argument: Option<&str>) -> Result<String> {
@@ -1253,8 +1318,8 @@ mod tests {
 
     use super::{
         format_bytes, select_cached_gguf_from_revisions, select_cached_gguf_path, select_revision,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, validate_args, CachedGgufRole,
-        Cli, StopReason,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, thinking_template_kwargs,
+        validate_args, CachedGgufRole, Cli, StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1282,6 +1347,50 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn configures_supported_thinking_templates() {
+        let available = vec!["enable_thinking".to_owned()];
+        assert_eq!(
+            thinking_template_kwargs(ThinkingMode::Auto, &available).unwrap(),
+            None
+        );
+        assert_eq!(
+            thinking_template_kwargs(ThinkingMode::On, &available)
+                .unwrap()
+                .unwrap()["enable_thinking"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            thinking_template_kwargs(ThinkingMode::Off, &available)
+                .unwrap()
+                .unwrap()["enable_thinking"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_or_raw_thinking_modes() {
+        let error = thinking_template_kwargs(ThinkingMode::Off, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not expose \"enable_thinking\""));
+
+        let raw = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--raw",
+            "--thinking",
+            "off",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("raw prompts bypass the chat template"));
     }
 
     #[test]
