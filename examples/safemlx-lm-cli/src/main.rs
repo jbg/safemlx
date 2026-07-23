@@ -665,11 +665,13 @@ fn main() -> Result<()> {
                 format_bytes(stats.fallback_checkpoint_bytes as usize),
             );
             eprintln!(
-                "native_quantization_formats: Q4_K={} tensors/{}, Q5_1={} tensors/{}",
+                "native_quantization_formats: Q4_K={} tensors/{}, Q5_1={} tensors/{}, Q8_0={} tensors/{}",
                 stats.q4k_tensor_count,
                 format_bytes(stats.q4k_bytes as usize),
                 stats.q5_1_tensor_count,
                 format_bytes(stats.q5_1_bytes as usize),
+                stats.q8_0_tensor_count,
+                format_bytes(stats.q8_0_bytes as usize),
             );
         }
         if profile_gemma4 {

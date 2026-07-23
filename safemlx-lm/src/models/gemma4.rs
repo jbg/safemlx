@@ -3285,16 +3285,33 @@ fn load_gemma4_gguf_weights(
         if physical_name.contains(".ffn_gate_up_exps.") {
             continue;
         }
-        if quantization.is_none() && tensor.descriptor().ggml_type == GgufType::Q4K {
+        let native_format = if quantization.is_none() {
+            match tensor.descriptor().ggml_type {
+                GgufType::Q4K => Some(NativeQuantizationFormat::GgufQ4K),
+                GgufType::Q8_0 => Some(NativeQuantizationFormat::GgufQ8_0),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(native_format) = native_format {
             let raw = materializer.raw_tensor(physical_name)?;
             if raw.endian() == GgufEndian::Little {
                 let shape = native_gguf_shape(raw.descriptor().mlx_shape(), physical_name)?;
-                let native = NativeQuantizedTensor::from_q4k_bytes(raw.data(), &shape, stream)?;
+                let native = match native_format {
+                    NativeQuantizationFormat::GgufQ4K => {
+                        NativeQuantizedTensor::from_q4k_bytes(raw.data(), &shape, stream)?
+                    }
+                    NativeQuantizationFormat::GgufQ8_0 => {
+                        NativeQuantizedTensor::from_q8_0_bytes(raw.data(), &shape, stream)?
+                    }
+                    NativeQuantizationFormat::GgufQ5_1 => unreachable!(),
+                };
                 let target = translate_gguf_weight_name(physical_name);
-                if attach_native_q4k(model, &target, native, report)? {
+                if attach_native_quantized(model, &target, native, report)? {
                     model
                         .native_quantization_stats
-                        .promote_native(NativeQuantizationFormat::GgufQ4K, raw.data().len() as u64);
+                        .promote_native(native_format, raw.data().len() as u64);
                     continue;
                 }
             }
@@ -3544,11 +3561,11 @@ fn attach_native_embedding(
     Ok(true)
 }
 
-/// Installs one native Q4_K tensor into a general Gemma module interface.
+/// Installs one native checkpoint tensor into a general Gemma module interface.
 ///
-/// The dispatch is model-layer integration only: physical Q4_K decoding and
+/// The dispatch is model-layer integration only: physical decoding and
 /// device policy remain in `safemlx::native_quantization`.
-fn attach_native_q4k(
+fn attach_native_quantized(
     model: &mut Model,
     target: &str,
     native: NativeQuantizedTensor,
