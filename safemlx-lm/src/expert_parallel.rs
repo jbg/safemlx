@@ -37,16 +37,17 @@ use crate::{
     },
     inspection::ActivationObserver,
     models::{
-        deepseek_v3, gpt_oss, inkling, lfm2, nemotron_h, qwen3, qwen3_5_moe, qwen3_next, qwen3_vl,
-        ModelKind, ModelLoadOptions,
+        deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
+        qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
+    mtp::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     parallel::{
         load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
         TensorPlacement,
     },
     pipeline::{assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken},
     quantization::{should_quantize_on_load, WeightQuantization},
-    sampler::Sampler,
+    sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     weight_store::{SafetensorsWeightStore, WeightStore},
     weights::{transform_split_swiglu_experts, StrictLoadConfig},
 };
@@ -1131,6 +1132,59 @@ pub struct ExpertParallelModel {
     cumulative_statistics: RoutingStatistics,
 }
 
+struct ExpertParallelQwenMtpTarget<'a> {
+    model: &'a mut ExpertParallelModel,
+    group: &'a Group,
+}
+
+struct ExpertParallelSpeculativeSampler<'a, S> {
+    sampler: &'a mut S,
+    sampling_rank: usize,
+    group: &'a Group,
+}
+
+impl<S: SpeculativeSampler> SpeculativeSampler for ExpertParallelSpeculativeSampler<'_, S> {
+    fn process_logits(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.sampler
+            .process_logits(logits, temperature, history, stream)
+    }
+
+    fn sample_processed(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        prng_state: Option<&mut safemlx::random::RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        // Sample on every rank so identical PRNG states remain aligned, then
+        // retain only the designated rank's choice before synchronizing it.
+        let sampled = self
+            .sampler
+            .sample_processed(logits, temperature, prng_state, stream)?;
+        let selected = if self.group.rank() == self.sampling_rank {
+            sampled
+        } else {
+            zeros_dtype(sampled.shape(), sampled.dtype(), stream)?
+        };
+        distributed::all_sum(&selected, self.group, stream)
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        self.sampler.commit_token(processed_logits, token, stream)
+    }
+}
+
 impl std::fmt::Debug for ExpertParallelModel {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1140,10 +1194,70 @@ impl std::fmt::Debug for ExpertParallelModel {
     }
 }
 
+impl crate::qwen_mtp::QwenMtpTarget for ExpertParallelQwenMtpTarget<'_> {
+    fn prefill_mtp_target(
+        &mut self,
+        input: runtime_input::ModelInput<'_>,
+        cache: &mut qwen3_5_moe::Cache,
+        stream: &Stream,
+    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Exception> {
+        let tokens = runtime_input::text_token_ids(input, stream)?;
+        cache.reset();
+        self.model
+            .forward_qwen_mtp_target(&tokens, cache, self.group, stream)
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut qwen3_5_moe::Cache,
+        stream: &Stream,
+    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Exception> {
+        self.model
+            .forward_qwen_mtp_target(tokens, cache, self.group, stream)
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    fn forward_mtp_drafter(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [qwen3_5_moe::LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match &mut self.model.architecture {
+            ExpertArchitecture::QwenHybrid(model) => {
+                model.forward_mtp_head(hidden, tokens, cache, stream)
+            }
+            _ => Err(Exception::custom(
+                "embedded Qwen MTP requires a Qwen3-Next or Qwen3.5 EP model",
+            )),
+        }
+    }
+
+    fn mtp_layer_count(&self) -> usize {
+        match &self.model.architecture {
+            ExpertArchitecture::QwenHybrid(model) => model.mtp_len(),
+            _ => 0,
+        }
+    }
+}
+
 impl ExpertParallelModel {
     /// Returns placement, assignment, and memory diagnostics.
     pub fn info(&self) -> &ExpertParallelInfo {
         &self.info
+    }
+
+    /// Reports whether this EP target can perform embedded MTP generation.
+    pub fn mtp_capability(&self) -> MtpCapability {
+        match &self.architecture {
+            ExpertArchitecture::QwenHybrid(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
+            _ => MtpCapability::Unavailable,
+        }
     }
 
     /// Returns dynamic rank-owned expert residency when sparse caching is active.
@@ -1983,6 +2097,86 @@ impl ExpertParallelModel {
         Ok(logits)
     }
 
+    fn forward_qwen_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut qwen3_5_moe::Cache,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Error> {
+        let total_started = Instant::now();
+        self.validate_group(group)?;
+        self.topology.validate_execution_stream(stream)?;
+        if tokens.ndim() != 2 {
+            return Err(Error::Parallel(format!(
+                "expert-parallel token input must be [batch, sequence], got {:?}",
+                tokens.shape()
+            )));
+        }
+        let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "Qwen embedded MTP currently requires sparse expert-cached EP loading".into(),
+            )
+        })?;
+        let pass = if tokens.dim(1) > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let assignment = &self.info.assignment;
+        let mut statistics = RoutingStatistics::default();
+        let output = match &mut self.architecture {
+            ExpertArchitecture::QwenHybrid(model) => {
+                let args = model.args.clone();
+                model.forward_cached_expert_parallel_mtp(
+                    tokens,
+                    cache,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            group,
+                            stream,
+                            |routes, stream| {
+                                let acquired = expert_cache.acquire_routes(
+                                    layer,
+                                    &routes.global_expert_ids,
+                                    pass,
+                                    stream,
+                                )?;
+                                execute_cached_qwen_hybrid(
+                                    &args,
+                                    layer,
+                                    &routes.hidden,
+                                    &acquired,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            _ => {
+                return Err(Error::UnsupportedArchitecture(
+                    "embedded Qwen MTP requires a Qwen3-Next or Qwen3.5 EP model".into(),
+                ))
+            }
+        };
+        materialize_timing_phase([&output.logits])?;
+        statistics.model_time = total_started.elapsed();
+        self.latest_statistics = statistics;
+        self.cumulative_statistics
+            .accumulate(&self.latest_statistics);
+        Ok(output)
+    }
+
     /// Prompt forward alias.
     pub fn prefill(
         &mut self,
@@ -2003,6 +2197,129 @@ impl ExpertParallelModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.forward(tokens, None, cache, group, stream)
+    }
+
+    /// Generates with replicated Qwen MTP weights and EP target verification.
+    ///
+    /// Every rank must call this method with identical inputs and PRNG keys.
+    /// Sampling decisions are selected on `sampling_rank` and synchronized
+    /// across the EP group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input(
+        &mut self,
+        cache: &mut ExpertParallelCache,
+        input: runtime_input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampling_rank: usize,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_embedded_mtp_input_with_sampler(
+            cache,
+            input,
+            config,
+            prng_key,
+            &mut DefaultSampler,
+            sampling_rank,
+            group,
+            stream,
+        )
+    }
+
+    /// Generates through embedded Qwen MTP with a caller-provided sampler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+        &mut self,
+        cache: &mut ExpertParallelCache,
+        input: runtime_input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        sampling_rank: usize,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_embedded_mtp_input_with_sampler_callback(
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            sampling_rank,
+            group,
+            stream,
+            |_| Ok(()),
+        )
+    }
+
+    /// Generates through embedded Qwen MTP and reports committed tokens on the
+    /// designated sampling rank.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
+        &mut self,
+        cache: &mut ExpertParallelCache,
+        input: runtime_input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        sampling_rank: usize,
+        group: &Group,
+        stream: &Stream,
+        mut on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
+        self.validate_group(group)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if sampling_rank >= group.size() {
+            return Err(Exception::custom(format!(
+                "sampling rank {sampling_rank} is outside EP size {}",
+                group.size()
+            )));
+        }
+        if !matches!(
+            self.mtp_capability(),
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded
+            }
+        ) {
+            return Err(Exception::custom(format!(
+                "embedded MTP runtime adapter is unavailable for EP model type {} ({:?})",
+                self.info.model_kind.model_type_name(),
+                self.mtp_capability()
+            )));
+        }
+        let ExpertParallelCache::QwenHybrid(cache) = cache else {
+            return Err(Exception::custom(
+                "embedded Qwen MTP requires a Qwen hybrid EP cache",
+            ));
+        };
+        let mut synchronized_sampler = ExpertParallelSpeculativeSampler {
+            sampler,
+            sampling_rank,
+            group,
+        };
+        let emit_callbacks = group.rank() == sampling_rank;
+        let mut target = ExpertParallelQwenMtpTarget { model: self, group };
+        crate::qwen_mtp::generate_with_callback(
+            &mut target,
+            cache,
+            input,
+            config,
+            prng_key,
+            &mut synchronized_sampler,
+            stream,
+            |token| {
+                if emit_callbacks {
+                    on_token(token)
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     /// Samples on one rank and synchronizes only token ids and stop state.
@@ -2307,6 +2624,16 @@ fn parameter_bytes_excluding(module: &impl ModuleParameters, marker: &str) -> us
         .flatten()
         .into_iter()
         .filter(|(name, _)| !name.contains(marker))
+        .map(|(_, value)| value.nbytes())
+        .sum()
+}
+
+fn qwen_hybrid_replicated_parameter_bytes(module: &impl ModuleParameters) -> usize {
+    module
+        .parameters()
+        .flatten()
+        .into_iter()
+        .filter(|(name, _)| !is_qwen_hybrid_decoder_expert_key(name))
         .map(|(_, value)| value.nbytes())
         .sum()
 }
@@ -3057,14 +3384,19 @@ fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
         ModelKind::Lfm2 => key.contains(".feed_forward.experts."),
         ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
         ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),
+        ModelKind::Qwen3Next | ModelKind::Qwen35Moe => is_qwen_hybrid_decoder_expert_key(key),
         _ => key.contains(".mlp.experts."),
     }
+}
+
+fn is_qwen_hybrid_decoder_expert_key(key: &str) -> bool {
+    key.starts_with("model.layers.") && key.contains(".mlp.experts.")
 }
 
 fn is_auxiliary_checkpoint_key(kind: ModelKind, key: &str) -> bool {
     match kind {
         ModelKind::Inkling => key.starts_with("model.mtp."),
-        ModelKind::Qwen3Next => key.starts_with("mtp.") || key.starts_with("model.mtp."),
+        ModelKind::Qwen3Next => key.starts_with("model.mtp."),
         _ => false,
     }
 }
@@ -3367,12 +3699,21 @@ fn load_additional_cached_ep(
             }
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-            let mut tensors = if kind == ModelKind::Qwen3Next {
+            let tensors = if kind == ModelKind::Qwen3Next {
                 transform_partition_tensors(tensors, |key, value| {
                     qwen3_next::split_fused_projection(&key, value, &args, stream)
                 })?
             } else {
                 tensors
+            };
+            // Decoder experts remain rank-owned and cache-backed, while the
+            // embedded MTP head is ordinary replicated state. Public
+            // Qwen3-Next checkpoints store both banks as split expert tensors,
+            // so pack the retained MTP bank before strict assignment.
+            let mut tensors = if args.uses_fp8() {
+                qwen3_5_moe::transform_split_qwen_fp8_experts(tensors, args.num_experts, stream)?
+            } else {
+                transform_split_swiglu_experts(tensors, args.num_experts, stream)?
             };
             let mut model = qwen3_5_moe::Model::new(
                 args.clone(),
@@ -3382,7 +3723,7 @@ fn load_additional_cached_ep(
                 stream,
             )?;
             assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
-                name.contains(".mlp.experts.")
+                is_qwen_hybrid_decoder_expert_key(name)
             })?;
             ensure_no_unused_tensors(tensors)?;
             let entries = crate::qwen_hybrid::qwen_hybrid_expert_catalog(&args, store.as_ref())?;
@@ -3394,7 +3735,7 @@ fn load_additional_cached_ep(
                 stream,
                 weights_stream,
             )?;
-            let replicated = parameter_bytes_excluding(&model, ".mlp.experts.");
+            let replicated = qwen_hybrid_replicated_parameter_bytes(&model);
             Ok(finish_additional_cached_ep(
                 topology,
                 kind,
@@ -3708,8 +4049,8 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_checkpoint_keys_are_omitted_by_family() {
-        assert!(is_auxiliary_checkpoint_key(
+    fn qwen_mtp_weights_are_replicated_while_decoder_experts_are_partitioned() {
+        assert!(!is_auxiliary_checkpoint_key(
             ModelKind::Qwen3Next,
             "mtp.fc.weight"
         ));
@@ -3729,6 +4070,16 @@ mod tests {
             ModelKind::Inkling,
             "mtp.fc.weight"
         ));
+        for kind in [ModelKind::Qwen3Next, ModelKind::Qwen35Moe] {
+            assert!(is_routed_expert_key(
+                kind,
+                "model.layers.0.mlp.experts.1.down_proj.weight"
+            ));
+            assert!(!is_routed_expert_key(
+                kind,
+                "mtp.layers.0.mlp.experts.1.down_proj.weight"
+            ));
+        }
     }
 
     fn save_zero_checkpoint(model: &impl ModuleParameters, directory: &Path, stream: &Stream) {

@@ -28,9 +28,10 @@ use safemlx_lm::{
     },
     inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
-        deepseek_v3, gpt_oss, inkling, lfm2, nemotron_h, qwen3, qwen3_5_moe, qwen3_vl,
-        ModelLoadOptions,
+        deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
+        qwen3_5_moe, qwen3_vl, ModelLoadOptions,
     },
+    mtp::{MtpCapability, MtpCheckpointKind, MtpConfig},
     quantization::{AffineQuantization, WeightQuantization},
     sampler::DefaultSampler,
     CacheResidencyPolicy, DeviceAssignment, PagedCacheOptions, ParallelTopology,
@@ -463,6 +464,52 @@ fn expert_parallel_model_ring_worker() {
     } else {
         let paging = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1).unwrap();
         assert!(model.new_qwen3_sliding_cache(2, paging).is_err());
+    }
+
+    if config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) > 0 {
+        assert_eq!(
+            model.mtp_capability(),
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded
+            }
+        );
+        let mut mtp_cache = model.new_cache();
+        let mtp_prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+        let input_parts = [runtime_input::InputPart::text_token_ids(&mtp_prompt)];
+        let mtp_input = runtime_input::ModelInput::new(&input_parts);
+        let mut committed = Vec::new();
+        let (tokens, stats) = model
+            .generate_embedded_mtp_input_with_sampler_callback(
+                &mut mtp_cache,
+                mtp_input,
+                &MtpConfig {
+                    max_tokens: 4,
+                    max_draft_tokens: 1,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                &mut sampler,
+                1,
+                &group,
+                stream,
+                |token| {
+                    committed.push(token);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(tokens, vec![0, 0, 0, 0]);
+        assert_eq!(stats.emitted_tokens, 4);
+        assert!(stats.draft_tokens > 0);
+        assert_eq!(stats.accepted_tokens, stats.draft_tokens);
+        if expected_rank == 1 {
+            assert_eq!(committed, tokens);
+        } else {
+            assert!(committed.is_empty());
+        }
+    } else {
+        assert_eq!(model.mtp_capability(), MtpCapability::Unavailable);
     }
     assert_eq!(architecture, format!("{:?}", model.info().model_kind));
 }
@@ -1126,6 +1173,7 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
         let config = serde_json::json!({
             "model_type": if next { "qwen3_next" } else { "qwen3_5_moe_text" },
             "vocab_size": 32, "hidden_size": 16, "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
             "test_moe_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
             "head_dim": 8, "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
             "tie_word_embeddings": false, "linear_conv_kernel_dim": 3,
@@ -1417,6 +1465,29 @@ fn ring_two_process_model_parity() {
             "expected.safetensors",
         );
     }
+}
+
+/// Verifies end-to-end embedded Qwen MTP generation with EP target routing,
+/// synchronized sampling, speculative acceptance, and rank-local callbacks.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_two_process_qwen_embedded_mtp_generation() {
+    assert!(distributed::is_available(Backend::Ring));
+    let fixture = tempfile::tempdir().unwrap();
+    let checkpoint = write_additional_sparse_fixtures(fixture.path())
+        .into_iter()
+        .find(|(_, architecture, _)| *architecture == "Qwen3Next")
+        .map(|(_, _, directory)| directory)
+        .unwrap();
+    run_ring_fixture(
+        "Qwen3-Next embedded MTP sparse expert cache",
+        "Qwen3Next",
+        "dense",
+        "balanced",
+        "sparse-cache",
+        &checkpoint,
+        "expected.safetensors",
+    );
 }
 
 /// Verifies rank-local paged prompt save/load parity for the two EP cache

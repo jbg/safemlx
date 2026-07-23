@@ -3562,6 +3562,19 @@ impl Qwen35MoeTextModel {
     pub(crate) fn forward_with_expert_executor<F>(
         &mut self,
         input: ModelInput<'_>,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let hidden = self.forward_hidden_with_expert_executor(input, execute, stream)?;
+        self.norm.forward(&hidden, stream)
+    }
+
+    pub(crate) fn forward_hidden_with_expert_executor<F>(
+        &mut self,
+        input: ModelInput<'_>,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Exception>
@@ -3614,7 +3627,7 @@ impl Qwen35MoeTextModel {
                 |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
             )?;
         }
-        self.norm.forward(&h, stream)
+        Ok(h)
     }
 }
 
@@ -3983,6 +3996,32 @@ impl Model {
             stream,
         )?;
         self.project_logits(&hidden, stream)
+    }
+
+    pub(crate) fn forward_cached_expert_parallel_mtp<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.reject_multimodal_tokens(inputs, false, stream)?;
+        let hidden = self.model.forward_hidden_with_expert_executor(
+            ModelInput {
+                inputs,
+                inputs_embeds: None,
+                mask: None,
+                cache: Some(cache),
+            },
+            execute,
+            stream,
+        )?;
+        let normalized = self.model.norm.forward(&hidden, stream)?;
+        let logits = self.project_logits(&normalized, stream)?;
+        Ok(QwenMtpStepOutput { logits, hidden })
     }
 
     /// Forward pass that reports activations to an observer.
@@ -5086,6 +5125,48 @@ where
     Ok(())
 }
 
+pub(crate) fn transform_split_qwen_fp8_experts(
+    loaded: HashMap<String, Array>,
+    num_experts: i32,
+    stream: &Stream,
+) -> Result<HashMap<String, Array>, Error> {
+    let mut transformed = HashMap::with_capacity(loaded.len());
+    let mut expert_parts = HashMap::<(String, i32), Fp8ExpertParts>::new();
+    for (key, value) in loaded {
+        let expert_part = parse_fp8_expert_projection_key(&key)
+            .map(|(prefix, expert, projection)| (prefix, expert, projection, false))
+            .or_else(|| {
+                parse_fp8_expert_scale_key(&key)
+                    .map(|(prefix, expert, projection)| (prefix, expert, projection, true))
+            });
+        if let Some((prefix, expert, projection, is_scale)) = expert_part {
+            set_fp8_expert_part(
+                expert_parts.entry((prefix, expert)).or_default(),
+                projection,
+                value,
+                is_scale,
+            );
+        } else {
+            transformed.insert(key, value);
+        }
+    }
+    let mut prefixes = expert_parts
+        .keys()
+        .map(|(prefix, _)| prefix.clone())
+        .collect::<Vec<_>>();
+    prefixes.sort();
+    prefixes.dedup();
+    for prefix in prefixes {
+        transformed.extend(pack_fp8_expert_prefix(
+            &mut expert_parts,
+            &prefix,
+            num_experts,
+            stream,
+        )?);
+    }
+    Ok(transformed)
+}
+
 fn set_fp8_expert_part(
     parts: &mut Fp8ExpertParts,
     projection: Fp8ExpertProjection,
@@ -5536,9 +5617,9 @@ mod tests {
         qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
         qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
         qwen35_translate_gguf_weight_name, qwen3_5_moe_strict_load_config, reverse_permutation,
-        vision_window_index, FeedForward, Fp8ExpertProjection, FullAttention, FullAttentionInput,
-        LayerType, LinearAttention, LinearAttentionInput, Model, ModelArgs, SparseMoeBlock,
-        VisionConfig,
+        transform_split_qwen_fp8_experts, vision_window_index, FeedForward, Fp8ExpertProjection,
+        FullAttention, FullAttentionInput, LayerType, LinearAttention, LinearAttentionInput, Model,
+        ModelArgs, SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
     use crate::processor::{load_processor, MediaInput, ProcessorInput, RgbImageView};
@@ -6839,6 +6920,48 @@ mod tests {
         assert_eq!(parsed.0, "model.language_model.layers.3.mlp.experts");
         assert_eq!(parsed.1, 17);
         assert!(matches!(parsed.2, Fp8ExpertProjection::Gate));
+    }
+
+    #[test]
+    fn packs_split_fp8_mtp_experts_for_replicated_loading() {
+        let _guard = mlx_runtime_test_guard();
+        let context = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut loaded = HashMap::new();
+        for expert in 0..2 {
+            let prefix = format!("mtp.layers.0.mlp.experts.{expert}");
+            for (projection, shape, scale_shape) in [
+                ("gate_proj", [2, 1], [1, 1]),
+                ("up_proj", [3, 1], [1, 1]),
+                ("down_proj", [1, 3], [1, 1]),
+            ] {
+                loaded.insert(
+                    format!("{prefix}.{projection}.weight"),
+                    Array::zeros::<f32>(&shape, stream).unwrap(),
+                );
+                loaded.insert(
+                    format!("{prefix}.{projection}.weight_scale_inv"),
+                    Array::ones::<f32>(&scale_shape, stream).unwrap(),
+                );
+            }
+        }
+        let packed = transform_split_qwen_fp8_experts(loaded, 2, stream).unwrap();
+        assert_eq!(
+            packed["mtp.layers.0.mlp.experts.gate_up_proj"].shape(),
+            &[2, 5, 1]
+        );
+        assert_eq!(
+            packed["mtp.layers.0.mlp.experts.gate_up_proj_scale_inv"].shape(),
+            &[2, 2, 1]
+        );
+        assert_eq!(
+            packed["mtp.layers.0.mlp.experts.down_proj"].shape(),
+            &[2, 1, 3]
+        );
+        assert_eq!(
+            packed["mtp.layers.0.mlp.experts.down_proj_scale_inv"].shape(),
+            &[2, 1, 1]
+        );
     }
 
     #[test]
