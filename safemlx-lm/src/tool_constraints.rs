@@ -169,6 +169,21 @@ impl GrammarState {
             .rollback(token_count)
             .map_err(|error| format!("failed to roll back grammar state: {error}"))
     }
+
+    pub(crate) fn token_bytes(&self, token: TokenId) -> Result<Vec<u8>, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let trie = token_env.tok_trie();
+        if token as usize >= trie.vocab_size() {
+            return Err(format!(
+                "token {token} is outside grammar vocabulary {}",
+                trie.vocab_size()
+            ));
+        }
+        Ok(trie.token(token).to_vec())
+    }
 }
 
 impl GenerationConstraint {

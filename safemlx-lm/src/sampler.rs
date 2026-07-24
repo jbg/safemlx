@@ -1,9 +1,16 @@
+use std::collections::VecDeque;
+
 use safemlx::{
     argmax_axis, array,
     error::Exception,
     ops::indexing::TryIndexOp,
     random::{self, RandomState},
     Array, Stream,
+};
+
+use crate::{
+    chat::{ToolChoice, ToolRuntimePlan},
+    tool_constraints::GrammarState,
 };
 
 /// Sampling policy suitable for lossless speculative decoding.
@@ -71,6 +78,363 @@ pub trait Sampler {
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<Array, Exception>;
+}
+
+/// A grammar-aware wrapper around an existing sampling policy.
+///
+/// The wrapper masks raw vocabulary logits before delegating penalties,
+/// filtering, temperature scaling, and token selection to the wrapped policy.
+/// Grammar state advances only when a selected token is committed. For
+/// [`ToolChoice::Auto`], masking starts only after the plan's exact activation
+/// trigger has been committed; [`ToolChoice::Required`] masks the first token.
+///
+/// The standard policies in this module implement [`Clone`], which lets this
+/// wrapper checkpoint delegated adaptive state together with grammar state for
+/// [`ConstrainedSampler::fork`] and [`ConstrainedSampler::rollback`].
+pub struct ConstrainedSampler<S> {
+    policy: S,
+    runtime: ConstraintRuntime,
+    committed_tokens: Vec<u32>,
+    checkpoints: Vec<ConstraintCheckpoint<S>>,
+}
+
+struct ConstraintCheckpoint<S> {
+    policy: S,
+    runtime: ConstraintRuntime,
+    committed_len: usize,
+}
+
+enum ConstraintRuntime {
+    Disabled,
+    Auto {
+        grammar: GrammarState,
+        trigger: Vec<u8>,
+        pending: VecDeque<PendingToken>,
+        pending_len: usize,
+    },
+    Active(GrammarState),
+}
+
+#[derive(Clone)]
+struct PendingToken {
+    id: u32,
+    bytes: Vec<u8>,
+}
+
+impl Clone for ConstraintRuntime {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Disabled => Self::Disabled,
+            Self::Auto {
+                grammar,
+                trigger,
+                pending,
+                pending_len,
+            } => Self::Auto {
+                grammar: grammar.fork(),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+                pending_len: *pending_len,
+            },
+            Self::Active(grammar) => Self::Active(grammar.fork()),
+        }
+    }
+}
+
+impl<S: Clone> Clone for ConstrainedSampler<S> {
+    fn clone(&self) -> Self {
+        Self {
+            policy: self.policy.clone(),
+            runtime: self.runtime.clone(),
+            committed_tokens: self.committed_tokens.clone(),
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .map(|checkpoint| ConstraintCheckpoint {
+                    policy: checkpoint.policy.clone(),
+                    runtime: checkpoint.runtime.clone(),
+                    committed_len: checkpoint.committed_len,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<S> ConstrainedSampler<S> {
+    /// Wraps `policy` with the constraint and activation semantics in `plan`.
+    pub fn from_tool_plan(
+        policy: S,
+        plan: &ToolRuntimePlan,
+        tool_choice: ToolChoice,
+    ) -> Result<Self, Exception> {
+        let constraint = plan.generation_constraint().clone();
+        let runtime = match tool_choice {
+            ToolChoice::None => ConstraintRuntime::Disabled,
+            ToolChoice::Auto => {
+                let trigger = plan.auto_activation_trigger().ok_or_else(|| {
+                    Exception::custom(
+                        "automatic constrained sampling requires an exact activation trigger",
+                    )
+                })?;
+                if trigger.is_empty() {
+                    return Err(Exception::custom(
+                        "automatic constrained sampling requires a non-empty activation trigger",
+                    ));
+                }
+                ConstraintRuntime::Auto {
+                    grammar: constraint.grammar_state(),
+                    trigger: trigger.as_bytes().to_vec(),
+                    pending: VecDeque::new(),
+                    pending_len: 0,
+                }
+            }
+            ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
+        };
+        Ok(Self {
+            policy,
+            runtime,
+            committed_tokens: Vec::new(),
+            checkpoints: Vec::new(),
+        })
+    }
+
+    /// Returns the wrapped sampling policy.
+    pub fn policy(&self) -> &S {
+        &self.policy
+    }
+
+    /// Returns the wrapped sampling policy mutably.
+    pub fn policy_mut(&mut self) -> &mut S {
+        &mut self.policy
+    }
+
+    /// Consumes the wrapper and returns the sampling policy.
+    pub fn into_policy(self) -> S {
+        self.policy
+    }
+
+    /// Returns whether grammar masking is currently active.
+    pub fn constraint_is_active(&self) -> bool {
+        matches!(self.runtime, ConstraintRuntime::Active(_))
+    }
+
+    /// Returns whether the active grammar can complete at the current prefix.
+    ///
+    /// An inactive automatic constraint and a disabled constraint both report
+    /// `false`.
+    pub fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    /// Returns the valid token IDs at the durable logical prefix.
+    ///
+    /// `None` means grammar masking is not active.
+    pub fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, Exception> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar
+                .allowed_tokens()
+                .map(|mask| Some(mask.iter().collect()))
+                .map_err(constraint_error),
+            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(None),
+        }
+    }
+
+    fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, Exception> {
+        if !history.starts_with(&self.committed_tokens) {
+            return Err(Exception::custom(
+                "constrained sampler history diverges from its committed logical prefix",
+            ));
+        }
+        let mut runtime = self.runtime.clone();
+        for &token in &history[self.committed_tokens.len()..] {
+            commit_runtime_token(&mut runtime, token)?;
+        }
+        Ok(runtime)
+    }
+
+    fn mask_at_runtime(
+        logits: &Array,
+        runtime: &mut ConstraintRuntime,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let ConstraintRuntime::Active(grammar) = runtime else {
+            return Ok(logits.clone());
+        };
+        let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
+        let vocab_size = logits.dim(-1) as usize;
+        if vocab_size == 0 {
+            return Err(Exception::custom(
+                "cannot apply a grammar mask to an empty logits vocabulary",
+            ));
+        }
+        if allowed.len() != vocab_size {
+            return Err(Exception::custom(format!(
+                "grammar vocabulary size {} does not match logits vocabulary size {vocab_size}",
+                allowed.len()
+            )));
+        }
+        let row_count = logits.size() / vocab_size;
+        let invalid = (0..row_count)
+            .flat_map(|_| (0..vocab_size).map(|token| !allowed.is_allowed(token as u32)))
+            .collect::<Vec<_>>();
+        let invalid = Array::from_slice(&invalid, logits.shape());
+        mask_logits(invalid, logits.clone(), stream)
+    }
+
+    fn commit_constraint_token(&mut self, token: u32) -> Result<(), Exception> {
+        commit_runtime_token(&mut self.runtime, token)?;
+        self.committed_tokens.push(token);
+        Ok(())
+    }
+}
+
+impl<S: Clone> ConstrainedSampler<S> {
+    /// Returns an independent sampler fork at the current logical prefix.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
+    /// Rolls back committed tokens and restores grammar and delegated state.
+    pub fn rollback(&mut self, token_count: usize) -> Result<(), Exception> {
+        if token_count > self.checkpoints.len() {
+            return Err(Exception::custom(format!(
+                "cannot roll back {token_count} constrained tokens after {} commits",
+                self.checkpoints.len()
+            )));
+        }
+        if token_count == 0 {
+            return Ok(());
+        }
+        let checkpoint_index = self.checkpoints.len() - token_count;
+        let checkpoint = self.checkpoints.remove(checkpoint_index);
+        self.checkpoints.truncate(checkpoint_index);
+        self.policy = checkpoint.policy;
+        self.runtime = checkpoint.runtime;
+        self.committed_tokens.truncate(checkpoint.committed_len);
+        Ok(())
+    }
+
+    fn checkpoint(&self) -> ConstraintCheckpoint<S> {
+        ConstraintCheckpoint {
+            policy: self.policy.clone(),
+            runtime: self.runtime.clone(),
+            committed_len: self.committed_tokens.len(),
+        }
+    }
+}
+
+impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
+    fn process_logits(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut runtime = self.runtime_at(history)?;
+        let masked = Self::mask_at_runtime(logits, &mut runtime, stream)?;
+        self.policy
+            .process_logits(&masked, temperature, history, stream)
+    }
+
+    fn sample_processed(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.policy
+            .sample_processed(logits, temperature, prng_state, stream)
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let checkpoint = self.checkpoint();
+        if let Err(error) = self
+            .policy
+            .commit_token(processed_logits, token, stream)
+            .and_then(|()| self.commit_constraint_token(token))
+        {
+            self.policy = checkpoint.policy;
+            self.runtime = checkpoint.runtime;
+            self.committed_tokens.truncate(checkpoint.committed_len);
+            return Err(error);
+        }
+        self.checkpoints.push(checkpoint);
+        Ok(())
+    }
+}
+
+impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temp: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let checkpoint = self.checkpoint();
+        let mut runtime = self.runtime.clone();
+        let masked = Self::mask_at_runtime(logits, &mut runtime, stream)?;
+        let token = self.policy.sample(&masked, temp, prng_state, stream)?;
+        let token_id = token.clone().item::<u32>(stream);
+        if let Err(error) = self.commit_constraint_token(token_id) {
+            self.policy = checkpoint.policy;
+            self.runtime = checkpoint.runtime;
+            self.committed_tokens.truncate(checkpoint.committed_len);
+            return Err(error);
+        }
+        self.checkpoints.push(checkpoint);
+        Ok(token)
+    }
+}
+
+fn commit_runtime_token(runtime: &mut ConstraintRuntime, token: u32) -> Result<(), Exception> {
+    match runtime {
+        ConstraintRuntime::Disabled => Ok(()),
+        ConstraintRuntime::Active(grammar) => grammar.commit(token).map_err(constraint_error),
+        ConstraintRuntime::Auto {
+            grammar,
+            trigger,
+            pending,
+            pending_len,
+        } => {
+            let bytes = grammar.token_bytes(token).map_err(constraint_error)?;
+            *pending_len += bytes.len();
+            pending.push_back(PendingToken { id: token, bytes });
+            while *pending_len > trigger.len() {
+                let removed = pending
+                    .pop_front()
+                    .expect("non-empty pending trigger exceeds trigger length");
+                *pending_len -= removed.bytes.len();
+            }
+            if *pending_len == trigger.len()
+                && pending
+                    .iter()
+                    .flat_map(|pending| pending.bytes.iter().copied())
+                    .eq(trigger.iter().copied())
+            {
+                let mut active = grammar.fork();
+                for pending in pending.iter() {
+                    active.commit(pending.id).map_err(constraint_error)?;
+                }
+                *runtime = ConstraintRuntime::Active(active);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn constraint_error(error: String) -> Exception {
+    Exception::custom(error)
 }
 
 /// Default sampler used by generation helpers.
@@ -685,7 +1049,122 @@ fn validate_positive_finite(name: &str, value: f32) -> Result<(), Exception> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationSampler, MirostatV2Sampler};
+    use safemlx::{
+        error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType,
+        ExecutionContext, Stream,
+    };
+    use serde_json::json;
+
+    use super::{
+        ConstrainedSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
+    };
+    use crate::{
+        chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
+        format_dialect::{
+            DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
+            GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
+        },
+        tool_constraints::ConstraintCompiler,
+    };
+
+    const SYNTHETIC_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: r#"{"calls":"#,
+            suffix: "}",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonList,
+        name_field: "name",
+        arguments_field: "arguments",
+        reasoning_channel: None,
+        text_channel: None,
+        call_separator: ",",
+        parallel_layout: ParallelCallLayout::SingleEnvelope,
+        auto_activation_trigger: Some(r#"{"calls":"#),
+        required_structural_token_ids: &[],
+        stop_sequences: &[],
+    };
+    const SYNTHETIC_PARAMETERS: DialectParameters = DialectParameters::Declarative(&SYNTHETIC_SPEC);
+    const SYNTHETIC_VOCAB_SIZE: usize = 262;
+    const AUTO_TRIGGER: &[u8] = br#"{"calls":"#;
+    const COMPLETE_CALL: &[u8] = br#"{"calls":[{"name":"ping","arguments":{}}]}"#;
+
+    #[derive(Clone, Default)]
+    struct CountingPolicy {
+        commits: usize,
+    }
+
+    impl SpeculativeSampler for CountingPolicy {
+        fn process_logits(
+            &mut self,
+            logits: &Array,
+            _temperature: f32,
+            _history: &[u32],
+            _stream: &Stream,
+        ) -> Result<Array, Exception> {
+            Ok(logits.clone())
+        }
+
+        fn commit_token(
+            &mut self,
+            _processed_logits: &Array,
+            _token: u32,
+            _stream: &Stream,
+        ) -> Result<(), Exception> {
+            self.commits += 1;
+            Ok(())
+        }
+    }
+
+    fn synthetic_plan(tool_choice: ToolChoice) -> ToolRuntimePlan {
+        ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[json!({
+                    "type": "function",
+                    "function": {
+                        "name": "ping",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }
+                })],
+                tool_choice,
+                ParallelToolCallPolicy::Disabled,
+            )
+            .unwrap()
+    }
+
+    fn test_context() -> ExecutionContext {
+        ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
+    }
+
+    fn placeholder_logits() -> Array {
+        Array::from_slice(
+            &vec![0.0f32; SYNTHETIC_VOCAB_SIZE],
+            &[1, SYNTHETIC_VOCAB_SIZE as i32],
+        )
+    }
+
+    fn commit_bytes<S: SpeculativeSampler>(
+        sampler: &mut S,
+        bytes: &[u8],
+        logits: &Array,
+        stream: &Stream,
+    ) {
+        for &byte in bytes {
+            sampler
+                .commit_token(logits, u32::from(byte), stream)
+                .unwrap();
+        }
+    }
 
     #[test]
     fn generation_sampler_accepts_external_token_history() {
@@ -700,6 +1179,153 @@ mod tests {
 
         sampler.clear_generated_tokens();
         assert!(sampler.generated_tokens().is_empty());
+    }
+
+    #[test]
+    fn constraint_mask_precedes_existing_top_k_and_selects_lower_valid_token() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Required);
+        let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
+        let mut sampler =
+            ConstrainedSampler::from_tool_plan(policy, &plan, ToolChoice::Required).unwrap();
+        let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
+        values[b'x' as usize] = 100.0;
+        values[b'{' as usize] = 10.0;
+        let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+
+        let processed = sampler.process_logits(&raw, 0.0, &[], stream).unwrap();
+        let invalid = processed
+            .try_index_device((0, i32::from(b'x')), stream)
+            .unwrap();
+        let valid = processed
+            .try_index_device((0, i32::from(b'{')), stream)
+            .unwrap();
+        let selected = Sampler::sample(&mut sampler, &raw, 0.0, None, stream).unwrap();
+        eval([&invalid, &valid, &selected]).unwrap();
+
+        assert!(invalid.item::<f32>(stream) < -1.0e30);
+        assert_eq!(valid.item::<f32>(stream), 10.0);
+        assert_eq!(selected.item::<u32>(stream), u32::from(b'{'));
+        assert_eq!(sampler.policy().generated_tokens(), &[u32::from(b'{')]);
+    }
+
+    #[test]
+    fn auto_ignores_partial_and_near_triggers() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Auto);
+        let logits = placeholder_logits();
+
+        let mut partial =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
+                .unwrap();
+        commit_bytes(
+            &mut partial,
+            &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
+            &logits,
+            stream,
+        );
+        assert!(!partial.constraint_is_active());
+        assert_eq!(partial.valid_token_ids().unwrap(), None);
+
+        let mut near =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
+                .unwrap();
+        commit_bytes(&mut near, br#"{"callx":"#, &logits, stream);
+        assert!(!near.constraint_is_active());
+        assert_eq!(near.valid_token_ids().unwrap(), None);
+    }
+
+    #[test]
+    fn exact_auto_trigger_spans_tokens_and_reports_completion_once() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Auto);
+        let logits = placeholder_logits();
+        let mut sampler =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
+                .unwrap();
+
+        for (index, &byte) in AUTO_TRIGGER.iter().enumerate() {
+            sampler
+                .commit_token(&logits, u32::from(byte), stream)
+                .unwrap();
+            assert_eq!(
+                sampler.constraint_is_active(),
+                index + 1 == AUTO_TRIGGER.len()
+            );
+        }
+        assert!(!sampler.grammar_is_complete().unwrap());
+        commit_bytes(
+            &mut sampler,
+            &COMPLETE_CALL[AUTO_TRIGGER.len()..],
+            &logits,
+            stream,
+        );
+
+        assert!(sampler.grammar_is_complete().unwrap());
+        assert_eq!(sampler.policy().commits, COMPLETE_CALL.len());
+    }
+
+    #[test]
+    fn required_is_immediate_and_rollback_restores_valid_tokens_and_policy() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Required);
+        let logits = placeholder_logits();
+        let mut sampler = ConstrainedSampler::from_tool_plan(
+            CountingPolicy::default(),
+            &plan,
+            ToolChoice::Required,
+        )
+        .unwrap();
+
+        assert!(sampler.constraint_is_active());
+        let initial = sampler.valid_token_ids().unwrap().unwrap();
+        assert!(initial.contains(&u32::from(b'{')));
+        sampler
+            .commit_token(&logits, u32::from(b'{'), stream)
+            .unwrap();
+        let after_open = sampler.valid_token_ids().unwrap().unwrap();
+        let mut fork = sampler.fork();
+        assert_eq!(fork.valid_token_ids().unwrap().unwrap(), after_open);
+
+        sampler
+            .commit_token(&logits, u32::from(b'"'), stream)
+            .unwrap();
+        sampler.rollback(1).unwrap();
+
+        assert_eq!(sampler.valid_token_ids().unwrap().unwrap(), after_open);
+        assert_eq!(sampler.policy().commits, 1);
+    }
+
+    #[test]
+    fn speculative_history_uses_a_state_fork_without_early_activation() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Auto);
+        let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
+        let mut sampler =
+            ConstrainedSampler::from_tool_plan(policy, &plan, ToolChoice::Auto).unwrap();
+        let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
+        values[b'x' as usize] = 100.0;
+        values[b'[' as usize] = 10.0;
+        let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+        let history = AUTO_TRIGGER
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>();
+
+        let processed = sampler.process_logits(&raw, 0.0, &history, stream).unwrap();
+        let selected = sampler
+            .sample_processed(&processed, 0.0, None, stream)
+            .unwrap();
+        eval([&selected]).unwrap();
+
+        assert_eq!(selected.item::<u32>(stream), u32::from(b'['));
+        assert!(!sampler.constraint_is_active());
     }
 
     #[test]
@@ -732,7 +1358,6 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn mirostat_v2_samples_and_updates_mu() {
-        use super::Sampler;
         use safemlx::{
             random::{self, RandomState},
             Array, Device, DeviceType, ExecutionContext,
