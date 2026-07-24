@@ -88,6 +88,8 @@ pub mod realtime;
 pub mod residency;
 /// Token sampling strategies.
 pub mod sampler;
+/// Protocol-independent semantic streaming contracts and machinery.
+pub mod streaming;
 /// Executable pure tensor-parallel model loading and inference.
 pub mod tensor_parallel;
 #[cfg(test)]
