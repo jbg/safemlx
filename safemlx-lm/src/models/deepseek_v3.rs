@@ -3392,10 +3392,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     }
     args.validate()?;
 
-    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id")?
-        .and_then(|value| u32::try_from(value).ok())
-        .into_iter()
-        .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
     Ok(PreparedDeepSeekGguf {
         args,
         eos_token_ids,

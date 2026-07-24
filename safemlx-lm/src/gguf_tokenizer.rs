@@ -374,7 +374,9 @@ fn register_special_tokens(
         "padding_token_id",
         "separator_token_id",
     ] {
-        if let Some(id) = special_id(metadata, name)? {
+        if name == "eos_token_id" {
+            ids.extend(special_ids(metadata, name)?);
+        } else if let Some(id) = special_id(metadata, name)? {
             ids.insert(id);
         }
     }
@@ -485,15 +487,43 @@ fn special_token(
     tokens: &[String],
     name: &str,
 ) -> Result<Option<String>, Error> {
-    special_id(metadata, name)?
+    let id = if name == "eos_token_id" {
+        special_ids(metadata, name)?.into_iter().next()
+    } else {
+        special_id(metadata, name)?
+    };
+    id.map(|id| {
+        tokens.get(id).cloned().ok_or_else(|| {
+            tokenizer_error(format!(
+                "tokenizer.ggml.{name}={id} is outside the vocabulary"
+            ))
+        })
+    })
+    .transpose()
+}
+
+fn special_ids(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    name: &str,
+) -> Result<Vec<usize>, Error> {
+    let key = format!("tokenizer.ggml.{name}");
+    let Some(value) = metadata.get(&key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .to_i64_vec()
+        .ok_or_else(|| tokenizer_error(format!("{key} must be an integer or integer array")))?;
+    values
+        .into_iter()
         .map(|id| {
-            tokens.get(id).cloned().ok_or_else(|| {
+            u32::try_from(id).map(|id| id as usize).map_err(|_| {
                 tokenizer_error(format!(
-                    "tokenizer.ggml.{name}={id} is outside the vocabulary"
+                    "{key} must contain integers from 0 through {}",
+                    u32::MAX
                 ))
             })
         })
-        .transpose()
+        .collect()
 }
 
 fn special_id(
@@ -559,6 +589,7 @@ mod tests {
                     "ll".into(),
                     "hell".into(),
                     "hello".into(),
+                    "<eos2>".into(),
                 ])),
             ),
             (
@@ -572,7 +603,7 @@ mod tests {
             ),
             (
                 "tokenizer.ggml.eos_token_id".into(),
-                GgufMetadataValue::Uint32(0),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![0, 9])),
             ),
             (
                 "tokenizer.ggml.add_eos_token".into(),
@@ -583,6 +614,7 @@ mod tests {
         let loaded = from_metadata(&metadata).unwrap().unwrap();
         let encoding = loaded.tokenizer.encode("hello", true).unwrap();
         assert_eq!(encoding.get_ids(), &[8, 0]);
+        assert_eq!(loaded.tokenizer.decode(&[0, 9], true).unwrap(), "");
         assert_eq!(loaded.template_kwargs["eos_token"], "<eos>");
     }
 

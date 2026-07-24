@@ -10,7 +10,7 @@ use std::path::Path;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
-    ops::{GgufCheckpoint, GgufMetadata, GgufMetadataValue},
+    ops::{GgufCheckpoint, GgufMetadata, GgufMetadataArray, GgufMetadataValue},
     random::RandomState,
     Array, Stream,
 };
@@ -95,8 +95,6 @@ pub(crate) mod qwen_vl;
 struct ModelMetadata {
     model_type: String,
     #[serde(default)]
-    eos_token_id: Option<TokenIdOrIds>,
-    #[serde(default)]
     text_config: Option<TextModelMetadata>,
 }
 
@@ -104,6 +102,18 @@ struct ModelMetadata {
 struct TextModelMetadata {
     #[serde(default)]
     model_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct EosTokenMetadata {
+    #[serde(default)]
+    eos_token_id: Option<TokenIdOrIds>,
+    #[serde(default)]
+    text_config: Option<TextEosTokenMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TextEosTokenMetadata {
     #[serde(default)]
     eos_token_id: Option<TokenIdOrIds>,
 }
@@ -122,6 +132,91 @@ impl TokenIdOrIds {
             Self::Multiple(ids) => ids,
         }
     }
+}
+
+fn append_unique_eos_token_ids(output: &mut Vec<u32>, ids: impl IntoIterator<Item = u32>) {
+    for id in ids {
+        if !output.contains(&id) {
+            output.push(id);
+        }
+    }
+}
+
+fn merge_eos_token_id_sources(
+    sources: impl IntoIterator<Item = impl IntoIterator<Item = u32>>,
+) -> Vec<u32> {
+    let mut output = Vec::new();
+    for source in sources {
+        append_unique_eos_token_ids(&mut output, source);
+    }
+    output
+}
+
+fn read_optional_eos_token_metadata(path: &Path) -> Result<Option<EosTokenMetadata>, Error> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_reader(file)?))
+}
+
+fn eos_token_ids_from_sidecar_dir(sidecar_dir: &Path) -> Result<Vec<u32>, Error> {
+    let mut output = Vec::new();
+    for filename in ["config.json", "generation_config.json"] {
+        let Some(metadata) = read_optional_eos_token_metadata(&sidecar_dir.join(filename))? else {
+            continue;
+        };
+        if let Some(ids) = metadata.eos_token_id {
+            append_unique_eos_token_ids(&mut output, ids.into_vec());
+        }
+        if let Some(ids) = metadata
+            .text_config
+            .and_then(|text_config| text_config.eos_token_id)
+        {
+            append_unique_eos_token_ids(&mut output, ids.into_vec());
+        }
+    }
+    Ok(output)
+}
+
+pub(crate) fn gguf_eos_token_ids(
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+) -> Result<Vec<u32>, Error> {
+    const KEY: &str = "tokenizer.ggml.eos_token_id";
+    let Some(value) = metadata.get(KEY) else {
+        return Ok(Vec::new());
+    };
+
+    fn invalid(value: impl std::fmt::Display) -> Error {
+        Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key \"tokenizer.ggml.eos_token_id\" contains invalid EOS token id {value}; expected an integer from 0 through {}",
+            u32::MAX
+        ))
+    }
+
+    let values = match value {
+        GgufMetadataValue::Uint64(value) => {
+            return u32::try_from(*value)
+                .map(|value| vec![value])
+                .map_err(|_| invalid(value));
+        }
+        GgufMetadataValue::Array(GgufMetadataArray::Uint64(values)) => {
+            return values
+                .iter()
+                .map(|&value| u32::try_from(value).map_err(|_| invalid(value)))
+                .collect();
+        }
+        value => value.to_i64_vec().ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {KEY:?} must be an integer or integer array"
+            ))
+        })?,
+    };
+    values
+        .into_iter()
+        .map(|value| u32::try_from(value).map_err(|_| invalid(value)))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1692,7 +1787,8 @@ impl TextDecoder {
 ///
 /// This is the most convenient entry point for text generation: it owns the
 /// architecture-specific [`Model`], tokenizer, optional chat template, model id
-/// used by the template renderer, and EOS token ids parsed from config.
+/// used by the template renderer, and EOS token ids collected from checkpoint
+/// and sidecar metadata.
 pub struct LoadedModel {
     model: Model,
     #[cfg(feature = "media-processing")]
@@ -2095,6 +2191,7 @@ impl LoadedModel {
             });
         }
         let metadata = read_model_metadata(model_dir)?;
+        let eos_token_ids = eos_token_ids_from_sidecar_dir(model_dir)?;
         let model_type = effective_model_type(&metadata);
         let kind = ModelKind::from_model_type(&model_type)?;
         let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
@@ -2110,15 +2207,6 @@ impl LoadedModel {
             }
             _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream)?,
         };
-        let eos_token_ids = metadata
-            .eos_token_id
-            .or_else(|| {
-                metadata
-                    .text_config
-                    .and_then(|text_config| text_config.eos_token_id)
-            })
-            .map(TokenIdOrIds::into_vec)
-            .unwrap_or_default();
 
         Ok(Self {
             model,
@@ -2328,7 +2416,7 @@ impl LoadedModel {
             .map_err(Into::into)
     }
 
-    /// Returns EOS token ids from the model config, if any.
+    /// Returns EOS token ids collected from the model's checkpoint metadata.
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.eos_token_ids
     }
@@ -2481,6 +2569,8 @@ fn load_gguf_model_data(
 ) -> Result<LoadedGgufModel, Error> {
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = crate::weights::gguf_metadata(&checkpoint);
+    let sidecar_eos_token_ids = eos_token_ids_from_sidecar_dir(gguf_sidecar_dir(gguf_file))?;
+    let gguf_eos_token_ids = gguf_eos_token_ids(&metadata)?;
     let architecture = match metadata.get("general.architecture") {
         Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
         Some(_) => {
@@ -2518,7 +2608,7 @@ fn load_gguf_model_data(
         ));
     }
 
-    let (model, eos_token_ids) = match architecture.as_str() {
+    let (model, architecture_eos_token_ids) = match architecture.as_str() {
         "deepseek2" => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = deepseek_v3::load_gguf_checkpoint(
@@ -2719,6 +2809,11 @@ fn load_gguf_model_data(
             "GGUF architecture {other:?}; supported GGUF architectures are deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
         ))),
     };
+    let eos_token_ids = merge_eos_token_id_sources([
+        sidecar_eos_token_ids,
+        architecture_eos_token_ids,
+        gguf_eos_token_ids,
+    ]);
     Ok(LoadedGgufModel {
         model,
         eos_token_ids,
@@ -3431,8 +3526,9 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 mod tests {
     use super::{
         chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
-        load_chat_template, load_model_with_options, load_tokenizer,
-        load_tokenizer_template_kwargs, validate_gguf_quantization_source, LoadedModel,
+        eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, load_chat_template,
+        load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
+        merge_eos_token_id_sources, validate_gguf_quantization_source, LoadedModel,
         ModelLoadOptions,
     };
     use crate::{
@@ -3443,7 +3539,7 @@ mod tests {
     use safemlx::{
         argmax_axis,
         module::ModuleParameters,
-        ops::{zeros_dtype, GgufMetadataValue},
+        ops::{zeros_dtype, GgufMetadataArray, GgufMetadataValue},
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
     use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
@@ -3522,6 +3618,116 @@ mod tests {
             .save(dir.join("tokenizer.json"), false)
             .unwrap();
         dir
+    }
+
+    #[test]
+    fn eos_sidecars_load_single_and_multiple_ids() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "llama",
+              "eos_token_id": 1,
+              "text_config": { "eos_token_id": [2, 3] }
+            }"#,
+        );
+
+        assert_eq!(eos_token_ids_from_sidecar_dir(&dir).unwrap(), [1, 2, 3]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn eos_sidecars_load_generation_config_only_ids() {
+        let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+        fs::write(
+            dir.join("generation_config.json"),
+            r#"{"eos_token_id":[4,5]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(eos_token_ids_from_sidecar_dir(&dir).unwrap(), [4, 5]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn eos_sidecars_use_text_config_when_top_level_is_missing() {
+        let dir = temp_model_dir(
+            r#"{
+              "model_type": "qwen3_vl",
+              "text_config": { "eos_token_id": [7, 8] }
+            }"#,
+        );
+
+        assert_eq!(eos_token_ids_from_sidecar_dir(&dir).unwrap(), [7, 8]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn eos_sources_merge_stably_and_deduplicate_overlaps() {
+        let merged =
+            merge_eos_token_id_sources([vec![1, 2, 1], vec![2, 3], vec![3, 4, 2], vec![4, 5]]);
+
+        assert_eq!(merged, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn gguf_eos_ids_merge_with_sidecars_and_loader_metadata() {
+        let dir = temp_model_dir(r#"{"model_type":"llama","eos_token_id":1}"#);
+        fs::write(
+            dir.join("generation_config.json"),
+            r#"{"eos_token_id":[2,3]}"#,
+        )
+        .unwrap();
+        let metadata = std::collections::HashMap::from([(
+            "tokenizer.ggml.eos_token_id".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![3, 4])),
+        )]);
+
+        let merged = merge_eos_token_id_sources([
+            eos_token_ids_from_sidecar_dir(&dir).unwrap(),
+            vec![4, 5],
+            gguf_eos_token_ids(&metadata).unwrap(),
+        ]);
+
+        assert_eq!(merged, [1, 2, 3, 4, 5]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn eos_loading_allows_missing_sidecar_files_and_gguf_key() {
+        let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+        fs::remove_file(dir.join("config.json")).unwrap();
+        let metadata = std::collections::HashMap::new();
+
+        assert!(eos_token_ids_from_sidecar_dir(&dir).unwrap().is_empty());
+        assert!(gguf_eos_token_ids(&metadata).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn eos_loading_rejects_invalid_json_and_gguf_values() {
+        for value in ["-1", "4294967296", "1.5", r#"[1,"2"]"#] {
+            let dir = temp_model_dir(&format!(
+                r#"{{"model_type":"llama","eos_token_id":{value}}}"#
+            ));
+            assert!(
+                eos_token_ids_from_sidecar_dir(&dir).is_err(),
+                "accepted invalid JSON EOS value {value}"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        for value in [
+            GgufMetadataValue::Int64(-1),
+            GgufMetadataValue::Uint64(u64::from(u32::MAX) + 1),
+            GgufMetadataValue::Array(GgufMetadataArray::Int64(vec![1, -2])),
+            GgufMetadataValue::String("3".into()),
+        ] {
+            let metadata =
+                std::collections::HashMap::from([("tokenizer.ggml.eos_token_id".into(), value)]);
+            assert!(
+                gguf_eos_token_ids(&metadata).is_err(),
+                "accepted invalid GGUF EOS value"
+            );
+        }
     }
 
     fn append_gguf_string(bytes: &mut Vec<u8>, value: &str) {

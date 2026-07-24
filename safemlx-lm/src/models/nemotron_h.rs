@@ -2133,11 +2133,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
     )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids =
-        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedNemotronHGguf {
         model,
         eos_token_ids,
@@ -2182,10 +2178,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-        .and_then(|value| u32::try_from(value).ok())
-        .into_iter()
-        .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
     Ok(PreparedNemotronHGguf {
         args,
         eos_token_ids,

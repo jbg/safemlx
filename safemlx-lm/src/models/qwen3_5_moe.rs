@@ -4272,11 +4272,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids =
-        qwen35_gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedQwen35Gguf {
         model,
         eos_token_ids,
@@ -4347,11 +4343,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         super::qwen3_next::split_fused_projection_configs(&mut configs)?;
     }
     args.quantized_weight_configs = Some(configs);
-    let eos_token_ids =
-        qwen35_gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
     Ok(PreparedQwen35Gguf {
         args,
         eos_token_ids,

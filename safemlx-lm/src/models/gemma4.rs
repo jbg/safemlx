@@ -3258,10 +3258,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         }
     }
 
-    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-        .and_then(|value| u32::try_from(value).ok())
-        .into_iter()
-        .collect();
+    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
     Ok(PreparedGemma4Gguf {
         args,
         eos_token_ids,
