@@ -3128,6 +3128,11 @@ pub(crate) struct LoadedGemma4Gguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedGemma4Gguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 /// Loads the text model from a Gemma 4 GGUF checkpoint.
 ///
 /// Dense tensors and every GGUF quantization supported by the shared backend are
@@ -3158,51 +3163,9 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if architecture != "gemma4" {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports only gemma4"
-        )));
-    }
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-
-    let mut args = gemma4_args_from_gguf(checkpoint, &metadata, weights_stream)?;
-    let mut quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
-    if args.enable_moe_block {
-        for layer in 0..args.num_hidden_layers {
-            let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
-            if let Some(config) =
-                quantized_weight_configs.remove(&format!("{prefix}.gate_up_proj.weight"))
-            {
-                quantized_weight_configs.insert(format!("{prefix}.gate_proj.weight"), config);
-                quantized_weight_configs.insert(format!("{prefix}.up_proj.weight"), config);
-            }
-        }
-    }
-    let quantized_weights = quantized_weight_configs
-        .keys()
-        .cloned()
-        .collect::<HashSet<_>>();
-    let has_quantized_tensors = !quantized_weights.is_empty();
-    if let Some(quantization) = quantization {
-        args.quantized = true;
-        args.weight_quantization = Some(quantization);
-        args.quantization_group_size = quantization.group_size();
-        args.quantization_bits = quantization.bits();
-        args.quantized_weights = None;
-        args.quantized_weight_configs = None;
-    } else {
-        args.quantized_weights = Some(quantized_weights);
-        args.quantized_weight_configs = Some(quantized_weight_configs);
-        if has_quantized_tensors {
-            args.quantized = true;
-        }
-    }
-
-    let mut model = Model::new(args, stream)?;
+    let prepared =
+        prepare_gemma4_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
+    let mut model = Model::new(prepared.args, stream)?;
     if quantization.is_none() {
         for tensor in checkpoint
             .catalog()
@@ -3239,13 +3202,68 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
-    let eos_token_ids =
-        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
     Ok(LoadedGemma4Gguf {
         model,
+        eos_token_ids: prepared.eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_gemma4_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    weights_stream: &Stream,
+) -> Result<PreparedGemma4Gguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if architecture != "gemma4" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports only gemma4"
+        )));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+
+    let mut args = gemma4_args_from_gguf(checkpoint, metadata, weights_stream)?;
+    let mut quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    if args.enable_moe_block {
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
+            if let Some(config) =
+                quantized_weight_configs.remove(&format!("{prefix}.gate_up_proj.weight"))
+            {
+                quantized_weight_configs.insert(format!("{prefix}.gate_proj.weight"), config);
+                quantized_weight_configs.insert(format!("{prefix}.up_proj.weight"), config);
+            }
+        }
+    }
+    let quantized_weights = quantized_weight_configs
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let has_quantized_tensors = !quantized_weights.is_empty();
+    if let Some(quantization) = quantization {
+        args.quantized = true;
+        args.weight_quantization = Some(quantization);
+        args.quantization_group_size = quantization.group_size();
+        args.quantization_bits = quantization.bits();
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(quantized_weights);
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+        if has_quantized_tensors {
+            args.quantized = true;
+        }
+    }
+
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+        .and_then(|value| u32::try_from(value).ok())
+        .into_iter()
+        .collect();
+    Ok(PreparedGemma4Gguf {
+        args,
         eos_token_ids,
     })
 }

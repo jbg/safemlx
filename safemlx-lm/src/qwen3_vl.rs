@@ -1,6 +1,11 @@
 //! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
-use std::{path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
@@ -9,7 +14,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{masked_scatter, TryIndexOp},
-        zeros_dtype,
+        zeros_dtype, GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -21,8 +26,9 @@ use crate::{
     error::Error,
     expert_cache::{ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass},
     layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
@@ -35,11 +41,13 @@ use crate::{
         },
     },
     module_binding::{
-        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
     residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_store::{SafetensorsWeightStore, WeightStore},
+    weight_recipe::DerivedWeightRecipe,
+    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";
@@ -95,8 +103,13 @@ impl Qwen3VlLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs typed multimodal prefill through vision and text execution groups.
@@ -172,6 +185,68 @@ pub fn load_qwen3_vl_layerwise_model(
     })
 }
 
+pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    vision_checkpoint: &GgufCheckpoint,
+    vision_metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Qwen3VlLayerwiseModel, Vec<u32>), Error> {
+    let prepared = resident::prepare_qwen3_vl_gguf_checkpoint(
+        checkpoint,
+        metadata,
+        vision_checkpoint,
+        vision_metadata,
+        weights_stream,
+    )?;
+    let deepstack = prepared.args.vision_config.deepstack_visual_indexes.clone();
+    let store: Arc<dyn WeightStore + Send + Sync> = Arc::new(
+        GgufWeightStore::builder()
+            .max_cached_readers(residency.max_mapped_shards())?
+            .add_checkpoint(checkpoint.clone(), |name| {
+                let name = crate::models::qwen3::translate_gguf_weight_name(name);
+                name.strip_prefix("model.")
+                    .map(|name| format!("model.language_model.{name}"))
+                    .unwrap_or(name)
+            })?
+            .add_checkpoint(vision_checkpoint.clone(), |name| {
+                resident::translate_qwen3_vl_mmproj_name(name, &deepstack)
+            })?
+            .build()?,
+    );
+    let adapter = Qwen3VlLayerwiseAdapter::new(prepared.args, stream)?;
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "sparse expert caching is not supported for dense Qwen3-VL GGUF checkpoints".into(),
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF Qwen3-VL loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((Qwen3VlLayerwiseModel { execution }, prepared.eos_token_ids))
+}
+
 /// Loads Qwen3-VL-MoE with expert-granular sparse caching.
 pub fn load_qwen3_vl_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -229,7 +304,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
         store.as_ref(),
         "model.language_model.layers",
     )?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
         options,
@@ -520,10 +595,30 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
     type ForwardContext = Qwen3VlForwardContext;
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+        let patch = "model.visual.patch_embed.proj.weight";
+        let vision_recipes = if store.keys().contains(&format!("{patch}.1")) {
+            BTreeMap::from([(
+                "patch_embed.proj.weight".to_string(),
+                DerivedWeightRecipe::Stack {
+                    axis: 2,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(patch, TensorSelection::Full),
+                        DerivedWeightRecipe::source(format!("{patch}.1"), TensorSelection::Full),
+                    ],
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
         let mut units = vec![
             StaticUnitBindings::new(
                 VISION_STATIC_UNIT,
-                build_module_bindings(&self.vision, "model.visual", store)?,
+                build_module_bindings_with_recipes(
+                    &self.vision,
+                    "model.visual",
+                    store,
+                    vision_recipes,
+                )?,
             )?,
             StaticUnitBindings::new(
                 EMBEDDING_UNIT,

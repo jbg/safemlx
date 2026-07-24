@@ -118,8 +118,8 @@ The default quantization group size is 64 weights; change it with
 so use a checkpoint already carrying matching quantization metadata when
 startup time is important.
 
-For a safetensors family with a registered host-residency adapter, select a
-bounded device window through the same architecture-detecting loader:
+For a SafeTensors or registered GGUF family, select a bounded device window
+through the same architecture-detecting loader:
 
 ```sh
 cargo run --release -p safemlx-lm-cli -- \
@@ -130,12 +130,22 @@ cargo run --release -p safemlx-lm-cli -- \
 ```
 
 `--verbose` also prints logical current/peak host and device parameter bytes,
-synchronous transfer counts, and mapped-shard diagnostics. Apple CPU and GPU
-tiers share unified physical memory, so these logical tiers do not increase
-total capacity. GGUF, load-time conversion, and KV cache offload are not
-supported by this path.
+synchronous transfer counts, and backend-tagged shard/reader diagnostics. Apple
+CPU and GPU tiers share unified physical memory, so these logical tiers do not
+increase total capacity. Load-time quantization and KV cache offload are not
+supported by this path; checkpoint-native GGUF quantization is.
 
-Supported safetensors MoE models can cache routed experts separately. This
+Stream dense layers from either backend with finite tier controls:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/model.gguf --dense-disk-stream \
+  --device-budget-bytes 8000000000 --host-budget-bytes 16000000000 \
+  --dense-host-lookahead 2 --dense-device-lookahead 1 \
+  --dense-background-queue 2 "Explain bounded GGUF loading."
+```
+
+Supported MoE models can cache routed experts separately. This
 includes DeepSeek-V3/R1, GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3,
 Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE:
 
@@ -150,12 +160,18 @@ cargo run --release -p safemlx-lm-cli -- \
   "Explain sparse expert residency."
 ```
 
+For GGUF, sparse expert caching is available for DeepSeek2, LFM2-MoE,
+Nemotron-H-MoE, Qwen3-MoE, Qwen3.5-MoE, and MoE Qwen3-Next. Other GGUF
+families still support the host-layerwise and dense-stream modes listed above.
+
 The ordinary device and host budgets govern non-expert layerwise weights; the
 `--expert-cache-*` budgets govern hot and warm expert copies. A zero expert host
 budget promotes misses directly from checkpoint storage. The scratch limit is
 checked against each temporary compact bank and is separate from the device
 cache budget. `--verbose` reports prefill and decode requests, hits, misses,
 evictions, compact-bank bytes, and current expert occupancy separately.
+Combine `--expert-cache` with `--dense-disk-stream` to stream non-expert units
+while keeping expert-granular reuse.
 
 Add `--expert-cache-benchmark` to run the real prompt through a cold prefill,
 a repeated prefill with fresh attention state, and one decode using the repeated

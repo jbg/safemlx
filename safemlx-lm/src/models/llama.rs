@@ -1067,6 +1067,11 @@ pub(crate) struct LoadedLlamaGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedLlamaGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 /// Loads a Llama-compatible GGUF checkpoint, including Mistral.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
@@ -1098,30 +1103,9 @@ pub(crate) fn load_llama_gguf_checkpoint(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedLlamaGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "llama" | "mistral") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports llama and mistral"
-        )));
-    }
-
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-    let mut args = llama_args_from_gguf(checkpoint, &metadata, &architecture, weights_stream)?;
-    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
-    if let Some(quantization) = quantization {
-        args.quantized_weights = None;
-        args.quantization = Some(quantization);
-        args.quantized_weight_configs = None;
-    } else {
-        args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
-        args.quantization = None;
-        args.quantized_weight_configs = Some(quantized_weight_configs);
-    }
-
-    let mut model = ResidentModel::new(args, stream)?;
+    let prepared =
+        prepare_llama_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
+    let mut model = ResidentModel::new(prepared.args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
     load_gguf_strict(
@@ -1135,13 +1119,47 @@ pub(crate) fn load_llama_gguf_checkpoint(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
-    let eos_token_ids =
-        gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
-            .and_then(|value| u32::try_from(value).ok())
-            .into_iter()
-            .collect();
     Ok(LoadedLlamaGguf {
         model,
+        eos_token_ids: prepared.eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_llama_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    weights_stream: &Stream,
+) -> Result<PreparedLlamaGguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "llama" | "mistral") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports llama and mistral"
+        )));
+    }
+
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args = llama_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
+    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    if let Some(quantization) = quantization {
+        args.quantized_weights = None;
+        args.quantization = Some(quantization);
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
+        args.quantization = None;
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+    }
+
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+        .and_then(|value| u32::try_from(value).ok())
+        .into_iter()
+        .collect();
+    Ok(PreparedLlamaGguf {
+        args,
         eos_token_ids,
     })
 }
@@ -1265,7 +1283,7 @@ fn gguf_rope_scaling(
     }
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     name.replace("blk.", "model.layers.")
         .replace("ffn_gate", "mlp.gate_proj")
         .replace("ffn_down", "mlp.down_proj")

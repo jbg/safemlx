@@ -1,7 +1,7 @@
 use crate::convert::{affine_shapes, conversion_kind, ConversionKind};
 use crate::{
-    ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, Reader, Result,
-    TensorDescriptor,
+    ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, OuterSelection, Reader,
+    Result, TensorDescriptor,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -225,13 +225,13 @@ struct TensorLocation {
 /// Name lookup is constant-time after construction. Consecutive requests from
 /// the same shard reuse one parsed reader; switching shards closes the previous
 /// reader before opening the next, so file-descriptor use remains bounded.
-pub struct TensorMaterializer<'a> {
-    checkpoint: &'a Checkpoint,
-    locations: HashMap<&'a str, TensorLocation>,
+pub struct TensorMaterializer {
+    checkpoint: Checkpoint,
+    locations: HashMap<String, TensorLocation>,
     reader: Option<(usize, Reader<BufReader<File>>)>,
 }
 
-impl std::fmt::Debug for TensorMaterializer<'_> {
+impl std::fmt::Debug for TensorMaterializer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TensorMaterializer")
@@ -435,7 +435,7 @@ impl Checkpoint {
     }
 
     /// Create an indexed named-tensor materializer with bounded reader reuse.
-    pub fn materializer(&self) -> TensorMaterializer<'_> {
+    pub fn materializer(&self) -> TensorMaterializer {
         let locations = self
             .shards
             .iter()
@@ -447,7 +447,7 @@ impl Checkpoint {
                     .enumerate()
                     .map(move |(tensor_index, tensor)| {
                         (
-                            tensor.descriptor.name.as_str(),
+                            tensor.descriptor.name.clone(),
                             TensorLocation {
                                 shard_index,
                                 tensor_index,
@@ -457,7 +457,7 @@ impl Checkpoint {
             })
             .collect();
         TensorMaterializer {
-            checkpoint: self,
+            checkpoint: self.clone(),
             locations,
             reader: None,
         }
@@ -509,7 +509,33 @@ impl Checkpoint {
     }
 }
 
-impl TensorMaterializer<'_> {
+impl TensorMaterializer {
+    /// Path of the shard containing `name`, without opening its payload reader.
+    pub fn shard_path_for_tensor(&self, name: &str) -> Result<&Path> {
+        let location = self
+            .locations
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::InvalidTensor {
+                tensor: name.to_string(),
+                reason: "tensor is not present in the checkpoint".into(),
+            })?;
+        Ok(&self.checkpoint.shards[location.shard_index].path)
+    }
+
+    /// Path of the currently cached shard reader, if any.
+    pub fn open_shard_path(&self) -> Option<&Path> {
+        self.reader
+            .as_ref()
+            .map(|(index, _)| self.checkpoint.shards[*index].path.as_path())
+    }
+
+    /// Close the currently cached shard reader.
+    pub fn close_reader(&mut self) -> Option<PathBuf> {
+        let (index, _) = self.reader.take()?;
+        Some(self.checkpoint.shards[index].path.clone())
+    }
+
     fn location_and_reader(
         &mut self,
         name: &str,
@@ -554,6 +580,50 @@ impl TensorMaterializer<'_> {
                 path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),
             })?;
+        Ok(ConvertedCheckpointTensor {
+            shard_index: location.shard_index,
+            tensor_index: location.tensor_index,
+            descriptor,
+            converted,
+        })
+    }
+
+    /// Materialize selected slabs along the outermost MLX tensor axis.
+    pub fn converted_tensor_outer(
+        &mut self,
+        name: &str,
+        selection: &OuterSelection,
+    ) -> Result<ConvertedCheckpointTensor> {
+        let (location, mut descriptor, _) = self.location_and_reader(name)?;
+        let converted = self
+            .reader
+            .as_mut()
+            .expect("requested shard reader opened above")
+            .1
+            .read_tensor_outer(&descriptor, selection)
+            .map_err(|source| Error::Shard {
+                path: self.checkpoint.shards[location.shard_index].path.clone(),
+                source: Box::new(source),
+            })?;
+        let selected_outer = match selection {
+            OuterSelection::Range { start, end } => end - start,
+            OuterSelection::Indices(indices) => indices.len(),
+        };
+        let original_outer = *descriptor
+            .dimensions
+            .last()
+            .expect("reader rejects scalar outer selections");
+        let selected_outer_u64 = u64::try_from(selected_outer)
+            .map_err(|_| Error::Overflow("selected outer dimension"))?;
+        descriptor.byte_len = descriptor
+            .byte_len
+            .checked_div(original_outer)
+            .and_then(|bytes| bytes.checked_mul(selected_outer_u64))
+            .ok_or(Error::Overflow("selected GGUF payload bytes"))?;
+        *descriptor
+            .dimensions
+            .last_mut()
+            .expect("reader rejects scalar outer selections") = selected_outer_u64;
         Ok(ConvertedCheckpointTensor {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,

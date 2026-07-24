@@ -36,7 +36,7 @@ use crate::{
     },
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "inkling.static.embedding";
@@ -104,8 +104,13 @@ impl InklingLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs the text decoder while preserving KV and convolution state.
@@ -226,7 +231,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = inkling_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
         options,

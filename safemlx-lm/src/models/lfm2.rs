@@ -1279,6 +1279,12 @@ pub(crate) struct LoadedLfm2Gguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedLfm2Gguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+    pub(crate) is_moe: bool,
+}
+
 /// Loads an LFM2 or LFM2-MoE GGUF checkpoint.
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
@@ -1410,6 +1416,48 @@ pub(crate) fn load_gguf_checkpoint(
     })
 }
 
+pub(crate) fn prepare_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    weights_stream: &Stream,
+) -> Result<PreparedLfm2Gguf, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "lfm2" | "lfm2moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports lfm2 and lfm2moe"
+        )));
+    }
+    let is_moe = architecture == "lfm2moe";
+    let mut args = args_from_gguf(checkpoint, metadata, &architecture, is_moe, weights_stream)?;
+    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
+    checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    if is_moe {
+        for layer in args.num_dense_layers..args.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.feed_forward.experts");
+            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
+                configs.remove(&format!("{prefix}.up_proj"));
+                configs.insert(format!("{prefix}.gate_up_proj"), config);
+            }
+        }
+    }
+    args.quantized_weights = Some(configs.keys().cloned().collect());
+    args.quantized_weight_configs = Some(configs);
+    validate_args(&args)?;
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id")?
+        .and_then(|value| u32::try_from(value).ok())
+        .into_iter()
+        .collect();
+    Ok(PreparedLfm2Gguf {
+        args,
+        eos_token_ids,
+        is_moe,
+    })
+}
+
 fn args_from_gguf(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
@@ -1509,7 +1557,7 @@ fn args_from_gguf(
     })
 }
 
-fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
     for (source, target) in [
         ("token_embd", "model.embed_tokens"),
         ("token_embd_norm", "model.embedding_norm"),

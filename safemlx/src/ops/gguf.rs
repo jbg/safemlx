@@ -3,11 +3,12 @@ use crate::{Array, Dtype};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use safemlx_gguf::{
-    Endian as GgufEndian, GgmlType as GgufType, MetadataArray as GgufMetadataArray,
-    MetadataValue as GgufMetadataValue,
+    Endian as GgufEndian, GgmlType as GgufType, LogicalDtype as GgufLogicalDtype,
+    MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue,
+    OuterSelection as GgufOuterSelection,
 };
 
 /// A validated GGUF checkpoint that materializes one physical tensor at a time.
@@ -125,8 +126,8 @@ pub struct GgufTensorIter<'a> {
 }
 
 /// Indexed named-tensor materializer that reuses the current shard reader.
-pub struct GgufMaterializer<'a> {
-    inner: safemlx_gguf::TensorMaterializer<'a>,
+pub struct GgufMaterializer {
+    inner: safemlx_gguf::TensorMaterializer,
 }
 
 /// One physical GGUF tensor retained in its checkpoint-native byte encoding.
@@ -165,7 +166,7 @@ impl std::fmt::Debug for GgufTensorIter<'_> {
     }
 }
 
-impl std::fmt::Debug for GgufMaterializer<'_> {
+impl std::fmt::Debug for GgufMaterializer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GgufMaterializer")
@@ -222,7 +223,7 @@ impl GgufCheckpoint {
     }
 
     /// Create an indexed named-tensor materializer with bounded reader reuse.
-    pub fn materializer(&self) -> GgufMaterializer<'_> {
+    pub fn materializer(&self) -> GgufMaterializer {
         GgufMaterializer {
             inner: self.inner.materializer(),
         }
@@ -240,10 +241,36 @@ impl GgufCheckpoint {
     }
 }
 
-impl GgufMaterializer<'_> {
+impl GgufMaterializer {
+    /// Path of the shard containing `name`, without opening its payload reader.
+    pub fn shard_path_for_tensor(&self, name: &str) -> Result<&Path, IoError> {
+        self.inner
+            .shard_path_for_tensor(name)
+            .map_err(IoError::from)
+    }
+
+    /// Path of the currently cached shard reader, if any.
+    pub fn open_shard_path(&self) -> Option<&Path> {
+        self.inner.open_shard_path()
+    }
+
+    /// Close the currently cached shard reader.
+    pub fn close_reader(&mut self) -> Option<PathBuf> {
+        self.inner.close_reader()
+    }
+
     /// Materialize one physical tensor by its GGUF name.
     pub fn converted_tensor(&mut self, name: &str) -> Result<GgufTensor, IoError> {
         convert_tensor(self.inner.converted_tensor(name)?)
+    }
+
+    /// Materialize selected slabs along the outermost MLX tensor axis.
+    pub fn converted_tensor_outer(
+        &mut self,
+        name: &str,
+        selection: &GgufOuterSelection,
+    ) -> Result<GgufTensor, IoError> {
+        convert_tensor(self.inner.converted_tensor_outer(name, selection)?)
     }
 
     /// Materialize one physical tensor without converting its GGUF blocks.

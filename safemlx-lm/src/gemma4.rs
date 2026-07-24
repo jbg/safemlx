@@ -1,12 +1,14 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
-use std::{collections::BTreeMap, collections::HashMap, path::Path};
+use std::{collections::BTreeMap, collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp, r#where, tanh},
+    ops::{
+        concatenate_axis, indexing::TryIndexOp, r#where, tanh, GgufCheckpoint, GgufMetadataValue,
+    },
     quantization::MaybeQuantized,
     Array, Stream,
 };
@@ -15,8 +17,9 @@ use crate::{
     cache::KeyValueCache,
     error::Error,
     layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::generation::CausalLm,
@@ -40,7 +43,7 @@ use crate::{
     residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
@@ -82,8 +85,13 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs the text decoder while preserving alternating and shared KV state.
@@ -204,6 +212,52 @@ pub fn load_gemma4_layerwise_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_gemma4_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
+    let prepared =
+        resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let adapter = Gemma4LayerwiseAdapter::new(prepared.args, None, None, None, None, None, stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "sparse expert caching is not supported for Gemma 4 GGUF checkpoints".into(),
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF Gemma 4 loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
 /// Adapter for Gemma 4 per-layer inputs and shared-KV attention blocks.
@@ -333,35 +387,66 @@ impl Gemma4LayerwiseAdapter {
     ) -> BTreeMap<String, DerivedWeightRecipe> {
         let normalized = normalized_checkpoint_keys(store);
         let keys = store.keys();
-        module
-            .parameters()
-            .flatten()
-            .keys()
-            .filter_map(|local_name| {
-                let destination = format!("{prefix}.{local_name}");
-                let canonical = canonical_checkpoint_name(&destination);
-                if keys.contains(&destination) || keys.contains(&canonical) {
-                    return None;
+        let parameters = module.parameters().flatten();
+        let mut recipes = BTreeMap::new();
+        if let Some(intermediate) = self.args.moe_intermediate_size {
+            let fused = format!("{prefix}.experts.switch_glu.gate_up_proj");
+            for suffix in ["weight", "scales", "biases"] {
+                let source = format!("{fused}.{suffix}");
+                if !keys.contains(&source) {
+                    continue;
                 }
-                normalized.get(&canonical).map(|raw| {
+                for (projection, start, end) in [
+                    ("gate_proj", 0usize, intermediate as usize),
                     (
-                        local_name.to_string(),
-                        DerivedWeightRecipe::Cast {
+                        "up_proj",
+                        intermediate as usize,
+                        (2 * intermediate) as usize,
+                    ),
+                ] {
+                    recipes.insert(
+                        format!("experts.switch_glu.{projection}.{suffix}"),
+                        DerivedWeightRecipe::Select {
                             input: Box::new(DerivedWeightRecipe::source(
-                                raw.clone(),
+                                source.clone(),
                                 TensorSelection::Full,
                             )),
-                            dtype: module
-                                .parameters()
-                                .flatten()
-                                .get(local_name)
-                                .expect("parameter came from the same flattened tree")
-                                .dtype(),
+                            selection: TensorSelection::Range {
+                                axis: 1,
+                                start,
+                                end,
+                            },
                         },
-                    )
-                })
-            })
-            .collect()
+                    );
+                }
+            }
+        }
+        for local_name in parameters.keys() {
+            if recipes.contains_key(local_name.as_ref()) {
+                continue;
+            }
+            let destination = format!("{prefix}.{local_name}");
+            let canonical = canonical_checkpoint_name(&destination);
+            if keys.contains(&destination) || keys.contains(&canonical) {
+                continue;
+            }
+            if let Some(raw) = normalized.get(&canonical) {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::Cast {
+                        input: Box::new(DerivedWeightRecipe::source(
+                            raw.clone(),
+                            TensorSelection::Full,
+                        )),
+                        dtype: parameters
+                            .get(local_name)
+                            .expect("parameter came from the same flattened tree")
+                            .dtype(),
+                    },
+                );
+            }
+        }
+        recipes
     }
 
     fn bindings(

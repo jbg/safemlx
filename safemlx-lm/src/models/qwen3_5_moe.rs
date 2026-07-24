@@ -4073,6 +4073,12 @@ pub(crate) struct LoadedQwen35Gguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedQwen35Gguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+    pub(crate) architecture: String,
+}
+
 /// Loads a text-only dense or MoE Qwen3.5 model from a GGUF checkpoint.
 pub fn load_qwen3_5_gguf(
     gguf_file: impl AsRef<Path>,
@@ -4274,6 +4280,82 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     Ok(LoadedQwen35Gguf {
         model,
         eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_qwen35_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    weights_stream: &Stream,
+) -> Result<PreparedQwen35Gguf, Error> {
+    let architecture = qwen35_gguf_string(metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe" | "qwen3next") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
+        )));
+    }
+    if checkpoint.any_gguf_tensor(|name| name.starts_with("v.") || name.starts_with("mm.")) {
+        return Err(Error::UnsupportedArchitecture(
+            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
+        ));
+    }
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let block_count = qwen35_gguf_i32(metadata, &key("block_count"), weights_stream)?;
+    let nextn_layers =
+        qwen35_gguf_optional_i64(metadata, &key("nextn_predict_layers"), weights_stream)?
+            .unwrap_or(0);
+    let nextn_layers = i32::try_from(nextn_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(
+            "Qwen3.5 next-token prediction layer count exceeds i32".into(),
+        )
+    })?;
+    if nextn_layers < 0 || nextn_layers >= block_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF has invalid block_count {block_count} and nextn_predict_layers {nextn_layers}"
+        )));
+    }
+    let num_hidden_layers = block_count - nextn_layers;
+    let mut args = qwen35_args_from_gguf(
+        checkpoint,
+        metadata,
+        &architecture,
+        num_hidden_layers,
+        weights_stream,
+    )?;
+    let mut configs = gguf_affine_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
+    if matches!(architecture.as_str(), "qwen35moe" | "qwen3next") {
+        for layer in 0..num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.mlp.experts");
+            if let Some(gate) = configs.remove(&format!("{prefix}.gate_proj")) {
+                let up = configs
+                    .remove(&format!("{prefix}.up_proj"))
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                        "Qwen3.5 GGUF layer {layer} is missing routed up-projection affine metadata"
+                    ))
+                    })?;
+                if gate != up {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Qwen3.5 GGUF layer {layer} routed gate/up affine layouts differ"
+                    )));
+                }
+                configs.insert(format!("{prefix}.gate_up_proj"), gate);
+            }
+        }
+    }
+    if architecture == "qwen3next" {
+        super::qwen3_next::split_fused_projection_configs(&mut configs)?;
+    }
+    args.quantized_weight_configs = Some(configs);
+    let eos_token_ids =
+        qwen35_gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+            .and_then(|value| u32::try_from(value).ok())
+            .into_iter()
+            .collect();
+    Ok(PreparedQwen35Gguf {
+        args,
+        eos_token_ids,
+        architecture,
     })
 }
 
@@ -4626,7 +4708,7 @@ fn qwen35_is_offset_norm(name: &str) -> bool {
             && !name.ends_with("ssm_norm.weight"))
 }
 
-fn qwen35_translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn qwen35_translate_gguf_weight_name(name: &str) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embed_tokens"),
         ("output_norm", "model.norm"),

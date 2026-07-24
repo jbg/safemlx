@@ -1,12 +1,18 @@
 //! Unified fully resident and bounded layer execution for Qwen3.
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, Param},
     nn,
     ops::indexing::TryIndexOp,
+    ops::{GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -20,8 +26,8 @@ use crate::{
         ExpertPass,
     },
     layerwise::{
-        load_layerwise_model, LayerExecutionLoadOptions, LayerwiseInput, LayerwiseModel,
-        LayerwiseModelAdapter, StaticUnitBindings,
+        load_layerwise_model, load_layerwise_model_with_store, LayerExecutionLoadOptions,
+        LayerwiseInput, LayerwiseModel, LayerwiseModelAdapter, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::{
@@ -36,13 +42,13 @@ use crate::{
         qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
     module_binding::{
-        build_module_bindings, build_module_bindings_excluding, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "qwen3.static.embedding";
@@ -90,8 +96,13 @@ impl Qwen3LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs dense or sparse-MoE Qwen3 with a standard KV cache.
@@ -158,6 +169,101 @@ pub fn load_qwen3_layerwise_model(
     })
 }
 
+pub(crate) fn load_qwen3_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Qwen3LayerwiseModel, Vec<u32>), Error> {
+    let is_moe = architecture == "qwen3moe";
+    let (args, eos_token_ids) = resident::prepare_qwen3_gguf_checkpoint(
+        checkpoint,
+        metadata,
+        architecture,
+        is_moe,
+        weights_stream,
+    )?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            |name| resident::translate_qwen3_gguf_weight_name(name, is_moe),
+            residency.max_mapped_shards(),
+        )?);
+
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => {
+            let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
+        WeightResidency::DenseDiskStream(options) => {
+            let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
+        WeightResidency::SparseExpertCache(options) => {
+            return Ok((
+                load_qwen3_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                eos_token_ids,
+            ));
+        }
+        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
+            return Ok((
+                load_qwen3_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options.expert_cache,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                eos_token_ids,
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF Qwen3 loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((Qwen3LayerwiseModel { execution }, eos_token_ids))
+}
+
+fn load_qwen3_gguf_sparse_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3LayerwiseModel, Error> {
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Qwen3 sparse-MoE GGUF checkpoint".into(),
+        ));
+    }
+    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let checkpoint_store = execution.weight_store_arc();
+    let entries = qwen3_expert_catalog(&args, checkpoint_store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+        checkpoint_store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(Qwen3LayerwiseModel { execution })
+}
+
 /// Loads sparse Qwen3 with layerwise non-expert weights and expert-granular caching.
 pub fn load_qwen3_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -210,7 +316,7 @@ fn load_qwen3_sparse_expert_cache_model_with_non_expert(
         load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = qwen3_expert_catalog(&args, store.as_ref())?;
-    let cache = ExpertCache::new(
+    let cache = ExpertCache::new_shared(
         store,
         entries,
         options,
@@ -380,10 +486,48 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
                 |name| name.starts_with("mlp.experts."),
             )?)
         } else {
-            Ok(build_module_bindings(
-                layer,
-                &format!("model.layers.{index}"),
-                store,
+            let prefix = format!("model.layers.{index}");
+            let expert_prefix = format!("{prefix}.mlp.experts");
+            let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+            let mut recipes = BTreeMap::new();
+            if keys.contains(&format!("{expert_prefix}.gate_proj"))
+                && keys.contains(&format!("{expert_prefix}.up_proj"))
+            {
+                recipes.insert(
+                    "mlp.experts.gate_up_proj".to_string(),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(
+                                format!("{expert_prefix}.gate_proj"),
+                                TensorSelection::Full,
+                            ),
+                            DerivedWeightRecipe::source(
+                                format!("{expert_prefix}.up_proj"),
+                                TensorSelection::Full,
+                            ),
+                        ],
+                    },
+                );
+                for suffix in ["_scales", "_biases"] {
+                    let gate = format!("{expert_prefix}.gate_proj{suffix}");
+                    let up = format!("{expert_prefix}.up_proj{suffix}");
+                    if keys.contains(&gate) && keys.contains(&up) {
+                        recipes.insert(
+                            format!("mlp.experts.gate_up_proj{suffix}"),
+                            DerivedWeightRecipe::Concatenate {
+                                axis: 1,
+                                inputs: vec![
+                                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                                    DerivedWeightRecipe::source(up, TensorSelection::Full),
+                                ],
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(build_module_bindings_with_recipes(
+                layer, &prefix, store, recipes,
             )?)
         }
     }
@@ -598,6 +742,62 @@ pub(crate) fn qwen3_expert_catalog_at(
                                     end: expert + 1,
                                 },
                             ),
+                            store,
+                        )?);
+                    }
+                }
+            } else if keys.contains(&format!("{prefix}.gate_proj"))
+                && keys.contains(&format!("{prefix}.up_proj"))
+                && keys.contains(&packed_down)
+            {
+                let selection = TensorSelection::Range {
+                    axis: 0,
+                    start: expert,
+                    end: expert + 1,
+                };
+                bindings.push(recipe_binding(
+                    "gate_up_proj",
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(
+                                format!("{prefix}.gate_proj"),
+                                selection.clone(),
+                            ),
+                            DerivedWeightRecipe::source(
+                                format!("{prefix}.up_proj"),
+                                selection.clone(),
+                            ),
+                        ],
+                    },
+                    store,
+                )?);
+                bindings.push(recipe_binding(
+                    "down_proj",
+                    DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
+                    store,
+                )?);
+                for suffix in ["_scales", "_biases"] {
+                    let gate = format!("{prefix}.gate_proj{suffix}");
+                    let up = format!("{prefix}.up_proj{suffix}");
+                    if keys.contains(&gate) && keys.contains(&up) {
+                        bindings.push(recipe_binding(
+                            &format!("gate_up_proj{suffix}"),
+                            DerivedWeightRecipe::Concatenate {
+                                axis: 1,
+                                inputs: vec![
+                                    DerivedWeightRecipe::source(gate, selection.clone()),
+                                    DerivedWeightRecipe::source(up, selection.clone()),
+                                ],
+                            },
+                            store,
+                        )?);
+                    }
+                    let down = format!("{packed_down}{suffix}");
+                    if keys.contains(&down) {
+                        bindings.push(recipe_binding(
+                            &format!("down_proj{suffix}"),
+                            DerivedWeightRecipe::source(down, selection.clone()),
                             store,
                         )?);
                     }

@@ -1,5 +1,6 @@
 use safemlx_gguf::{
-    Checkpoint, ConvertedTensor, Error, GgmlType, LogicalDtype, MetadataValue, TensorInput, Writer,
+    Checkpoint, ConvertedTensor, Endian, Error, GgmlType, LogicalDtype, MetadataValue,
+    OuterSelection, TensorInput, Writer, WriterOptions,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,6 +10,208 @@ struct FixtureTensor<'a> {
     dimensions: &'a [u64],
     ty: GgmlType,
     data: &'a [u8],
+}
+
+#[test]
+fn selects_dense_outer_ranges_and_reordered_indices_without_full_conversion() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected.gguf");
+    let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "selected",
+        &[FixtureTensor {
+            name: "matrix.weight",
+            dimensions: &[3, 4],
+            ty: GgmlType::F32,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let mut materializer = checkpoint.materializer();
+    let range = materializer
+        .converted_tensor_outer("matrix.weight", &OuterSelection::Range { start: 1, end: 3 })
+        .unwrap();
+    let ConvertedTensor::Dense(range) = range.converted() else {
+        panic!("expected dense selection");
+    };
+    assert_eq!(range.shape, [2, 3]);
+    assert_eq!(range.data, bytes[12..36]);
+
+    let reordered = materializer
+        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![3, 0, 2]))
+        .unwrap();
+    let ConvertedTensor::Dense(reordered) = reordered.converted() else {
+        panic!("expected dense selection");
+    };
+    assert_eq!(reordered.shape, [3, 3]);
+    let expected = [
+        bytes[36..48].to_vec(),
+        bytes[0..12].to_vec(),
+        bytes[24..36].to_vec(),
+    ]
+    .concat();
+    assert_eq!(reordered.data, expected);
+}
+
+#[test]
+fn selects_affine_outer_rows_equal_to_slicing_the_converted_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected-affine.gguf");
+    let first = [0u8; 18];
+    let second = [0xffu8; 18];
+    let bytes = [first.as_slice(), second.as_slice()].concat();
+    write_file(
+        &path,
+        None,
+        "selected affine",
+        &[FixtureTensor {
+            name: "experts.weight",
+            dimensions: &[32, 2],
+            ty: GgmlType::Q4_0,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let mut materializer = checkpoint.materializer();
+    let full = materializer.converted_tensor("experts.weight").unwrap();
+    let selected = materializer
+        .converted_tensor_outer("experts.weight", &OuterSelection::Indices(vec![1]))
+        .unwrap();
+    let ConvertedTensor::Affine(full) = full.converted() else {
+        panic!("expected affine tensor");
+    };
+    let ConvertedTensor::Affine(selected) = selected.converted() else {
+        panic!("expected affine tensor");
+    };
+    assert_eq!(selected.weight_shape, [1, 4]);
+    assert_eq!(selected.scale_shape, [1, 1]);
+    assert_eq!(selected.weights, full.weights[4..8]);
+    assert_eq!(selected.scales, full.scales[1..2]);
+    assert_eq!(selected.biases, full.biases[1..2]);
+}
+
+#[test]
+fn rejects_invalid_outer_selections() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("invalid-selection.gguf");
+    let bytes = [0u8; 16];
+    write_file(
+        &path,
+        None,
+        "invalid selection",
+        &[FixtureTensor {
+            name: "matrix.weight",
+            dimensions: &[2, 2],
+            ty: GgmlType::F32,
+            data: &bytes,
+        }],
+    );
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let mut materializer = checkpoint.materializer();
+    assert!(materializer
+        .converted_tensor_outer("matrix.weight", &OuterSelection::Range { start: 2, end: 1 },)
+        .is_err());
+    assert!(materializer
+        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![]))
+        .is_err());
+    assert!(materializer
+        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![2]))
+        .is_err());
+}
+
+#[test]
+fn selects_from_a_big_endian_tensor_in_a_noninitial_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("model-00001-of-00002.gguf");
+    let second = directory.path().join("model-00002-of-00002.gguf");
+    write_file(
+        &first,
+        Some((0, 2, 2)),
+        "first",
+        &[FixtureTensor {
+            name: "first.weight",
+            dimensions: &[1],
+            ty: GgmlType::F32,
+            data: &0f32.to_le_bytes(),
+        }],
+    );
+    let metadata = BTreeMap::from([
+        (
+            "general.name".into(),
+            MetadataValue::String("second".into()),
+        ),
+        ("split.no".into(), MetadataValue::Uint16(1)),
+        ("split.count".into(), MetadataValue::Uint16(2)),
+        ("split.tensors.count".into(), MetadataValue::Uint16(2)),
+    ]);
+    let values = [1f32, 2.0, 3.0, 4.0];
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_be_bytes())
+        .collect::<Vec<_>>();
+    Writer::new(WriterOptions {
+        endian: Endian::Big,
+        ..WriterOptions::default()
+    })
+    .unwrap()
+    .write(
+        std::fs::File::create(second).unwrap(),
+        &metadata,
+        &[TensorInput {
+            name: "second.weight",
+            dimensions: &[2, 2],
+            ggml_type: GgmlType::F32,
+            data: &bytes,
+        }],
+    )
+    .unwrap();
+
+    // Shards must agree on endianness, so rewrite the first shard as big-endian too.
+    let first_metadata = BTreeMap::from([
+        ("general.name".into(), MetadataValue::String("first".into())),
+        ("split.no".into(), MetadataValue::Uint16(0)),
+        ("split.count".into(), MetadataValue::Uint16(2)),
+        ("split.tensors.count".into(), MetadataValue::Uint16(2)),
+    ]);
+    Writer::new(WriterOptions {
+        endian: Endian::Big,
+        ..WriterOptions::default()
+    })
+    .unwrap()
+    .write(
+        std::fs::File::create(&first).unwrap(),
+        &first_metadata,
+        &[TensorInput {
+            name: "first.weight",
+            dimensions: &[1],
+            ggml_type: GgmlType::F32,
+            data: &0f32.to_be_bytes(),
+        }],
+    )
+    .unwrap();
+
+    let checkpoint = Checkpoint::open(first).unwrap();
+    let selected = checkpoint
+        .materializer()
+        .converted_tensor_outer("second.weight", &OuterSelection::Range { start: 1, end: 2 })
+        .unwrap();
+    let ConvertedTensor::Dense(selected) = selected.converted() else {
+        panic!("expected dense selection");
+    };
+    let selected = selected
+        .data
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(selected, [3.0, 4.0]);
 }
 
 fn write_file(

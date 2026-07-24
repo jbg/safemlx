@@ -1,12 +1,17 @@
 //! Unified fully resident and bounded layer execution for Nemotron-H.
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::indexing::TryIndexOp,
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -20,8 +25,9 @@ use crate::{
         ExpertPass,
     },
     layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
@@ -38,7 +44,7 @@ use crate::{
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
@@ -84,8 +90,13 @@ impl NemotronHLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs the hybrid decoder while preserving KV and Mamba state.
@@ -150,6 +161,109 @@ pub fn load_nemotron_h_layerwise_model(
     })
 }
 
+pub(crate) fn load_nemotron_h_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(NemotronHLayerwiseModel, Vec<u32>), Error> {
+    let prepared =
+        resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let args = prepared.args;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            NemotronHLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            NemotronHLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(options) => {
+            return Ok((
+                load_nemotron_h_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
+            return Ok((
+                load_nemotron_h_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options.expert_cache,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF Nemotron-H loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((
+        NemotronHLayerwiseModel { execution },
+        prepared.eos_token_ids,
+    ))
+}
+
+fn load_nemotron_h_gguf_sparse_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<NemotronHLayerwiseModel, Error> {
+    if !args.layer_block_types()?.contains(&LayerBlockType::Moe) {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse expert caching requires a Nemotron-H MoE GGUF checkpoint".into(),
+        ));
+    }
+    let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let checkpoint_store = execution.weight_store_arc();
+    let entries = nemotron_h_expert_catalog(&args, checkpoint_store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+        checkpoint_store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(NemotronHLayerwiseModel { execution })
+}
+
 /// Loads Nemotron-H with expert-granular sparse caching.
 pub fn load_nemotron_h_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -203,7 +317,7 @@ fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = nemotron_h_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
         options,
@@ -309,6 +423,44 @@ impl NemotronHLayerwiseAdapter {
                         inputs: down,
                     },
                 );
+            }
+        }
+
+        if layer_index.is_some_and(|index| {
+            self.args.layer_block_type(index).ok() == Some(LayerBlockType::Mamba)
+        }) {
+            let parameters = module.parameters().flatten();
+            for local_name in [
+                "mamba.conv1d.weight",
+                "mamba.A_log",
+                "mamba.D",
+                "mamba.norm.weight",
+            ] {
+                let source = format!("{prefix}.{local_name}");
+                let Some(parameter) = parameters.get(local_name) else {
+                    continue;
+                };
+                if !keys.contains(&source) {
+                    continue;
+                }
+                let mut recipe = DerivedWeightRecipe::source(source, TensorSelection::Full);
+                if local_name == "mamba.A_log" {
+                    recipe = DerivedWeightRecipe::NegLog {
+                        input: Box::new(recipe),
+                    };
+                }
+                let expected = parameter
+                    .shape()
+                    .iter()
+                    .map(|dimension| *dimension as usize)
+                    .collect::<Vec<_>>();
+                if recipe.infer(store)?.shape() != expected {
+                    recipe = DerivedWeightRecipe::Reshape {
+                        input: Box::new(recipe),
+                        shape: expected,
+                    };
+                }
+                recipes.insert(local_name.to_string(), recipe);
             }
         }
 

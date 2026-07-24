@@ -62,11 +62,13 @@ tensor encodings are listed in the
 
 ## Weight loading and residency
 
-Fully resident loading is the default. Supported SafeTensors families can also
-use host-backed layer windows or experimental dense disk streaming. Supported
-MoE families can cache routed experts independently; the registered families
-are DeepSeek-V3/R1, GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next,
-Qwen3-VL-MoE, and Qwen3.5-MoE.
+Fully resident loading is the default. SafeTensors and registered GGUF families
+can also use host-backed layer windows or experimental dense disk streaming.
+GGUF bounded loading covers DeepSeek2, Gemma 4, Llama/Mistral, LFM2,
+Nemotron-H, Qwen3, dense Qwen3-VL with its mmproj, Qwen3.5, and Qwen3-Next.
+Supported MoE families can cache routed experts independently; for GGUF these
+are DeepSeek2, LFM2-MoE, Nemotron-H-MoE, Qwen3-MoE, Qwen3.5-MoE, and MoE
+Qwen3-Next.
 
 Qwen3-Next supports the official native fine-grained E4M3 checkpoint format
 (`fp8`, dynamic activations, 128 x 128 weight blocks) with fully resident,
@@ -77,8 +79,9 @@ granularity for sparse-cache and expert-parallel execution.
 
 Important boundaries:
 
-- GGUF models are fully resident; layerwise and sparse expert-cache policies
-  reject GGUF instead of silently changing policy.
+- GGUF remains fully resident by default. `LayerwiseHost`, `DenseDiskStream`,
+  and supported sparse-expert policies use header-only logical catalogs and
+  bounded payload materialization.
 - Load-time quantization is incompatible with streamed or sparse-cache loading;
   use a checkpoint-native packed format for those policies.
 - Transfers and route inspection are synchronous because the pinned MLX C API
@@ -87,7 +90,9 @@ Important boundaries:
   the same physical unified memory. They do not create additional capacity.
 - Parameter budgets do not include activations, KV or recurrent state, kernels,
   allocator caches, checkpoint mappings, or every temporary buffer.
-- Mapping and logical-transfer counters cannot report exact physical disk I/O;
+- SafeTensors mapping and logical-transfer counters cannot report exact
+  physical disk I/O. GGUF additionally reports physical payload read requests
+  and bytes issued by its selected-read backend;
   operating-system page caching materially affects disk-backed performance.
 
 The example CLI exposes the common loading policies and their diagnostics. See

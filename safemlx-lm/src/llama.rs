@@ -1,9 +1,14 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
-    error::Exception, module::Module, nn, ops::indexing::TryIndexOp, quantization::MaybeQuantized,
+    error::Exception,
+    module::Module,
+    nn,
+    ops::indexing::TryIndexOp,
+    ops::{GgufCheckpoint, GgufMetadataValue},
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 
@@ -16,9 +21,9 @@ use crate::{
     },
     error::Error,
     layerwise::{
-        load_layerwise_model, DenseDiskStreamReport, LayerwiseInput, LayerwiseLoadOptions,
-        LayerwiseModel, LayerwiseModelAdapter, LayerwiseModelMetadata, StaticUnitBindings,
-        WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store, DenseDiskStreamReport,
+        LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter,
+        LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::{
@@ -34,7 +39,7 @@ use crate::{
     module_binding::{build_module_bindings, populate_module_from_lease},
     residency::{ResidencyReport, ResidentUnitLease},
     utils::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
-    weight_store::{SafetensorsWeightStore, WeightStore},
+    weight_store::{GgufWeightStore, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -213,12 +218,17 @@ impl LlamaModel {
         }
     }
 
-    /// Returns the persistent safetensors store used by a layerwise model.
-    pub fn weight_store(&self) -> Option<&SafetensorsWeightStore> {
+    /// Returns the persistent checkpoint store used by a layerwise model.
+    pub fn checkpoint_store(&self) -> Option<&(dyn WeightStore + Send + Sync)> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::LayerwiseHost(model) => Some(model.weight_store()),
+            LlamaExecution::LayerwiseHost(model) => Some(model.checkpoint_store()),
         }
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> Option<&(dyn WeightStore + Send + Sync)> {
+        self.checkpoint_store()
     }
 
     /// Returns the number of pinned static leases used by the layerwise engine.
@@ -528,6 +538,45 @@ pub fn load_llama_model(
         }
     };
     Ok(LlamaModel { execution })
+}
+
+/// Loads a Llama/Mistral GGUF checkpoint using the selected residency policy.
+pub(crate) fn load_llama_gguf_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(LlamaModel, Vec<u32>), Error> {
+    let prepared =
+        resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => LlamaExecution::LayerwiseHost(
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
+        ),
+        WeightResidency::DenseDiskStream(options) => LlamaExecution::LayerwiseHost(
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
+        ),
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "sparse expert caching is not supported for Llama GGUF checkpoints".into(),
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF Llama loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((LlamaModel { execution }, prepared.eos_token_ids))
 }
 
 /// Llama implementation of the generic layerwise model-family contract.

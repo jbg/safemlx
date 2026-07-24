@@ -30,6 +30,8 @@ use crate::{
     weight_store::{SafetensorsWeightStore, WeightStore},
 };
 
+pub(crate) type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+
 /// Loader controls for a host-backed layerwise execution engine.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LayerwiseLoadOptions {
@@ -80,6 +82,27 @@ pub enum WeightResidency {
     SparseExpertCache(crate::expert_cache::ExpertCacheLoadOptions),
     /// Cache experts independently while disk-streaming non-expert execution units.
     SparseExpertCacheWithDenseLayers(crate::expert_cache::SparseExpertDenseStreamLoadOptions),
+}
+
+impl WeightResidency {
+    /// Returns the backend shard/reader cache bound carried by this policy.
+    pub(crate) const fn max_mapped_shards(self) -> usize {
+        match self {
+            Self::FullyResident => crate::weight_store::DEFAULT_MAX_MAPPED_SHARDS,
+            Self::LayerwiseHost(options) => options.max_mapped_shards,
+            Self::DenseDiskStream(options) => options.max_mapped_shards,
+            Self::SparseExpertCache(options) => options.non_expert.max_mapped_shards,
+            Self::SparseExpertCacheWithDenseLayers(options) => {
+                if options.non_expert.max_mapped_shards
+                    < options.expert_cache.non_expert.max_mapped_shards
+                {
+                    options.non_expert.max_mapped_shards
+                } else {
+                    options.expert_cache.non_expert.max_mapped_shards
+                }
+            }
+        }
+    }
 }
 
 /// Loader controls accepted by the shared layerwise execution engines.
@@ -1321,7 +1344,7 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
 /// architecture math, cache validation, and runtime-unit construction.
 pub struct GeneralLayerwiseModel<A: GeneralLayerwiseModelAdapter> {
     adapter: A,
-    store: Arc<SafetensorsWeightStore>,
+    store: SharedWeightStore,
     residency: ResidencyManager,
     groups: Vec<ResidentLayerGroup>,
     static_leases: Vec<ResidentUnitLease>,
@@ -1334,7 +1357,7 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
     /// Creates an engine from a validated residency manager and execution groups.
     pub fn new(
         adapter: A,
-        store: Arc<SafetensorsWeightStore>,
+        store: SharedWeightStore,
         residency: ResidencyManager,
         groups: Vec<ResidentLayerGroup>,
         static_leases: Vec<ResidentUnitLease>,
@@ -1387,13 +1410,18 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
     }
 
     /// Returns a shared handle to the persistent checkpoint store.
-    pub(crate) fn weight_store_arc(&self) -> Arc<SafetensorsWeightStore> {
+    pub(crate) fn weight_store_arc(&self) -> SharedWeightStore {
         Arc::clone(&self.store)
     }
 
-    /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        &self.store
+    /// Returns the persistent backend-neutral checkpoint store.
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.store.as_ref()
+    }
+
+    /// Returns the persistent backend-neutral checkpoint store.
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Returns named execution groups in deterministic order.
@@ -1568,7 +1596,7 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
 /// Builds a generalized layerwise model with independently bounded groups.
 pub fn load_general_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
-    mut adapter: A,
+    adapter: A,
     options: O,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1582,14 +1610,29 @@ where
     if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
         return Err(LayerwiseModelError::GgufUnsupported.into());
     }
-    let depth = options.device_depth();
-    let dense = options.dense();
-    let offload = options.offload()?;
     let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
         model_dir,
         options.max_mapped_shards(),
     )?);
+    load_general_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
+}
 
+/// Builds a generalized layerwise model from an already cataloged checkpoint.
+pub(crate) fn load_general_layerwise_model_with_store<A, O>(
+    store: SharedWeightStore,
+    mut adapter: A,
+    options: O,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GeneralLayerwiseModel<A>, Error>
+where
+    A: GeneralLayerwiseModelAdapter,
+    O: Into<LayerExecutionLoadOptions>,
+{
+    let options = options.into();
+    let depth = options.device_depth();
+    let dense = options.dense();
+    let offload = options.offload()?;
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
@@ -1704,7 +1747,7 @@ where
     validate_device_budget(offload, static_device_bytes, device_window_bytes, depth)?;
 
     let plan = OffloadPlan::new(offload, specs)?;
-    let residency = ResidencyManager::new(
+    let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
         plan,
         definitions,
@@ -1741,7 +1784,7 @@ where
 /// Generic host-backed layerwise decoder execution engine.
 pub struct LayerwiseModel<A: LayerwiseModelAdapter> {
     adapter: A,
-    store: Arc<SafetensorsWeightStore>,
+    store: SharedWeightStore,
     residency: ResidencyManager,
     layer_group: ResidentLayerGroup,
     static_leases: Vec<ResidentUnitLease>,
@@ -1763,7 +1806,7 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
     }
 
     /// Returns a shared handle to the persistent checkpoint store.
-    pub(crate) fn weight_store_arc(&self) -> Arc<SafetensorsWeightStore> {
+    pub(crate) fn weight_store_arc(&self) -> SharedWeightStore {
         Arc::clone(&self.store)
     }
 
@@ -1772,9 +1815,14 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         &self.metadata
     }
 
-    /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        &self.store
+    /// Returns the persistent backend-neutral checkpoint store.
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.store.as_ref()
+    }
+
+    /// Returns the persistent backend-neutral checkpoint store.
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Returns the reusable residency manager.
@@ -1906,7 +1954,7 @@ pub struct LayerwiseInput<'a, C> {
 /// Builds a generic layerwise model from an architecture adapter and safetensors.
 pub fn load_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
-    mut adapter: A,
+    adapter: A,
     options: O,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1920,6 +1968,26 @@ where
     if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
         return Err(LayerwiseModelError::GgufUnsupported.into());
     }
+    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        options.max_mapped_shards(),
+    )?);
+    load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
+}
+
+/// Builds a homogeneous layerwise model from an already cataloged checkpoint.
+pub(crate) fn load_layerwise_model_with_store<A, O>(
+    store: SharedWeightStore,
+    mut adapter: A,
+    options: O,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseModel<A>, Error>
+where
+    A: LayerwiseModelAdapter,
+    O: Into<LayerExecutionLoadOptions>,
+{
+    let options = options.into();
     let layer_count = adapter.layer_count()?;
     let depth = options.device_depth();
     let dense = options.dense();
@@ -1936,11 +2004,6 @@ where
             .into());
         }
     }
-    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
-        model_dir,
-        options.max_mapped_shards(),
-    )?);
-
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
@@ -2018,7 +2081,7 @@ where
     validate_device_budget(offload, static_device_bytes, maximum_window_bytes, depth)?;
 
     let plan = OffloadPlan::new(offload, specs)?;
-    let residency = ResidencyManager::new(
+    let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
         plan,
         definitions,

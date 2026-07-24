@@ -699,6 +699,11 @@ pub(crate) struct LoadedQwen3VlGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedQwen3VlGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 pub(crate) fn load_qwen3_vl_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     mmproj_file: impl AsRef<Path>,
@@ -933,7 +938,126 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
     })
 }
 
-fn validate_qwen3_vl_mmproj(metadata: &HashMap<String, GgufMetadataValue>) -> Result<(), Error> {
+pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    vision_checkpoint: &GgufCheckpoint,
+    vision_metadata: &HashMap<String, GgufMetadataValue>,
+    weights_stream: &Stream,
+) -> Result<PreparedQwen3VlGguf, Error> {
+    let architecture = qwen3::gguf_string(metadata, "general.architecture")?;
+    if architecture != "qwen3vl" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports dense qwen3vl"
+        )));
+    }
+    validate_qwen3_vl_mmproj(vision_metadata)?;
+    let (mut text_config, eos_token_ids) = qwen3::prepare_qwen3_gguf_checkpoint(
+        checkpoint,
+        metadata,
+        &architecture,
+        false,
+        weights_stream,
+    )?;
+    text_config.model_type = "qwen3_vl_text".into();
+    if !text_config.tie_word_embeddings {
+        return Err(Error::UnsupportedArchitecture(
+            "qwen3vl GGUF with an untied output head is not supported".into(),
+        ));
+    }
+    let mrope_section = gguf_integer_array(metadata, "qwen3vl.rope.dimension_sections", Some(3))?;
+    if mrope_section.iter().sum::<i32>() != text_config.head_dim / 2 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF RoPE sections {mrope_section:?} do not cover half of head_dim {}",
+            text_config.head_dim
+        )));
+    }
+    let deepstack_visual_indexes = gguf_deepstack_layers(vision_metadata)?;
+    let hidden_size = qwen3::gguf_i32(
+        vision_metadata,
+        "clip.vision.embedding_length",
+        weights_stream,
+    )?;
+    let position_layout = vision_checkpoint
+        .catalog()
+        .tensors()
+        .find(|tensor| tensor.descriptor().name == "v.position_embd.weight")
+        .and_then(|tensor| tensor.outputs().first())
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "qwen3vl mmproj is missing v.position_embd.weight".into(),
+            )
+        })?;
+    if position_layout.shape.len() != 2 || position_layout.shape[1] != hidden_size as u64 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "unexpected qwen3vl position embedding shape {:?}",
+            position_layout.shape
+        )));
+    }
+    let vision_config = VisionConfig {
+        depth: qwen3::gguf_i32(vision_metadata, "clip.vision.block_count", weights_stream)?,
+        hidden_size,
+        hidden_act: "gelu_pytorch_tanh".into(),
+        intermediate_size: qwen3::gguf_i32(
+            vision_metadata,
+            "clip.vision.feed_forward_length",
+            weights_stream,
+        )?,
+        num_heads: qwen3::gguf_i32(
+            vision_metadata,
+            "clip.vision.attention.head_count",
+            weights_stream,
+        )?,
+        num_position_embeddings: i32::try_from(position_layout.shape[0]).map_err(|_| {
+            Error::UnsupportedArchitecture("qwen3vl position count exceeds i32".into())
+        })?,
+        in_channels: 3,
+        patch_size: qwen3::gguf_i32(vision_metadata, "clip.vision.patch_size", weights_stream)?,
+        spatial_merge_size: qwen3::gguf_i32(
+            vision_metadata,
+            "clip.vision.spatial_merge_size",
+            weights_stream,
+        )?,
+        temporal_patch_size: 2,
+        window_size: 112,
+        out_hidden_size: qwen3::gguf_i32(
+            vision_metadata,
+            "clip.vision.projection_dim",
+            weights_stream,
+        )?,
+        fullatt_block_indexes: Vec::new(),
+        deepstack_visual_indexes,
+    };
+    if vision_config.out_hidden_size != text_config.hidden_size {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF projector output {} does not match language hidden size {}",
+            vision_config.out_hidden_size, text_config.hidden_size
+        )));
+    }
+    if vision_checkpoint
+        .catalog()
+        .tensors()
+        .any(|tensor| tensor.affine().is_some())
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "quantized qwen3vl mmproj GGUF tensors are not supported; use the F16 projector".into(),
+        ));
+    }
+    Ok(PreparedQwen3VlGguf {
+        args: ModelArgs {
+            text_config,
+            vision_config,
+            image_token_id: gguf_token_id(metadata, "<|image_pad|>")?,
+            video_token_id: gguf_token_id(metadata, "<|video_pad|>")?,
+            mrope_section,
+        },
+        eos_token_ids,
+    })
+}
+
+pub(crate) fn validate_qwen3_vl_mmproj(
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<(), Error> {
     let architecture = qwen3::gguf_string(metadata, "general.architecture")?;
     let projector = qwen3::gguf_string(metadata, "clip.projector_type")?;
     if architecture != "clip" || projector != "qwen3vl_merger" {
@@ -1012,7 +1136,7 @@ fn gguf_token_id(metadata: &HashMap<String, GgufMetadataValue>, token: &str) -> 
         .map_err(|_| Error::UnsupportedArchitecture("qwen3vl token id exceeds u32".into()))
 }
 
-fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32]) -> String {
+pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32]) -> String {
     const ROOTS: [(&str, &str); 6] = [
         ("v.position_embd", "model.visual.pos_embed"),
         ("v.patch_embd", "model.visual.patch_embed.proj"),

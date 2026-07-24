@@ -13,13 +13,14 @@ contributors.
 This fork adds model/runtime support including Gemma 4 loading, Gemma 4
 assistant drafting, expanded model dispatch, and related generation utilities.
 
-## Persistent safetensors storage
+## Persistent checkpoint storage
 
-The public `safemlx_lm::weight_store` module catalogs safetensors checkpoints
-without materializing tensor arrays. `SafetensorsWeightStore` accepts a direct
-payload file, a directory containing `model.safetensors`, or a Hugging
-Face-style sharded index. Indexed construction reads only the index; payload
-shards and their tensor metadata are mapped lazily when a tensor is acquired.
+The public `safemlx_lm::weight_store` module catalogs SafeTensors and GGUF
+checkpoints without materializing tensor arrays. `SafetensorsWeightStore`
+accepts a direct payload file, a directory containing `model.safetensors`, or a
+Hugging Face-style sharded index. `GgufWeightStore` accepts one or more
+validated GGUF checkpoints and translated logical-name catalogs. GGUF payload
+readers are opened lazily and retained under the same bounded shard control.
 
 An acquired `WeightLease` pins its mapped bytes. Full tensors, contiguous axis
 ranges, and ordered axis indices are selected before the result is copied to a
@@ -96,7 +97,10 @@ device lookahead depths are independent; older cacheable copies remain resident
 until deterministic LRU or LFU eviction is needed. A zero host budget is an
 explicit direct disk-to-device mode and requires zero host lookahead and queue
 capacity. The persistent `SafetensorsWeightStore` remains the canonical cold
-source and its mapped-shard cache stays independently bounded.
+source and its mapped-shard cache stays independently bounded. GGUF uses the
+same policy and budget accounting through `GgufWeightStore`; checkpoint-native
+affine triples remain packed, outer-axis expert selections issue bounded payload
+reads, and the shard control also bounds cached GGUF readers.
 
 This mode is experimental and capacity-oriented. A dense decoder touches
 essentially every layer for every token. If neither the logical layer caches nor

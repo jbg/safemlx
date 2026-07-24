@@ -23,5 +23,5 @@ pub use error::{Error, Result};
 pub use format::{
     Endian, GgmlType, MetadataArray, MetadataValue, TensorDescriptor, DEFAULT_ALIGNMENT,
 };
-pub use reader::{Limits, Reader};
+pub use reader::{Limits, OuterSelection, Reader};
 pub use writer::{TensorInput, Writer, WriterOptions};

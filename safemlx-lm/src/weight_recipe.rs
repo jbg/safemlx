@@ -192,6 +192,16 @@ pub enum DerivedWeightRecipe {
         /// Output execution dtype.
         dtype: Dtype,
     },
+    /// Applies `log(-x)` elementwise.
+    NegLog {
+        /// Child recipe.
+        input: Box<Self>,
+    },
+    /// Subtracts one elementwise for GGUF offset-normalization weights.
+    SubtractOne {
+        /// Child recipe.
+        input: Box<Self>,
+    },
 }
 
 impl DerivedWeightRecipe {
@@ -223,7 +233,9 @@ impl DerivedWeightRecipe {
             Self::Select { input, .. }
             | Self::Reshape { input, .. }
             | Self::Transpose { input, .. }
-            | Self::Cast { input, .. } => input.collect_source_keys(keys),
+            | Self::Cast { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => input.collect_source_keys(keys),
         }
     }
 
@@ -275,6 +287,8 @@ impl DerivedWeightRecipe {
                 let metadata = input.infer(store)?;
                 metadata_for(metadata.shape, (*dtype).into())
             }
+            Self::NegLog { input } => input.infer(store),
+            Self::SubtractOne { input } => input.infer(store),
         }
     }
 
@@ -382,6 +396,14 @@ impl DerivedWeightRecipe {
             Self::Cast { input, dtype } => {
                 let array = input.materialize_inner(store, stream, sources)?;
                 Ok(array.as_dtype(*dtype, stream)?)
+            }
+            Self::NegLog { input } => {
+                let array = input.materialize_inner(store, stream, sources)?;
+                Ok(array.multiply(Array::from_f32(-1.0), stream)?.log(stream)?)
+            }
+            Self::SubtractOne { input } => {
+                let array = input.materialize_inner(store, stream, sources)?;
+                Ok(array.subtract(Array::from_f32(1.0), stream)?)
             }
         }
     }

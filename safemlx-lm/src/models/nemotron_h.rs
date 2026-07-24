@@ -2050,6 +2050,11 @@ pub(crate) struct LoadedNemotronHGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedNemotronHGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 /// Loads a dense or sparse-MoE Nemotron-H text model from a GGUF checkpoint.
 pub fn load_nemotron_h_gguf(
     gguf_file: impl AsRef<Path>,
@@ -2135,6 +2140,54 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
             .collect();
     Ok(LoadedNemotronHGguf {
         model,
+        eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    weights_stream: &Stream,
+) -> Result<PreparedNemotronHGguf, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "nemotron_h" | "nemotron_h_moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
+        )));
+    }
+    let is_moe = architecture == "nemotron_h_moe";
+    let expert_count_key = format!("{architecture}.expert_count");
+    let has_experts = gguf_optional_i64(metadata, &expert_count_key, weights_stream)?.unwrap_or(0)
+        > 0
+        || checkpoint.any_gguf_tensor(|name| name.contains("_exps"));
+    if is_moe != has_experts {
+        return Err(Error::UnsupportedArchitecture(
+            "Nemotron-H GGUF architecture and expert tensors disagree".into(),
+        ));
+    }
+    let latent_size_key = format!("{architecture}.moe_latent_size");
+    if gguf_optional_i64(metadata, &latent_size_key, weights_stream)?.unwrap_or(0) > 0
+        || checkpoint.any_gguf_tensor(|name| name.contains("ffn_latent_"))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
+        ));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args = nemotron_h_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
+    let configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    args.quantized_weights = Some(configs.keys().cloned().collect());
+    args.quantized_weight_configs = Some(configs);
+    args.quantization = None;
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id", weights_stream)?
+        .and_then(|value| u32::try_from(value).ok())
+        .into_iter()
+        .collect();
+    Ok(PreparedNemotronHGguf {
+        args,
         eos_token_ids,
     })
 }
@@ -2412,7 +2465,7 @@ fn translate_gguf_weight(
     Ok((translated, value))
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embeddings"),
         ("output_norm", "model.norm_f"),

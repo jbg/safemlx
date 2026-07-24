@@ -7,6 +7,15 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// A non-empty selection along the outermost MLX/row-major tensor axis.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OuterSelection {
+    /// Select the half-open outer-axis range `start..end`.
+    Range { start: usize, end: usize },
+    /// Select outer-axis indices in caller-supplied order.
+    Indices(Vec<usize>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max_metadata_entries: u64,
@@ -284,6 +293,120 @@ impl<R: Read + Seek> Reader<R> {
     pub fn read_tensor(&mut self, tensor: &TensorDescriptor) -> Result<ConvertedTensor> {
         let raw = self.read_raw(tensor)?;
         crate::convert::convert(tensor, &raw, self.endian)
+    }
+
+    /// Reads and converts only selected outermost row-major tensor slabs.
+    ///
+    /// GGUF stores its fastest-moving dimension first. Consequently the
+    /// outermost MLX dimension is the last GGUF dimension and each selected
+    /// item is one contiguous payload span, including for block-quantized
+    /// encodings.
+    pub fn read_tensor_outer(
+        &mut self,
+        tensor: &TensorDescriptor,
+        selection: &OuterSelection,
+    ) -> Result<ConvertedTensor> {
+        let outer = tensor
+            .dimensions
+            .last()
+            .copied()
+            .ok_or_else(|| Error::tensor(&tensor.name, "scalar outer selection is invalid"))?;
+        let outer = usize::try_from(outer).map_err(|_| Error::Overflow("outer dimension"))?;
+        if outer == 0 {
+            return Err(Error::tensor(
+                &tensor.name,
+                "empty tensor outer selection is invalid",
+            ));
+        }
+        let (selected_outer, spans) = match selection {
+            OuterSelection::Range { start, end } => {
+                if start >= end || *end > outer {
+                    return Err(Error::tensor(
+                        &tensor.name,
+                        format!("outer range {start}..{end} exceeds dimension {outer}"),
+                    ));
+                }
+                (*end - *start, vec![(*start, *end - *start)])
+            }
+            OuterSelection::Indices(indices) => {
+                if indices.is_empty() || indices.iter().any(|index| *index >= outer) {
+                    return Err(Error::tensor(
+                        &tensor.name,
+                        format!("outer indices {indices:?} exceed dimension {outer}"),
+                    ));
+                }
+                let mut spans = Vec::new();
+                for &index in indices {
+                    match spans.last_mut() {
+                        Some((start, count)) if *start + *count == index => *count += 1,
+                        _ => spans.push((index, 1)),
+                    }
+                }
+                (indices.len(), spans)
+            }
+        };
+        let outer_u64 = u64::try_from(outer).map_err(|_| Error::Overflow("outer dimension"))?;
+        if tensor.byte_len % outer_u64 != 0 {
+            return Err(Error::tensor(
+                &tensor.name,
+                "payload is not divisible by its outer dimension",
+            ));
+        }
+        let slab_bytes = tensor.byte_len / outer_u64;
+        if slab_bytes == 0 {
+            return Err(Error::tensor(
+                &tensor.name,
+                "outer tensor slabs must contain payload bytes",
+            ));
+        }
+        let selected_bytes = slab_bytes
+            .checked_mul(
+                u64::try_from(selected_outer)
+                    .map_err(|_| Error::Overflow("selected outer dimension"))?,
+            )
+            .ok_or(Error::Overflow("selected tensor byte length"))?;
+        check_limit(
+            "tensor allocation",
+            selected_bytes,
+            self.limits.max_allocation_bytes,
+        )?;
+        let selected_len = usize::try_from(selected_bytes)
+            .map_err(|_| Error::Overflow("selected tensor allocation"))?;
+        let slab_len =
+            usize::try_from(slab_bytes).map_err(|_| Error::Overflow("tensor slab allocation"))?;
+        let mut raw = Vec::with_capacity(selected_len);
+        for (index, count) in spans {
+            let offset = tensor
+                .data_offset
+                .checked_add(
+                    slab_bytes
+                        .checked_mul(
+                            u64::try_from(index)
+                                .map_err(|_| Error::Overflow("outer selection offset"))?,
+                        )
+                        .ok_or(Error::Overflow("outer selection offset"))?,
+                )
+                .ok_or(Error::Overflow("outer selection offset"))?;
+            let span_len = slab_len
+                .checked_mul(count)
+                .ok_or(Error::Overflow("outer selection span allocation"))?;
+            self.inner
+                .seek(SeekFrom::Start(offset))
+                .map_err(|source| Error::Io { offset, source })?;
+            let start = raw.len();
+            raw.resize(start + span_len, 0);
+            self.inner
+                .read_exact(&mut raw[start..])
+                .map_err(|source| Error::Io { offset, source })?;
+        }
+        let mut descriptor = tensor.clone();
+        *descriptor
+            .dimensions
+            .last_mut()
+            .expect("validated non-scalar tensor above") = u64::try_from(selected_outer)
+            .map_err(|_| Error::Overflow("selected outer dimension"))?;
+        descriptor.byte_len = selected_bytes;
+        crate::convert::convert(&descriptor, &raw, self.endian)
     }
 }
 

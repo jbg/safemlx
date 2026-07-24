@@ -1658,7 +1658,16 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut args =
         qwen3_args_from_gguf(checkpoint, metadata, architecture, is_moe, weights_stream)?;
-    let configs = gguf_affine_configs(checkpoint, translate)?;
+    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    if is_moe {
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.mlp.experts");
+            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
+                configs.remove(&format!("{prefix}.up_proj"));
+                configs.insert(format!("{prefix}.gate_up_proj"), config);
+            }
+        }
+    }
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
@@ -1790,7 +1799,7 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     translate_qwen3_gguf_weight_name(name, false)
 }
 
-fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
+pub(crate) fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embed_tokens"),
         ("output_norm", "model.norm"),

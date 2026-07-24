@@ -31,7 +31,7 @@ use crate::{
     residency::{ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding},
     sampler::Sampler,
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{TensorSelection, WeightStore},
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -89,8 +89,13 @@ impl MoshiLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs one frame with teacher-forced depth inputs.

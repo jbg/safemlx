@@ -3272,6 +3272,11 @@ pub(crate) struct LoadedDeepSeekGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+pub(crate) struct PreparedDeepSeekGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
 /// Loads a llama.cpp `deepseek2` GGUF checkpoint.
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
@@ -3290,27 +3295,8 @@ pub(crate) fn load_gguf_checkpoint(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedDeepSeekGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if architecture != "deepseek2" {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
-        )));
-    }
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-    let mut args = args_from_gguf(checkpoint, &metadata, weights_stream)?;
-    args.quantized_weight_configs =
-        Some(gguf_affine_configs(checkpoint, translate_gguf_weight_name)?);
-    if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-        args.quantization_config = None;
-        args.quantized_weight_configs = None;
-    }
-    args.validate()?;
-
-    let mut model = Model::new(args, stream)?;
+    let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
+    let mut model = Model::new(prepared.args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
     let expert_keys = expected_expert_banks(&model.args)
@@ -3374,12 +3360,44 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = gguf_optional_i64(&metadata, "tokenizer.ggml.eos_token_id")?
+    Ok(LoadedDeepSeekGguf {
+        model,
+        eos_token_ids: prepared.eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    weights_stream: &Stream,
+) -> Result<PreparedDeepSeekGguf, Error> {
+    let architecture = gguf_string(&metadata, "general.architecture")?;
+    if architecture != "deepseek2" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
+        )));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut args = args_from_gguf(checkpoint, metadata, weights_stream)?;
+    args.quantized_weight_configs =
+        Some(gguf_affine_configs(checkpoint, translate_gguf_weight_name)?);
+    if let Some(quantization) = quantization {
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weight_configs = None;
+    }
+    args.validate()?;
+
+    let eos_token_ids = gguf_optional_i64(metadata, "tokenizer.ggml.eos_token_id")?
         .and_then(|value| u32::try_from(value).ok())
         .into_iter()
         .collect();
-    Ok(LoadedDeepSeekGguf {
-        model,
+    Ok(PreparedDeepSeekGguf {
+        args,
         eos_token_ids,
     })
 }
@@ -3499,7 +3517,7 @@ fn args_from_gguf(
     })
 }
 
-fn translate_gguf_weight_name(name: &str) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     for (source, target) in [
         ("token_embd", "model.embed_tokens"),
         ("output_norm", "model.norm"),

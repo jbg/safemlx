@@ -1,12 +1,17 @@
 //! Bounded layer execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::indexing::TryIndexOp,
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -23,8 +28,9 @@ use crate::{
         ExpertPass,
     },
     layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     models::{
         common::{self, generation::CausalLm},
@@ -38,7 +44,7 @@ use crate::{
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";
@@ -134,8 +140,13 @@ impl DeepSeekV3LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs MLA and dense/MoE decoder blocks while preserving compressed state.
@@ -201,6 +212,102 @@ pub fn load_deepseek_v3_layerwise_model(
     })
 }
 
+pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let args = prepared.args;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(options) => {
+            return Ok((
+                load_deepseek_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
+            return Ok((
+                load_deepseek_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options.expert_cache,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GGUF DeepSeek loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((
+        DeepSeekV3LayerwiseModel { execution },
+        prepared.eos_token_ids,
+    ))
+}
+
+fn load_deepseek_gguf_sparse_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let checkpoint_store = execution.weight_store_arc();
+    let entries = deepseek_expert_catalog(&args, checkpoint_store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+        checkpoint_store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(DeepSeekV3LayerwiseModel { execution })
+}
+
 /// Loads DeepSeek-V3/R1 with layerwise non-expert weights and expert-granular caching.
 pub fn load_deepseek_v3_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -249,7 +356,7 @@ fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
-    let cache = ExpertCache::new(
+    let cache = ExpertCache::new_shared(
         store,
         entries,
         options,

@@ -39,7 +39,7 @@ use crate::{
     residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
     weight_recipe::DerivedWeightRecipe,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    weight_store::{TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -159,8 +159,13 @@ impl GptOssLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn weight_store(&self) -> &SafetensorsWeightStore {
-        self.execution.weight_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
+    /// Backward-compatible alias for [`Self::checkpoint_store`].
+    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.checkpoint_store()
     }
 
     /// Runs GPT-OSS while preserving its heterogeneous cache schedule.
@@ -273,7 +278,7 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new(
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
         options,

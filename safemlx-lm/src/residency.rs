@@ -850,6 +850,18 @@ impl ResidencyManager {
     where
         S: WeightStore + Send + Sync + 'static,
     {
+        let store: Arc<dyn WeightStore + Send + Sync> = store;
+        Self::new_shared(store, plan, units, source_stream, device_stream)
+    }
+
+    /// Creates a manager from an already type-erased checkpoint store.
+    pub fn new_shared(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ResidencyError> {
         let source_device = source_stream
             .get_device()
             .map_err(|source| ResidencyError::Mlx {
@@ -891,7 +903,6 @@ impl ResidencyManager {
             return Err(ResidencyError::UnexpectedUnitDefinition { id });
         }
 
-        let store: Arc<dyn WeightStore + Send + Sync> = store;
         let mut records = BTreeMap::new();
         for spec in plan.units() {
             let definition = definitions.remove(spec.id()).expect("validated above");

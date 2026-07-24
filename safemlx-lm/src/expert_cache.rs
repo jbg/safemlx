@@ -276,6 +276,18 @@ impl ExpertCache {
     where
         S: WeightStore + Send + Sync + 'static,
     {
+        let store: Arc<dyn WeightStore + Send + Sync> = store;
+        Self::new_shared(store, entries, options, source_stream, device_stream)
+    }
+
+    /// Creates a cache from an already type-erased checkpoint store.
+    pub fn new_shared(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        entries: impl IntoIterator<Item = ExpertCatalogEntry>,
+        options: ExpertCacheLoadOptions,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ExpertCacheError> {
         if options.compact_bank_scratch_bytes == 0 {
             return Err(ExpertCacheError::ZeroScratchLimit);
         }
@@ -310,7 +322,7 @@ impl ExpertCache {
         }
         let plan = OffloadPlan::new(options.experts, specs)?;
         let manager =
-            ResidencyManager::new(store, plan, definitions, source_stream, device_stream)?;
+            ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
         manager.initialize()?;
         Ok(Self {
             manager,

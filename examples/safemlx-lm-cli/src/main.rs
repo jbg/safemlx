@@ -16,7 +16,11 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    expert_cache::{ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics},
+    dense_stream::DenseDiskStreamLoadOptions,
+    expert_cache::{
+        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
+        SparseExpertDenseStreamLoadOptions,
+    },
     layerwise::{LayerwiseLoadOptions, WeightResidency},
     models::{
         input::{InputPart, ModelInput},
@@ -215,7 +219,23 @@ struct Cli {
     #[arg(long)]
     layerwise_host: bool,
 
-    /// Cache routed experts independently for any supported safetensors MoE model.
+    /// Stream ordinary execution layers through bounded disk, host, and device caches.
+    #[arg(long)]
+    dense_disk_stream: bool,
+
+    /// Dense-stream host lookahead; use zero with a zero host budget.
+    #[arg(long, default_value_t = 2, value_name = "LAYERS")]
+    dense_host_lookahead: usize,
+
+    /// Dense-stream device lookahead.
+    #[arg(long, default_value_t = 1, value_name = "LAYERS")]
+    dense_device_lookahead: usize,
+
+    /// Maximum queued dense-stream background host materializations.
+    #[arg(long, default_value_t = 2, value_name = "REQUESTS")]
+    dense_background_queue: usize,
+
+    /// Cache routed experts independently for any supported MoE model.
     #[arg(long)]
     expert_cache: bool,
 
@@ -251,7 +271,7 @@ struct Cli {
     #[arg(long)]
     expert_cache_benchmark: bool,
 
-    /// Maximum simultaneously mapped safetensors payload shards.
+    /// Maximum simultaneously mapped safetensors shards or cached GGUF readers.
     #[arg(long, default_value_t = 4, value_name = "SHARDS")]
     mapped_shards: usize,
 
@@ -365,6 +385,21 @@ fn main() -> Result<()> {
         )?),
         None => ModelLoadOptions::default(),
     };
+    let dense_options = || -> Result<DenseDiskStreamLoadOptions> {
+        let defaults = DenseDiskStreamLoadOptions::default();
+        let mut options = DenseDiskStreamLoadOptions::new(
+            args.device_budget_bytes
+                .unwrap_or(defaults.device_budget_bytes),
+            args.host_budget_bytes.unwrap_or(defaults.host_budget_bytes),
+            args.dense_host_lookahead,
+            args.dense_device_lookahead,
+            args.dense_background_queue,
+        )?;
+        options.max_mapped_shards = args.mapped_shards;
+        options.sample_mlx_memory = args.verbose;
+        options.sample_process_memory = args.verbose;
+        Ok(options)
+    };
     if args.expert_cache {
         let non_expert = LayerwiseLoadOptions {
             offload: OffloadConfig::new(
@@ -383,9 +418,18 @@ fn main() -> Result<()> {
             1,
         )?
         .with_eviction_policy(args.expert_cache_eviction.into());
-        load_options = load_options.with_weight_residency(WeightResidency::SparseExpertCache(
-            ExpertCacheLoadOptions::new(non_expert, experts, args.expert_cache_scratch_bytes)?,
-        ));
+        let expert_options =
+            ExpertCacheLoadOptions::new(non_expert, experts, args.expert_cache_scratch_bytes)?;
+        load_options = if args.dense_disk_stream {
+            load_options.with_weight_residency(WeightResidency::SparseExpertCacheWithDenseLayers(
+                SparseExpertDenseStreamLoadOptions::new(expert_options, dense_options()?),
+            ))
+        } else {
+            load_options.with_weight_residency(WeightResidency::SparseExpertCache(expert_options))
+        };
+    } else if args.dense_disk_stream {
+        load_options =
+            load_options.with_weight_residency(WeightResidency::DenseDiskStream(dense_options()?));
     } else if args.layerwise_host {
         let offload = OffloadConfig::new(
             args.device_budget_bytes,
@@ -980,8 +1024,14 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.expert_cache && args.quantize.is_some() {
         bail!("--quantize is not supported with --expert-cache; use checkpoint-native weights");
     }
+    if args.dense_disk_stream && args.quantize.is_some() {
+        bail!("--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights");
+    }
     if args.expert_cache && args.layerwise_host {
         bail!("--expert-cache conflicts with --layerwise-host");
+    }
+    if args.dense_disk_stream && args.layerwise_host {
+        bail!("--dense-disk-stream conflicts with --layerwise-host");
     }
     if args.expert_cache_benchmark && !args.expert_cache {
         bail!("--expert-cache-benchmark requires --expert-cache");
@@ -1479,6 +1529,33 @@ mod tests {
         ])
         .unwrap();
         validate_args(&speculative).unwrap();
+    }
+
+    #[test]
+    fn validates_dense_stream_residency_conflicts() {
+        for arguments in [
+            vec!["--dense-disk-stream", "--layerwise-host"],
+            vec!["--dense-disk-stream", "--quantize", "4"],
+        ] {
+            let mut command = vec!["safemlx-lm", "--model", "model-id"];
+            command.extend(arguments);
+            command.push("prompt");
+            assert!(validate_args(&Cli::try_parse_from(command).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_combined_expert_cache_and_dense_streaming() {
+        let arguments = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--expert-cache",
+            "--dense-disk-stream",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&arguments).unwrap();
     }
 
     #[test]
