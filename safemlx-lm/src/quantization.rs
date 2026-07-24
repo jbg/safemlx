@@ -12,7 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use safemlx::{ops, Array, Stream};
+use safemlx::{
+    native_quantization::NativeQuantizationFormat,
+    ops::{self, GgufEndian, GgufType},
+    Array, Stream,
+};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
@@ -145,6 +149,13 @@ pub enum WeightQuantization {
     Affine(AffineQuantization),
     /// Microscaling FP4 with E2M1 values and E8M0 scales.
     MxFp4,
+    /// Checkpoint-native nonlinear GGML IQ blocks.
+    GgufIQuant {
+        /// Canonical IQ tensor encoding.
+        ggml_type: GgufType,
+        /// Byte order declared by the containing GGUF file.
+        endian: GgufEndian,
+    },
 }
 
 impl WeightQuantization {
@@ -154,26 +165,35 @@ impl WeightQuantization {
     pub const MXFP4_BITS: i32 = 4;
 
     /// Returns the group size passed to MLX.
-    pub const fn group_size(self) -> i32 {
+    pub fn group_size(self) -> i32 {
         match self {
             Self::Affine(config) => config.group_size,
             Self::MxFp4 => Self::MXFP4_GROUP_SIZE,
+            Self::GgufIQuant { ggml_type, .. } => {
+                ggml_type.block_and_bytes().expect("canonical IQ type").0 as i32
+            }
         }
     }
 
     /// Returns the packed value width passed to MLX.
-    pub const fn bits(self) -> i32 {
+    pub fn bits(self) -> i32 {
         match self {
             Self::Affine(config) => config.bits,
             Self::MxFp4 => Self::MXFP4_BITS,
+            Self::GgufIQuant { ggml_type, .. } => {
+                ggml_type.block_and_bytes().expect("canonical IQ type").1 as i32
+            }
         }
     }
 
     /// Returns the corresponding typed MLX execution mode.
-    pub const fn mode(self) -> ops::QuantizationMode {
+    pub fn mode(self) -> ops::QuantizationMode {
         match self {
             Self::Affine(_) => ops::QuantizationMode::Affine,
             Self::MxFp4 => ops::QuantizationMode::MxFp4,
+            Self::GgufIQuant { .. } => {
+                panic!("GGML IQ executes through checkpoint-native kernels")
+            }
         }
     }
 
@@ -187,6 +207,23 @@ impl WeightQuantization {
         match self {
             Self::Affine(config) => config.validate(),
             Self::MxFp4 => Ok(()),
+            Self::GgufIQuant { ggml_type, .. } => {
+                NativeQuantizationFormat::from_ggml_type(ggml_type)
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        Error::Quantization(format!(
+                            "{ggml_type:?} is not a canonical GGML IQ encoding"
+                        ))
+                    })
+            }
+        }
+    }
+
+    /// Returns checkpoint-native IQ metadata when present.
+    pub const fn gguf_iquant(self) -> Option<(GgufType, GgufEndian)> {
+        match self {
+            Self::GgufIQuant { ggml_type, endian } => Some((ggml_type, endian)),
+            _ => None,
         }
     }
 }
@@ -220,6 +257,11 @@ impl Serialize for WeightQuantization {
             mode: match self {
                 Self::Affine(_) => "affine",
                 Self::MxFp4 => "mxfp4",
+                Self::GgufIQuant { .. } => {
+                    return Err(serde::ser::Error::custom(
+                        "checkpoint-native GGML IQ metadata is not serializable",
+                    ))
+                }
             }
             .into(),
         }

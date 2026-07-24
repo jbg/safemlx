@@ -39,14 +39,14 @@ use crate::{
         },
         input,
     },
-    quantization::{AffineQuantization, WeightQuantization},
+    quantization::WeightQuantization,
     utils::{
         create_attention_mask, create_sliding_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_dir_lenient,
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
         load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
@@ -112,7 +112,7 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     /// Exact affine settings for mixed GGUF tensors.
     #[serde(skip)]
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 impl ModelArgs {
@@ -126,7 +126,7 @@ impl ModelArgs {
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some((*config).into());
+            return Some(*config);
         }
         let quantization = self.weight_quantization()?;
         match &self.quantized_weights {
@@ -1143,7 +1143,8 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let mut args = llama_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
-    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let quantized_weight_configs =
+        gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     if let Some(quantization) = quantization {
         args.quantized_weights = None;
         args.quantization = Some(quantization);
@@ -1485,6 +1486,7 @@ mod tests {
 
     use lazy_static::lazy_static;
     use safemlx::{
+        module::Module,
         ops::indexing::{NewAxis, TryIndexOp},
         ops::{GgufMetadataArray, GgufMetadataValue},
         transforms::eval,
@@ -1602,7 +1604,7 @@ mod tests {
                 model_type: "mistral".into(),
                 hidden_size: 32,
                 num_hidden_layers: 1,
-                intermediate_size: 64,
+                intermediate_size: 256,
                 num_attention_heads: 1,
                 rms_norm_eps: 1e-5,
                 vocab_size: 32,
@@ -1657,7 +1659,7 @@ mod tests {
             ("mistral.block_count".into(), GgufMetadataValue::Uint32(1)),
             (
                 "mistral.feed_forward_length".into(),
-                GgufMetadataValue::Uint32(64),
+                GgufMetadataValue::Uint32(256),
             ),
             (
                 "mistral.attention.head_count".into(),
@@ -1703,6 +1705,50 @@ mod tests {
         assert_eq!(loaded.model.model_type(), "mistral");
         assert_eq!(loaded.model.sliding_window(), Some(16));
         assert_eq!(loaded.eos_token_ids, vec![2]);
+
+        // A model-loader smoke fixture mixing ordinary dense tensors, one
+        // affine K-quant, and one nonlinear IQ tensor. Q2_K uses MLX's packed
+        // affine layout while IQ4_NL retains its original GGML blocks.
+        let mixed_fixture =
+            crate::test_utils::SyntheticGguf::with_packed_tensors(&arrays, &metadata, |name, _| {
+                match name {
+                    "blk.0.attn_q.weight" => Some(safemlx_gguf::GgmlType::IQ4NL),
+                    "blk.0.ffn_down.weight" => Some(safemlx_gguf::GgmlType::Q2K),
+                    _ => None,
+                }
+            });
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(mixed_fixture.path()).unwrap();
+        let mut mixed = super::load_llama_gguf_checkpoint(
+            &checkpoint,
+            crate::weights::gguf_metadata(&checkpoint),
+            None,
+            stream,
+            stream,
+        )
+        .unwrap();
+        let mixed_params = mixed.model.parameters().flatten();
+        assert!(mixed_params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        assert!(mixed_params.contains_key("model.layers.0.self_attn.q_proj.scales"));
+        assert!(mixed_params.contains_key("model.layers.0.mlp.down_proj.inner.weight"));
+        assert!(mixed_params.contains_key("model.layers.0.mlp.down_proj.scales"));
+        drop(mixed_params);
+
+        let safemlx::quantization::MaybeQuantized::Quantized(q_proj) =
+            &mut mixed.model.model.layers[0].self_attn.q_proj
+        else {
+            panic!("IQ4_NL projection must use a quantized module");
+        };
+        assert_eq!(
+            q_proj.native_format,
+            Some(safemlx::native_quantization::NativeQuantizationFormat::GgufIQ4NL)
+        );
+        assert_eq!(q_proj.inner.weight.value.dtype(), safemlx::Dtype::Uint8);
+        assert_eq!(q_proj.inner.weight.value.shape(), &[32, 18]);
+        let projected = q_proj
+            .forward(&Array::from_slice(&vec![1.0f32; 32], &[1, 32]), stream)
+            .unwrap();
+        eval([&projected]).unwrap();
+        assert_eq!(projected.shape(), &[1, 32]);
 
         let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();

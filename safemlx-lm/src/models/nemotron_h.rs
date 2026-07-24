@@ -9,6 +9,7 @@ use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
+    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         arange, broadcast_to, concatenate_axis, exp, gather_grouped_rows, gather_qmm,
@@ -39,10 +40,10 @@ use crate::{
         },
         input,
     },
-    quantization::AffineQuantization,
+    quantization::{AffineQuantization, WeightQuantization},
     utils::{create_attention_mask, AttentionMask},
     weights::{
-        gguf_affine_configs, gguf_metadata, load_gguf_strict,
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
         load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
         GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
@@ -220,19 +221,29 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight affine settings for GGUF files with mixed Q2/Q3/Q4/Q5/Q6/Q8 tensors.
     #[serde(skip)]
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 impl ModelArgs {
     pub(crate) fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
         if let Some(configs) = &self.quantized_weight_configs {
-            return configs.get(weight_name).copied();
+            return match configs.get(weight_name).copied() {
+                Some(WeightQuantization::Affine(affine)) => Some(affine),
+                _ => None,
+            };
         }
         let quantization = self.quantization?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(quantization),
         }
+    }
+
+    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+        if let Some(configs) = &self.quantized_weight_configs {
+            return configs.get(weight_name).copied();
+        }
+        self.affine_quantization_for(weight_name).map(Into::into)
     }
 
     /// Returns the parsed layer kinds from `hybrid_override_pattern`.
@@ -474,7 +485,7 @@ impl Mlp {
         hidden_size: i32,
         intermediate_size: i32,
         bias: bool,
-        quantization: [Option<AffineQuantization>; 2],
+        quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
@@ -482,14 +493,14 @@ impl Mlp {
                 hidden_size,
                 intermediate_size,
                 bias,
-                quantization[0].map(Into::into),
+                quantization[0],
                 stream,
             )?,
             down_proj: common::linear::unloaded_maybe_quantized_linear(
                 intermediate_size,
                 hidden_size,
                 bias,
-                quantization[1].map(Into::into),
+                quantization[1],
                 stream,
             )?,
         })
@@ -527,6 +538,10 @@ pub struct Experts {
     pub up_quantization: Option<AffineQuantization>,
     /// Optional affine settings for the down-projection bank.
     pub down_quantization: Option<AffineQuantization>,
+    /// Optional checkpoint-native IQ settings for the up-projection bank.
+    pub up_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ settings for the down-projection bank.
+    pub down_iquant: Option<WeightQuantization>,
     #[param]
     /// Expert up-projection weights.
     pub up_proj: Param<Array>,
@@ -553,16 +568,50 @@ impl Experts {
         num_experts: i32,
         hidden_size: i32,
         intermediate_size: i32,
-        quantization: [Option<AffineQuantization>; 2],
+        quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let split = |quantization| -> Result<_, Exception> {
+            Ok(match quantization {
+                Some(WeightQuantization::Affine(affine)) => (Some(affine), None),
+                Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+                None => (None, None),
+                Some(other) => {
+                    return Err(Exception::custom(format!(
+                        "unsupported Nemotron-H routed expert quantization {other:?}"
+                    )))
+                }
+            })
+        };
+        let (up_quantization, up_iquant) = split(quantization[0])?;
+        let (down_quantization, down_iquant) = split(quantization[1])?;
         let projection = |out_features: i32,
                           in_features: i32,
-                          quantization: Option<AffineQuantization>|
+                          quantization: Option<AffineQuantization>,
+                          iquant: Option<WeightQuantization>|
          -> Result<
             (Param<Array>, Param<Option<Array>>, Param<Option<Array>>),
             Exception,
         > {
+            if let Some(iquant) = iquant {
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (block_values, block_bytes) = ggml_type
+                    .block_and_bytes()
+                    .expect("canonical IQ block geometry");
+                return Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / block_values as i32 * block_bytes as i32,
+                        ],
+                        Dtype::Uint8,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ));
+            }
             match quantization {
                 Some(quantization) => Ok((
                     Param::<Array>::unloaded(
@@ -605,15 +654,21 @@ impl Experts {
             }
         };
         let (up_proj, up_proj_scales, up_proj_biases) =
-            projection(intermediate_size, hidden_size, quantization[0])?;
-        let (down_proj, down_proj_scales, down_proj_biases) =
-            projection(hidden_size, intermediate_size, quantization[1])?;
+            projection(intermediate_size, hidden_size, up_quantization, up_iquant)?;
+        let (down_proj, down_proj_scales, down_proj_biases) = projection(
+            hidden_size,
+            intermediate_size,
+            down_quantization,
+            down_iquant,
+        )?;
         Ok(Self {
             num_experts,
             hidden_size,
             intermediate_size,
-            up_quantization: quantization[0],
-            down_quantization: quantization[1],
+            up_quantization,
+            down_quantization,
+            up_iquant,
+            down_iquant,
             up_proj,
             up_proj_scales,
             up_proj_biases,
@@ -662,54 +717,76 @@ impl Experts {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let hidden = match self.up_quantization {
-            Some(quantization) => Self::quantized_grouped_matmul(
-                &hidden,
-                &self.up_proj,
-                self.up_proj_scales
-                    .as_ref()
-                    .as_ref()
-                    .expect("quantized expert scales"),
-                self.up_proj_biases
-                    .as_ref()
-                    .as_ref()
-                    .expect("quantized expert biases"),
-                &plan.sorted_group_ids,
-                quantization,
-                stream,
-            )?,
-            None => grouped_matmul(
-                &hidden,
-                &self.up_proj.as_ref().swap_axes(-1, -2, stream)?,
-                &plan.sorted_group_ids,
-                true,
-                stream,
-            )?,
+        let hidden = if let Some(iquant) = self.up_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.up_proj.value.clone(),
+                &[self.num_experts, self.intermediate_size, self.hidden_size],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else {
+            match self.up_quantization {
+                Some(quantization) => Self::quantized_grouped_matmul(
+                    &hidden,
+                    &self.up_proj,
+                    self.up_proj_scales
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert scales"),
+                    self.up_proj_biases
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert biases"),
+                    &plan.sorted_group_ids,
+                    quantization,
+                    stream,
+                )?,
+                None => grouped_matmul(
+                    &hidden,
+                    &self.up_proj.as_ref().swap_axes(-1, -2, stream)?,
+                    &plan.sorted_group_ids,
+                    true,
+                    stream,
+                )?,
+            }
         };
         let hidden = relu2(hidden, stream)?;
-        let current = match self.down_quantization {
-            Some(quantization) => Self::quantized_grouped_matmul(
-                &hidden,
-                &self.down_proj,
-                self.down_proj_scales
-                    .as_ref()
-                    .as_ref()
-                    .expect("quantized expert scales"),
-                self.down_proj_biases
-                    .as_ref()
-                    .as_ref()
-                    .expect("quantized expert biases"),
-                &plan.sorted_group_ids,
-                quantization,
-                stream,
-            )?,
-            None => grouped_matmul(
-                &hidden,
-                &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
-                &plan.sorted_group_ids,
-                true,
-                stream,
-            )?,
+        let current = if let Some(iquant) = self.down_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.down_proj.value.clone(),
+                &[self.num_experts, self.hidden_size, self.intermediate_size],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else {
+            match self.down_quantization {
+                Some(quantization) => Self::quantized_grouped_matmul(
+                    &hidden,
+                    &self.down_proj,
+                    self.down_proj_scales
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert scales"),
+                    self.down_proj_biases
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert biases"),
+                    &plan.sorted_group_ids,
+                    quantization,
+                    stream,
+                )?,
+                None => grouped_matmul(
+                    &hidden,
+                    &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
+                    &plan.sorted_group_ids,
+                    true,
+                    stream,
+                )?,
+            }
         };
         weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
@@ -757,8 +834,8 @@ impl SparseMoeBlock {
                 args.hidden_size,
                 args.moe_intermediate_size,
                 [
-                    args.affine_quantization_for(&format!("{prefix}.experts.up_proj")),
-                    args.affine_quantization_for(&format!("{prefix}.experts.down_proj")),
+                    args.weight_quantization_for(&format!("{prefix}.experts.up_proj")),
+                    args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
                 ],
                 stream,
             )?,
@@ -767,10 +844,10 @@ impl SparseMoeBlock {
                 args.moe_shared_expert_intermediate_size,
                 args.mlp_bias,
                 [
-                    args.affine_quantization_for(&format!(
+                    args.weight_quantization_for(&format!(
                         "{prefix}.shared_experts.up_proj.weight"
                     )),
-                    args.affine_quantization_for(&format!(
+                    args.weight_quantization_for(&format!(
                         "{prefix}.shared_experts.down_proj.weight"
                     )),
                 ],
@@ -868,32 +945,28 @@ impl Attention {
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.q_proj.weight"))
-                    .map(Into::into),
+                args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
             k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.k_proj.weight"))
-                    .map(Into::into),
+                args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
             v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.v_proj.weight"))
-                    .map(Into::into),
+                args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
             o_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
-                args.affine_quantization_for(&format!("{prefix}.o_proj.weight"))
-                    .map(Into::into),
+                args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
                 stream,
             )?,
         })
@@ -1050,10 +1123,9 @@ impl Mamba2Mixer {
                 args.hidden_size,
                 projection_size,
                 args.use_bias,
-                args.affine_quantization_for(&format!(
+                args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.in_proj.weight"
-                ))
-                .map(Into::into),
+                )),
                 stream,
             )?,
             conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
@@ -1070,10 +1142,9 @@ impl Mamba2Mixer {
                 intermediate_size,
                 args.hidden_size,
                 args.use_bias,
-                args.affine_quantization_for(&format!(
+                args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.out_proj.weight"
-                ))
-                .map(Into::into),
+                )),
                 stream,
             )?,
         })
@@ -1443,8 +1514,8 @@ impl TransformerBlock {
                     args.intermediate_size,
                     args.mlp_bias,
                     [
-                        args.affine_quantization_for(&format!("{prefix}.up_proj.weight")),
-                        args.affine_quantization_for(&format!("{prefix}.down_proj.weight")),
+                        args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
+                        args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
                     ],
                     stream,
                 )?)
@@ -1695,8 +1766,7 @@ impl NemotronHModel {
         let embeddings = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization_for("model.embeddings.weight")
-                .map(Into::into),
+            args.weight_quantization_for("model.embeddings.weight"),
             stream,
         )?;
         let layers = (0..args.num_hidden_layers)
@@ -1909,8 +1979,7 @@ impl Model {
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                args.affine_quantization_for("lm_head.weight")
-                    .map(Into::into),
+                args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?)
         } else {
@@ -2115,7 +2184,8 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
 
     let mut args = nemotron_h_args_from_gguf(checkpoint, &metadata, &architecture, weights_stream)?;
-    let quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let quantized_weight_configs =
+        gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
     args.quantization = None;
     args.quantized_weight_configs = Some(quantized_weight_configs);
@@ -2174,7 +2244,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let mut args = nemotron_h_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
-    let configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;

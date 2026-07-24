@@ -23,6 +23,28 @@ pub struct DenseTensor {
     pub data: Vec<u8>,
 }
 
+/// One nonlinear GGML IQ tensor retained in its checkpoint-native block layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IQuantTensor {
+    pub shape: Vec<u64>,
+    pub ggml_type: GgmlType,
+    pub endian: Endian,
+    pub data: Vec<u8>,
+}
+
+impl IQuantTensor {
+    /// Shape of the packed byte rows consumed by checkpoint-native runtimes.
+    pub fn packed_shape(&self) -> Result<Vec<u64>> {
+        iquant_packed_shape(&self.shape, self.ggml_type)
+    }
+
+    /// Canonically dequantize the tensor for differential testing and generic
+    /// execution backends. Model loading does not call this method.
+    pub fn dequantize_f32(&self) -> Result<Vec<f32>> {
+        crate::iquant::decode_f32(self.ggml_type, &self.data, self.endian)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffineTensor {
     pub weight_shape: Vec<u64>,
@@ -62,18 +84,27 @@ impl AffineTensor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertedTensor {
     Dense(DenseTensor),
+    IQuant(IQuantTensor),
     Affine(AffineTensor),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversionKind {
     Dense(DenseDtype),
-    Affine { bits: u8, group_size: u32 },
+    /// Nonlinear IQ codebook blocks retained without conversion.
+    IQuant,
+    Affine {
+        bits: u8,
+        group_size: u32,
+    },
 }
 
 pub(crate) fn conversion_kind(ty: GgmlType) -> Result<ConversionKind> {
     if let Some(dtype) = dense_dtype(ty) {
         return Ok(ConversionKind::Dense(dtype));
+    }
+    if ty.is_iq() {
+        return Ok(ConversionKind::IQuant);
     }
     let (bits, group_size) = match ty {
         GgmlType::Q2K => (2, 16),
@@ -111,6 +142,25 @@ pub(crate) fn affine_shapes(
     Ok((weight_shape, scale_shape))
 }
 
+pub(crate) fn iquant_packed_shape(shape: &[u64], ty: GgmlType) -> Result<Vec<u64>> {
+    let (block_values, block_bytes) = ty.block_and_bytes()?;
+    let mut packed = shape.to_vec();
+    let columns = packed
+        .last_mut()
+        .ok_or_else(|| Error::tensor("<unnamed>", "IQ scalar is invalid"))?;
+    if *columns % block_values != 0 {
+        return Err(Error::tensor(
+            "<unnamed>",
+            format!("IQ row width is not divisible by block length {block_values}"),
+        ));
+    }
+    *columns = columns
+        .checked_div(block_values)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or(Error::Overflow("IQ packed row width"))?;
+    Ok(packed)
+}
+
 pub(crate) fn convert(
     desc: &TensorDescriptor,
     raw: &[u8],
@@ -128,6 +178,14 @@ pub(crate) fn convert(
                 shape: desc.mlx_shape(),
                 dtype,
                 data: normalize_dense(raw, dtype, endian),
+            }));
+        }
+        ConversionKind::IQuant => {
+            return Ok(ConvertedTensor::IQuant(IQuantTensor {
+                shape: desc.mlx_shape(),
+                ggml_type: desc.ggml_type,
+                endian,
+                data: raw.to_vec(),
             }));
         }
         ConversionKind::Affine { .. } => {}
@@ -173,7 +231,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
     let ConversionKind::Affine { bits, group_size } = conversion_kind(desc.ggml_type)? else {
         return Err(Error::tensor(
             &desc.name,
-            "dense tensor was sent to affine conversion",
+            "dense or IQ tensor was sent to affine conversion",
         ));
     };
     let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;

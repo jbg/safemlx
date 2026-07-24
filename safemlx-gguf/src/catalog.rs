@@ -1,4 +1,4 @@
-use crate::convert::{affine_shapes, conversion_kind, ConversionKind};
+use crate::convert::{affine_shapes, conversion_kind, iquant_packed_shape, ConversionKind};
 use crate::{
     ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, OuterSelection, Reader,
     Result, TensorDescriptor,
@@ -20,6 +20,7 @@ pub enum LogicalDtype {
     Bf16,
     I8,
     I16,
+    U8,
     U32,
     I32,
     I64,
@@ -66,7 +67,7 @@ impl CatalogTensor {
         &self.outputs
     }
 
-    /// Packed affine `(bits, group_size)`, or `None` for a dense output.
+    /// Packed affine `(bits, group_size)`, or `None` for dense and IQ outputs.
     pub fn affine(&self) -> Option<(u8, u32)> {
         self.affine
     }
@@ -736,6 +737,17 @@ fn catalog_tensors(descriptors: &[TensorDescriptor]) -> Result<Vec<CatalogTensor
 
 fn catalog_tensor(descriptor: &TensorDescriptor) -> Result<CatalogTensor> {
     let kind = conversion_kind(descriptor.ggml_type)?;
+    if let ConversionKind::IQuant = kind {
+        return Ok(CatalogTensor {
+            descriptor: descriptor.clone(),
+            outputs: vec![LogicalTensorLayout {
+                name: descriptor.name.clone(),
+                shape: iquant_packed_shape(&descriptor.mlx_shape(), descriptor.ggml_type)?,
+                dtype: LogicalDtype::U8,
+            }],
+            affine: None,
+        });
+    }
     if let ConversionKind::Dense(dtype) = kind {
         return Ok(CatalogTensor {
             descriptor: descriptor.clone(),
@@ -749,7 +761,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor) -> Result<CatalogTensor> {
     }
 
     let ConversionKind::Affine { bits, group_size } = kind else {
-        unreachable!("dense conversion returned above");
+        unreachable!("dense and IQ conversions returned above");
     };
     let prefix = descriptor.name.strip_suffix(".weight").ok_or_else(|| {
         Error::tensor(

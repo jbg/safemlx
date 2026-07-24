@@ -695,7 +695,7 @@ impl WeightStore for GgufWeightStore {
 
 fn logical_dtype_width(dtype: GgufLogicalDtype) -> usize {
     match dtype {
-        GgufLogicalDtype::I8 => 1,
+        GgufLogicalDtype::U8 | GgufLogicalDtype::I8 => 1,
         GgufLogicalDtype::F16 | GgufLogicalDtype::Bf16 | GgufLogicalDtype::I16 => 2,
         GgufLogicalDtype::F32 | GgufLogicalDtype::U32 | GgufLogicalDtype::I32 => 4,
         GgufLogicalDtype::I64 | GgufLogicalDtype::F64 => 8,
@@ -707,6 +707,7 @@ fn stored_dtype_for_logical(dtype: GgufLogicalDtype) -> StoredDtype {
         GgufLogicalDtype::F32 => StoredDtype::F32,
         GgufLogicalDtype::F16 => StoredDtype::F16,
         GgufLogicalDtype::Bf16 => StoredDtype::BF16,
+        GgufLogicalDtype::U8 => StoredDtype::U8,
         GgufLogicalDtype::I8 => StoredDtype::I8,
         GgufLogicalDtype::I16 => StoredDtype::I16,
         GgufLogicalDtype::U32 => StoredDtype::U32,

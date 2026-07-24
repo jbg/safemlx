@@ -89,11 +89,49 @@ impl GgufAffineTensor {
     }
 }
 
+/// One checkpoint-native nonlinear GGML IQ tensor.
+#[derive(Debug)]
+pub struct GgufIQuantTensor {
+    physical_name: String,
+    ggml_type: GgufType,
+    endian: GgufEndian,
+    logical_shape: Vec<i32>,
+    packed: GgufArray,
+}
+
+impl GgufIQuantTensor {
+    pub fn physical_name(&self) -> &str {
+        &self.physical_name
+    }
+
+    pub fn ggml_type(&self) -> GgufType {
+        self.ggml_type
+    }
+
+    pub fn endian(&self) -> GgufEndian {
+        self.endian
+    }
+
+    pub fn logical_shape(&self) -> &[i32] {
+        &self.logical_shape
+    }
+
+    pub fn packed(&self) -> &GgufArray {
+        &self.packed
+    }
+
+    pub fn into_packed(self) -> GgufArray {
+        self.packed
+    }
+}
+
 /// One converted physical GGUF tensor.
 #[derive(Debug)]
 pub enum GgufTensor {
     /// A physical tensor represented by one dense MLX array.
     Dense(GgufArray),
+    /// A nonlinear tensor retained in its GGML block encoding.
+    IQuant(GgufIQuantTensor),
     /// A packed tensor represented by one atomic affine triple.
     Affine(GgufAffineTensor),
 }
@@ -103,6 +141,7 @@ impl GgufTensor {
     pub fn physical_name(&self) -> &str {
         match self {
             Self::Dense(tensor) => tensor.name(),
+            Self::IQuant(tensor) => tensor.physical_name(),
             Self::Affine(tensor) => tensor.physical_name(),
         }
     }
@@ -111,6 +150,7 @@ impl GgufTensor {
     pub fn into_arrays(self) -> Vec<(String, Array)> {
         match self {
             Self::Dense(tensor) => vec![tensor.into_parts()],
+            Self::IQuant(tensor) => vec![tensor.into_packed().into_parts()],
             Self::Affine(tensor) => tensor
                 .into_arrays()
                 .into_iter()
@@ -300,6 +340,23 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
             Ok(GgufTensor::Dense(GgufArray {
                 name: descriptor.name,
                 array,
+            }))
+        }
+        safemlx_gguf::ConvertedTensor::IQuant(iquant) => {
+            let packed_shape = mlx_shape_i32(&descriptor.name, &iquant.packed_shape()?)?;
+            let logical_shape = mlx_shape_i32(&descriptor.name, &iquant.shape)?;
+            let array = unsafe {
+                Array::from_raw_data(iquant.data.as_ptr().cast(), &packed_shape, Dtype::Uint8)
+            };
+            Ok(GgufTensor::IQuant(GgufIQuantTensor {
+                physical_name: descriptor.name.clone(),
+                ggml_type: iquant.ggml_type,
+                endian: iquant.endian,
+                logical_shape,
+                packed: GgufArray {
+                    name: descriptor.name,
+                    array,
+                },
             }))
         }
         safemlx_gguf::ConvertedTensor::Affine(affine) => {

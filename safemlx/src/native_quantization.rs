@@ -3,8 +3,12 @@
 //! Native tensors keep their physical checkpoint blocks intact and describe
 //! logical matrices as zero-copy row views. Backends select kernels from the
 //! format, operation, shape, and device; callers remain independent of the
-//! originating model architecture. Unsupported operations use a transient
-//! dequantized fallback and never require a second persistent affine copy.
+//! originating model architecture. Metal linear kernels reuse each decoded
+//! block across a small activation-row tile, and routed-expert kernels fuse
+//! gate/up activation and down-projection reduction where the representation
+//! permits it. CPU execution decodes one packed weight row at a time into
+//! bounded scratch space; it never materializes the complete dense matrix or a
+//! second persistent affine copy.
 //!
 //! The bundled MLX C API exposes managed host buffers, but its public contract
 //! still describes their input as copied and it exposes no API that wraps an
@@ -15,15 +19,16 @@
 //! identity and device accessibility; logical views already share ownership
 //! through `Arc` and will not need to change.
 
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 
 use crate::{
     error::Exception,
     fast::{MetalKernel, MetalKernelConfig},
-    ops::{grouped_matmul, indexing::TryIndexOp, matmul, sum_axis},
+    ops::{matmul, stack_axis, sum_axis},
     transforms::eval,
     Array, DeviceType, Dtype, Stream,
 };
+use safemlx_gguf::{Endian as GgufEndian, GgmlType};
 
 const Q4_K_BLOCK_VALUES: i32 = 256;
 const Q4_K_BLOCK_BYTES: i32 = 144;
@@ -33,23 +38,39 @@ const Q8_0_BLOCK_VALUES: i32 = 32;
 const Q8_0_BLOCK_BYTES: i32 = 34;
 const OUT_TILE: i32 = 4;
 const REDUCTION_TILE: i32 = 32;
-const Q8_BATCH_TILE: i32 = 8;
+const NATIVE_BATCH_TILE: i32 = 8;
 const Q8_LARGE_OUT_TILE: i32 = 8;
 const Q8_LARGE_OUTPUT_ROWS: i32 = 65_536;
 
 thread_local! {
     static Q4K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q4K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GATE_UP_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q5_1_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q5_1_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q5_1_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static IQ_LINEAR_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
+        RefCell::new(HashMap::new());
+    static IQ_BATCH_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
+        RefCell::new(HashMap::new());
+    static IQ_GROUPED_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
+        RefCell::new(HashMap::new());
+    static IQ_EMBEDDING_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
+        RefCell::new(HashMap::new());
+    static IQ_GATE_UP_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool, i32), MetalKernel>> =
+        RefCell::new(HashMap::new());
+    static IQ_DOWN_REDUCE_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Physical quantization encoding retained from a checkpoint.
@@ -61,6 +82,75 @@ pub enum NativeQuantizationFormat {
     GgufQ5_1,
     /// GGUF/GGML Q8_0 blocks: 32 signed weights and one FP16 scale in 34 bytes.
     GgufQ8_0,
+    /// GGUF/GGML IQ2_XXS codebook blocks.
+    GgufIQ2XXS,
+    /// GGUF/GGML IQ2_XS codebook blocks.
+    GgufIQ2XS,
+    /// GGUF/GGML IQ3_XXS codebook blocks.
+    GgufIQ3XXS,
+    /// GGUF/GGML IQ1_S codebook blocks.
+    GgufIQ1S,
+    /// GGUF/GGML IQ4_NL nonlinear blocks.
+    GgufIQ4NL,
+    /// GGUF/GGML IQ3_S codebook blocks.
+    GgufIQ3S,
+    /// GGUF/GGML IQ2_S codebook blocks.
+    GgufIQ2S,
+    /// GGUF/GGML IQ4_XS nonlinear blocks.
+    GgufIQ4XS,
+    /// GGUF/GGML IQ1_M codebook blocks.
+    GgufIQ1M,
+}
+
+impl NativeQuantizationFormat {
+    /// Maps a canonical GGML IQ type to native execution metadata.
+    pub fn from_ggml_type(ty: GgmlType) -> Option<Self> {
+        Some(match ty {
+            GgmlType::IQ2XXS => Self::GgufIQ2XXS,
+            GgmlType::IQ2XS => Self::GgufIQ2XS,
+            GgmlType::IQ3XXS => Self::GgufIQ3XXS,
+            GgmlType::IQ1S => Self::GgufIQ1S,
+            GgmlType::IQ4NL => Self::GgufIQ4NL,
+            GgmlType::IQ3S => Self::GgufIQ3S,
+            GgmlType::IQ2S => Self::GgufIQ2S,
+            GgmlType::IQ4XS => Self::GgufIQ4XS,
+            GgmlType::IQ1M => Self::GgufIQ1M,
+            _ => return None,
+        })
+    }
+
+    /// Returns the GGML type for an IQ format.
+    pub fn ggml_type(self) -> Option<GgmlType> {
+        Some(match self {
+            Self::GgufIQ2XXS => GgmlType::IQ2XXS,
+            Self::GgufIQ2XS => GgmlType::IQ2XS,
+            Self::GgufIQ3XXS => GgmlType::IQ3XXS,
+            Self::GgufIQ1S => GgmlType::IQ1S,
+            Self::GgufIQ4NL => GgmlType::IQ4NL,
+            Self::GgufIQ3S => GgmlType::IQ3S,
+            Self::GgufIQ2S => GgmlType::IQ2S,
+            Self::GgufIQ4XS => GgmlType::IQ4XS,
+            Self::GgufIQ1M => GgmlType::IQ1M,
+            _ => return None,
+        })
+    }
+
+    /// Returns `(values_per_block, bytes_per_block)`.
+    pub fn block_geometry(self) -> (i32, i32) {
+        match self {
+            Self::GgufQ4K => (Q4_K_BLOCK_VALUES, Q4_K_BLOCK_BYTES),
+            Self::GgufQ5_1 => (Q5_1_BLOCK_VALUES, Q5_1_BLOCK_BYTES),
+            Self::GgufQ8_0 => (Q8_0_BLOCK_VALUES, Q8_0_BLOCK_BYTES),
+            iq => {
+                let (values, bytes) = iq
+                    .ggml_type()
+                    .expect("IQ format")
+                    .block_and_bytes()
+                    .expect("canonical IQ geometry");
+                (values as i32, bytes as i32)
+            }
+        }
+    }
 }
 
 /// Persistent native and generic-fallback quantization storage loaded by a model.
@@ -114,6 +204,7 @@ impl NativeQuantizationStats {
                 self.q8_0_tensor_count += 1;
                 self.q8_0_bytes += bytes;
             }
+            _ => {}
         }
     }
 }
@@ -191,6 +282,7 @@ impl NativeCapabilities {
 #[derive(Debug)]
 pub struct NativeStorage {
     format: NativeQuantizationFormat,
+    endian: GgufEndian,
     bytes: Array,
     byte_len: usize,
     kind: NativeStorageKind,
@@ -215,6 +307,11 @@ impl NativeStorage {
     /// Raw MLX byte array consumed by device kernels.
     pub fn bytes(&self) -> &Array {
         &self.bytes
+    }
+
+    /// Byte order of multibyte fields in the retained blocks.
+    pub fn endian(&self) -> GgufEndian {
+        self.endian
     }
 }
 
@@ -244,6 +341,7 @@ impl NativeQuantizedTensor {
             NativeQuantizationFormat::GgufQ4K,
             Q4_K_BLOCK_VALUES,
             Q4_K_BLOCK_BYTES,
+            GgufEndian::Little,
             stream,
         )
     }
@@ -258,6 +356,7 @@ impl NativeQuantizedTensor {
             NativeQuantizationFormat::GgufQ5_1,
             Q5_1_BLOCK_VALUES,
             Q5_1_BLOCK_BYTES,
+            GgufEndian::Little,
             stream,
         )
     }
@@ -272,8 +371,22 @@ impl NativeQuantizedTensor {
             NativeQuantizationFormat::GgufQ8_0,
             Q8_0_BLOCK_VALUES,
             Q8_0_BLOCK_BYTES,
+            GgufEndian::Little,
             stream,
         )
+    }
+
+    /// Retains an already materialized MLX byte array as an IQ tensor.
+    pub fn from_iq_array(
+        bytes: Array,
+        shape: &[i32],
+        ty: GgmlType,
+        endian: GgufEndian,
+    ) -> Result<Self, Exception> {
+        let format = NativeQuantizationFormat::from_ggml_type(ty)
+            .ok_or_else(|| Exception::custom(format!("{ty:?} is not an IQ encoding")))?;
+        let (block_values, block_bytes) = format.block_geometry();
+        Self::from_native_array(bytes, shape, format, block_values, block_bytes, endian)
     }
 
     fn from_native_bytes(
@@ -282,6 +395,7 @@ impl NativeQuantizedTensor {
         format: NativeQuantizationFormat,
         block_values: i32,
         block_bytes: i32,
+        endian: GgufEndian,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let (matrix_count, physical_rows, columns) = match shape {
@@ -315,12 +429,67 @@ impl NativeQuantizedTensor {
         eval([&bytes])?;
         let storage = Arc::new(NativeStorage {
             format,
+            endian,
             bytes,
             byte_len: data.len(),
             kind: NativeStorageKind::MlxOwnedCopy,
         });
         Ok(Self {
             storage,
+            matrix_count,
+            physical_rows,
+            row_start: 0,
+            rows: physical_rows,
+            columns,
+        })
+    }
+
+    fn from_native_array(
+        bytes: Array,
+        shape: &[i32],
+        format: NativeQuantizationFormat,
+        block_values: i32,
+        block_bytes: i32,
+        endian: GgufEndian,
+    ) -> Result<Self, Exception> {
+        let (matrix_count, physical_rows, columns) = match shape {
+            [rows, columns] => (1, *rows, *columns),
+            [matrices, rows, columns] => (*matrices, *rows, *columns),
+            _ => {
+                return Err(Exception::custom(format!(
+                    "native {format:?} expects rank-2 or rank-3 shape, got {shape:?}"
+                )))
+            }
+        };
+        if bytes.dtype() != Dtype::Uint8 {
+            return Err(Exception::custom(format!(
+                "native {format:?} storage must be uint8, got {:?}",
+                bytes.dtype()
+            )));
+        }
+        let expected = i64::from(matrix_count)
+            * i64::from(physical_rows)
+            * i64::from(columns / block_values)
+            * i64::from(block_bytes);
+        if matrix_count <= 0
+            || physical_rows <= 0
+            || columns <= 0
+            || columns % block_values != 0
+            || expected != bytes.size() as i64
+        {
+            return Err(Exception::custom(format!(
+                "native {format:?} storage shape mismatch: logical {shape:?}, {} bytes",
+                bytes.size()
+            )));
+        }
+        Ok(Self {
+            storage: Arc::new(NativeStorage {
+                format,
+                endian,
+                byte_len: bytes.size(),
+                bytes,
+                kind: NativeStorageKind::MlxOwnedCopy,
+            }),
             matrix_count,
             physical_rows,
             row_start: 0,
@@ -404,9 +573,9 @@ impl NativeQuantizedTensor {
                 selected_down_reduce: true,
             },
             NativeQuantizationFormat::GgufQ5_1 => NativeCapabilities {
-                linear: false,
+                linear: self.matrix_count == 1,
                 linear_untransposed: false,
-                embedding: false,
+                embedding: self.matrix_count == 1,
                 grouped_linear: true,
                 selected_gate_up: false,
                 selected_down_reduce: true,
@@ -417,6 +586,14 @@ impl NativeQuantizedTensor {
                 embedding: self.matrix_count == 1,
                 grouped_linear: true,
                 selected_gate_up: false,
+                selected_down_reduce: true,
+            },
+            _ => NativeCapabilities {
+                linear: self.matrix_count == 1,
+                linear_untransposed: false,
+                embedding: self.matrix_count == 1,
+                grouped_linear: true,
+                selected_gate_up: true,
                 selected_down_reduce: true,
             },
         }
@@ -465,9 +642,8 @@ impl NativeQuantizedTensor {
             return match self.format() {
                 NativeQuantizationFormat::GgufQ4K => q4k_linear_metal(input, self, stream),
                 NativeQuantizationFormat::GgufQ8_0 => q8_0_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ5_1 => {
-                    self.linear_fallback(input, transpose, stream)
-                }
+                NativeQuantizationFormat::GgufQ5_1 => q5_1_linear_metal(input, self, stream),
+                _ => iq_linear_metal(input, self, stream),
             };
         }
         self.linear_fallback(input, transpose, stream)
@@ -484,14 +660,11 @@ impl NativeQuantizedTensor {
             return match self.format() {
                 NativeQuantizationFormat::GgufQ4K => q4k_embedding_metal(indices, self, stream),
                 NativeQuantizationFormat::GgufQ8_0 => q8_0_embedding_metal(indices, self, stream),
-                NativeQuantizationFormat::GgufQ5_1 => {
-                    let dense = self.dequantize(stream)?;
-                    dense.try_index_device(indices, stream)
-                }
+                NativeQuantizationFormat::GgufQ5_1 => q5_1_embedding_metal(indices, self, stream),
+                _ => iq_embedding_metal(indices, self, stream),
             };
         }
-        let dense = self.dequantize(stream)?;
-        dense.try_index_device(indices, stream)
+        self.embedding_cpu_streaming(indices, stream)
     }
 
     /// Transiently dequantizes this logical view to float32.
@@ -502,6 +675,42 @@ impl NativeQuantizedTensor {
             NativeQuantizationFormat::GgufQ4K => decode_q4k_view(raw, self)?,
             NativeQuantizationFormat::GgufQ5_1 => decode_q5_1_view(raw, self)?,
             NativeQuantizationFormat::GgufQ8_0 => decode_q8_0_view(raw, self)?,
+            format => {
+                let ty = format.ggml_type().expect("IQ format");
+                let physical_shape = if self.matrix_count == 1 {
+                    vec![self.physical_rows as u64, self.columns as u64]
+                } else {
+                    vec![
+                        self.matrix_count as u64,
+                        self.physical_rows as u64,
+                        self.columns as u64,
+                    ]
+                };
+                let tensor = safemlx_gguf::IQuantTensor {
+                    shape: physical_shape,
+                    ggml_type: ty,
+                    endian: self.storage.endian,
+                    data: raw.to_vec(),
+                };
+                let all = tensor
+                    .dequantize_f32()
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                if self.row_start == 0 && self.rows == self.physical_rows {
+                    all
+                } else {
+                    let mut selected = Vec::with_capacity(
+                        self.matrix_count as usize * self.rows as usize * self.columns as usize,
+                    );
+                    let matrix_stride = self.physical_rows as usize * self.columns as usize;
+                    for matrix in 0..self.matrix_count as usize {
+                        let start = matrix * matrix_stride
+                            + self.row_start as usize * self.columns as usize;
+                        let end = start + self.rows as usize * self.columns as usize;
+                        selected.extend_from_slice(&all[start..end]);
+                    }
+                    selected
+                }
+            }
         };
         let shape = if self.matrix_count == 1 {
             vec![self.rows, self.columns]
@@ -519,6 +728,9 @@ impl NativeQuantizedTensor {
         transpose: bool,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        if native_execution_backend(stream)? == NativeExecutionBackend::GenericFallback {
+            return self.linear_cpu_streaming(input, transpose, stream);
+        }
         let dense = self.dequantize(stream)?;
         if transpose {
             matmul(input, dense.transpose(stream)?, stream)
@@ -526,6 +738,220 @@ impl NativeQuantizedTensor {
             matmul(input, dense, stream)
         }
     }
+
+    fn linear_cpu_streaming(
+        &self,
+        input: &Array,
+        transpose: bool,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let expected = if transpose { self.columns } else { self.rows };
+        if input.dim(-1) != expected {
+            return Err(Exception::custom(format!(
+                "native CPU linear expected trailing dimension {expected}, got {:?}",
+                input.shape()
+            )));
+        }
+        let outer = input.size() as i32 / expected;
+        let input = input.as_dtype(Dtype::Float32, stream)?;
+        eval([&input, self.storage.bytes()])?;
+        let evaluated_input = input.evaluated()?;
+        let input_values = evaluated_input.as_slice::<f32>();
+        let evaluated_storage = self.storage.bytes.evaluated()?;
+        let raw = evaluated_storage.as_slice::<u8>();
+
+        let output_width = if transpose { self.rows } else { self.columns };
+        let mut output = vec![0.0f32; outer as usize * output_width as usize];
+        if transpose {
+            for output_row in 0..self.rows {
+                let weights = decode_native_row(raw, self, 0, output_row)?;
+                for input_row in 0..outer as usize {
+                    let input_start = input_row * self.columns as usize;
+                    output[input_row * self.rows as usize + output_row as usize] = dot_f32(
+                        &input_values[input_start..input_start + self.columns as usize],
+                        &weights,
+                    );
+                }
+            }
+        } else {
+            for weight_row in 0..self.rows {
+                let weights = decode_native_row(raw, self, 0, weight_row)?;
+                for input_row in 0..outer as usize {
+                    let scale = input_values[input_row * self.rows as usize + weight_row as usize];
+                    let output_row = &mut output[input_row * self.columns as usize
+                        ..(input_row + 1) * self.columns as usize];
+                    for (value, weight) in output_row.iter_mut().zip(&weights) {
+                        *value += scale * weight;
+                    }
+                }
+            }
+        }
+        let mut shape = input.shape()[..input.ndim() - 1].to_vec();
+        shape.push(output_width);
+        Array::from_slice(&output, &shape).copy(stream)
+    }
+
+    fn embedding_cpu_streaming(
+        &self,
+        indices: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let indices = indices.as_dtype(Dtype::Int32, stream)?;
+        eval([&indices, self.storage.bytes()])?;
+        let evaluated_indices = indices.evaluated()?;
+        let index_values = evaluated_indices.as_slice::<i32>();
+        let evaluated_storage = self.storage.bytes.evaluated()?;
+        let raw = evaluated_storage.as_slice::<u8>();
+        let mut output = Vec::with_capacity(index_values.len() * self.columns as usize);
+        for &index in index_values {
+            if index < 0 || index >= self.rows {
+                return Err(Exception::custom(format!(
+                    "native embedding index {index} is outside 0..{}",
+                    self.rows
+                )));
+            }
+            output.extend(decode_native_row(raw, self, 0, index)?);
+        }
+        let mut shape = indices.shape().to_vec();
+        shape.push(self.columns);
+        Array::from_slice(&output, &shape).copy(stream)
+    }
+}
+
+fn dot_f32(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .zip(rhs)
+        .fold(0.0f32, |sum, (&left, &right)| left.mul_add(right, sum))
+}
+
+fn decode_native_row(
+    raw: &[u8],
+    view: &NativeQuantizedTensor,
+    matrix: i32,
+    logical_row: i32,
+) -> Result<Vec<f32>, Exception> {
+    if matrix < 0 || matrix >= view.matrix_count || logical_row < 0 || logical_row >= view.rows {
+        return Err(Exception::custom(format!(
+            "native row ({matrix}, {logical_row}) is outside {:?}",
+            view.shape()
+        )));
+    }
+    let (block_values, block_bytes) = view.format().block_geometry();
+    let blocks = view.columns / block_values;
+    let row_bytes = blocks as usize * block_bytes as usize;
+    let physical_row =
+        matrix as usize * view.physical_rows as usize + (view.row_start + logical_row) as usize;
+    let start = physical_row * row_bytes;
+    let end = start + row_bytes;
+    let row = raw
+        .get(start..end)
+        .ok_or_else(|| Exception::custom("native packed row exceeds storage"))?;
+    let mut values = Vec::with_capacity(view.columns as usize);
+    match view.format() {
+        NativeQuantizationFormat::GgufQ4K => {
+            for block in row.chunks_exact(Q4_K_BLOCK_BYTES as usize) {
+                decode_q4k_block(block, &mut values);
+            }
+        }
+        NativeQuantizationFormat::GgufQ5_1 => {
+            for block in row.chunks_exact(Q5_1_BLOCK_BYTES as usize) {
+                decode_q5_1_block(block, &mut values);
+            }
+        }
+        NativeQuantizationFormat::GgufQ8_0 => {
+            for block in row.chunks_exact(Q8_0_BLOCK_BYTES as usize) {
+                decode_q8_0_block(block, &mut values);
+            }
+        }
+        format => {
+            values = safemlx_gguf::IQuantTensor {
+                shape: vec![1, view.columns as u64],
+                ggml_type: format.ggml_type().expect("IQ format"),
+                endian: view.storage.endian,
+                data: row.to_vec(),
+            }
+            .dequantize_f32()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        }
+    }
+    debug_assert_eq!(values.len(), view.columns as usize);
+    Ok(values)
+}
+
+fn native_grouped_linear_cpu(
+    input: &Array,
+    weight: &NativeQuantizedTensor,
+    group_ids: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let input = input.as_dtype(Dtype::Float32, stream)?;
+    let group_ids = group_ids.as_dtype(Dtype::Int32, stream)?;
+    eval([&input, &group_ids, weight.storage.bytes()])?;
+    let evaluated_input = input.evaluated()?;
+    let input_values = evaluated_input.as_slice::<f32>();
+    let evaluated_ids = group_ids.evaluated()?;
+    let ids = evaluated_ids.as_slice::<i32>();
+    let evaluated_storage = weight.storage.bytes.evaluated()?;
+    let raw = evaluated_storage.as_slice::<u8>();
+    let routes = input.dim(0);
+    let mut output = vec![0.0f32; routes as usize * weight.rows as usize];
+    for route in 0..routes as usize {
+        let expert = ids[route];
+        if expert < 0 || expert >= weight.matrix_count {
+            return Err(Exception::custom(format!(
+                "native grouped expert {expert} is outside 0..{}",
+                weight.matrix_count
+            )));
+        }
+        let input_row =
+            &input_values[route * weight.columns as usize..(route + 1) * weight.columns as usize];
+        for output_row in 0..weight.rows {
+            let weights = decode_native_row(raw, weight, expert, output_row)?;
+            output[route * weight.rows as usize + output_row as usize] =
+                dot_f32(input_row, &weights);
+        }
+    }
+    Array::from_slice(&output, &[routes, weight.rows]).copy(stream)
+}
+
+fn native_selected_gate_up_cpu(
+    hidden: &Array,
+    weight: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    intermediate: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let hidden = hidden.as_dtype(Dtype::Float32, stream)?;
+    let expert_ids = expert_ids.as_dtype(Dtype::Int32, stream)?;
+    eval([&hidden, &expert_ids, weight.storage.bytes()])?;
+    let evaluated_hidden = hidden.evaluated()?;
+    let hidden_values = evaluated_hidden.as_slice::<f32>();
+    let evaluated_ids = expert_ids.evaluated()?;
+    let ids = evaluated_ids.as_slice::<i32>();
+    let evaluated_storage = weight.storage.bytes.evaluated()?;
+    let raw = evaluated_storage.as_slice::<u8>();
+    let mut output = vec![0.0f32; ids.len() * intermediate as usize];
+    let gelu_coefficient = 0.797_884_6f32;
+    for (route, &expert) in ids.iter().enumerate() {
+        if expert < 0 || expert >= weight.matrix_count {
+            return Err(Exception::custom(format!(
+                "native selected expert {expert} is outside 0..{}",
+                weight.matrix_count
+            )));
+        }
+        for row in 0..intermediate {
+            let gate = dot_f32(hidden_values, &decode_native_row(raw, weight, expert, row)?);
+            let up = dot_f32(
+                hidden_values,
+                &decode_native_row(raw, weight, expert, intermediate + row)?,
+            );
+            let activated = 0.5
+                * gate
+                * (1.0 + (gelu_coefficient * (gate + 0.044_715 * gate * gate * gate)).tanh());
+            output[route * intermediate as usize + row as usize] = activated * up;
+        }
+    }
+    Array::from_slice(&output, &[ids.len() as i32, intermediate]).copy(stream)
 }
 
 /// Applies an expert-major native quantized matrix bank.
@@ -558,16 +984,10 @@ pub fn native_grouped_linear(
             NativeQuantizationFormat::GgufQ8_0 => {
                 q8_0_grouped_metal(input, weight, group_ids, stream)
             }
+            _ => iq_grouped_metal(input, weight, group_ids, stream),
         };
     }
-    let dense = weight.dequantize(stream)?;
-    grouped_matmul(
-        input,
-        &dense.swap_axes(-1, -2, stream)?,
-        group_ids,
-        true,
-        stream,
-    )
+    native_grouped_linear_cpu(input, weight, group_ids, stream)
 }
 
 /// Runs direct selected-expert fused gate/up projection and approximate GELU.
@@ -595,26 +1015,18 @@ pub fn native_selected_gate_up(
             fused_gate_up.shape()
         )));
     }
-    if native_execution_backend(stream)? == NativeExecutionBackend::Metal
-        && fused_gate_up.format() == NativeQuantizationFormat::GgufQ4K
-    {
-        return q4k_gate_up_metal(hidden, fused_gate_up, expert_ids, intermediate, stream);
+    if native_execution_backend(stream)? == NativeExecutionBackend::Metal {
+        match fused_gate_up.format() {
+            NativeQuantizationFormat::GgufQ4K => {
+                return q4k_gate_up_metal(hidden, fused_gate_up, expert_ids, intermediate, stream);
+            }
+            format if format.ggml_type().is_some() => {
+                return iq_gate_up_metal(hidden, fused_gate_up, expert_ids, intermediate, stream);
+            }
+            _ => {}
+        }
     }
-    let top_k = expert_ids.dim(0);
-    let repeated = Array::repeat_axis::<f32>(hidden.clone(), top_k, 0, stream)?;
-    let gate = native_grouped_linear(
-        &repeated,
-        &fused_gate_up.row_view(0, intermediate)?,
-        expert_ids,
-        stream,
-    )?;
-    let up = native_grouped_linear(
-        &repeated,
-        &fused_gate_up.row_view(intermediate, intermediate)?,
-        expert_ids,
-        stream,
-    )?;
-    crate::nn::gelu_approximate(gate, stream)?.multiply(up, stream)
+    native_selected_gate_up_cpu(hidden, fused_gate_up, expert_ids, intermediate, stream)
 }
 
 /// Runs selected-expert native down projection, route weighting, and reduction.
@@ -650,6 +1062,7 @@ pub fn native_selected_down_reduce(
             NativeQuantizationFormat::GgufQ8_0 => {
                 q8_0_down_reduce_metal(activated, down, expert_ids, route_weights, stream)
             }
+            _ => iq_down_reduce_metal(activated, down, expert_ids, route_weights, stream),
         };
     }
     let projected = native_grouped_linear(activated, down, expert_ids, stream)?;
@@ -730,17 +1143,34 @@ fn q4k_linear_metal(
     let dtype = validate_activation_dtype(input)?;
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
-    let config = q4k_config(outer, view, outer, view.rows, dtype);
-    let output = Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(q4k_linear_kernel()?);
-        }
-        cell.borrow()
-            .as_ref()
-            .expect("Q4_K linear kernel initialized")
-            .apply_one_device([&flat, view.storage.bytes()], &config, stream)
-    })?;
-    let mut shape = input.shape()[..input.ndim() as usize - 1].to_vec();
+    let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+    let mut config = q4k_config(outer, view, outer, view.rows, dtype)
+        .with_template_arg_int("ROWS", outer)
+        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE);
+    let output = if outer == 1 {
+        Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(q4k_linear_kernel()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("Q4_K linear kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    } else {
+        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
+        Q4K_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(q4k_batch_kernel()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("Q4_K batch kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    };
+    let mut shape = input.shape()[..input.ndim() - 1].to_vec();
     shape.push(view.rows);
     output.reshape(&shape, stream)
 }
@@ -789,6 +1219,135 @@ fn q5_1_config(
         .with_output_arg([output_rows, output_cols], dtype)
 }
 
+fn iq_linear_metal(
+    input: &Array,
+    view: &NativeQuantizedTensor,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(input)?;
+    if input.dim(-1) != view.columns {
+        return Err(Exception::custom(format!(
+            "IQ linear input {:?} does not match {} columns",
+            input.shape(),
+            view.columns
+        )));
+    }
+    let rows = input.size() as i32 / view.columns;
+    let big_endian = view.storage.endian == GgufEndian::Big;
+    let kernel_key = (view.format(), big_endian);
+    let flat = input.reshape(&[rows, view.columns], stream)?;
+    let (_, block_bytes) = view.format().block_geometry();
+    let mut config = MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("ROWS", rows)
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_template_arg_int("OUT_DIM", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / view.format().block_geometry().0)
+        .with_template_arg_int("BLOCK_BYTES", block_bytes)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE)
+        .with_grid([32, rows * view.rows, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg([rows, view.rows], dtype);
+    let output = if rows == 1 {
+        IQ_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+            let mut kernels = cell.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(kernel_key) {
+                entry.insert(iq_linear_kernel(view.format(), big_endian)?);
+            }
+            kernels
+                .get(&kernel_key)
+                .expect("IQ linear kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    } else {
+        let batch_tiles = (rows + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        config = config.with_grid([32, view.rows, batch_tiles]);
+        IQ_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
+            let mut kernels = cell.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(kernel_key) {
+                entry.insert(iq_batch_kernel(view.format(), big_endian)?);
+            }
+            kernels
+                .get(&kernel_key)
+                .expect("IQ batch kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    };
+    let mut shape = input.shape()[..input.ndim() - 1].to_vec();
+    shape.push(view.rows);
+    output.reshape(&shape, stream)
+}
+
+fn iq_embedding_metal(
+    indices: &Array,
+    view: &NativeQuantizedTensor,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let count = indices.size() as i32;
+    let big_endian = view.storage.endian == GgufEndian::Big;
+    let kernel_key = (view.format(), big_endian);
+    let (block_values, block_bytes) = view.format().block_geometry();
+    let config = MetalKernelConfig::new()
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_template_arg_int("ROWS", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / block_values)
+        .with_template_arg_int("BLOCK_BYTES", block_bytes)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_grid([count * view.columns, 1, 1])
+        .with_thread_group([256, 1, 1])
+        .with_output_arg([count, view.columns], Dtype::Float32);
+    let output = IQ_EMBEDDING_KERNEL.with(|cell| -> Result<_, Exception> {
+        let mut kernels = cell.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(kernel_key) {
+            entry.insert(iq_embedding_kernel(view.format(), big_endian)?);
+        }
+        kernels
+            .get(&kernel_key)
+            .expect("IQ embedding kernel initialized")
+            .apply_one_device([view.storage.bytes(), indices], &config, stream)
+    })?;
+    let mut shape = indices.shape().to_vec();
+    shape.push(view.columns);
+    output.reshape(&shape, stream)
+}
+
+fn iq_grouped_metal(
+    input: &Array,
+    view: &NativeQuantizedTensor,
+    group_ids: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(input)?;
+    let rows = input.dim(0);
+    let big_endian = view.storage.endian == GgufEndian::Big;
+    let kernel_key = (view.format(), big_endian);
+    let (block_values, block_bytes) = view.format().block_geometry();
+    let config = MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_template_arg_int("OUT_DIM", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / block_values)
+        .with_template_arg_int("BLOCK_BYTES", block_bytes)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_grid([32, rows * view.rows, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg([rows, view.rows], dtype);
+    IQ_GROUPED_KERNEL.with(|cell| -> Result<_, Exception> {
+        let mut kernels = cell.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(kernel_key) {
+            entry.insert(iq_grouped_kernel(view.format(), big_endian)?);
+        }
+        kernels
+            .get(&kernel_key)
+            .expect("IQ grouped kernel initialized")
+            .apply_one_device([input, view.storage.bytes(), group_ids], &config, stream)
+    })
+}
+
 fn q8_0_config(
     view: &NativeQuantizedTensor,
     output_rows: i32,
@@ -807,7 +1366,7 @@ fn q8_0_config(
         .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
         .with_template_arg_int("ROW_START", view.row_start)
         .with_template_arg_int("OUT_TILE", out_tile)
-        .with_template_arg_int("BATCH_TILE", Q8_BATCH_TILE)
+        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE)
         .with_thread_group([REDUCTION_TILE, out_tile, 1])
         .with_output_arg([output_rows, output_cols], dtype)
 }
@@ -841,6 +1400,77 @@ fn q5_1_grouped_metal(
     })
 }
 
+fn q5_1_linear_metal(
+    input: &Array,
+    view: &NativeQuantizedTensor,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if input.dim(-1) != view.columns {
+        return Err(Exception::custom(format!(
+            "native Q5_1 linear expected input dimension {}, got {:?}",
+            view.columns,
+            input.shape()
+        )));
+    }
+    let dtype = validate_activation_dtype(input)?;
+    let outer = input.size() as i32 / view.columns;
+    let flat = input.reshape(&[outer, view.columns], stream)?;
+    let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+    let mut config = q5_1_config(outer, view, outer, view.rows, dtype)
+        .with_template_arg_int("ROWS", outer)
+        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE);
+    let output = if outer == 1 {
+        Q5_1_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(q5_1_linear_kernel()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("Q5_1 linear kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    } else {
+        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
+        Q5_1_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(q5_1_batch_kernel()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("Q5_1 batch kernel initialized")
+                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+        })?
+    };
+    let mut shape = input.shape()[..input.ndim() - 1].to_vec();
+    shape.push(view.rows);
+    output.reshape(&shape, stream)
+}
+
+fn q5_1_embedding_metal(
+    indices: &Array,
+    view: &NativeQuantizedTensor,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let count = indices.size() as i32;
+    let config = q5_1_config(count, view, count, view.columns, Dtype::Float32)
+        .with_template_arg_int("ROWS", view.rows)
+        .with_grid([count * view.columns, 1, 1])
+        .with_thread_group([256, 1, 1]);
+    let output = Q5_1_EMBEDDING_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q5_1_embedding_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q5_1 embedding kernel initialized")
+            .apply_one_device([view.storage.bytes(), indices], &config, stream)
+    })?;
+    let mut shape = indices.shape().to_vec();
+    shape.push(view.columns);
+    output.reshape(&shape, stream)
+}
+
 fn q8_0_linear_metal(
     input: &Array,
     view: &NativeQuantizedTensor,
@@ -871,7 +1501,7 @@ fn q8_0_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
-        let batch_tiles = (outer + Q8_BATCH_TILE - 1) / Q8_BATCH_TILE;
+        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
         config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
         Q8_0_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -883,7 +1513,7 @@ fn q8_0_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     };
-    let mut shape = input.shape()[..input.ndim() as usize - 1].to_vec();
+    let mut shape = input.shape()[..input.ndim() - 1].to_vec();
     shape.push(view.rows);
     output.reshape(&shape, stream)
 }
@@ -1077,6 +1707,274 @@ fn q8_0_down_reduce_metal(
     })
 }
 
+fn iq_gate_up_metal(
+    hidden: &Array,
+    view: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    intermediate: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(hidden)?;
+    let top_k = expert_ids.dim(0);
+    let big_endian = view.storage.endian == GgufEndian::Big;
+    let (block_values, block_bytes) = view.format().block_geometry();
+    let base_config = MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_template_arg_int("INTERMEDIATE", intermediate)
+        .with_template_arg_int("BLOCKS", view.columns / block_values)
+        .with_template_arg_int("BLOCK_BYTES", block_bytes)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
+        .with_grid([32, intermediate, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg([intermediate], dtype);
+    let outputs = IQ_GATE_UP_KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
+        let mut outputs = Vec::with_capacity(top_k as usize);
+        for route in 0..top_k {
+            let config = base_config.clone();
+            let mut kernels = cell.borrow_mut();
+            let key = (view.format(), big_endian, route);
+            if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(key) {
+                entry.insert(iq_gate_up_kernel(view.format(), big_endian, route)?);
+            }
+            let output = kernels
+                .get(&key)
+                .expect("IQ gate/up kernel initialized")
+                .apply_one_device([hidden, view.storage.bytes(), expert_ids], &config, stream)?;
+            outputs.push(output);
+        }
+        Ok(outputs)
+    })?;
+    stack_axis(&outputs, 0, stream)
+}
+
+fn iq_down_reduce_metal(
+    activated: &Array,
+    view: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    route_weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(activated)?;
+    let top_k = expert_ids.dim(0);
+    let big_endian = view.storage.endian == GgufEndian::Big;
+    let kernel_key = (view.format(), big_endian);
+    let (block_values, block_bytes) = view.format().block_geometry();
+    let config = MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("TOP_K", top_k)
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_template_arg_int("OUT_DIM", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / block_values)
+        .with_template_arg_int("BLOCK_BYTES", block_bytes)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_grid([32, view.rows, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg([1, view.rows], dtype);
+    IQ_DOWN_REDUCE_KERNEL.with(|cell| -> Result<_, Exception> {
+        let mut kernels = cell.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = kernels.entry(kernel_key) {
+            entry.insert(iq_down_reduce_kernel(view.format(), big_endian)?);
+        }
+        kernels
+            .get(&kernel_key)
+            .expect("IQ down/reduce kernel initialized")
+            .apply_one_device(
+                [activated, view.storage.bytes(), expert_ids, route_weights],
+                &config,
+                stream,
+            )
+    })
+}
+
+fn iq_linear_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+) -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        format!("native_{format:?}_linear_be_{big_endian}").to_lowercase(),
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint item = thread_position_in_grid.y;",
+            "uint row = item / OUT_DIM;",
+            "uint out_col = item % OUT_DIM;",
+            "uint physical_row = ROW_START + out_col;",
+            "uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
+            "float acc = 0.0f;",
+            "for (uint col = lane; col < IN_DIM; col += 32) {",
+            " acc += float(input[row * IN_DIM + col]) * iq_value(weight, row_base, col);",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0) out[row * OUT_DIM + out_col] = T(total);"
+        ),
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
+fn iq_batch_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+) -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        format!("native_{format:?}_batch_be_{big_endian}").to_lowercase(),
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y;",
+            "uint first_row = thread_position_in_grid.z * BATCH_TILE;",
+            "uint physical_row = ROW_START + out_col;",
+            "uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
+            "float acc[BATCH_TILE];",
+            "for (uint r = 0; r < BATCH_TILE; ++r) acc[r] = 0.0f;",
+            "for (uint col = lane; col < IN_DIM; col += 32) {",
+            " float w = iq_value(weight, row_base, col);",
+            " for (uint r = 0; r < BATCH_TILE; ++r) {",
+            "  uint row = first_row + r;",
+            "  if (row < ROWS) acc[r] += float(input[row * IN_DIM + col]) * w;",
+            " }",
+            "}",
+            "for (uint r = 0; r < BATCH_TILE; ++r) {",
+            " float total = simd_sum(acc[r]);",
+            " uint row = first_row + r;",
+            " if (lane == 0 && row < ROWS) out[row * OUT_DIM + out_col] = T(total);",
+            "}"
+        ),
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
+fn iq_embedding_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+) -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        format!("native_{format:?}_embedding_be_{big_endian}").to_lowercase(),
+        ["weight", "indices"],
+        ["out"],
+        concat!(
+            "uint elem = thread_position_in_grid.x;",
+            "uint col = elem % IN_DIM;",
+            "uint output_row = elem / IN_DIM;",
+            "uint row = uint(indices[output_row]);",
+            "if (row >= ROWS) { out[elem] = 0.0f; return; }",
+            "uint physical_row = ROW_START + row;",
+            "uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
+            "out[elem] = iq_value(weight, row_base, col);"
+        ),
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
+fn iq_grouped_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+) -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        format!("native_{format:?}_grouped_be_{big_endian}").to_lowercase(),
+        ["input", "weight", "group_ids"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint item = thread_position_in_grid.y;",
+            "uint row = item / OUT_DIM;",
+            "uint out_col = item % OUT_DIM;",
+            "uint expert = uint(group_ids[row]);",
+            "uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
+            "float acc = 0.0f;",
+            "for (uint col = lane; col < IN_DIM; col += 32) {",
+            " acc += float(input[row * IN_DIM + col]) * iq_value(weight, row_base, col);",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0) out[row * OUT_DIM + out_col] = T(total);"
+        ),
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
+fn iq_gate_up_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+    route: i32,
+) -> Result<MetalKernel, Exception> {
+    let source = concat!(
+        "uint lane = thread_position_in_grid.x;",
+        "uint out_col = thread_position_in_grid.y;",
+        "uint expert = uint(expert_ids[ROUTE_INDEX]);",
+        " uint gate_row = expert * PHYSICAL_ROWS + out_col;",
+        " uint up_row = gate_row + INTERMEDIATE;",
+        " uint gate_base = gate_row * BLOCKS * BLOCK_BYTES;",
+        " uint up_base = up_row * BLOCKS * BLOCK_BYTES;",
+        " float gate_acc = 0.0f;",
+        " float up_acc = 0.0f;",
+        " for (uint col = lane; col < IN_DIM; col += 32) {",
+        "  float x = float(input[col]);",
+        "  gate_acc += x * iq_value(weight, gate_base, col);",
+        "  up_acc += x * iq_value(weight, up_base, col);",
+        " }",
+        " float gate = simd_sum(gate_acc);",
+        " float up = simd_sum(up_acc);",
+        "if (lane == 0) {",
+        "  float c = 0.7978845608028654f;",
+        "  float activated = 0.5f * gate * (1.0f + metal::tanh(c * (gate + 0.044715f * gate * gate * gate)));",
+        "  out[out_col] = T(activated * up);",
+        "}"
+    )
+    .replace("ROUTE_INDEX", &route.to_string());
+    MetalKernel::new(
+        format!("native_{format:?}_selected_gate_up_be_{big_endian}_route_{route}").to_lowercase(),
+        ["input", "weight", "expert_ids"],
+        ["out"],
+        source,
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
+fn iq_down_reduce_kernel(
+    format: NativeQuantizationFormat,
+    big_endian: bool,
+) -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        format!("native_{format:?}_selected_down_reduce_be_{big_endian}").to_lowercase(),
+        ["input", "weight", "expert_ids", "route_weights"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y;",
+            "float acc = 0.0f;",
+            "for (uint route = 0; route < TOP_K; ++route) {",
+            " uint expert = uint(expert_ids[route]);",
+            " uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            " uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
+            " float route_acc = 0.0f;",
+            " for (uint col = lane; col < IN_DIM; col += 32) {",
+            "  route_acc += float(input[route * IN_DIM + col]) * iq_value(weight, row_base, col);",
+            " }",
+            " acc += route_acc * float(route_weights[route]);",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0) out[out_col] = T(total);"
+        ),
+        iq_metal_header(format, big_endian),
+        true,
+        false,
+    )
+}
+
 fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "native_q4k_linear",
@@ -1091,6 +1989,113 @@ fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
         ]
         .concat(),
         Q4K_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q4k_batch_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q4k_batch",
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y;",
+            "uint first_row = thread_position_in_grid.z * BATCH_TILE;",
+            "float acc[BATCH_TILE];",
+            "for (uint r = 0; r < BATCH_TILE; ++r) acc[r] = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " uint physical_row = ROW_START + out_col;",
+            " uint matrix_base = physical_row * BLOCKS * 144;",
+            " for (uint block = 0; block < BLOCKS; ++block) {",
+            "  uint base = matrix_base + block * 144;",
+            "  uint input_block = block * 256;",
+            "  for (uint g = 0; g < 8; ++g) {",
+            "   float w = q4k_value(weight, base, g, lane);",
+            "   uint col = input_block + g * 32 + lane;",
+            "   for (uint r = 0; r < BATCH_TILE; ++r) {",
+            "    uint row = first_row + r;",
+            "    if (row < ROWS) acc[r] += float(input[row * IN_DIM + col]) * w;",
+            "   }",
+            "  }",
+            " }",
+            "}",
+            "for (uint r = 0; r < BATCH_TILE; ++r) {",
+            " float total = simd_sum(acc[r]);",
+            " uint row = first_row + r;",
+            " if (lane == 0 && row < ROWS && out_col < OUT_DIM) out[row * OUT_DIM + out_col] = T(total);",
+            "}"
+        ),
+        Q4K_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q5_1_linear_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q5_1_linear",
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint row = thread_position_in_grid.y / OUT_GRID;",
+            "uint out_col = thread_position_in_grid.y % OUT_GRID;",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " uint physical_row = ROW_START + out_col;",
+            " uint matrix_base = physical_row * BLOCKS * 24;",
+            " for (uint block = lane; block < BLOCKS; block += REDUCTION_TILE) {",
+            "  uint base = matrix_base + block * 24;",
+            "  uint input_block = row * IN_DIM + block * 32;",
+            "  for (uint i = 0; i < 32; ++i) {",
+            "   acc += float(input[input_block + i]) * q5_1_value(weight, base, i);",
+            "  }",
+            " }",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0 && out_col < OUT_DIM) out[row * OUT_DIM + out_col] = T(total);"
+        ),
+        Q5_1_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q5_1_batch_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q5_1_batch",
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y;",
+            "uint first_row = thread_position_in_grid.z * BATCH_TILE;",
+            "float acc[BATCH_TILE];",
+            "for (uint r = 0; r < BATCH_TILE; ++r) acc[r] = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " uint physical_row = ROW_START + out_col;",
+            " uint matrix_base = physical_row * BLOCKS * 24;",
+            " for (uint block = lane; block < BLOCKS; block += REDUCTION_TILE) {",
+            "  uint base = matrix_base + block * 24;",
+            "  for (uint i = 0; i < 32; ++i) {",
+            "   float w = q5_1_value(weight, base, i);",
+            "   uint col = block * 32 + i;",
+            "   for (uint r = 0; r < BATCH_TILE; ++r) {",
+            "    uint row = first_row + r;",
+            "    if (row < ROWS) acc[r] += float(input[row * IN_DIM + col]) * w;",
+            "   }",
+            "  }",
+            " }",
+            "}",
+            "for (uint r = 0; r < BATCH_TILE; ++r) {",
+            " float total = simd_sum(acc[r]);",
+            " uint row = first_row + r;",
+            " if (lane == 0 && row < ROWS && out_col < OUT_DIM) out[row * OUT_DIM + out_col] = T(total);",
+            "}"
+        ),
+        Q5_1_METAL_HEADER,
         true,
         false,
     )
@@ -1140,6 +2145,29 @@ fn q5_1_grouped_kernel() -> Result<MetalKernel, Exception> {
             "}",
             "float total = simd_sum(acc);",
             "if (lane == 0 && out_col < OUT_DIM) out[row * OUT_DIM + out_col] = T(total);"
+        ),
+        Q5_1_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q5_1_embedding_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q5_1_embedding",
+        ["weight", "indices"],
+        ["out"],
+        concat!(
+            "uint elem = thread_position_in_grid.x;",
+            "uint col = elem % IN_DIM;",
+            "uint output_row = elem / IN_DIM;",
+            "uint row = uint(indices[output_row]);",
+            "if (row >= ROWS) { out[elem] = 0.0f; return; }",
+            "uint physical_row = ROW_START + row;",
+            "uint block = col / 32;",
+            "uint within = col % 32;",
+            "uint base = (physical_row * BLOCKS + block) * 24;",
+            "out[elem] = q5_1_value(weight, base, within);"
         ),
         Q5_1_METAL_HEADER,
         true,
@@ -1544,6 +2572,158 @@ const Q8_0_METAL_HEADER: &str = concat!(
     "}\n"
 );
 
+fn iq_metal_array<T: std::fmt::LowerHex>(
+    output: &mut String,
+    metal_type: &str,
+    name: &str,
+    values: &[T],
+) {
+    let _ = write!(output, "constant {metal_type} {name}[{}]={{", values.len());
+    for value in values {
+        let _ = write!(output, "0x{value:x},");
+    }
+    output.push_str("};\n");
+}
+
+fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String {
+    use safemlx_gguf::iquant_tables::{
+        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+        KVALUES_IQ4NL,
+    };
+
+    let mut header = format!(
+        "constant bool BIG_ENDIAN = {};\n",
+        if big_endian { "true" } else { "false" }
+    );
+    header.push_str(concat!(
+        "ushort iq_u16(const device uint8_t* w,uint p){",
+        "return BIG_ENDIAN ? ushort((uint(w[p])<<8)|uint(w[p+1])) : ushort(uint(w[p])|(uint(w[p+1])<<8));}\n",
+        "uint iq_u32(const device uint8_t* w,uint p){",
+        "return BIG_ENDIAN ? ((uint(w[p])<<24)|(uint(w[p+1])<<16)|(uint(w[p+2])<<8)|uint(w[p+3]))",
+        ": (uint(w[p])|(uint(w[p+1])<<8)|(uint(w[p+2])<<16)|(uint(w[p+3])<<24));}\n",
+        "float iq_half(const device uint8_t* w,uint p){return float(as_type<half>(iq_u16(w,p)));}\n",
+        "uint iq_grid8(const constant ulong* t,uint i,uint j){return uint((t[i]>>(8*j))&255ul);}\n",
+        "uint iq_grid4(const constant uint* t,uint i,uint j){return (t[i]>>(8*j))&255u;}\n",
+        "float iq_sign(float v,uint signs,uint j){return ((signs>>j)&1u)!=0u ? -v:v;}\n"
+    ));
+
+    match format {
+        NativeQuantizationFormat::GgufIQ2XXS => {
+            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
+            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2XXS_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*66u;float d=iq_half(w,p);uint q=p+2u+8u*g;",
+                "uint w0=uint(iq_u16(w,q+2u*(l/2u)));",
+                "uint aux=uint(iq_u16(w,q+4u))|(uint(iq_u16(w,q+6u))<<16);",
+                "uint index=(l&1u)==0u?(w0&255u):(w0>>8);",
+                "float db=d*(0.5f+float(aux>>28))*0.25f;",
+                "return iq_sign(db*float(iq_grid8(IQ_GRID,index,j)),uint(IQ_SIGNS[(aux>>(7u*l))&127u]),j);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ2XS => {
+            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
+            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2XS_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*74u;float d=iq_half(w,p);uint q=uint(iq_u16(w,p+2u+2u*(4u*g+l)));",
+                "uint s=uint(w[p+66u+g]);uint nib=(l/2u)==0u?(s&15u):(s>>4);",
+                "float db=d*(0.5f+float(nib))*0.25f;",
+                "return iq_sign(db*float(iq_grid8(IQ_GRID,q&511u,j)),uint(IQ_SIGNS[q>>9]),j);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ2S => {
+            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2S_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*82u;float d=iq_half(w,p);uint qh=uint(w[p+66u+g]);",
+                "uint index=uint(w[p+2u+4u*g+l])|((qh<<(8u-2u*l))&0x300u);",
+                "uint s=uint(w[p+74u+g]);uint nib=(l/2u)==0u?(s&15u):(s>>4);",
+                "float db=d*(0.5f+float(nib))*0.25f;",
+                "return iq_sign(db*float(iq_grid8(IQ_GRID,index,j)),uint(w[p+34u+4u*g+l]),j);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ3XXS => {
+            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
+            iq_metal_array(&mut header, "uint", "IQ_GRID", &IQ3XXS_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*98u;float d=iq_half(w,p);uint aux=iq_u32(w,p+66u+4u*g);",
+                "uint qi=uint(w[p+2u+8u*g+2u*l+(j/4u)]);",
+                "float db=d*(0.5f+float(aux>>28))*0.5f;",
+                "return iq_sign(db*float(iq_grid4(IQ_GRID,qi,j%4u)),uint(IQ_SIGNS[(aux>>(7u*l))&127u]),j);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ3S => {
+            iq_metal_array(&mut header, "uint", "IQ_GRID", &IQ3S_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint pair=x/64u;uint side=(x%64u)/32u;",
+                "uint l=(x%32u)/8u;uint j=x%8u;uint p=r+b*110u;float d=iq_half(w,p);",
+                "uint scale=uint(w[p+106u+pair]);uint nib=side==0u?(scale&15u):(scale>>4);",
+                "float db=d*float(1u+2u*nib);uint high=uint(w[p+66u+2u*pair+side]);",
+                "uint qoff=p+2u+16u*pair+8u*side+2u*l+(j/4u);",
+                "uint index=uint(w[qoff])|((high<<(8u-2u*l-(j/4u)))&256u);",
+                "uint signs=uint(w[p+74u+8u*pair+4u*side+l]);",
+                "return iq_sign(db*float(iq_grid4(IQ_GRID,index,j%4u)),signs,j);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ1S => {
+            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ1S_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*50u;float d=iq_half(w,p);uint hi=uint(iq_u16(w,p+34u+2u*g));",
+                "float dl=d*float(2u*((hi>>12)&7u)+1u);float delta=(hi&0x8000u)!=0u?-0.125f:0.125f;",
+                "uint index=uint(w[p+2u+4u*g+l])|(((hi>>(3u*l))&7u)<<8);",
+                "int q=int(as_type<char>(uchar(iq_grid8(IQ_GRID,index,j))));return dl*(float(q)+delta);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ1M => {
+            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ1S_GRID);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
+                "uint p=r+b*56u;uint s0=uint(iq_u16(w,p+48u));uint s1=uint(iq_u16(w,p+50u));",
+                "uint s2=uint(iq_u16(w,p+52u));uint s3=uint(iq_u16(w,p+54u));",
+                "uint dbits=(s0>>12)|((s1>>8)&0xf0u)|((s2>>4)&0xf00u)|(s3&0xf000u);",
+                "float d=float(as_type<half>(ushort(dbits)));uint sw=g<2u?s0:(g<4u?s1:(g<6u?s2:s3));",
+                "uint shift=6u*(g&1u)+3u*(l/2u);float dl=d*float(2u*((sw>>shift)&7u)+1u);",
+                "uint h=uint(w[p+32u+2u*g+l/2u]);uint index=uint(w[p+4u*g+l])|",
+                "(((h>>((l&1u)*4u))&7u)<<8);uint negbit=(l&1u)==0u?8u:128u;",
+                "float delta=(h&negbit)!=0u?-0.125f:0.125f;",
+                "int q=int(as_type<char>(uchar(iq_grid8(IQ_GRID,index,j))));return dl*(float(q)+delta);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ4NL => {
+            iq_metal_array(&mut header, "uchar", "IQ4", &KVALUES_IQ4NL);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/32u;uint x=c%32u;uint p=r+b*18u;uint q=uint(w[p+2u+(x%16u)]);",
+                "uint code=x<16u?(q&15u):(q>>4);return iq_half(w,p)*float(as_type<char>(IQ4[code]));}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufIQ4XS => {
+            iq_metal_array(&mut header, "uchar", "IQ4", &KVALUES_IQ4NL);
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint z=x%32u;uint p=r+b*136u;",
+                "uint sh=uint(iq_u16(w,p+2u));uint sl=uint(w[p+4u+g/2u]);",
+                "uint low=(sl>>(4u*(g&1u)))&15u;uint high=(sh>>(2u*g))&3u;",
+                "float dl=iq_half(w,p)*float(int(low|(high<<4))-32);",
+                "uint q=uint(w[p+8u+16u*g+(z%16u)]);uint code=z<16u?(q&15u):(q>>4);",
+                "return dl*float(as_type<char>(IQ4[code]));}\n"
+            ));
+        }
+        _ => unreachable!("IQ Metal header requested for non-IQ format"),
+    }
+    header
+}
+
 fn decode_q4k_view(raw: &[u8], view: &NativeQuantizedTensor) -> Result<Vec<f32>, Exception> {
     let blocks = view.columns as usize / Q4_K_BLOCK_VALUES as usize;
     let matrix_stride = view.physical_rows as usize * blocks * Q4_K_BLOCK_BYTES as usize;
@@ -1676,6 +2856,472 @@ mod tests {
     use super::*;
     use crate::ops::indexing::TryIndexOp;
 
+    fn unhex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_iq_format_executes_direct_packed_linear_embedding_and_grouped() {
+        let stream = crate::test_stream();
+        for line in
+            include_str!("../../safemlx-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
+        {
+            let mut fields = line.split('|');
+            let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
+            let all_raw = unhex(fields.next().unwrap());
+            let _oracle_f16 = fields.next().unwrap();
+            let (block_values, block_bytes) = ty.block_and_bytes().unwrap();
+            let raw = &all_raw[..block_bytes as usize];
+            let canonical = safemlx_gguf::IQuantTensor {
+                shape: vec![1, block_values],
+                ggml_type: ty,
+                endian: GgufEndian::Little,
+                data: raw.to_vec(),
+            }
+            .dequantize_f32()
+            .unwrap();
+            let packed = Array::from_slice(raw, &[1, block_bytes as i32])
+                .copy(stream)
+                .unwrap();
+            let native = NativeQuantizedTensor::from_iq_array(
+                packed,
+                &[1, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+
+            let input = (0..block_values)
+                .map(|index| ((index % 17) as f32 - 8.0) / 16.0)
+                .collect::<Vec<_>>();
+            let expected = input
+                .iter()
+                .zip(&canonical)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum::<f32>();
+            let actual = native
+                .linear(
+                    &Array::from_slice(&input, &[1, block_values as i32]),
+                    true,
+                    stream,
+                )
+                .unwrap();
+            eval([&actual]).unwrap();
+            let actual = actual.evaluated().unwrap().as_slice::<f32>()[0];
+            let tolerance = 2e-4 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{ty:?}: packed linear {actual} != {expected}"
+            );
+
+            let prefill_values = (0..9)
+                .flat_map(|row| input.iter().map(move |value| value + row as f32 * 0.01))
+                .collect::<Vec<_>>();
+            let prefill = Array::from_slice(&prefill_values, &[9, block_values as i32]);
+            let actual = native.linear(&prefill, true, stream).unwrap();
+            let dense = Array::from_slice(&canonical, &[1, block_values as i32]);
+            let expected = matmul(&prefill, dense.transpose(stream).unwrap(), stream).unwrap();
+            assert!(actual
+                .all_close(&expected, Some(3e-4), Some(3e-4), None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+
+            let embedded = native
+                .embedding(&Array::from_slice(&[0i32], &[1]), stream)
+                .unwrap();
+            eval([&embedded]).unwrap();
+            let evaluated = embedded.evaluated().unwrap();
+            let actual = evaluated.as_slice::<f32>();
+            for (index, (&actual, &expected)) in actual.iter().zip(&canonical).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{ty:?} embedding element {index}"
+                );
+            }
+
+            let bank = Array::from_slice(&all_raw, &[2, 1, block_bytes as i32])
+                .copy(stream)
+                .unwrap();
+            let bank = NativeQuantizedTensor::from_iq_array(
+                bank,
+                &[2, 1, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let grouped_input = Array::from_slice(
+                &[input.as_slice(), input.as_slice()].concat(),
+                &[2, block_values as i32],
+            );
+            let grouped = native_grouped_linear(
+                &grouped_input,
+                &bank,
+                &Array::from_slice(&[1i32, 0], &[2]),
+                stream,
+            )
+            .unwrap();
+            let dense = bank.dequantize(stream).unwrap();
+            let selected = dense
+                .try_index_device(&Array::from_slice(&[1i32, 0], &[2]), stream)
+                .unwrap();
+            let expected = matmul(
+                &grouped_input
+                    .reshape(&[2, 1, block_values as i32], stream)
+                    .unwrap(),
+                selected.swap_axes(-1, -2, stream).unwrap(),
+                stream,
+            )
+            .unwrap()
+            .reshape(&[2, 1], stream)
+            .unwrap();
+            assert!(grouped
+                .all_close(&expected, Some(2e-4), Some(2e-4), None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+
+            let intermediate = block_values as i32;
+            let gate_up_raw = raw.repeat(4 * block_values as usize);
+            let gate_up = NativeQuantizedTensor::from_iq_array(
+                Array::from_slice(&gate_up_raw, &[2, 2 * intermediate, block_bytes as i32])
+                    .copy(stream)
+                    .unwrap(),
+                &[2, 2 * intermediate, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let down_raw = raw.repeat(2);
+            let down = NativeQuantizedTensor::from_iq_array(
+                Array::from_slice(&down_raw, &[2, 1, block_bytes as i32])
+                    .copy(stream)
+                    .unwrap(),
+                &[2, 1, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let ids = Array::from_slice(&[1i32, 0], &[2]);
+            let route_weights = Array::from_slice(&[0.25f32, 0.75], &[2]);
+            let hidden = Array::from_slice(&input, &[1, block_values as i32]);
+            let activated =
+                native_selected_gate_up(&hidden, &gate_up, &ids, intermediate, stream).unwrap();
+            let actual =
+                native_selected_down_reduce(&activated, &down, &ids, &route_weights, stream)
+                    .unwrap();
+            let selected_gate_up = gate_up
+                .dequantize(stream)
+                .unwrap()
+                .try_index_device(&ids, stream)
+                .unwrap();
+            let repeated_hidden =
+                crate::ops::broadcast_to(&hidden, &[2, block_values as i32], stream).unwrap();
+            let gate = matmul(
+                &repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
+                selected_gate_up
+                    .try_index_device((.., ..intermediate, ..), stream)
+                    .unwrap()
+                    .swap_axes(-1, -2, stream)
+                    .unwrap(),
+                stream,
+            )
+            .unwrap()
+            .reshape(&[2, intermediate], stream)
+            .unwrap();
+            let up = matmul(
+                &repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
+                selected_gate_up
+                    .try_index_device((.., intermediate.., ..), stream)
+                    .unwrap()
+                    .swap_axes(-1, -2, stream)
+                    .unwrap(),
+                stream,
+            )
+            .unwrap()
+            .reshape(&[2, intermediate], stream)
+            .unwrap();
+            let activated_ref = crate::nn::gelu_approximate(gate, stream)
+                .unwrap()
+                .multiply(up, stream)
+                .unwrap();
+            let activated_close = activated
+                .all_close(&activated_ref, Some(4e-4), Some(4e-4), None, stream)
+                .unwrap()
+                .item::<bool>(stream);
+            if !activated_close {
+                eval([&activated, &activated_ref]).unwrap();
+                let actual_values = activated.evaluated().unwrap();
+                let actual_values = actual_values.as_slice::<f32>();
+                let expected_values = activated_ref.evaluated().unwrap();
+                let expected_values = expected_values.as_slice::<f32>();
+                let mismatch =
+                    actual_values
+                        .iter()
+                        .zip(expected_values)
+                        .position(|(&actual, &expected)| {
+                            (actual - expected).abs() > 4e-4 * expected.abs().max(1.0)
+                        });
+                panic!(
+                    "{ty:?} fused gate/up mismatch {mismatch:?}: actual {:?}, expected {:?}",
+                    mismatch.map(|index| actual_values[index]),
+                    mismatch.map(|index| expected_values[index]),
+                );
+            }
+            let selected_down = down
+                .dequantize(stream)
+                .unwrap()
+                .try_index_device(&ids, stream)
+                .unwrap();
+            let projected = matmul(
+                &activated_ref
+                    .reshape(&[2, 1, intermediate], stream)
+                    .unwrap(),
+                selected_down.swap_axes(-1, -2, stream).unwrap(),
+                stream,
+            )
+            .unwrap()
+            .reshape(&[2, 1], stream)
+            .unwrap();
+            let expected = sum_axis(
+                projected
+                    .multiply(route_weights.reshape(&[2, 1], stream).unwrap(), stream)
+                    .unwrap(),
+                0,
+                true,
+                stream,
+            )
+            .unwrap();
+            let close = actual
+                .all_close(&expected, Some(4e-4), Some(4e-4), None, stream)
+                .unwrap()
+                .item::<bool>(stream);
+            if !close {
+                eval([&actual, &expected]).unwrap();
+                panic!(
+                    "{ty:?} fused expert output {:?} != {:?}",
+                    actual.evaluated().unwrap().as_slice::<f32>(),
+                    expected.evaluated().unwrap().as_slice::<f32>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn every_iq_format_executes_batched_and_fused_metal_kernels() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        for line in
+            include_str!("../../safemlx-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
+        {
+            let mut fields = line.split('|');
+            let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
+            let all_raw = unhex(fields.next().unwrap());
+            let _oracle_f16 = fields.next().unwrap();
+            let (block_values, block_bytes) = ty.block_and_bytes().unwrap();
+            let raw = &all_raw[..block_bytes as usize];
+            let input_values = (0..9 * block_values as usize)
+                .map(|index| ((index % 17) as f32 - 8.0) / 16.0)
+                .collect::<Vec<_>>();
+            let input = Array::from_slice(&input_values, &[9, block_values as i32])
+                .copy(&stream)
+                .unwrap();
+            let native = NativeQuantizedTensor::from_iq_array(
+                Array::from_slice(raw, &[1, block_bytes as i32])
+                    .copy(&stream)
+                    .unwrap(),
+                &[1, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let dense = native.dequantize(&stream).unwrap();
+            let actual = native.linear(&input, true, &stream).unwrap();
+            let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+            assert!(
+                actual
+                    .all_close(&expected, Some(4e-4), Some(4e-4), None, &stream)
+                    .unwrap()
+                    .item::<bool>(&stream),
+                "{ty:?} batched Metal linear"
+            );
+
+            let intermediate = block_values as i32;
+            let gate_up = NativeQuantizedTensor::from_iq_array(
+                Array::from_slice(
+                    &raw.repeat(4 * block_values as usize),
+                    &[2, 2 * intermediate, block_bytes as i32],
+                )
+                .copy(&stream)
+                .unwrap(),
+                &[2, 2 * intermediate, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let down = NativeQuantizedTensor::from_iq_array(
+                Array::from_slice(&raw.repeat(2), &[2, 1, block_bytes as i32])
+                    .copy(&stream)
+                    .unwrap(),
+                &[2, 1, block_values as i32],
+                ty,
+                GgufEndian::Little,
+            )
+            .unwrap();
+            let ids = Array::from_slice(&[1i32, 0], &[2]).copy(&stream).unwrap();
+            let route_weights = Array::from_slice(&[0.25f32, 0.75], &[2])
+                .copy(&stream)
+                .unwrap();
+            let hidden = Array::from_slice(
+                &input_values[..block_values as usize]
+                    .iter()
+                    .map(|value| value / 1024.0)
+                    .collect::<Vec<_>>(),
+                &[1, block_values as i32],
+            )
+            .copy(&stream)
+            .unwrap();
+            let activated =
+                native_selected_gate_up(&hidden, &gate_up, &ids, intermediate, &stream).unwrap();
+            let actual =
+                native_selected_down_reduce(&activated, &down, &ids, &route_weights, &stream)
+                    .unwrap();
+
+            let selected_gate_up = gate_up
+                .dequantize(&stream)
+                .unwrap()
+                .try_index_device(&ids, &stream)
+                .unwrap();
+            let repeated =
+                crate::ops::broadcast_to(&hidden, &[2, block_values as i32], &stream).unwrap();
+            let gate = matmul(
+                &repeated.reshape(&[2, 1, -1], &stream).unwrap(),
+                selected_gate_up
+                    .try_index_device((.., ..intermediate, ..), &stream)
+                    .unwrap()
+                    .swap_axes(-1, -2, &stream)
+                    .unwrap(),
+                &stream,
+            )
+            .unwrap()
+            .reshape(&[2, intermediate], &stream)
+            .unwrap();
+            let up = matmul(
+                &repeated.reshape(&[2, 1, -1], &stream).unwrap(),
+                selected_gate_up
+                    .try_index_device((.., intermediate.., ..), &stream)
+                    .unwrap()
+                    .swap_axes(-1, -2, &stream)
+                    .unwrap(),
+                &stream,
+            )
+            .unwrap()
+            .reshape(&[2, intermediate], &stream)
+            .unwrap();
+            let activated_ref = crate::nn::gelu_approximate(gate, &stream)
+                .unwrap()
+                .multiply(up, &stream)
+                .unwrap();
+            let gate_up_close = activated
+                .all_close(&activated_ref, Some(6e-4), Some(6e-4), None, &stream)
+                .unwrap()
+                .item::<bool>(&stream);
+            if !gate_up_close {
+                eval([&activated, &activated_ref]).unwrap();
+                let actual_evaluated = activated.evaluated().unwrap();
+                let actual_values = actual_evaluated.as_slice::<f32>();
+                let expected_evaluated = activated_ref.evaluated().unwrap();
+                let expected_values = expected_evaluated.as_slice::<f32>();
+                let mismatch =
+                    actual_values
+                        .iter()
+                        .zip(expected_values)
+                        .position(|(&actual, &expected)| {
+                            (actual - expected).abs() > 6e-4 * expected.abs().max(1.0)
+                        });
+                panic!(
+                    "{ty:?} fused Metal gate/up mismatch {mismatch:?}: {:?} != {:?}",
+                    mismatch.map(|index| actual_values[index]),
+                    mismatch.map(|index| expected_values[index])
+                );
+            }
+            let selected_down = down
+                .dequantize(&stream)
+                .unwrap()
+                .try_index_device(&ids, &stream)
+                .unwrap();
+            let projected = matmul(
+                &activated_ref.reshape(&[2, 1, -1], &stream).unwrap(),
+                selected_down.swap_axes(-1, -2, &stream).unwrap(),
+                &stream,
+            )
+            .unwrap()
+            .reshape(&[2, 1], &stream)
+            .unwrap();
+            let expected = sum_axis(
+                projected
+                    .multiply(route_weights.reshape(&[2, 1], &stream).unwrap(), &stream)
+                    .unwrap(),
+                0,
+                true,
+                &stream,
+            )
+            .unwrap();
+            assert!(
+                actual
+                    .all_close(&expected, Some(6e-4), Some(6e-4), None, &stream)
+                    .unwrap()
+                    .item::<bool>(&stream),
+                "{ty:?} fused Metal down/reduce"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn iq_metal_execution_honors_big_endian_block_fields() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        for ty in [GgmlType::IQ4NL, GgmlType::IQ2XS] {
+            let (values, bytes) = ty.block_and_bytes().unwrap();
+            let mut little = (0..bytes)
+                .map(|index| (index * 29 + 7) as u8)
+                .collect::<Vec<_>>();
+            little[..2].copy_from_slice(&half::f16::from_f32(0.75).to_bits().to_le_bytes());
+            let mut big = little.clone();
+            match ty {
+                GgmlType::IQ4NL => big[..2].reverse(),
+                GgmlType::IQ2XS => {
+                    for pair in big[..66].chunks_exact_mut(2) {
+                        pair.reverse();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let input = Array::from_slice(&vec![1.0f32; values as usize], &[1, values as i32])
+                .copy(&stream)
+                .unwrap();
+            let execute = |raw: &[u8], endian| {
+                let packed = Array::from_slice(raw, &[1, bytes as i32])
+                    .copy(&stream)
+                    .unwrap();
+                let native =
+                    NativeQuantizedTensor::from_iq_array(packed, &[1, values as i32], ty, endian)
+                        .unwrap();
+                let output = native.linear(&input, true, &stream).unwrap();
+                eval([&output]).unwrap();
+                output.evaluated().unwrap().as_slice::<f32>()[0]
+            };
+            assert_eq!(
+                execute(&little, GgufEndian::Little).to_bits(),
+                execute(&big, GgufEndian::Big).to_bits(),
+                "{ty:?}"
+            );
+        }
+    }
+
     fn sample_block() -> Vec<u8> {
         let mut block = vec![0u8; 144];
         block[0..2].copy_from_slice(&half::f16::from_f32(0.125).to_bits().to_le_bytes());
@@ -1778,15 +3424,31 @@ mod tests {
         raw.extend(sample_block());
         raw.extend(sample_block());
         let matrix = NativeQuantizedTensor::from_q4k_bytes(&raw, &[2, 256], &stream).unwrap();
+        let dense = matrix.dequantize(&stream).unwrap();
         let input = Array::from_slice(&vec![0.5f32; 512], &[2, 256]);
         let output = matrix.linear(&input, true, &stream).unwrap();
         assert_eq!(output.shape(), &[2, 2]);
+        let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+        assert!(output
+            .all_close(&expected, Some(1e-5), Some(1e-5), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
         let untransposed_input = Array::from_slice(&[0.25f32, -0.5], &[1, 2]);
         let untransposed = matrix.linear(&untransposed_input, false, &stream).unwrap();
         assert_eq!(untransposed.shape(), &[1, 256]);
+        let expected = matmul(&untransposed_input, &dense, &stream).unwrap();
+        assert!(untransposed
+            .all_close(&expected, Some(1e-5), Some(1e-5), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
         let ids = Array::from_slice(&[1i32, 0], &[2]);
         let embedded = matrix.embedding(&ids, &stream).unwrap();
         assert_eq!(embedded.shape(), &[2, 256]);
+        let expected = dense.try_index_device(&ids, &stream).unwrap();
+        assert!(embedded
+            .all_close(&expected, Some(1e-6), Some(1e-6), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
 
         let mut expert_raw = Vec::new();
         for _ in 0..4 {
@@ -1797,6 +3459,23 @@ mod tests {
         let group_ids = Array::from_slice(&[1i32, 0], &[2]);
         let grouped = native_grouped_linear(&input, &experts, &group_ids, &stream).unwrap();
         assert_eq!(grouped.shape(), &[2, 2]);
+        let selected = experts
+            .dequantize(&stream)
+            .unwrap()
+            .try_index_device(&group_ids, &stream)
+            .unwrap();
+        let expected = matmul(
+            &input.reshape(&[2, 1, 256], &stream).unwrap(),
+            selected.swap_axes(-1, -2, &stream).unwrap(),
+            &stream,
+        )
+        .unwrap()
+        .reshape(&[2, 2], &stream)
+        .unwrap();
+        assert!(grouped
+            .all_close(&expected, Some(1e-5), Some(1e-5), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
     }
 
     #[test]
@@ -1830,6 +3509,71 @@ mod tests {
         for (actual, expected) in actual.as_slice::<f32>().iter().zip(reference.dequantize()) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn q5_1_direct_linear_prefill_and_embedding_match_dequantized_reference() {
+        let stream = crate::test_stream();
+        let mut raw = sample_q5_1_block();
+        let mut second = sample_q5_1_block();
+        second[8] ^= 0x5a;
+        raw.extend(second);
+        let native = NativeQuantizedTensor::from_q5_1_bytes(&raw, &[2, 32], stream).unwrap();
+        let input_values = (0..9 * 32)
+            .map(|index| (index as f32 % 29.0 - 14.0) / 20.0)
+            .collect::<Vec<_>>();
+        let input = Array::from_slice(&input_values, &[9, 32]);
+        let actual = native.linear(&input, true, stream).unwrap();
+        let dense = native.dequantize(stream).unwrap();
+        let expected = matmul(&input, dense.transpose(stream).unwrap(), stream).unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-4), Some(2e-4), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+
+        let ids = Array::from_slice(&[1i32, 0, 1], &[3]);
+        let actual = native.embedding(&ids, stream).unwrap();
+        let expected = dense.try_index_device(&ids, stream).unwrap();
+        assert!(actual
+            .all_close(&expected, Some(1e-6), Some(1e-6), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn q5_1_metal_linear_prefill_and_embedding_match_dequantized_reference() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        let mut raw = sample_q5_1_block();
+        let mut second = sample_q5_1_block();
+        second[8] ^= 0x5a;
+        raw.extend(second);
+        let native = NativeQuantizedTensor::from_q5_1_bytes(&raw, &[2, 32], &stream).unwrap();
+        let input = Array::from_slice(
+            &(0..9 * 32)
+                .map(|index| (index as f32 % 29.0 - 14.0) / 20.0)
+                .collect::<Vec<_>>(),
+            &[9, 32],
+        )
+        .copy(&stream)
+        .unwrap();
+        let dense = native.dequantize(&stream).unwrap();
+        let actual = native.linear(&input, true, &stream).unwrap();
+        let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-4), Some(2e-4), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+
+        let ids = Array::from_slice(&[1i32, 0, 1], &[3])
+            .copy(&stream)
+            .unwrap();
+        let actual = native.embedding(&ids, &stream).unwrap();
+        let expected = dense.try_index_device(&ids, &stream).unwrap();
+        assert!(actual
+            .all_close(&expected, Some(1e-6), Some(1e-6), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
     }
 
     #[test]

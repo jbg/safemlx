@@ -61,7 +61,7 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        gguf_affine_configs, gguf_metadata, load_named_array_strict,
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_quantized_strict, load_safetensors_strict, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
     },
@@ -308,7 +308,7 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     #[serde(skip)]
     /// Exact affine settings for mixed GGUF tensors.
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     #[serde(skip)]
     /// Quantization group size for quantized weights.
     pub quantization_group_size: i32,
@@ -426,7 +426,7 @@ impl ModelArgs {
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some((*config).into());
+            return Some(*config);
         }
         self.is_quantized(weight_name)
             .then(|| self.weight_quantization())
@@ -547,6 +547,16 @@ fn maybe_quantized_linear_with_config(
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     match quantization {
+        Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => {
+            Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded_iq(
+                input_dims,
+                output_dims,
+                ggml_type,
+                endian,
+                false,
+                stream,
+            )?))
+        }
         Some(config) => Ok(MaybeQuantized::Quantized(
             nn::QuantizedLinear::unloaded_with_mode(
                 input_dims,
@@ -575,7 +585,16 @@ pub(super) fn maybe_quantized_linear_with_bias(
     bias: bool,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    if let Some(config) = quantization {
+    if let Some(WeightQuantization::GgufIQuant { ggml_type, endian }) = quantization {
+        Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded_iq(
+            input_dims,
+            output_dims,
+            ggml_type,
+            endian,
+            bias,
+            stream,
+        )?))
+    } else if let Some(config) = quantization {
         Ok(MaybeQuantized::Quantized(
             nn::QuantizedLinear::unloaded_with_mode(
                 input_dims,
@@ -1267,6 +1286,12 @@ impl MoeRouter {
 pub struct ExpertProjection {
     /// Quantization encoding, when packed.
     pub quantization: Option<WeightQuantization>,
+    /// Checkpoint-native IQ encoding, when packed as GGML blocks.
+    pub iquant: Option<WeightQuantization>,
+    /// Logical projection input dimension.
+    pub input_dim: i32,
+    /// Logical projection output dimension.
+    pub output_dim: i32,
     /// Optional checkpoint-native expert-major storage.
     pub native: Option<NativeQuantizedTensor>,
     #[param]
@@ -1288,9 +1313,35 @@ impl ExpertProjection {
         quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        if let Some(quantization) = quantization {
+        if let Some(iquant @ WeightQuantization::GgufIQuant { .. }) = quantization {
+            let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+            let (block_values, block_bytes) = ggml_type
+                .block_and_bytes()
+                .expect("canonical IQ block geometry");
+            Ok(Self {
+                quantization: None,
+                iquant: Some(iquant),
+                input_dim,
+                output_dim,
+                native: None,
+                weight: Param::<Array>::unloaded(
+                    &[
+                        num_experts,
+                        output_dim,
+                        input_dim / block_values as i32 * block_bytes as i32,
+                    ],
+                    Dtype::Uint8,
+                    stream,
+                )?,
+                scales: Param::new(None),
+                biases: Param::new(None),
+            })
+        } else if let Some(quantization) = quantization {
             Ok(Self {
                 quantization: Some(quantization),
+                iquant: None,
+                input_dim,
+                output_dim,
                 native: None,
                 weight: Param::<Array>::unloaded(
                     &[
@@ -1331,6 +1382,9 @@ impl ExpertProjection {
         } else {
             Ok(Self {
                 quantization: None,
+                iquant: None,
+                input_dim,
+                output_dim,
                 native: None,
                 weight: Param::<Array>::unloaded(
                     &[num_experts, output_dim, input_dim],
@@ -1361,6 +1415,16 @@ impl ExpertProjection {
     ) -> Result<Array, Exception> {
         if let Some(native) = &self.native {
             return native_grouped_linear(hidden_states, native, group_ids, stream);
+        }
+        if let Some(iquant) = self.iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.weight.dim(0), self.output_dim, self.input_dim],
+                ggml_type,
+                endian,
+            )?;
+            return native_grouped_linear(hidden_states, &native, group_ids, stream);
         }
         if let Some(quantization) = self.quantization {
             affine_grouped_linear_with_options(
@@ -3226,7 +3290,8 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
 
     let mut args = gemma4_args_from_gguf(checkpoint, metadata, weights_stream)?;
-    let mut quantized_weight_configs = gguf_affine_configs(checkpoint, translate_gguf_weight_name)?;
+    let mut quantized_weight_configs =
+        gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     if args.enable_moe_block {
         for layer in 0..args.num_hidden_layers {
             let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
@@ -3321,6 +3386,7 @@ fn load_gemma4_gguf_weights(
                         NativeQuantizedTensor::from_q8_0_bytes(raw.data(), &shape, stream)?
                     }
                     NativeQuantizationFormat::GgufQ5_1 => unreachable!(),
+                    _ => unreachable!("IQ tensors are loaded through the general native path"),
                 };
                 let target = translate_gguf_weight_name(physical_name);
                 if attach_native_quantized(model, &target, native, report)? {

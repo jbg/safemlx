@@ -39,14 +39,14 @@ use crate::{
         },
         input,
     },
-    quantization::{AffineQuantization, WeightQuantization},
+    quantization::WeightQuantization,
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        gguf_affine_configs, gguf_metadata, load_gguf_strict, load_named_array_strict,
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
         load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
     },
@@ -107,7 +107,7 @@ pub struct ModelArgs {
     pub norm_topk_prob: bool,
     /// Per-weight affine settings for mixed GGUF Q2/Q3/Q4/Q5/Q6/Q8 tensors.
     #[serde(skip)]
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 impl ModelArgs {
@@ -121,7 +121,7 @@ impl ModelArgs {
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some((*config).into());
+            return Some(*config);
         }
         let quantization = self.weight_quantization()?;
         match &self.quantized_weights {
@@ -1541,7 +1541,7 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut args =
         qwen3_args_from_gguf(checkpoint, &metadata, &architecture, is_moe, weights_stream)?;
-    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
             let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -1654,7 +1654,7 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut args =
         qwen3_args_from_gguf(checkpoint, metadata, architecture, is_moe, weights_stream)?;
-    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
             let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -2166,11 +2166,11 @@ mod tests {
         args.quantized_weight_configs = Some(HashMap::from([
             (
                 "model.layers.0.mlp.experts.gate_up_proj".into(),
-                AffineQuantization::new(32, 4).unwrap(),
+                AffineQuantization::new(32, 4).unwrap().into(),
             ),
             (
                 "model.layers.0.mlp.experts.down_proj".into(),
-                AffineQuantization::new(32, 4).unwrap(),
+                AffineQuantization::new(32, 4).unwrap().into(),
             ),
         ]));
         let model = super::Model::new(args, ctx.stream()).unwrap();
@@ -2520,7 +2520,7 @@ mod tests {
             .args
             .quantized_weight_configs
             .as_ref()
-            .is_some_and(|configs| configs.values().any(|config| config.bits == 4)));
+            .is_some_and(|configs| configs.values().any(|config| config.bits() == 4)));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
@@ -2551,7 +2551,7 @@ mod tests {
             .as_ref()
             .is_some_and(|configs| configs
                 .values()
-                .any(|config| config.group_size == 16 && config.bits == bits)));
+                .any(|config| config.group_size() == 16 && config.bits() == bits)));
 
         // Keep this above every QMV/QMM crossover so the real-checkpoint test
         // exercises the tiled group-16 prefill kernels in every projection.

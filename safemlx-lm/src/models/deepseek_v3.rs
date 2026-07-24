@@ -13,6 +13,7 @@ use safemlx::{
     fast::ScaledDotProductAttentionMask,
     macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         broadcast_to, concatenate_axis, einsum, gather_grouped_rows, grouped_matmul,
@@ -48,14 +49,15 @@ use crate::{
     },
     error::Error,
     inspection::{ActivationObserver, MoeRoutingObservation},
-    quantization::{quantize_tensor, AffineQuantization, WeightQuantization},
+    quantization::{quantize_tensor, WeightQuantization},
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     weights::{
-        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_quantized_strict,
-        load_array_strict, safetensors_files, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs,
+        load_array_quantized_strict, load_array_strict, safetensors_files, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -310,7 +312,7 @@ pub struct ModelArgs {
     pub quantization: Option<WeightQuantization>,
     /// Per-weight affine settings for mixed-quantization GGUF tensors.
     #[serde(skip)]
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     /// Whether the checkpoint stores per-head MLA K/V reconstruction separately.
     #[serde(skip)]
     pub split_kv_b: bool,
@@ -463,14 +465,17 @@ impl ModelArgs {
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            WeightFormat::Affine((*config).into())
+            match *config {
+                iq @ WeightQuantization::GgufIQuant { .. } => WeightFormat::IQuant(iq),
+                affine => WeightFormat::Affine(affine),
+            }
         } else {
             WeightFormat::Dense
         }
     }
 
     pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
-        self.weight_format_for(weight_name).affine()
+        self.weight_format_for(weight_name).quantization()
     }
 }
 
@@ -1480,6 +1485,12 @@ pub struct RoutedExperts {
     pub up_affine: Option<WeightQuantization>,
     /// Optional affine encoding for the down projection.
     pub down_affine: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the gate projection.
+    pub gate_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the up projection.
+    pub up_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the down projection.
+    pub down_iquant: Option<WeightQuantization>,
     #[param]
     /// Packed gate weights `[experts, intermediate, hidden]`.
     pub gate_proj: Param<Option<Array>>,
@@ -1521,19 +1532,25 @@ pub struct RoutedExperts {
 impl RoutedExperts {
     fn new(args: &ModelArgs, layer: i32) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer}.mlp.experts");
+        let split = |format: WeightFormat| match format.quantization() {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            affine => (affine, None),
+        };
+        let (gate_affine, gate_iquant) =
+            split(args.weight_format_for(&format!("{prefix}.gate_proj")));
+        let (up_affine, up_iquant) = split(args.weight_format_for(&format!("{prefix}.up_proj")));
+        let (down_affine, down_iquant) =
+            split(args.weight_format_for(&format!("{prefix}.down_proj")));
         Ok(Self {
             num_experts: args.n_routed_experts,
             intermediate_size: args.moe_intermediate_size,
             use_fp8: args.native_fp8_config().is_some(),
-            gate_affine: args
-                .weight_format_for(&format!("{prefix}.gate_proj"))
-                .affine(),
-            up_affine: args
-                .weight_format_for(&format!("{prefix}.up_proj"))
-                .affine(),
-            down_affine: args
-                .weight_format_for(&format!("{prefix}.down_proj"))
-                .affine(),
+            gate_affine,
+            up_affine,
+            down_affine,
+            gate_iquant,
+            up_iquant,
+            down_iquant,
             gate_proj: Param::new(None),
             gate_proj_scale_inv: Param::new(None),
             gate_proj_scales: Param::new(None),
@@ -1556,20 +1573,31 @@ impl RoutedExperts {
     ) -> Result<(), Exception> {
         let expert_weight = |output: i32,
                              input: i32,
-                             affine: Option<WeightQuantization>|
+                             affine: Option<WeightQuantization>,
+                             iquant: Option<WeightQuantization>|
          -> Result<Param<Option<Array>>, Exception> {
-            let packed_input = affine.map_or(input, |quantization| {
-                quantized_packed_dimension(input, quantization.bits())
-            });
+            let (packed_input, dtype) = if let Some(iquant) = iquant {
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (block_values, block_bytes) = ggml_type
+                    .block_and_bytes()
+                    .expect("canonical IQ block geometry");
+                (
+                    input / block_values as i32 * block_bytes as i32,
+                    Dtype::Uint8,
+                )
+            } else if let Some(quantization) = affine {
+                (
+                    quantized_packed_dimension(input, quantization.bits()),
+                    Dtype::Uint32,
+                )
+            } else if args.native_fp8_config().is_some() {
+                (input, Dtype::Uint8)
+            } else {
+                (input, Dtype::Float32)
+            };
             Param::<Option<Array>>::unloaded_some(
                 &[args.n_routed_experts, output, packed_input],
-                if args.native_fp8_config().is_some() {
-                    Dtype::Uint8
-                } else if affine.is_some() {
-                    Dtype::Uint32
-                } else {
-                    Dtype::Float32
-                },
+                dtype,
                 stream,
             )
         };
@@ -1613,6 +1641,7 @@ impl RoutedExperts {
             args.moe_intermediate_size,
             args.hidden_size,
             self.gate_affine,
+            self.gate_iquant,
         )?;
         self.gate_proj_scale_inv = fp8_scale(args.moe_intermediate_size, args.hidden_size)?;
         self.gate_proj_scales = affine_component(
@@ -1627,7 +1656,12 @@ impl RoutedExperts {
             self.gate_affine,
             true,
         )?;
-        self.up_proj = expert_weight(args.moe_intermediate_size, args.hidden_size, self.up_affine)?;
+        self.up_proj = expert_weight(
+            args.moe_intermediate_size,
+            args.hidden_size,
+            self.up_affine,
+            self.up_iquant,
+        )?;
         self.up_proj_scale_inv = fp8_scale(args.moe_intermediate_size, args.hidden_size)?;
         self.up_proj_scales = affine_component(
             args.moe_intermediate_size,
@@ -1645,6 +1679,7 @@ impl RoutedExperts {
             args.hidden_size,
             args.moe_intermediate_size,
             self.down_affine,
+            self.down_iquant,
         )?;
         self.down_proj_scale_inv = fp8_scale(args.hidden_size, args.moe_intermediate_size)?;
         self.down_proj_scales = affine_component(
@@ -1683,10 +1718,21 @@ impl RoutedExperts {
         affine_scales: Option<&Array>,
         affine_biases: Option<&Array>,
         affine: Option<WeightQuantization>,
+        iquant: Option<WeightQuantization>,
+        logical_shape: &[i32],
         group_ids: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if let Some(affine) = affine {
+        if let Some(iquant) = iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                weight.clone(),
+                logical_shape,
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(input, &native, group_ids, stream)
+        } else if let Some(affine) = affine {
             common::moe::affine_grouped_linear(
                 input,
                 weight,
@@ -1733,6 +1779,12 @@ impl RoutedExperts {
             self.gate_proj_scales.as_ref().as_ref(),
             self.gate_proj_biases.as_ref().as_ref(),
             self.gate_affine,
+            self.gate_iquant,
+            &[
+                self.num_experts,
+                self.intermediate_size,
+                hidden_states.dim(-1),
+            ],
             &plan.sorted_group_ids,
             stream,
         )?;
@@ -1747,6 +1799,12 @@ impl RoutedExperts {
             self.up_proj_scales.as_ref().as_ref(),
             self.up_proj_biases.as_ref().as_ref(),
             self.up_affine,
+            self.up_iquant,
+            &[
+                self.num_experts,
+                self.intermediate_size,
+                hidden_states.dim(-1),
+            ],
             &plan.sorted_group_ids,
             stream,
         )?;
@@ -1763,6 +1821,12 @@ impl RoutedExperts {
             self.down_proj_scales.as_ref().as_ref(),
             self.down_proj_biases.as_ref().as_ref(),
             self.down_affine,
+            self.down_iquant,
+            &[
+                self.num_experts,
+                hidden_states.dim(-1),
+                self.intermediate_size,
+            ],
             &plan.sorted_group_ids,
             stream,
         )?;
@@ -3383,8 +3447,10 @@ pub(crate) fn prepare_gguf_checkpoint(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let mut args = args_from_gguf(checkpoint, metadata, weights_stream)?;
-    args.quantized_weight_configs =
-        Some(gguf_affine_configs(checkpoint, translate_gguf_weight_name)?);
+    args.quantized_weight_configs = Some(gguf_quantization_configs(
+        checkpoint,
+        translate_gguf_weight_name,
+    )?);
     if let Some(quantization) = quantization {
         args.quantization = Some(quantization);
         args.quantization_config = None;

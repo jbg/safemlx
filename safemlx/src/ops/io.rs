@@ -472,6 +472,15 @@ mod tests {
             ("q6_k.weight", safemlx_gguf::GgmlType::Q6K),
             ("q5_0.weight", safemlx_gguf::GgmlType::Q5_0),
             ("q5_1.weight", safemlx_gguf::GgmlType::Q5_1),
+            ("iq2_xxs.weight", safemlx_gguf::GgmlType::IQ2XXS),
+            ("iq2_xs.weight", safemlx_gguf::GgmlType::IQ2XS),
+            ("iq3_xxs.weight", safemlx_gguf::GgmlType::IQ3XXS),
+            ("iq1_s.weight", safemlx_gguf::GgmlType::IQ1S),
+            ("iq4_nl.weight", safemlx_gguf::GgmlType::IQ4NL),
+            ("iq3_s.weight", safemlx_gguf::GgmlType::IQ3S),
+            ("iq2_s.weight", safemlx_gguf::GgmlType::IQ2S),
+            ("iq4_xs.weight", safemlx_gguf::GgmlType::IQ4XS),
+            ("iq1_m.weight", safemlx_gguf::GgmlType::IQ1M),
         ];
         let payloads = formats
             .iter()
@@ -502,19 +511,29 @@ mod tests {
             )
             .unwrap();
         let (arrays, _) = collect_gguf(&path);
-        for (name, _) in &formats {
+        for (name, ty) in &formats {
             let prefix = name.strip_suffix(".weight").unwrap();
-            assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint32);
-            assert_eq!(
-                arrays[&format!("{prefix}.scales")].dtype(),
-                crate::Dtype::Float16
-            );
-            assert_eq!(
-                arrays[&format!("{prefix}.biases")].dtype(),
-                crate::Dtype::Float16
-            );
+            if ty.is_iq() {
+                assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint8);
+                assert_eq!(
+                    arrays[*name].size(),
+                    ty.block_and_bytes().unwrap().1 as usize
+                );
+                assert!(!arrays.contains_key(&format!("{prefix}.scales")));
+                assert!(!arrays.contains_key(&format!("{prefix}.biases")));
+            } else {
+                assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint32);
+                assert_eq!(
+                    arrays[&format!("{prefix}.scales")].dtype(),
+                    crate::Dtype::Float16
+                );
+                assert_eq!(
+                    arrays[&format!("{prefix}.biases")].dtype(),
+                    crate::Dtype::Float16
+                );
+            }
         }
-        assert_eq!(arrays.len(), 30);
+        assert_eq!(arrays.len(), 39);
 
         #[cfg(feature = "metal")]
         if crate::metal::is_available().unwrap_or(false) {

@@ -343,8 +343,7 @@ impl NemotronHLayerwiseAdapter {
         let embeddings = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization_for("model.embeddings.weight")
-                .map(Into::into),
+            args.weight_quantization_for("model.embeddings.weight"),
             stream,
         )?;
         let norm = nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, Dtype::Float32, stream)?;
@@ -355,8 +354,7 @@ impl NemotronHLayerwiseAdapter {
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                args.affine_quantization_for("lm_head.weight")
-                    .map(Into::into),
+                args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?)
         };
@@ -800,9 +798,9 @@ impl GeneralLayerwiseModelAdapter for NemotronHLayerwiseAdapter {
                         self.args.moe_intermediate_size,
                         [
                             self.args
-                                .affine_quantization_for(&format!("{prefix}.up_proj")),
+                                .weight_quantization_for(&format!("{prefix}.up_proj")),
                             self.args
-                                .affine_quantization_for(&format!("{prefix}.down_proj")),
+                                .weight_quantization_for(&format!("{prefix}.down_proj")),
                         ],
                         stream,
                     )?;

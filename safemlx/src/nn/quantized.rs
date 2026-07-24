@@ -3,7 +3,7 @@ use std::iter::once;
 use crate::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
-    native_quantization::NativeQuantizedTensor,
+    native_quantization::{NativeQuantizationFormat, NativeQuantizedTensor},
     ops::indexing::TryIndexOp,
     ops::{
         self, dequantize_with_mode, quantized_matmul_with_mode, quantized_packed_dimension,
@@ -12,6 +12,7 @@ use crate::{
     quantization::Quantizable,
     Array, Dtype, Stream,
 };
+use safemlx_gguf::{Endian as GgufEndian, GgmlType};
 use safemlx_macros::ModuleParameters;
 
 use crate::nn::{Embedding, Linear};
@@ -71,6 +72,15 @@ pub struct QuantizedEmbedding {
 
     /// Optional checkpoint-native storage used instead of affine parameters.
     pub native: Option<NativeQuantizedTensor>,
+
+    /// Checkpoint-native IQ format stored in `inner.weight`.
+    pub native_format: Option<NativeQuantizationFormat>,
+
+    /// Byte order of checkpoint-native IQ blocks.
+    pub native_endian: GgufEndian,
+
+    /// Logical input width represented by checkpoint-native IQ blocks.
+    pub native_columns: i32,
 
     /// Scales
     #[param]
@@ -160,6 +170,9 @@ fn build_quantized_embedding_inner(
         bits,
         mode,
         native: None,
+        native_format: None,
+        native_endian: GgufEndian::Little,
+        native_columns: 0,
         scales: Param::new(arrays.scales),
         biases: Param::new(arrays.biases),
         inner,
@@ -244,6 +257,9 @@ impl QuantizedEmbedding {
             bits,
             mode,
             native: None,
+            native_format: None,
+            native_endian: GgufEndian::Little,
+            native_columns: 0,
             scales: Param::<Array>::unloaded(
                 &[embedding_count, dimensions / group_size],
                 scale_dtype,
@@ -262,6 +278,45 @@ impl QuantizedEmbedding {
         };
         qe.freeze_parameters(true);
         Ok(qe)
+    }
+
+    /// Creates an unloaded embedding backed by checkpoint-native GGML IQ rows.
+    pub fn unloaded_iq(
+        embedding_count: i32,
+        dimensions: i32,
+        ggml_type: GgmlType,
+        endian: GgufEndian,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let format = NativeQuantizationFormat::from_ggml_type(ggml_type)
+            .ok_or_else(|| Exception::custom(format!("{ggml_type:?} is not an IQ type")))?;
+        let (block_values, block_bytes) = format.block_geometry();
+        if dimensions <= 0 || dimensions % block_values != 0 {
+            return Err(Exception::custom(format!(
+                "IQ embedding width {dimensions} is not divisible by {block_values}"
+            )));
+        }
+        let stream = stream.as_ref();
+        let mut embedding = Self {
+            group_size: block_values,
+            bits: block_bytes,
+            mode: QuantizationMode::Affine,
+            native: None,
+            native_format: Some(format),
+            native_endian: endian,
+            native_columns: dimensions,
+            scales: Param::<Array>::unloaded(&[1], Dtype::Float32, stream)?,
+            biases: Param::new(None),
+            inner: Embedding {
+                weight: Param::<Array>::unloaded(
+                    &[embedding_count, dimensions / block_values * block_bytes],
+                    Dtype::Uint8,
+                    stream,
+                )?,
+            },
+        };
+        embedding.freeze_parameters(true);
+        Ok(embedding)
     }
 
     /// Create a new quantized embedding using `stream` for quantization.
@@ -309,6 +364,15 @@ impl QuantizedEmbedding {
         if let Some(native) = &self.native {
             return native.linear(x.as_ref(), true, stream);
         }
+        if let Some(format) = self.native_format {
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.inner.weight.value.clone(),
+                &[self.inner.weight.value.dim(0), self.native_columns],
+                format.ggml_type().expect("IQ format"),
+                self.native_endian,
+            )?;
+            return native.linear(x.as_ref(), true, stream);
+        }
         quantized_matmul_with_mode(
             x.as_ref(),
             &self.inner.weight,
@@ -329,6 +393,15 @@ impl Module<&Array> for QuantizedEmbedding {
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         if let Some(native) = &self.native {
+            return native.embedding(x, stream);
+        }
+        if let Some(format) = self.native_format {
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.inner.weight.value.clone(),
+                &[self.inner.weight.value.dim(0), self.native_columns],
+                format.ggml_type().expect("IQ format"),
+                self.native_endian,
+            )?;
             return native.embedding(x, stream);
         }
         let s = x.shape();
@@ -464,6 +537,9 @@ fn build_quantized_linear_inner(
         bits,
         mode,
         native: None,
+        native_format: None,
+        native_endian: GgufEndian::Little,
+        native_columns: 0,
         scales: Param::new(arrays.scales),
         biases: Param::new(arrays.biases),
         inner,
@@ -516,6 +592,15 @@ pub struct QuantizedLinear {
 
     /// Optional checkpoint-native storage used instead of affine parameters.
     pub native: Option<NativeQuantizedTensor>,
+
+    /// Checkpoint-native IQ format stored in `inner.weight`.
+    pub native_format: Option<NativeQuantizationFormat>,
+
+    /// Byte order of checkpoint-native IQ blocks.
+    pub native_endian: GgufEndian,
+
+    /// Logical input width represented by checkpoint-native IQ blocks.
+    pub native_columns: i32,
 
     /// Scales
     #[param]
@@ -596,6 +681,9 @@ impl QuantizedLinear {
             bits,
             mode,
             native: None,
+            native_format: None,
+            native_endian: GgufEndian::Little,
+            native_columns: 0,
             scales: Param::<Array>::unloaded(
                 &[output_dims, input_dims / group_size],
                 scale_dtype,
@@ -614,6 +702,52 @@ impl QuantizedLinear {
         };
         ql.freeze_parameters(true);
         Ok(ql)
+    }
+
+    /// Creates an unloaded linear layer backed by checkpoint-native GGML IQ rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unloaded_iq(
+        input_dims: i32,
+        output_dims: i32,
+        ggml_type: GgmlType,
+        endian: GgufEndian,
+        bias: bool,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Self, Exception> {
+        let format = NativeQuantizationFormat::from_ggml_type(ggml_type)
+            .ok_or_else(|| Exception::custom(format!("{ggml_type:?} is not an IQ type")))?;
+        let (block_values, block_bytes) = format.block_geometry();
+        if input_dims <= 0 || input_dims % block_values != 0 {
+            return Err(Exception::custom(format!(
+                "IQ linear width {input_dims} is not divisible by {block_values}"
+            )));
+        }
+        let stream = stream.as_ref();
+        let mut linear = Self {
+            group_size: block_values,
+            bits: block_bytes,
+            mode: QuantizationMode::Affine,
+            native: None,
+            native_format: Some(format),
+            native_endian: endian,
+            native_columns: input_dims,
+            scales: Param::<Array>::unloaded(&[1], Dtype::Float32, stream)?,
+            biases: Param::new(None),
+            inner: Linear {
+                weight: Param::<Array>::unloaded(
+                    &[output_dims, input_dims / block_values * block_bytes],
+                    Dtype::Uint8,
+                    stream,
+                )?,
+                bias: if bias {
+                    Param::<Option<Array>>::unloaded_some(&[output_dims], Dtype::Float32, stream)?
+                } else {
+                    Param::new(None)
+                },
+            },
+        };
+        linear.freeze_parameters(true);
+        Ok(linear)
     }
 
     /// Create a new quantized linear layer using `stream` for quantization.
@@ -657,6 +791,19 @@ impl Module<&Array> for QuantizedLinear {
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
         if let Some(native) = &self.native {
+            let mut output = native.linear(x, true, stream)?;
+            if let Some(bias) = &self.inner.bias.value {
+                output = output.add(bias, stream)?;
+            }
+            return Ok(output);
+        }
+        if let Some(format) = self.native_format {
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.inner.weight.value.clone(),
+                &[self.inner.weight.value.dim(0), self.native_columns],
+                format.ggml_type().expect("IQ format"),
+                self.native_endian,
+            )?;
             let mut output = native.linear(x, true, stream)?;
             if let Some(bias) = &self.inner.bias.value {
                 output = output.add(bias, stream)?;

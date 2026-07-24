@@ -113,6 +113,9 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
                 assert_eq!(dtype, "Float16");
                 assert_eq!(d.data, unhex(data), "legacy dense output for {code}");
             }
+            ConvertedTensor::IQuant(_) => {
+                panic!("legacy affine oracle does not contain IQ tensors")
+            }
         }
     }
 }
@@ -202,8 +205,8 @@ fn assert_q5_repacked(ty: GgmlType, scales: [f32; 2], biases: [f32; 2]) {
     for block in 0..2 {
         let d = half::f16::from_f32(scales[block]).to_f32();
         let m = half::f16::from_f32(biases[block]).to_f32();
-        for index in 0..32 {
-            let code = i32::from(codes[block][index]);
+        for (index, code) in codes[block].iter().copied().enumerate() {
+            let code = i32::from(code);
             let expected = if ty == GgmlType::Q5_0 {
                 d * (code - 16) as f32
             } else {

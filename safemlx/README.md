@@ -22,6 +22,28 @@ dense array or one atomic affine weight/scales/biases group.
 `GgufCheckpoint::materializer` provides indexed named access while reusing one
 open shard reader, which is useful for bounded multi-tensor model transforms.
 
+## Checkpoint-native quantization
+
+`native_quantization` retains Q4_K, Q5_1, Q8_0, and the canonical GGML IQ
+encodings as their original packed blocks. On Metal, decode and prefill use
+direct packed kernels; prefill reuses decoded weights across eight activation
+rows at a time. IQ routed experts also fuse gate/GELU/up and
+down/route-weight/reduction operations. Embedding and grouped linear operations
+do not require a persistent dense copy.
+
+CPU execution is bounded as well: it decodes one logical weight row at a time
+and accumulates directly into the result. Peak scratch is proportional to one
+row, not the full matrix. This preserves packed resident memory, although the
+custom kernels remain correctness-first and can be slower than dense F16 for
+small matrices. Run the reproducible packed-versus-dense microbenchmark with:
+
+```console
+cargo bench -p safemlx --bench native_quantization
+```
+
+`SAFEMLX_BENCH_ROWS`, `SAFEMLX_BENCH_COLUMNS`, and
+`SAFEMLX_BENCH_ITERS` control its dimensions and sample count.
+
 ## Features
 
 - `accelerate`: enables Accelerate-backed MLX operations.

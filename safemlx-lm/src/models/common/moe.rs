@@ -4,6 +4,7 @@ use safemlx::{
     error::Exception,
     macros::ModuleParameters,
     module::Param,
+    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     ops::{
         arange, argpartition_axis, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode,
         gather_route_values, grouped_matmul,
@@ -698,6 +699,10 @@ pub struct PackedSwiGluExperts {
     pub gate_up_affine: Option<WeightQuantization>,
     /// Optional encoding for the down projection.
     pub down_affine: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the gate/up projection.
+    pub gate_up_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the down projection.
+    pub down_iquant: Option<WeightQuantization>,
     #[param]
     /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
     pub gate_up_proj: Param<Array>,
@@ -730,11 +735,38 @@ impl PackedSwiGluExperts {
         down_affine: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let (gate_up_affine, gate_up_iquant) = match gate_up_affine {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            affine => (affine, None),
+        };
+        let (down_affine, down_iquant) = match down_affine {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            affine => (affine, None),
+        };
         let projection = |out_features: i32,
                           in_features: i32,
-                          quantization: Option<WeightQuantization>|
+                          quantization: Option<WeightQuantization>,
+                          iquant: Option<WeightQuantization>|
          -> Result<ExpertProjectionParams, Exception> {
-            if let Some(quantization) = quantization {
+            if let Some(iquant) = iquant {
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (block_values, block_bytes) = ggml_type
+                    .block_and_bytes()
+                    .expect("canonical IQ block geometry");
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / block_values as i32 * block_bytes as i32,
+                        ],
+                        Dtype::Uint8,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ))
+            } else if let Some(quantization) = quantization {
                 Ok((
                     Param::<Array>::unloaded(
                         &[
@@ -784,16 +816,22 @@ impl PackedSwiGluExperts {
                 ))
             }
         };
-        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) =
-            projection(2 * intermediate_dim, hidden_dim, gate_up_affine)?;
+        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = projection(
+            2 * intermediate_dim,
+            hidden_dim,
+            gate_up_affine,
+            gate_up_iquant,
+        )?;
         let (down_proj, down_proj_scales, down_proj_biases) =
-            projection(hidden_dim, intermediate_dim, down_affine)?;
+            projection(hidden_dim, intermediate_dim, down_affine, down_iquant)?;
         Ok(Self {
             num_experts,
             hidden_dim,
             intermediate_dim,
             gate_up_affine,
             down_affine,
+            gate_up_iquant,
+            down_iquant,
             gate_up_proj,
             gate_up_proj_scales,
             gate_up_proj_biases,
@@ -813,7 +851,16 @@ impl PackedSwiGluExperts {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let Some(quantization) = self.gate_up_affine {
+        let gate_up = if let Some(iquant) = self.gate_up_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.gate_up_proj.value.clone(),
+                &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(quantization) = self.gate_up_affine {
             affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -838,7 +885,16 @@ impl PackedSwiGluExperts {
         let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
         let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
         let activated = silu(gate, stream)?.multiply(up, stream)?;
-        let output = if let Some(quantization) = self.down_affine {
+        let output = if let Some(iquant) = self.down_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.down_proj.value.clone(),
+                &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&activated, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(quantization) = self.down_affine {
             affine_grouped_linear(
                 &activated,
                 self.down_proj.as_ref(),

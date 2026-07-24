@@ -47,6 +47,10 @@ pretty_assertions = "1"
 float_eq = "1"
 tempfile = "3"
 
+[[bench]]
+name = "native_quantization"
+harness = false
+
 [features]
 default = ["accelerate", "metal"]
 

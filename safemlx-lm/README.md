@@ -332,8 +332,8 @@ MLX's 32-value affine groups, while Q2_K, Q3_K, and Q6_K map exactly to
 16-value affine groups. Group-16 K-quants use tiled quantized matrix kernels for
 prefill and the corresponding vector kernels for decode. These formats execute
 without expanding matrix weights to float16.
-Q5_0 and Q5_1 tensors are converted to float16 while loading; unsupported GGUF
-tensor types return an error. Model dispatch uses
+Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
+layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
 `gemma4`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
@@ -355,6 +355,40 @@ Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
 GGUFs retain their supported packed affine weights while the vision projector
 remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
 currently handled.
+
+GGUF IQ tensors are also model-loadable: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S,
+IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, and IQ1_M. Their nonlinear codebooks cannot be
+represented faithfully by MLX affine weights/scales/biases. Safemlx therefore
+retains the original GGML blocks as `uint8` device parameters. Linear,
+embedding, and grouped routed-expert operations decode codebook values directly
+inside Metal kernels, without a persistent dense or affine copy. Resident
+storage stays at the GGUF encoding's native bytes-per-weight. Prefill kernels
+reuse each decoded block across tiles of eight activation rows. Routed IQ
+experts fuse gate/GELU/up and fuse down projection, route weighting, and
+reduction, avoiding intermediate dense expert weights. Q4_K, Q5_1, and Q8_0
+checkpoint-native linear paths use the same activation-row tiling where
+applicable.
+
+CPU execution no longer creates a transient dense weight matrix. It streams one
+packed logical row into F32 scratch and immediately consumes it; scratch memory
+is therefore proportional to the tensor width rather than its full element
+count. These direct kernels preserve the packed-memory advantage, but they
+remain correctness-first implementations and may trail highly tuned dense or
+llama.cpp kernels for some shapes. The
+`safemlx/benches/native_quantization.rs` benchmark reports packed and dense-F16
+decode/prefill medians:
+
+```console
+cargo bench -p safemlx --bench native_quantization
+```
+
+Names such as IQ2_M, IQ3_M, UD-IQ2_M, UD-Q2_K_XL, and UD-Q3_K_M describe
+mixed-precision file recipes rather than extra tensor type codes. Recipe files
+are tensor-format compatible when each contained tensor uses a supported
+encoding. This includes UD-IQ2_XXS, UD-IQ2_M, UD-Q2_K_XL with IQ4_NL,
+UD-IQ3_XXS, UD-IQ3_S, UD-Q3_K_M or UD-Q3_K_XL with IQ4_NL, UD-IQ4_XS, and
+UD-IQ4_NL. Historical codes 36-38 named IQ4_NL_4_4, IQ4_NL_4_8, and
+IQ4_NL_8_8 are removed upstream runtime layouts, not canonical GGUF encodings.
 
 ## Usage
 

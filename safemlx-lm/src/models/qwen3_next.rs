@@ -246,8 +246,8 @@ fn validate_affine_fused_component(
     Ok(())
 }
 
-pub(crate) fn split_fused_projection_configs(
-    configs: &mut std::collections::HashMap<String, AffineQuantization>,
+pub(crate) fn split_fused_projection_configs<T: Copy>(
+    configs: &mut std::collections::HashMap<String, T>,
 ) -> Result<(), Error> {
     let fused = configs
         .keys()

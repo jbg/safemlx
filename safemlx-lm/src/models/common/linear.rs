@@ -52,6 +52,16 @@ pub fn unloaded_maybe_quantized_linear(
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     match quantization {
+        Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => {
+            Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded_iq(
+                input_dims,
+                output_dims,
+                ggml_type,
+                endian,
+                bias,
+                stream,
+            )?))
+        }
         Some(config) => Ok(MaybeQuantized::Quantized(
             nn::QuantizedLinear::unloaded_with_mode(
                 input_dims,
@@ -81,6 +91,15 @@ pub fn unloaded_maybe_quantized_embedding(
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
     match quantization {
+        Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => Ok(
+            MaybeQuantized::Quantized(nn::QuantizedEmbedding::unloaded_iq(
+                embedding_count,
+                dimensions,
+                ggml_type,
+                endian,
+                stream,
+            )?),
+        ),
         Some(config) => Ok(MaybeQuantized::Quantized(
             nn::QuantizedEmbedding::unloaded_with_mode(
                 embedding_count,

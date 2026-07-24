@@ -343,6 +343,9 @@ impl QuantizedAllToShardedLinear {
             bits: linear.bits,
             mode: linear.mode,
             native: None,
+            native_format: None,
+            native_endian: safemlx_gguf::Endian::Little,
+            native_columns: 0,
             scales: Param::new(shard_axis(
                 &linear.scales.value,
                 0,
@@ -491,6 +494,9 @@ impl QuantizedShardedToAllLinear {
             bits: linear.bits,
             mode: linear.mode,
             native: None,
+            native_format: None,
+            native_endian: safemlx_gguf::Endian::Little,
+            native_columns: 0,
             scales: Param::new(shard_axis(
                 &linear.scales.value,
                 1,

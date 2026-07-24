@@ -220,6 +220,14 @@ impl MetadataValue {
 }
 
 /// GGML tensor encodings relevant to the safemlx public path.
+///
+/// Numeric codes and block geometry are pinned to llama.cpp commit
+/// `c0bc8591e8815c63cb01dd3f051a8b0df02501c9` (`ggml/include/ggml.h`,
+/// `ggml/src/ggml-common.h`, and `ggml/src/ggml.c`). The three
+/// `IQ4_NL_*_*` entries are retained only so their historical numeric codes do
+/// not become [`Unknown`](Self::Unknown): that upstream revision explicitly
+/// marks them as removed runtime-repacking layouts with zero block and type
+/// sizes, not GGUF tensor encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
     F32,
@@ -234,12 +242,24 @@ pub enum GgmlType {
     Q4K,
     Q5K,
     Q6K,
+    IQ2XXS,
+    IQ2XS,
+    IQ3XXS,
+    IQ1S,
+    IQ4NL,
+    IQ3S,
+    IQ2S,
+    IQ4XS,
     I8,
     I16,
     I32,
     I64,
     F64,
+    IQ1M,
     Bf16,
+    RemovedIQ4NL4_4,
+    RemovedIQ4NL4_8,
+    RemovedIQ4NL8_8,
     Unknown(u32),
 }
 
@@ -258,12 +278,24 @@ impl GgmlType {
             12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
+            16 => Self::IQ2XXS,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            19 => Self::IQ1S,
+            20 => Self::IQ4NL,
+            21 => Self::IQ3S,
+            22 => Self::IQ2S,
+            23 => Self::IQ4XS,
             24 => Self::I8,
             25 => Self::I16,
             26 => Self::I32,
             27 => Self::I64,
             28 => Self::F64,
+            29 => Self::IQ1M,
             30 => Self::Bf16,
+            36 => Self::RemovedIQ4NL4_4,
+            37 => Self::RemovedIQ4NL4_8,
+            38 => Self::RemovedIQ4NL8_8,
             other => Self::Unknown(other),
         }
     }
@@ -281,12 +313,24 @@ impl GgmlType {
             Self::Q4K => 12,
             Self::Q5K => 13,
             Self::Q6K => 14,
+            Self::IQ2XXS => 16,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ1S => 19,
+            Self::IQ4NL => 20,
+            Self::IQ3S => 21,
+            Self::IQ2S => 22,
+            Self::IQ4XS => 23,
             Self::I8 => 24,
             Self::I16 => 25,
             Self::I32 => 26,
             Self::I64 => 27,
             Self::F64 => 28,
+            Self::IQ1M => 29,
             Self::Bf16 => 30,
+            Self::RemovedIQ4NL4_4 => 36,
+            Self::RemovedIQ4NL4_8 => 37,
+            Self::RemovedIQ4NL8_8 => 38,
             Self::Unknown(v) => v,
         }
     }
@@ -307,8 +351,36 @@ impl GgmlType {
             Self::Q4K => Ok((256, 144)),
             Self::Q5K => Ok((256, 176)),
             Self::Q6K => Ok((256, 210)),
+            Self::IQ2XXS => Ok((256, 66)),
+            Self::IQ2XS => Ok((256, 74)),
+            Self::IQ3XXS => Ok((256, 98)),
+            Self::IQ1S => Ok((256, 50)),
+            Self::IQ4NL => Ok((32, 18)),
+            Self::IQ3S => Ok((256, 110)),
+            Self::IQ2S => Ok((256, 82)),
+            Self::IQ4XS => Ok((256, 136)),
+            Self::IQ1M => Ok((256, 56)),
+            Self::RemovedIQ4NL4_4 | Self::RemovedIQ4NL4_8 | Self::RemovedIQ4NL8_8 => {
+                Err(Error::UnsupportedTensorType(self.code()))
+            }
             Self::Unknown(v) => Err(Error::UnsupportedTensorType(v)),
         }
+    }
+
+    /// Whether this is one of the nine canonical, on-disk GGML IQ encodings.
+    pub fn is_iq(self) -> bool {
+        matches!(
+            self,
+            Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ3XXS
+                | Self::IQ1S
+                | Self::IQ4NL
+                | Self::IQ3S
+                | Self::IQ2S
+                | Self::IQ4XS
+                | Self::IQ1M
+        )
     }
 }
 

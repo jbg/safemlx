@@ -36,14 +36,14 @@ use crate::{
         input,
         qwen3::{gguf_i32, gguf_string},
     },
-    quantization::{AffineQuantization, WeightQuantization},
+    quantization::WeightQuantization,
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
     weights::{
-        gguf_affine_configs, gguf_metadata, load_named_array_strict,
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
         load_safetensors_dir_strict_with_split_swiglu_experts, GgufTensorNames, StrictLoadConfig,
         StrictLoadReport,
@@ -185,7 +185,7 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight affine layouts populated by GGUF loading.
     #[serde(skip)]
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 impl ModelArgs {
@@ -238,7 +238,7 @@ impl ModelArgs {
             .as_ref()
             .and_then(|configs| configs.get(weight_name))
         {
-            return Some((*config).into());
+            return Some(*config);
         }
         let quantization = self.weight_quantization()?;
         match &self.quantized_weights {
@@ -1316,7 +1316,7 @@ pub(crate) fn load_gguf_checkpoint(
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in args.num_dense_layers..args.num_hidden_layers {
             let prefix = format!("model.layers.{layer}.feed_forward.experts");
@@ -1431,7 +1431,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut configs = gguf_affine_configs(checkpoint, translate)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in args.num_dense_layers..args.num_hidden_layers {
             let prefix = format!("model.layers.{layer}.feed_forward.experts");

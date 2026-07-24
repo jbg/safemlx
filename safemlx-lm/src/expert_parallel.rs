@@ -2826,8 +2826,8 @@ fn execute_cached_nemotron_h(
         args.hidden_size,
         args.moe_intermediate_size,
         [
-            args.affine_quantization_for(&format!("{prefix}.up_proj")),
-            args.affine_quantization_for(&format!("{prefix}.down_proj")),
+            args.weight_quantization_for(&format!("{prefix}.up_proj")),
+            args.weight_quantization_for(&format!("{prefix}.down_proj")),
         ],
         stream,
     )?;

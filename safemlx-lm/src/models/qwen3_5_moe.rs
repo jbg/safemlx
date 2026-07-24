@@ -9,6 +9,7 @@ use safemlx::{
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, grouped_matmul,
@@ -52,7 +53,7 @@ use crate::{
         AttentionMask,
     },
     weights::{
-        for_each_safetensor_array, gguf_affine_configs, gguf_metadata, load_array_strict,
+        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
         load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
         load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
         StrictLoadReport,
@@ -301,7 +302,7 @@ pub struct ModelArgs {
     pub quantization: Option<WeightQuantization>,
     #[serde(skip)]
     /// Exact GGUF affine settings keyed by runtime weight name.
-    pub quantized_weight_configs: Option<HashMap<String, AffineQuantization>>,
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -493,17 +494,26 @@ impl ModelArgs {
         self.quantization_config.is_some()
     }
 
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    fn quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         self.quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(weight_name).copied())
     }
 
     fn weight_format_for(&self, weight_name: &str, fallback: QwenWeightFormat) -> QwenWeightFormat {
-        self.affine_quantization_for(weight_name)
-            .map(WeightQuantization::from)
-            .map(QwenWeightFormat::Affine)
+        self.quantization_for(weight_name)
+            .map(|format| match format {
+                iq @ WeightQuantization::GgufIQuant { .. } => QwenWeightFormat::IQuant(iq),
+                affine => QwenWeightFormat::Affine(affine),
+            })
             .unwrap_or(fallback)
+    }
+
+    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+        match self.quantization_for(weight_name) {
+            Some(WeightQuantization::Affine(affine)) => Some(affine),
+            _ => None,
+        }
     }
 
     pub(crate) fn is_moe(&self) -> bool {
@@ -555,11 +565,13 @@ pub(crate) enum QwenWeightFormat {
     Dense,
     Fp8,
     Affine(WeightQuantization),
+    IQuant(WeightQuantization),
 }
 
 impl QwenWeightFormat {
     pub(crate) fn for_text(args: &ModelArgs, affine: Option<WeightQuantization>) -> Self {
         match affine.or(args.quantization) {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => Self::IQuant(iq),
             Some(affine) => Self::Affine(affine),
             None if args.uses_fp8() => Self::Fp8,
             None => Self::Dense,
@@ -569,7 +581,21 @@ impl QwenWeightFormat {
     pub(crate) fn affine(self) -> Option<WeightQuantization> {
         match self {
             Self::Affine(affine) => Some(affine),
+            Self::Dense | Self::Fp8 | Self::IQuant(_) => None,
+        }
+    }
+
+    pub(crate) fn quantization(self) -> Option<WeightQuantization> {
+        match self {
+            Self::Affine(quantization) | Self::IQuant(quantization) => Some(quantization),
             Self::Dense | Self::Fp8 => None,
+        }
+    }
+
+    fn iquant(self) -> Option<WeightQuantization> {
+        match self {
+            Self::IQuant(iq) => Some(iq),
+            _ => None,
         }
     }
 }
@@ -602,6 +628,8 @@ pub struct QwenLinear {
     pub bits: i32,
     /// Quantized weight encoding for packed storage.
     pub mode: QuantizationMode,
+    /// Checkpoint-native IQ encoding and byte order.
+    pub iquant: Option<WeightQuantization>,
 }
 
 impl QwenLinear {
@@ -630,6 +658,17 @@ impl QwenLinear {
                 ],
                 Dtype::Uint32,
             ),
+            QwenWeightFormat::IQuant(quantization) => {
+                let (ggml_type, _) = quantization.gguf_iquant().expect("IQ format");
+                let (block_values, block_bytes) = ggml_type.block_and_bytes().unwrap();
+                (
+                    vec![
+                        output_dims,
+                        input_dims / block_values as i32 * block_bytes as i32,
+                    ],
+                    Dtype::Uint8,
+                )
+            }
         };
         Ok(Self {
             input_dims,
@@ -676,6 +715,7 @@ impl QwenLinear {
             mode: format
                 .affine()
                 .map_or(QuantizationMode::Affine, WeightQuantization::mode),
+            iquant: format.iquant(),
         })
     }
 
@@ -698,7 +738,16 @@ impl QwenLinear {
     }
 
     pub(crate) fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let mut output = if let Some(scales) = self.scales.as_ref() {
+        let mut output = if let Some(iquant) = self.iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ format");
+            safemlx::native_quantization::NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.output_dims, self.input_dims],
+                ggml_type,
+                endian,
+            )?
+            .linear(input, true, stream)?
+        } else if let Some(scales) = self.scales.as_ref() {
             quantized_matmul_with_mode(
                 input,
                 self.weight.as_ref(),
@@ -758,7 +807,16 @@ impl QwenLinear {
     fn training_mode(&mut self, _mode: bool) {}
 
     pub(crate) fn dequantized_weight(&self, stream: &Stream) -> Result<Array, Exception> {
-        if let Some(scales) = self.scales.as_ref() {
+        if let Some(iquant) = self.iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ format");
+            safemlx::native_quantization::NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.output_dims, self.input_dims],
+                ggml_type,
+                endian,
+            )?
+            .dequantize(stream)
+        } else if let Some(scales) = self.scales.as_ref() {
             safemlx::ops::dequantize_with_mode(
                 self.weight.as_ref(),
                 scales,
@@ -2067,6 +2125,10 @@ pub struct Experts {
     pub gate_up_affine: Option<WeightQuantization>,
     /// Optional affine quantization for the packed down bank.
     pub down_affine: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the packed gate/up bank.
+    pub gate_up_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ encoding for the packed down bank.
+    pub down_iquant: Option<WeightQuantization>,
     #[param]
     /// Packed gate and up projection weights for all experts.
     pub gate_up_proj: Param<Array>,
@@ -2113,14 +2175,20 @@ impl Experts {
         format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let gate_up_affine = args
-            .affine_quantization_for(&format!("{prefix}.gate_up_proj"))
-            .map(WeightQuantization::from)
-            .or_else(|| format.affine());
-        let down_affine = args
-            .affine_quantization_for(&format!("{prefix}.down_proj"))
-            .map(WeightQuantization::from)
-            .or_else(|| format.affine());
+        let gate_up_quantization = args
+            .quantization_for(&format!("{prefix}.gate_up_proj"))
+            .or_else(|| format.quantization());
+        let down_quantization = args
+            .quantization_for(&format!("{prefix}.down_proj"))
+            .or_else(|| format.quantization());
+        let (gate_up_affine, gate_up_iquant) = match gate_up_quantization {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            affine => (affine, None),
+        };
+        let (down_affine, down_iquant) = match down_quantization {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            affine => (affine, None),
+        };
         let use_fp8 = format == QwenWeightFormat::Fp8;
         let expert_weight_dtype = if use_fp8 {
             Dtype::Uint8
@@ -2129,9 +2197,28 @@ impl Experts {
         };
         let projection = |out_features: i32,
                           in_features: i32,
-                          affine: Option<WeightQuantization>|
+                          affine: Option<WeightQuantization>,
+                          iquant: Option<WeightQuantization>|
          -> Result<AffineExpertProjectionParams, Exception> {
-            if let Some(affine) = affine {
+            if let Some(iquant) = iquant {
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (block_values, block_bytes) = ggml_type
+                    .block_and_bytes()
+                    .expect("canonical IQ block geometry");
+                Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            args.num_experts,
+                            out_features,
+                            in_features / block_values as i32 * block_bytes as i32,
+                        ],
+                        Dtype::Uint8,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ))
+            } else if let Some(affine) = affine {
                 Ok((
                     Param::<Array>::unloaded(
                         &[
@@ -2185,9 +2272,14 @@ impl Experts {
             2 * args.moe_intermediate_size,
             args.hidden_size,
             gate_up_affine,
+            gate_up_iquant,
         )?;
-        let (down_proj, down_proj_scales, down_proj_biases) =
-            projection(args.hidden_size, args.moe_intermediate_size, down_affine)?;
+        let (down_proj, down_proj_scales, down_proj_biases) = projection(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            down_affine,
+            down_iquant,
+        )?;
         Ok(Self {
             num_experts: args.num_experts,
             hidden_dim: args.hidden_size,
@@ -2195,6 +2287,8 @@ impl Experts {
             use_fp8,
             gate_up_affine,
             down_affine,
+            gate_up_iquant,
+            down_iquant,
             gate_up_proj,
             gate_up_proj_scale_inv: if use_fp8 {
                 Param::<Option<Array>>::unloaded_some(
@@ -2436,7 +2530,16 @@ impl Experts {
         let num_tokens = hidden_states.shape()[0];
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let Some(affine) = self.gate_up_affine {
+        let gate_up = if let Some(iquant) = self.gate_up_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.gate_up_proj.value.clone(),
+                &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(affine) = self.gate_up_affine {
             common::moe::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -2471,7 +2574,16 @@ impl Experts {
         let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
         let current = silu(gate, stream)?.multiply(up, stream)?;
 
-        let current = if let Some(affine) = self.down_affine {
+        let current = if let Some(iquant) = self.down_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.down_proj.value.clone(),
+                &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&current, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(affine) = self.down_affine {
             common::moe::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
@@ -2525,7 +2637,16 @@ impl Experts {
         )?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         observer.observe(&format!("{prefix}.expert_major_input"), &hidden)?;
-        let gate_up = if let Some(affine) = self.gate_up_affine {
+        let gate_up = if let Some(iquant) = self.gate_up_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.gate_up_proj.value.clone(),
+                &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(affine) = self.gate_up_affine {
             common::moe::affine_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -2569,7 +2690,16 @@ impl Experts {
         let current = gate_activation.multiply(up, stream)?;
         observer.observe(&format!("{prefix}.expert_major_down_proj_input"), &current)?;
 
-        let route_output = if let Some(affine) = self.down_affine {
+        let route_output = if let Some(iquant) = self.down_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.down_proj.value.clone(),
+                &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&current, &native, &plan.sorted_group_ids, stream)?
+        } else if let Some(affine) = self.down_affine {
             common::moe::affine_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
@@ -4150,7 +4280,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
         num_hidden_layers,
         weights_stream,
     )?;
-    let mut configs = gguf_affine_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
+    let mut configs = gguf_quantization_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
     if is_moe {
         for layer in 0..num_hidden_layers {
             let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -4163,7 +4293,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
                 (None, None) => {}
                 (gate, up) => {
                     return Err(Error::UnsupportedArchitecture(format!(
-                        "Qwen3.5 GGUF routed expert gate/up tensors in layer {layer} must use the same affine layout; gate={gate:?}, up={up:?}"
+                        "Qwen3.5 GGUF routed expert gate/up tensors in layer {layer} must use the same quantized layout; gate={gate:?}, up={up:?}"
                     )));
                 }
             }
@@ -4201,6 +4331,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
                 i32::from(affine.bits()),
             )?),
             GgufTensor::Dense(_) => None,
+            GgufTensor::IQuant(_) => None,
         };
         for (name, value) in group.into_arrays() {
             let (name, value) =
@@ -4318,7 +4449,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         num_hidden_layers,
         weights_stream,
     )?;
-    let mut configs = gguf_affine_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
+    let mut configs = gguf_quantization_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
     if matches!(architecture.as_str(), "qwen35moe" | "qwen3next") {
         for layer in 0..num_hidden_layers {
             let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -6188,37 +6319,42 @@ mod tests {
         let q5 = AffineQuantization::new(32, 5).unwrap();
         let q6 = AffineQuantization::new(16, 6).unwrap();
         let q8 = AffineQuantization::new(32, 8).unwrap();
-        args.quantized_weight_configs = Some(HashMap::from([
-            ("model.embed_tokens.weight".into(), q5),
-            ("model.layers.0.linear_attn.in_proj_qkv.weight".into(), q3),
-            ("model.layers.0.linear_attn.in_proj_z.weight".into(), q4),
-            ("model.layers.0.linear_attn.in_proj_b.weight".into(), q5),
-            ("model.layers.0.linear_attn.in_proj_a.weight".into(), q6),
-            ("model.layers.0.linear_attn.out_proj.weight".into(), q8),
-            (
-                "model.layers.0.mlp.shared_expert.gate_proj.weight".into(),
-                q2,
-            ),
-            ("model.layers.0.mlp.shared_expert.up_proj.weight".into(), q4),
-            (
-                "model.layers.0.mlp.shared_expert.down_proj.weight".into(),
-                q6,
-            ),
-            ("model.layers.0.mlp.gate.weight".into(), q8),
-            ("model.layers.0.mlp.shared_expert_gate.weight".into(), q4),
-            ("model.layers.0.mlp.experts.gate_up_proj".into(), q4),
-            ("model.layers.0.mlp.experts.down_proj".into(), q5),
-            ("model.layers.1.self_attn.q_proj.weight".into(), q2),
-            ("model.layers.1.self_attn.k_proj.weight".into(), q3),
-            ("model.layers.1.self_attn.v_proj.weight".into(), q4),
-            ("model.layers.1.self_attn.o_proj.weight".into(), q6),
-            ("mtp.layers.0.self_attn.q_proj.weight".into(), q3),
-            ("mtp.layers.0.mlp.shared_expert.gate_proj.weight".into(), q2),
-            ("mtp.layers.0.mlp.gate.weight".into(), q3),
-            ("mtp.layers.0.mlp.experts.gate_up_proj".into(), q6),
-            ("mtp.layers.0.mlp.experts.down_proj".into(), q5),
-            ("lm_head.weight".into(), q8),
-        ]));
+        args.quantized_weight_configs = Some(
+            HashMap::from([
+                ("model.embed_tokens.weight".into(), q5),
+                ("model.layers.0.linear_attn.in_proj_qkv.weight".into(), q3),
+                ("model.layers.0.linear_attn.in_proj_z.weight".into(), q4),
+                ("model.layers.0.linear_attn.in_proj_b.weight".into(), q5),
+                ("model.layers.0.linear_attn.in_proj_a.weight".into(), q6),
+                ("model.layers.0.linear_attn.out_proj.weight".into(), q8),
+                (
+                    "model.layers.0.mlp.shared_expert.gate_proj.weight".into(),
+                    q2,
+                ),
+                ("model.layers.0.mlp.shared_expert.up_proj.weight".into(), q4),
+                (
+                    "model.layers.0.mlp.shared_expert.down_proj.weight".into(),
+                    q6,
+                ),
+                ("model.layers.0.mlp.gate.weight".into(), q8),
+                ("model.layers.0.mlp.shared_expert_gate.weight".into(), q4),
+                ("model.layers.0.mlp.experts.gate_up_proj".into(), q4),
+                ("model.layers.0.mlp.experts.down_proj".into(), q5),
+                ("model.layers.1.self_attn.q_proj.weight".into(), q2),
+                ("model.layers.1.self_attn.k_proj.weight".into(), q3),
+                ("model.layers.1.self_attn.v_proj.weight".into(), q4),
+                ("model.layers.1.self_attn.o_proj.weight".into(), q6),
+                ("mtp.layers.0.self_attn.q_proj.weight".into(), q3),
+                ("mtp.layers.0.mlp.shared_expert.gate_proj.weight".into(), q2),
+                ("mtp.layers.0.mlp.gate.weight".into(), q3),
+                ("mtp.layers.0.mlp.experts.gate_up_proj".into(), q6),
+                ("mtp.layers.0.mlp.experts.down_proj".into(), q5),
+                ("lm_head.weight".into(), q8),
+            ])
+            .into_iter()
+            .map(|(name, affine)| (name, affine.into()))
+            .collect(),
+        );
 
         let model = Model::new(args, None, None, None, stream).unwrap();
         let params = model.parameters().flatten();
