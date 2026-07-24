@@ -79,6 +79,10 @@ pub enum Error {
     #[error("GGUF tokenizer error: {0}")]
     GgufTokenizer(String),
 
+    /// The loaded checkpoint does not provide a chat template.
+    #[error("the loaded model does not provide a chat template")]
+    MissingChatTemplate,
+
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]
     StrictLoadValidation {

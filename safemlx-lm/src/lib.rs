@@ -25,6 +25,8 @@
 pub mod cache;
 /// Block-addressable attention-cache residency and prompt-cache persistence.
 pub mod cache_residency;
+/// Chat-template preparation and native tool-runtime contracts.
+pub mod chat;
 /// Bounded layer execution for DeepSeek-V3 and DeepSeek-R1.
 pub mod deepseek_v3;
 /// Experimental bounded dense-layer streaming from safetensors checkpoints.

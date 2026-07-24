@@ -16,13 +16,17 @@ use safemlx::{
 };
 use safemlx_lm_utils::tokenizer::{
     chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
-    ApplyChatTemplateArgs, Chat, ChatTemplateIdentity, ModelChatTemplate,
-    Tokenizer as ChatTokenizer,
+    ApplyChatTemplateArgs, Chat, ModelChatTemplate, Tokenizer as ChatTokenizer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+use crate::chat::prepare_format_profile;
+pub use crate::chat::{
+    ChatTemplateIdentity, ChatTemplateRequest, GenerationConstraint, NativeToolSupport,
+    ParallelToolCallPolicy, PreparedChat, ToolChoice, ToolRuntimePlan,
+};
 use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
 use crate::models::common::generation::CausalLm;
@@ -1783,6 +1787,94 @@ impl TextDecoder {
     }
 }
 
+fn prepare_rendered_chat(
+    template: &ModelChatTemplate,
+    tools: Option<&[serde_json::Value]>,
+    rendered_prompt: String,
+    generation_prompt: String,
+    eos_token_ids: &[u32],
+) -> Result<PreparedChat, Error> {
+    let selected = template.select(tools)?;
+    let profile = prepare_format_profile(selected.template());
+    Ok(PreparedChat {
+        rendered_prompt,
+        generation_prompt,
+        template_identity: selected.identity().clone(),
+        format_profile_identity: profile.identity,
+        native_tool_support: profile.native_tool_support,
+        eos_token_ids: eos_token_ids.to_vec(),
+        preserved_structural_token_ids: profile.preserved_structural_token_ids,
+        profile_stop_sequences: profile.stop_sequences,
+    })
+}
+
+fn prepare_chat_from_parts(
+    tokenizer: &mut ChatTokenizer,
+    template: ModelChatTemplate,
+    model_id: &str,
+    eos_token_ids: &[u32],
+    request: ChatTemplateRequest,
+) -> Result<PreparedChat, Error> {
+    let ChatTemplateRequest {
+        messages,
+        tools,
+        tool_choice: _,
+        parallel_tool_calls: _,
+        enable_thinking,
+        add_generation_prompt,
+        mut extra_template_kwargs,
+    } = request;
+
+    if let Some(enable_thinking) = enable_thinking {
+        extra_template_kwargs.insert(
+            "enable_thinking".into(),
+            serde_json::Value::Bool(enable_thinking),
+        );
+    }
+
+    let without_generation_prompt = tokenizer
+        .apply_chat_template_json(
+            template.clone(),
+            [messages.clone()],
+            Some(&tools),
+            model_id,
+            false,
+            Some(&extra_template_kwargs),
+        )?
+        .into_iter()
+        .next()
+        .expect("one input conversation must produce one rendered prompt");
+    let with_generation_prompt = tokenizer
+        .apply_chat_template_json(
+            template.clone(),
+            [messages],
+            Some(&tools),
+            model_id,
+            true,
+            Some(&extra_template_kwargs),
+        )?
+        .into_iter()
+        .next()
+        .expect("one input conversation must produce one rendered prompt");
+    let generation_prompt = with_generation_prompt
+        .strip_prefix(&without_generation_prompt)
+        .unwrap_or_default()
+        .to_owned();
+    let rendered_prompt = if add_generation_prompt {
+        with_generation_prompt
+    } else {
+        without_generation_prompt
+    };
+
+    prepare_rendered_chat(
+        &template,
+        Some(&tools),
+        rendered_prompt,
+        generation_prompt,
+        eos_token_ids,
+    )
+}
+
 /// A model directory or GGUF file loaded together with its tokenizer and chat template.
 ///
 /// This is the most convenient entry point for text generation: it owns the
@@ -2300,6 +2392,27 @@ impl LoadedModel {
         )
     }
 
+    /// Prepares one JSON-valued chat for generation.
+    ///
+    /// The selected checkpoint template is rendered with and without its
+    /// generation prompt so the appended contribution is available
+    /// independently. Native tool support is reported only when the exact
+    /// selected template signature has one unambiguous registered format
+    /// profile.
+    pub fn prepare_chat(&mut self, request: ChatTemplateRequest) -> Result<PreparedChat, Error> {
+        let template = self
+            .chat_template
+            .clone()
+            .ok_or(Error::MissingChatTemplate)?;
+        prepare_chat_from_parts(
+            &mut self.tokenizer,
+            template,
+            &self.model_id,
+            &self.eos_token_ids,
+            request,
+        )
+    }
+
     /// Applies the loaded chat template to structured conversations.
     ///
     /// Returns `Ok(None)` when no chat template is available.
@@ -2337,7 +2450,7 @@ impl LoadedModel {
         };
 
         let rendered = self.tokenizer.apply_chat_template(
-            template,
+            template.clone(),
             ApplyChatTemplateArgs {
                 conversations,
                 tools,
@@ -2349,7 +2462,20 @@ impl LoadedModel {
                 template_kwargs,
             },
         )?;
-        Ok(rendered.into_iter().next())
+        rendered
+            .into_iter()
+            .next()
+            .map(|rendered_prompt| {
+                prepare_rendered_chat(
+                    &template,
+                    tools,
+                    rendered_prompt,
+                    String::new(),
+                    &self.eos_token_ids,
+                )
+                .map(|prepared| prepared.rendered_prompt)
+            })
+            .transpose()
     }
 
     /// Applies the loaded chat template to JSON-valued conversations.
@@ -2379,14 +2505,27 @@ impl LoadedModel {
         };
 
         let rendered = self.tokenizer.apply_chat_template_json(
-            template,
+            template.clone(),
             conversations,
             tools,
             &self.model_id,
             add_generation_prompt,
             template_kwargs,
         )?;
-        Ok(rendered.into_iter().next())
+        rendered
+            .into_iter()
+            .next()
+            .map(|rendered_prompt| {
+                prepare_rendered_chat(
+                    &template,
+                    tools,
+                    rendered_prompt,
+                    String::new(),
+                    &self.eos_token_ids,
+                )
+                .map(|prepared| prepared.rendered_prompt)
+            })
+            .transpose()
     }
 
     /// Encodes text to tokenizer ids.
@@ -3528,10 +3667,14 @@ mod tests {
         chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
         eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, load_chat_template,
         load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
-        merge_eos_token_id_sources, validate_gguf_quantization_source, LoadedModel,
-        ModelLoadOptions,
+        merge_eos_token_id_sources, prepare_chat_from_parts, validate_gguf_quantization_source,
+        LoadedModel, ModelLoadOptions,
     };
     use crate::{
+        chat::{
+            ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat,
+            ToolChoice,
+        },
         error::Error,
         inspection::ActivationRecorder,
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
@@ -3618,6 +3761,153 @@ mod tests {
             .save(dir.join("tokenizer.json"), false)
             .unwrap();
         dir
+    }
+
+    #[test]
+    fn chat_preparation_contracts_are_public_and_default_conservatively() {
+        let request = ChatTemplateRequest::default();
+        assert_eq!(request.tool_choice, ToolChoice::Auto);
+        assert_eq!(
+            request.parallel_tool_calls,
+            ParallelToolCallPolicy::Disabled
+        );
+        let _: fn(&mut LoadedModel, ChatTemplateRequest) -> Result<PreparedChat, Error> =
+            LoadedModel::prepare_chat;
+    }
+
+    #[test]
+    fn prepares_prompt_and_generation_contribution_separately() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let template = ModelChatTemplate::Single(
+            concat!(
+                "{% for message in messages %}{{ message.role }}={{ message.content }};",
+                "{% endfor %}tools={{ tools|length }};",
+                "{% if enable_thinking %}thinking=on;{% else %}thinking=off;{% endif %}",
+                "tone={{ tone }}",
+                "{% if add_generation_prompt %}<assistant>{% endif %}",
+            )
+            .into(),
+        );
+        let request = ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            tools: vec![json!({
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}}
+            })],
+            tool_choice: ToolChoice::Required,
+            parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                max_calls: std::num::NonZeroUsize::new(2),
+            },
+            enable_thinking: Some(false),
+            add_generation_prompt: false,
+            extra_template_kwargs: serde_json::Map::from_iter([("tone".into(), json!("brief"))]),
+        };
+
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            template,
+            "chat-preparation-test",
+            &[7, 8],
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.rendered_prompt(),
+            "user=hello;tools=1;thinking=off;tone=brief"
+        );
+        assert_eq!(prepared.generation_prompt(), "<assistant>");
+        assert_eq!(prepared.template_identity(), &ChatTemplateIdentity::Single);
+        assert_eq!(prepared.format_profile_identity(), None);
+        assert_eq!(prepared.eos_token_ids(), &[7, 8]);
+        assert!(prepared.preserved_structural_token_ids().is_empty());
+        assert!(prepared.profile_stop_sequences().is_empty());
+        assert!(matches!(
+            prepared.native_tool_support(),
+            NativeToolSupport::Unsupported { reason }
+                if reason.contains("no registered format profile")
+        ));
+    }
+
+    #[test]
+    fn preparation_selects_named_tool_template_without_model_type_fallback() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let template = ModelChatTemplate::Named(BTreeMap::from([
+            ("default".into(), "default".into()),
+            (
+                "tool_use".into(),
+                "tool-use{% if add_generation_prompt %}:generate{% endif %}".into(),
+            ),
+        ]));
+        let request = ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            tools: vec![json!({"type": "function"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        };
+
+        let prepared =
+            prepare_chat_from_parts(&mut tokenizer, template, "llama", &[], request).unwrap();
+
+        assert_eq!(prepared.rendered_prompt(), "tool-use:generate");
+        assert_eq!(prepared.generation_prompt(), ":generate");
+        assert_eq!(
+            prepared.template_identity(),
+            &ChatTemplateIdentity::Named("tool_use".into())
+        );
+        assert_eq!(prepared.format_profile_identity(), None);
+    }
+
+    #[test]
+    fn prepared_prompt_matches_existing_json_renderer() {
+        let template = ModelChatTemplate::Single(
+            concat!(
+                "{{ prefix }}",
+                "{% for message in messages %}{{ message.role }}:{{ message.content }};",
+                "{% endfor %}",
+                "{% if tools %}tools={{ tools|length }};{% endif %}",
+                "{% if add_generation_prompt %}assistant:{% endif %}",
+            )
+            .into(),
+        );
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let tools = vec![json!({"type": "function"})];
+        let kwargs = serde_json::Map::from_iter([("prefix".into(), json!("<bos>"))]);
+
+        for add_generation_prompt in [false, true] {
+            let raw = Tokenizer::new(WordLevel::default());
+            let mut existing_tokenizer = ChatTokenizer::from_tokenizer(raw.clone());
+            let expected = existing_tokenizer
+                .apply_chat_template_json(
+                    template.clone(),
+                    [messages.clone()],
+                    Some(&tools),
+                    "legacy-json-renderer",
+                    add_generation_prompt,
+                    Some(&kwargs),
+                )
+                .unwrap()
+                .remove(0);
+            let mut preparation_tokenizer = ChatTokenizer::from_tokenizer(raw);
+            let prepared = prepare_chat_from_parts(
+                &mut preparation_tokenizer,
+                template.clone(),
+                "prepared-json-renderer",
+                &[],
+                ChatTemplateRequest {
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    add_generation_prompt,
+                    extra_template_kwargs: kwargs.clone(),
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(prepared.rendered_prompt(), expected);
+        }
     }
 
     #[test]
