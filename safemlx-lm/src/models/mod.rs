@@ -35,6 +35,7 @@ use crate::parallel::ParallelTopology;
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::WeightQuantization;
 use crate::sampler::{DefaultSampler, Sampler, SpeculativeSampler};
+use crate::tool_constraints::ConstraintCompiler;
 use crate::{
     cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     cache_residency::{
@@ -1801,7 +1802,11 @@ fn prepare_rendered_chat(
         generation_prompt,
         template_identity: selected.identity().clone(),
         format_profile_identity: profile.identity,
-        native_tool_support: profile.native_tool_support,
+        native_tool_support: NativeToolSupport::Unsupported {
+            reason: profile.native_tool_unavailable_reason.unwrap_or_else(|| {
+                "native tool constraints require prepare_chat with an explicit request".into()
+            }),
+        },
         eos_token_ids: eos_token_ids.to_vec(),
         preserved_structural_token_ids: profile.preserved_structural_token_ids,
         profile_stop_sequences: profile.stop_sequences,
@@ -1813,8 +1818,41 @@ fn prepare_chat_from_parts(
     template: ModelChatTemplate,
     model_id: &str,
     eos_token_ids: &[u32],
+    constraint_compiler: Option<&Result<ConstraintCompiler, String>>,
     request: ChatTemplateRequest,
 ) -> Result<PreparedChat, Error> {
+    let selected = template.select(Some(&request.tools))?;
+    let template_identity = selected.identity().clone();
+    let profile = prepare_format_profile(selected.template());
+    let native_tool_support = match profile.tool_dialect {
+        Some(dialect) => {
+            let compiler = constraint_compiler
+                .ok_or_else(|| {
+                    Error::ToolConstraint(
+                        "the loaded model does not have tokenizer constraint data".into(),
+                    )
+                })?
+                .as_ref()
+                .map_err(|error| Error::ToolConstraint(error.clone()))?;
+            NativeToolSupport::Supported(
+                compiler
+                    .compile_tool_plan(
+                        dialect,
+                        &request.tools,
+                        request.tool_choice,
+                        request.parallel_tool_calls,
+                    )
+                    .map_err(Error::ToolConstraint)?,
+            )
+        }
+        None => NativeToolSupport::Unsupported {
+            reason: profile
+                .native_tool_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "format profile does not provide a native tool dialect".into()),
+        },
+    };
+
     let ChatTemplateRequest {
         messages,
         tools,
@@ -1866,13 +1904,16 @@ fn prepare_chat_from_parts(
         without_generation_prompt
     };
 
-    prepare_rendered_chat(
-        &template,
-        Some(&tools),
+    Ok(PreparedChat {
         rendered_prompt,
         generation_prompt,
-        eos_token_ids,
-    )
+        template_identity,
+        format_profile_identity: profile.identity,
+        native_tool_support,
+        eos_token_ids: eos_token_ids.to_vec(),
+        preserved_structural_token_ids: profile.preserved_structural_token_ids,
+        profile_stop_sequences: profile.stop_sequences,
+    })
 }
 
 /// A model directory or GGUF file loaded together with its tokenizer and chat template.
@@ -1889,6 +1930,7 @@ pub struct LoadedModel {
     chat_template: Option<ModelChatTemplate>,
     model_id: String,
     eos_token_ids: Vec<u32>,
+    constraint_compiler: Result<ConstraintCompiler, String>,
 }
 
 impl LoadedModel {
@@ -2272,6 +2314,8 @@ impl LoadedModel {
             let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
             tokenizer.set_template_kwargs(template_kwargs);
             let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
+            let constraint_compiler =
+                ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
             return Ok(Self {
                 model,
                 #[cfg(feature = "media-processing")]
@@ -2280,6 +2324,7 @@ impl LoadedModel {
                 chat_template,
                 model_id: model_dir.display().to_string(),
                 eos_token_ids,
+                constraint_compiler,
             });
         }
         let metadata = read_model_metadata(model_dir)?;
@@ -2288,6 +2333,7 @@ impl LoadedModel {
         let kind = ModelKind::from_model_type(&model_type)?;
         let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
+        let constraint_compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
         let chat_template = load_chat_template(model_dir)?;
         #[cfg(feature = "media-processing")]
         let processor = load_processor(model_dir)?;
@@ -2308,6 +2354,7 @@ impl LoadedModel {
             chat_template,
             model_id: model_type,
             eos_token_ids,
+            constraint_compiler,
         })
     }
 
@@ -2409,6 +2456,7 @@ impl LoadedModel {
             template,
             &self.model_id,
             &self.eos_token_ids,
+            Some(&self.constraint_compiler),
             request,
         )
     }
@@ -3673,11 +3721,12 @@ mod tests {
     use crate::{
         chat::{
             ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat,
-            ToolChoice,
+            ToolChoice, SYNTHETIC_TOOL_TEMPLATE,
         },
         error::Error,
         inspection::ActivationRecorder,
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
+        tool_constraints::ConstraintCompiler,
     };
     use safemlx::{
         argmax_axis,
@@ -3809,6 +3858,7 @@ mod tests {
             template,
             "chat-preparation-test",
             &[7, 8],
+            None,
             request,
         )
         .unwrap();
@@ -3849,7 +3899,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_chat_from_parts(&mut tokenizer, template, "llama", &[], request).unwrap();
+            prepare_chat_from_parts(&mut tokenizer, template, "llama", &[], None, request).unwrap();
 
         assert_eq!(prepared.rendered_prompt(), "tool-use:generate");
         assert_eq!(prepared.generation_prompt(), ":generate");
@@ -3858,6 +3908,84 @@ mod tests {
             &ChatTemplateIdentity::Named("tool_use".into())
         );
         assert_eq!(prepared.format_profile_identity(), None);
+    }
+
+    #[test]
+    fn synthetic_profile_compiles_request_tools_before_rendering() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let template = ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into());
+        let valid = ChatTemplateRequest {
+            tools: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            })],
+            tool_choice: ToolChoice::Required,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        };
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            template.clone(),
+            "synthetic",
+            &[],
+            Some(&compiler),
+            valid,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.format_profile_identity(),
+            Some("safemlx.synthetic-tools.v1")
+        );
+        assert!(matches!(
+            prepared.native_tool_support(),
+            NativeToolSupport::Supported(_)
+        ));
+
+        let invalid = ChatTemplateRequest {
+            tools: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "oneOf": [{"type": "string"}, {"type": "number"}]
+                            }
+                        }
+                    }
+                }
+            })],
+            tool_choice: ToolChoice::Required,
+            extra_template_kwargs: serde_json::Map::from_iter([(
+                "fail_render".into(),
+                json!(true),
+            )]),
+            ..ChatTemplateRequest::default()
+        };
+        let error = prepare_chat_from_parts(
+            &mut tokenizer,
+            template,
+            "synthetic",
+            &[],
+            Some(&compiler),
+            invalid,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ToolConstraint(ref message) if message.contains("unsupported schema composition")
+        ));
     }
 
     #[test]
@@ -3896,6 +4024,7 @@ mod tests {
                 template.clone(),
                 "prepared-json-renderer",
                 &[],
+                None,
                 ChatTemplateRequest {
                     messages: messages.clone(),
                     tools: tools.clone(),

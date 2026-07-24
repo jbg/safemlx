@@ -4,10 +4,12 @@
 //! selected only from registered signatures of the selected template body;
 //! model architecture metadata is deliberately not a fallback.
 
-use std::num::NonZeroUsize;
+use std::{fmt, num::NonZeroUsize, sync::Arc};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::tool_constraints::{ConstraintBlueprint, ToolDialect};
 
 pub use safemlx_lm_utils::tokenizer::ChatTemplateIdentity;
 
@@ -62,10 +64,29 @@ pub struct ChatTemplateRequest {
 ///
 /// The representation is intentionally private so future constraint engines
 /// can evolve without exposing a dialect-specific implementation as public API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct GenerationConstraint {
-    _private: (),
+    pub(crate) fingerprint: [u8; 32],
+    #[allow(dead_code)]
+    pub(crate) inner: Arc<ConstraintBlueprint>,
 }
+
+impl fmt::Debug for GenerationConstraint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerationConstraint")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GenerationConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for GenerationConstraint {}
 
 /// An opaque, format-profile-specific plan for native tool generation.
 ///
@@ -75,6 +96,19 @@ pub struct GenerationConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRuntimePlan {
     generation_constraint: GenerationConstraint,
+}
+
+impl ToolRuntimePlan {
+    pub(crate) fn from_constraint(generation_constraint: GenerationConstraint) -> Self {
+        Self {
+            generation_constraint,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn generation_constraint(&self) -> &GenerationConstraint {
+        &self.generation_constraint
+    }
 }
 
 /// Whether the selected checkpoint template has registered native tool support.
@@ -158,7 +192,8 @@ impl PreparedChat {
 #[derive(Debug)]
 pub(crate) struct PreparedFormatProfile {
     pub(crate) identity: Option<String>,
-    pub(crate) native_tool_support: NativeToolSupport,
+    pub(crate) tool_dialect: Option<ToolDialect>,
+    pub(crate) native_tool_unavailable_reason: Option<String>,
     pub(crate) preserved_structural_token_ids: Vec<u32>,
     pub(crate) stop_sequences: Vec<String>,
 }
@@ -169,12 +204,29 @@ struct FormatProfile {
     template_signatures: &'static [[u8; 32]],
     preserved_structural_token_ids: &'static [u32],
     stop_sequences: &'static [&'static str],
-    tool_runtime_plan: Option<&'static ToolRuntimePlan>,
+    tool_dialect: Option<ToolDialect>,
 }
 
-// Intentionally empty: production dialects and constraint engines are added
-// only alongside audited, exact template signatures.
-const FORMAT_PROFILES: &[FormatProfile] = &[];
+/// Test-only protocol surface used to exercise constrained tool generation
+/// without claiming compatibility with a production checkpoint dialect.
+#[allow(dead_code)]
+pub(crate) const SYNTHETIC_TOOL_TEMPLATE: &str = concat!(
+    "{% if fail_render %}{{ raise_exception('rendered before constraint compilation') }}",
+    "{% endif %}safemlx synthetic tool template",
+);
+
+const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x5e, 0xc6, 0xe8, 0xcc, 0x55, 0x35, 0x8f, 0x00, 0x81, 0xdf, 0x23, 0xf7, 0x16, 0x52, 0x95, 0xc0,
+    0x2a, 0x4b, 0xf7, 0x9c, 0x15, 0x33, 0xd6, 0x8d, 0x04, 0x77, 0x90, 0x30, 0x3d, 0xd8, 0x59, 0xf4,
+];
+
+const FORMAT_PROFILES: &[FormatProfile] = &[FormatProfile {
+    identity: "safemlx.synthetic-tools.v1",
+    template_signatures: &[SYNTHETIC_TOOL_TEMPLATE_SIGNATURE],
+    preserved_structural_token_ids: &[],
+    stop_sequences: &[],
+    tool_dialect: Some(ToolDialect::Synthetic),
+}];
 
 fn template_signature(template: &str) -> [u8; 32] {
     Sha256::digest(template.as_bytes()).into()
@@ -195,23 +247,22 @@ fn prepare_format_profile_with_registry(
     match matching_profiles(template, profiles).as_slice() {
         [] => PreparedFormatProfile {
             identity: None,
-            native_tool_support: NativeToolSupport::Unsupported {
-                reason: "no registered format profile matches the selected chat template".into(),
-            },
+            tool_dialect: None,
+            native_tool_unavailable_reason: Some(
+                "no registered format profile matches the selected chat template".into(),
+            ),
             preserved_structural_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
         },
         [profile] => PreparedFormatProfile {
             identity: Some(profile.identity.to_owned()),
-            native_tool_support: match profile.tool_runtime_plan {
-                Some(plan) => NativeToolSupport::Supported(plan.clone()),
-                None => NativeToolSupport::Unsupported {
-                    reason: format!(
-                        "format profile {:?} does not provide a native tool runtime plan",
-                        profile.identity
-                    ),
-                },
-            },
+            tool_dialect: profile.tool_dialect,
+            native_tool_unavailable_reason: profile.tool_dialect.is_none().then(|| {
+                format!(
+                    "format profile {:?} does not provide a native tool runtime plan",
+                    profile.identity
+                )
+            }),
             preserved_structural_token_ids: profile.preserved_structural_token_ids.to_vec(),
             stop_sequences: profile
                 .stop_sequences
@@ -221,10 +272,10 @@ fn prepare_format_profile_with_registry(
         },
         _ => PreparedFormatProfile {
             identity: None,
-            native_tool_support: NativeToolSupport::Unsupported {
-                reason: "multiple registered format profiles match the selected chat template"
-                    .into(),
-            },
+            tool_dialect: None,
+            native_tool_unavailable_reason: Some(
+                "multiple registered format profiles match the selected chat template".into(),
+            ),
             preserved_structural_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
         },
@@ -239,7 +290,7 @@ pub(crate) fn prepare_format_profile(template: &str) -> PreparedFormatProfile {
 mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, template_signature,
-        FormatProfile, NativeToolSupport,
+        FormatProfile, ToolDialect, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
 
     #[test]
@@ -247,13 +298,13 @@ mod tests {
         let prepared = prepare_format_profile("unknown template");
 
         assert_eq!(prepared.identity, None);
+        assert_eq!(prepared.tool_dialect, None);
+        assert!(prepared
+            .native_tool_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no registered format profile")));
         assert!(prepared.preserved_structural_token_ids.is_empty());
         assert!(prepared.stop_sequences.is_empty());
-        assert!(matches!(
-            prepared.native_tool_support,
-            NativeToolSupport::Unsupported { ref reason }
-                if reason.contains("no registered format profile")
-        ));
     }
 
     #[test]
@@ -266,23 +317,38 @@ mod tests {
                 template_signatures: signatures,
                 preserved_structural_token_ids: &[],
                 stop_sequences: &[],
-                tool_runtime_plan: None,
+                tool_dialect: Some(ToolDialect::Synthetic),
             },
             FormatProfile {
                 identity: "second",
                 template_signatures: signatures,
                 preserved_structural_token_ids: &[],
                 stop_sequences: &[],
-                tool_runtime_plan: None,
+                tool_dialect: Some(ToolDialect::Synthetic),
             },
         ];
 
         let prepared = prepare_format_profile_with_registry("same template", &profiles);
         assert_eq!(prepared.identity, None);
-        assert!(matches!(
-            prepared.native_tool_support,
-            NativeToolSupport::Unsupported { ref reason }
-                if reason.contains("multiple registered format profiles")
-        ));
+        assert_eq!(prepared.tool_dialect, None);
+        assert!(prepared
+            .native_tool_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("multiple registered format profiles")));
+    }
+
+    #[test]
+    fn synthetic_profile_uses_an_exact_auditable_signature() {
+        assert_eq!(
+            template_signature(SYNTHETIC_TOOL_TEMPLATE),
+            SYNTHETIC_TOOL_TEMPLATE_SIGNATURE
+        );
+        let prepared = prepare_format_profile(SYNTHETIC_TOOL_TEMPLATE);
+        assert_eq!(
+            prepared.identity.as_deref(),
+            Some("safemlx.synthetic-tools.v1")
+        );
+        assert_eq!(prepared.tool_dialect, Some(ToolDialect::Synthetic));
+        assert_eq!(prepared.native_tool_unavailable_reason, None);
     }
 }

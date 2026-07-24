@@ -83,6 +83,10 @@ pub enum Error {
     #[error("the loaded model does not provide a chat template")]
     MissingChatTemplate,
 
+    /// A native tool definition or its generation grammar is invalid.
+    #[error("native tool constraint error: {0}")]
+    ToolConstraint(String),
+
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]
     StrictLoadValidation {

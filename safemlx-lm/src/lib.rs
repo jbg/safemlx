@@ -94,6 +94,7 @@ pub mod streaming;
 pub mod tensor_parallel;
 #[cfg(test)]
 mod test_utils;
+mod tool_constraints;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
 pub mod utils;
 /// Composable metadata-validated checkpoint-derived weight recipes.
