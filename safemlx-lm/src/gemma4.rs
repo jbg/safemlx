@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::{Module, ModuleParameters, ModuleParametersExt},
     nn,
     ops::{
         concatenate_axis, indexing::TryIndexOp, r#where, tanh, GgufCheckpoint, GgufMetadataValue,
@@ -143,14 +143,14 @@ impl Gemma4LayerwiseModel {
         })
     }
 
-    pub(crate) fn mtp_token_embedding(
-        &mut self,
-        token: u32,
+    pub(crate) fn mtp_embedding_snapshot(
+        &self,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
         self.execution
-            .adapter_mut()
-            .mtp_token_embedding(token, stream)
+            .adapter()
+            .mtp_embedding_snapshot(stream, copy)
     }
 
     /// Clears temporary media and decoder blocks from the execution device.
@@ -370,13 +370,22 @@ impl Gemma4LayerwiseAdapter {
         &self.args
     }
 
-    fn mtp_token_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
-        self.embedding
-            .forward(&Array::from_slice(&[token], &[1, 1]), stream)?
-            .multiply(
-                Array::from_f32((self.args.hidden_size as f32).sqrt()),
-                stream,
-            )
+    fn mtp_embedding_snapshot(
+        &self,
+        stream: &Stream,
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
+        let mut embedding = self.embedding.clone();
+        if copy {
+            embedding.copy_to_stream(stream)?;
+            embedding.native = embedding
+                .native
+                .as_ref()
+                .map(|native| native.copy_to_stream(stream))
+                .transpose()?;
+            stream.synchronize()?;
+        }
+        Ok(embedding)
     }
 
     fn recipes_for(

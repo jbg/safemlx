@@ -2,27 +2,24 @@
 
 use std::collections::HashMap;
 
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Stream};
 
 use crate::{
     gemma4::Gemma4LayerwiseModel,
     models::{
-        gemma4::{Cache, Gemma4StepOutput, LayerType, Model as Gemma4Model},
-        gemma4_assistant::Gemma4AssistantDraftModel,
+        gemma4::{Cache, Gemma4Embedding, Gemma4StepOutput, LayerType, Model as Gemma4Model},
+        gemma4_assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
         input::ModelInput as RuntimeInput,
     },
-    mtp::{self, MtpBackend, MtpCommit, MtpConfig, MtpPrefill},
+    mtp::{self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill},
     sampler::SpeculativeSampler,
 };
 
+#[derive(Clone)]
 pub(crate) struct Gemma4TargetState {
     hidden: Array,
     shared_kv: HashMap<LayerType, (Array, Array)>,
     cache_len: usize,
-}
-
-pub(crate) struct Gemma4DraftState {
-    hidden: Array,
 }
 
 pub(crate) struct Gemma4Verification {
@@ -43,7 +40,11 @@ pub(crate) trait Gemma4MtpTarget {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Gemma4StepOutput, Exception>;
-    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception>;
+    fn mtp_embedding_snapshot(
+        &self,
+        stream: &Stream,
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception>;
 }
 
 impl Gemma4MtpTarget for Gemma4Model {
@@ -65,8 +66,12 @@ impl Gemma4MtpTarget for Gemma4Model {
         self.verify_mtp(tokens, cache, stream)
     }
 
-    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
-        self.mtp_token_embedding(token, stream)
+    fn mtp_embedding_snapshot(
+        &self,
+        stream: &Stream,
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
+        self.mtp_embedding_snapshot(stream, copy)
     }
 }
 
@@ -89,8 +94,12 @@ impl Gemma4MtpTarget for Gemma4LayerwiseModel {
         self.verify_mtp(tokens, cache, stream)
     }
 
-    fn mtp_embedding(&mut self, token: u32, stream: &Stream) -> Result<Array, Exception> {
-        self.mtp_token_embedding(token, stream)
+    fn mtp_embedding_snapshot(
+        &self,
+        stream: &Stream,
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
+        self.mtp_embedding_snapshot(stream, copy)
     }
 }
 
@@ -98,11 +107,16 @@ impl Gemma4MtpTarget for Gemma4LayerwiseModel {
 pub(crate) struct Gemma4MtpBackend<'a, T> {
     target: &'a mut T,
     assistant: &'a mut Gemma4AssistantDraftModel,
+    draft_embedding: Option<Gemma4Embedding>,
 }
 
 impl<'a, T> Gemma4MtpBackend<'a, T> {
     pub(crate) fn new(target: &'a mut T, assistant: &'a mut Gemma4AssistantDraftModel) -> Self {
-        Self { target, assistant }
+        Self {
+            target,
+            assistant,
+            draft_embedding: None,
+        }
     }
 
     fn state_at(
@@ -134,12 +148,53 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
             cache_len,
         })
     }
+
+    fn state_on_draft_stream(
+        state: &Gemma4TargetState,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Gemma4TargetState, Exception> {
+        if !streams.is_split() {
+            return Ok(state.clone());
+        }
+
+        eval(
+            std::iter::once(&state.hidden).chain(
+                state
+                    .shared_kv
+                    .values()
+                    .flat_map(|(keys, values)| [keys, values]),
+            ),
+        )?;
+        streams.target().synchronize()?;
+
+        let hidden = state.hidden.copy(streams.draft())?;
+        let shared_kv = state
+            .shared_kv
+            .iter()
+            .map(|(kind, (keys, values))| {
+                Ok((
+                    *kind,
+                    (keys.copy(streams.draft())?, values.copy(streams.draft())?),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, Exception>>()?;
+        eval(
+            std::iter::once(&hidden)
+                .chain(shared_kv.values().flat_map(|(keys, values)| [keys, values])),
+        )?;
+        streams.draft().synchronize()?;
+        Ok(Gemma4TargetState {
+            hidden,
+            shared_kv,
+            cache_len: state.cache_len,
+        })
+    }
 }
 
 impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     type Cache = Cache;
     type TargetState = Gemma4TargetState;
-    type DraftState = Gemma4DraftState;
+    type DraftState = Gemma4AssistantDraftState;
     type CacheCheckpoint = Cache;
     type Verification = Gemma4Verification;
 
@@ -174,15 +229,33 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     fn begin_draft(
         &mut self,
         state: &Self::TargetState,
-        _last_token: u32,
-        _stream: &Stream,
+        last_token: u32,
+        stream: &Stream,
     ) -> Result<Self::DraftState, Exception> {
+        self.begin_draft_with_streams(state, last_token, MtpExecutionStreams::single(stream))
+    }
+
+    fn begin_draft_with_streams(
+        &mut self,
+        state: &Self::TargetState,
+        _last_token: u32,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Self::DraftState, Exception> {
+        let state = Self::state_on_draft_stream(state, streams)?;
+        if self.draft_embedding.is_none() {
+            if streams.is_split() {
+                streams.target().synchronize()?;
+            }
+            self.draft_embedding = Some(
+                self.target
+                    .mtp_embedding_snapshot(streams.draft(), streams.is_split())?,
+            );
+        }
         let offset = i32::try_from(state.cache_len)
             .map_err(|_| Exception::custom("Gemma 4 MTP cache offset exceeds i32"))?;
-        let hidden = self
+        Ok(self
             .assistant
-            .begin_round(state.shared_kv.clone(), offset, &state.hidden);
-        Ok(Gemma4DraftState { hidden })
+            .begin_round(state.shared_kv, offset, &state.hidden))
     }
 
     fn draft_logits(
@@ -191,9 +264,16 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
         last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let embedding = self.target.mtp_embedding(last_token, stream)?;
-        self.assistant
-            .draft_step(&embedding, &mut state.hidden, stream)
+        let embedding = self
+            .draft_embedding
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Gemma 4 draft embedding is not initialized"))?
+            .forward(&Array::from_slice(&[last_token], &[1, 1]), stream)?
+            .multiply(
+                Array::from_f32((self.assistant.config.backbone_hidden_size as f32).sqrt()),
+                stream,
+            )?;
+        self.assistant.draft_step(&embedding, state, stream)
     }
 
     fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
@@ -219,12 +299,32 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     fn commit_verification(
         &mut self,
         output: Self::Verification,
-        _draft_state: Self::DraftState,
+        draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
         stream: &Stream,
     ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        self.commit_verification_with_streams(
+            output,
+            draft_state,
+            cache,
+            checkpoint,
+            verified_inputs,
+            MtpExecutionStreams::single(stream),
+        )
+    }
+
+    fn commit_verification_with_streams(
+        &mut self,
+        output: Self::Verification,
+        _draft_state: Self::DraftState,
+        cache: &mut Self::Cache,
+        checkpoint: Self::CacheCheckpoint,
+        verified_inputs: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        let stream = streams.target();
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs > input_len {
             return Err(Exception::custom(format!(
@@ -265,7 +365,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_callback<T, S, F>(
+pub(crate) fn generate_with_streams_and_callback<T, S, F>(
     target: &mut T,
     assistant: &mut Gemma4AssistantDraftModel,
     cache: &mut Cache,
@@ -273,7 +373,7 @@ pub(crate) fn generate_with_callback<T, S, F>(
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    stream: &Stream,
+    streams: MtpExecutionStreams<'_>,
     on_token: F,
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
 where
@@ -282,14 +382,57 @@ where
     F: FnMut(u32) -> Result<(), Exception>,
 {
     let mut backend = Gemma4MtpBackend::new(target, assistant);
-    mtp::generate_with_callback(
+    mtp::generate_with_streams_and_callback(
         &mut backend,
         cache,
         input,
         config,
         prng_key,
         sampler,
-        stream,
+        streams,
         on_token,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn target_state_copies_from_gpu_to_cpu_draft_stream() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let hidden = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        let keys = Array::from_slice(&[3.0f32, 4.0], &[1, 1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        let values = Array::from_slice(&[5.0f32, 6.0], &[1, 1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        let state = Gemma4TargetState {
+            hidden,
+            shared_kv: HashMap::from([(LayerType::FullAttention, (keys, values))]),
+            cache_len: 9,
+        };
+
+        let copied = Gemma4MtpBackend::<Gemma4Model>::state_on_draft_stream(
+            &state,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+        )
+        .unwrap();
+
+        assert_eq!(copied.cache_len, 9);
+        assert_eq!(
+            copied.hidden.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0, 2.0]
+        );
+        let (keys, values) = &copied.shared_kv[&LayerType::FullAttention];
+        assert_eq!(keys.evaluated().unwrap().as_slice::<f32>(), &[3.0, 4.0]);
+        assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[5.0, 6.0]);
+    }
 }

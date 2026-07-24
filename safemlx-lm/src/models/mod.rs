@@ -47,7 +47,7 @@ use crate::{
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
     mtp::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
-        MtpStats,
+        MtpExecutionStreams, MtpStats,
     },
 };
 
@@ -620,20 +620,20 @@ impl Model {
         sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_mtp_input_with_sampler_callback(
+        self.generate_mtp_input_with_sampler_callback_and_streams(
             drafter,
             cache,
             input,
             config,
             prng_key,
             sampler,
-            stream,
+            MtpExecutionStreams::single(stream),
             |_| Ok(()),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_mtp_input_with_sampler_callback<S, F>(
+    fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
         &mut self,
         drafter: &mut LoadedDrafter,
         cache: &mut ModelCache,
@@ -641,7 +641,7 @@ impl Model {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        stream: &Stream,
+        streams: MtpExecutionStreams<'_>,
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
@@ -652,14 +652,14 @@ impl Model {
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                crate::gemma4_mtp::generate_with_callback(
-                    target, assistant, cache, input, config, prng_key, sampler, stream, on_token,
+                crate::gemma4_mtp::generate_with_streams_and_callback(
+                    target, assistant, cache, input, config, prng_key, sampler, streams, on_token,
                 )
             }
             (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::gemma4_mtp::generate_with_callback(
-                    target, assistant, cache, input, config, prng_key, sampler, stream, on_token,
+                crate::gemma4_mtp::generate_with_streams_and_callback(
+                    target, assistant, cache, input, config, prng_key, sampler, streams, on_token,
                 )
             }
             (model, _) => Err(Exception::custom(format!(
@@ -1980,6 +1980,27 @@ impl LoadedModel {
         )
     }
 
+    /// Generates through MTP with separate target and draft streams.
+    pub fn generate_mtp_input_with_streams(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_mtp_input_with_sampler_and_streams(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            &mut DefaultSampler,
+            streams,
+        )
+    }
+
     /// Generates through MTP with a caller-provided speculative sampling policy.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler>(
@@ -1992,13 +2013,73 @@ impl LoadedModel {
         sampler: &mut S,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        self.generate_mtp_input_with_sampler_and_streams(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            MtpExecutionStreams::single(stream),
+        )
+    }
+
+    /// Generates through MTP with a caller-provided sampler and separate
+    /// target/draft streams.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_input_with_sampler_and_streams<S: SpeculativeSampler>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let mut config = config.clone();
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        self.model.generate_mtp_input_with_sampler(
-            drafter, cache, input, &config, prng_key, sampler, stream,
-        )
+        self.model
+            .generate_mtp_input_with_sampler_callback_and_streams(
+                drafter,
+                cache,
+                input,
+                &config,
+                prng_key,
+                sampler,
+                streams,
+                |_| Ok(()),
+            )
+    }
+
+    /// Generates through MTP with separate streams and reports committed
+    /// tokens as they become available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        streams: MtpExecutionStreams<'_>,
+        on_token: F,
+    ) -> Result<(Vec<u32>, MtpStats), Exception>
+    where
+        S: SpeculativeSampler,
+        F: FnMut(u32) -> Result<(), Exception>,
+    {
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
+        }
+        self.model
+            .generate_mtp_input_with_sampler_callback_and_streams(
+                drafter, cache, input, &config, prng_key, sampler, streams, on_token,
+            )
     }
 
     /// Generates through MTP and reports each committed token as it becomes available.
@@ -2018,12 +2099,15 @@ impl LoadedModel {
         S: SpeculativeSampler,
         F: FnMut(u32) -> Result<(), Exception>,
     {
-        let mut config = config.clone();
-        if config.eos_token_ids.is_empty() {
-            config.eos_token_ids.clone_from(&self.eos_token_ids);
-        }
-        self.model.generate_mtp_input_with_sampler_callback(
-            drafter, cache, input, &config, prng_key, sampler, stream, on_token,
+        self.generate_mtp_input_with_sampler_callback_and_streams(
+            drafter,
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            MtpExecutionStreams::single(stream),
+            on_token,
         )
     }
 

@@ -599,6 +599,15 @@ bounded-layer targets accept typed multimodal prefill and an explicit
 safetensors or GGUF `LoadedDrafter`.
 Gemma assistant GGUF files may embed their JSON config in the
 `safemlx.mtp.config` metadata string or provide a sibling `config.json`.
+External Gemma assistants may execute on a separate CPU stream through
+`MtpExecutionStreams`; target prefill and verification remain on the target
+stream. The runtime takes a draft-device snapshot of the target token
+embedding, copies committed target hidden/shared-KV state at each round
+boundary, and synchronizes the streams conservatively. Mutable assistant
+round state is cloneable and separate from model parameters so future
+optimistic lookahead can fork and discard draft branches. This mode establishes
+correct heterogeneous placement but does not yet overlap one request's draft
+and verification phases.
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
 head through `generate_embedded_mtp_input`; resident and bounded-layer loading
 are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text

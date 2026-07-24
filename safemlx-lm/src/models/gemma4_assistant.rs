@@ -236,8 +236,18 @@ pub struct Gemma4AssistantDraftModel {
     #[param]
     /// Optional masked embedding head.
     pub masked_embedding: Option<MaskedEmbedder>,
-    shared_kv: Option<HashMap<LayerType, (Array, Array)>>,
+}
+
+/// Cloneable per-branch state for one Gemma 4 assistant draft path.
+///
+/// Keeping this state outside [`Gemma4AssistantDraftModel`] lets a future
+/// optimistic scheduler fork a draft path before target verification and
+/// discard the losing branch without copying or mutating model parameters.
+#[derive(Debug, Clone)]
+pub(crate) struct Gemma4AssistantDraftState {
+    shared_kv: HashMap<LayerType, (Array, Array)>,
     kv_offset: i32,
+    hidden: Array,
 }
 
 impl Gemma4AssistantDraftModel {
@@ -300,8 +310,6 @@ impl Gemma4AssistantDraftModel {
             post_projection,
             lm_head,
             masked_embedding,
-            shared_kv: None,
-            kv_offset: 0,
         })
     }
 
@@ -312,46 +320,46 @@ impl Gemma4AssistantDraftModel {
 
     /// Begins one generalized speculative round from committed target state.
     pub(crate) fn begin_round(
-        &mut self,
+        &self,
         shared_kv: HashMap<LayerType, (Array, Array)>,
         kv_offset: i32,
         hidden: &Array,
-    ) -> Array {
-        self.shared_kv = Some(shared_kv);
-        self.kv_offset = kv_offset;
-        hidden.clone()
+    ) -> Gemma4AssistantDraftState {
+        Gemma4AssistantDraftState {
+            shared_kv,
+            kv_offset,
+            hidden: hidden.clone(),
+        }
     }
 
     /// Produces one draft distribution and advances the round's hidden state.
     pub(crate) fn draft_step(
         &mut self,
         token_embedding: &Array,
-        previous_hidden: &mut Array,
+        state: &mut Gemma4AssistantDraftState,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let inputs_embeds =
-            safemlx::ops::concatenate_axis(&[token_embedding, &*previous_hidden], -1, stream)?;
-        let (next_hidden, logits) = self.forward(&inputs_embeds, stream)?;
-        *previous_hidden = next_hidden;
-        self.kv_offset = self.kv_offset.saturating_add(1);
+            safemlx::ops::concatenate_axis(&[token_embedding, &state.hidden], -1, stream)?;
+        let (next_hidden, logits) = self.forward(&inputs_embeds, state, stream)?;
+        state.hidden = next_hidden;
+        state.kv_offset = state.kv_offset.saturating_add(1);
         Ok(logits)
     }
 
     fn forward(
         &mut self,
         inputs_embeds: &Array,
+        state: &mut Gemma4AssistantDraftState,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let mut h = self.pre_projection.forward(inputs_embeds, stream)?;
         let query_len = h.shape()[1];
-        let query_offset = self.kv_offset.saturating_sub(1);
-        let shared_kv = self
-            .shared_kv
-            .as_mut()
-            .ok_or_else(|| Exception::custom("Gemma 4 assistant requires shared K/V states"))?;
+        let query_offset = state.kv_offset.saturating_sub(1);
 
         for layer in &mut self.model.layers {
-            let kv = shared_kv
+            let kv = state
+                .shared_kv
                 .get(&layer.layer_type)
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared K/V state for assistant layer"))?;
@@ -909,6 +917,26 @@ mod tests {
         "attention_k_eq_v":false,"layer_types":["full_attention"]
       }
     }"#;
+
+    #[test]
+    fn draft_state_forks_without_shared_mutable_progress() {
+        let original = super::Gemma4AssistantDraftState {
+            shared_kv: HashMap::new(),
+            kv_offset: 7,
+            hidden: Array::from_slice(&[1.0f32], &[1, 1, 1]),
+        };
+        let mut fork = original.clone();
+        fork.kv_offset += 1;
+        fork.hidden = Array::from_slice(&[2.0f32], &[1, 1, 1]);
+
+        assert_eq!(original.kv_offset, 7);
+        assert_eq!(fork.kv_offset, 8);
+        assert_eq!(
+            original.hidden.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0]
+        );
+        assert_eq!(fork.hidden.evaluated().unwrap().as_slice::<f32>(), &[2.0]);
+    }
 
     #[test]
     fn translates_published_gguf_names() {

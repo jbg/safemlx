@@ -4503,20 +4503,23 @@ impl Model {
         )
     }
 
-    /// Embeds one generated token for the external assistant.
-    pub(crate) fn mtp_token_embedding(
-        &mut self,
-        token: u32,
+    /// Copies the target token embedding table onto the draft stream.
+    pub(crate) fn mtp_embedding_snapshot(
+        &self,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.model
-            .language_model
-            .embed_tokens
-            .forward(&Array::from_slice(&[token], &[1, 1]), stream)?
-            .multiply(
-                Array::from_f32((self.args.hidden_size as f32).sqrt()),
-                stream,
-            )
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
+        let mut embedding = self.model.language_model.embed_tokens.clone();
+        if copy {
+            embedding.copy_to_stream(stream)?;
+            embedding.native = embedding
+                .native
+                .as_ref()
+                .map(|native| native.copy_to_stream(stream))
+                .transpose()?;
+            stream.synchronize()?;
+        }
+        Ok(embedding)
     }
 }
 

@@ -73,9 +73,18 @@ assistant is loaded independently and remains fully resident:
 cargo run --release -p safemlx-lm-cli -- \
   --model /path/to/gemma4 \
   --draft-model /path/to/gemma4-assistant \
+  --mtp-device cpu \
   --mtp-draft-tokens 3 --temperature 0.7 \
   "Explain speculative decoding."
 ```
+
+`--mtp-device gpu` is the default. `--mtp-device cpu` keeps target prefill and
+verification on the GPU while loading and executing the external assistant on
+the CPU. Target state and stochastic acceptance data cross devices through
+explicit, conservatively synchronized copies. This is correctness-first
+heterogeneous execution; it does not yet overlap drafting and verification for
+one request. The option currently requires `--draft-model` and is not available
+for embedded Qwen MTP.
 
 The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published

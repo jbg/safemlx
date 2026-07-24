@@ -26,7 +26,7 @@ use safemlx_lm::{
         input::{InputPart, ModelInput},
         LoadedModel, ModelLoadOptions, TextDecoder,
     },
-    mtp::{LoadedDrafter, MtpConfig, MtpStats},
+    mtp::{LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
     sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler},
@@ -46,6 +46,14 @@ enum ThinkingMode {
     On,
     /// Ask a compatible chat template to disable thinking/reasoning.
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum MtpDevice {
+    /// Run the external assistant on the target GPU stream.
+    Gpu,
+    /// Run the external assistant on a CPU stream and verify on the GPU.
+    Cpu,
 }
 
 impl ThinkingMode {
@@ -146,6 +154,10 @@ struct Cli {
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
     mtp_draft_tokens: usize,
+
+    /// Device used by an external MTP assistant.
+    #[arg(long, value_enum, default_value_t = MtpDevice::Gpu)]
+    mtp_device: MtpDevice,
 
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
@@ -373,6 +385,11 @@ fn main() -> Result<()> {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
+    let draft_execution = (args.mtp_device == MtpDevice::Cpu)
+        .then(|| ExecutionContext::new(Device::new(DeviceType::Cpu, 0)));
+    let draft_stream = draft_execution
+        .as_ref()
+        .map_or(stream, ExecutionContext::stream);
     if args.verbose {
         // Capture the complete model-load and generation high-water mark.
         safemlx::memory::reset_peak_memory()?;
@@ -472,11 +489,14 @@ fn main() -> Result<()> {
                 )?),
                 None => ModelLoadOptions::default(),
             };
-            LoadedDrafter::load_with_options(path, options, stream, weights.stream())
+            LoadedDrafter::load_with_options(path, options, draft_stream, weights.stream())
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;
     stream.synchronize()?;
+    if draft_stream != stream {
+        draft_stream.synchronize()?;
+    }
     let load_elapsed = load_started.elapsed();
 
     let (rendered_prompt, add_special_tokens) = if args.raw {
@@ -578,14 +598,14 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
-        let (tokens, stats) = model.generate_mtp_input_with_sampler_callback(
+        let (tokens, stats) = model.generate_mtp_input_with_sampler_callback_and_streams(
             drafter,
             &mut cache,
             input,
             &config,
             prng_key,
             &mut sampler,
-            stream,
+            MtpExecutionStreams::new(stream, draft_stream),
             |token_id| {
                 if time_to_first_token.is_none() {
                     time_to_first_token = Some(generation_started.elapsed());
@@ -984,6 +1004,9 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
         bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
+    }
+    if args.mtp_device == MtpDevice::Cpu && args.draft_model.is_none() {
+        bail!("--mtp-device cpu currently requires an external --draft-model");
     }
     if !args.temperature.is_finite() || args.temperature < 0.0 {
         bail!("--temperature must be a finite, non-negative number");
@@ -1529,6 +1552,36 @@ mod tests {
         ])
         .unwrap();
         validate_args(&speculative).unwrap();
+    }
+
+    #[test]
+    fn cpu_mtp_device_requires_external_drafter() {
+        let without_drafter = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--mtp-device",
+            "cpu",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&without_drafter)
+            .unwrap_err()
+            .to_string()
+            .contains("requires an external --draft-model"));
+
+        let with_drafter = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--draft-model",
+            "draft-id",
+            "--mtp-device",
+            "cpu",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&with_drafter).unwrap();
     }
 
     #[test]

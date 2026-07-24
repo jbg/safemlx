@@ -331,6 +331,27 @@ pub struct NativeQuantizedTensor {
 }
 
 impl NativeQuantizedTensor {
+    /// Copies the packed storage to another execution stream while preserving
+    /// this tensor's logical matrix and row view.
+    pub fn copy_to_stream(&self, stream: &Stream) -> Result<Self, Exception> {
+        let bytes = self.storage.bytes.copy(stream)?;
+        eval([&bytes])?;
+        Ok(Self {
+            storage: Arc::new(NativeStorage {
+                format: self.storage.format,
+                endian: self.storage.endian,
+                bytes,
+                byte_len: self.storage.byte_len,
+                kind: NativeStorageKind::MlxOwnedCopy,
+            }),
+            matrix_count: self.matrix_count,
+            physical_rows: self.physical_rows,
+            row_start: self.row_start,
+            rows: self.rows,
+            columns: self.columns,
+        })
+    }
+
     /// Copies one little-endian Q4_K physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
@@ -3372,6 +3393,40 @@ mod tests {
         // Logical views retain the backing allocation after the physical
         // parent object is gone.
         assert_eq!(gate.dequantize(&stream).unwrap().shape(), &[2, 2, 256]);
+    }
+
+    #[test]
+    fn native_view_copy_preserves_logical_slice() {
+        let source = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Cpu, 0));
+        let destination = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Cpu, 0));
+        let mut raw = Vec::new();
+        for _ in 0..8 {
+            raw.extend(sample_block());
+        }
+        let source_view = NativeQuantizedTensor::from_q4k_bytes(&raw, &[2, 4, 256], &source)
+            .unwrap()
+            .row_view(1, 2)
+            .unwrap();
+        let copied = source_view.copy_to_stream(&destination).unwrap();
+
+        assert!(!Arc::ptr_eq(source_view.storage(), copied.storage()));
+        assert_eq!(copied.shape(), source_view.shape());
+        assert_eq!(copied.row_start(), source_view.row_start());
+        assert_eq!(copied.physical_rows(), source_view.physical_rows());
+        assert_eq!(
+            copied
+                .dequantize(&destination)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            source_view
+                .dequantize(&source)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+        );
     }
 
     #[test]

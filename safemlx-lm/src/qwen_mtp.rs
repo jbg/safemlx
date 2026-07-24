@@ -107,6 +107,7 @@ pub(crate) struct QwenTargetState {
     mtp_cache: Vec<LayerCache>,
 }
 
+#[derive(Clone)]
 pub(crate) struct QwenDraftState {
     hidden: Array,
     mtp_cache: Vec<LayerCache>,

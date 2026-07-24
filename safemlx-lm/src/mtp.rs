@@ -35,6 +35,48 @@ enum DrafterModel {
     Gemma4(Gemma4AssistantDraftModel),
 }
 
+/// Target and draft streams used by one MTP generation sequence.
+///
+/// A single-stream execution preserves the original behavior. Supplying
+/// distinct streams places target prefill/verification and accepted-token
+/// sampling on `target`, while proposal generation runs on `draft`. The
+/// current engine uses conservative synchronized handoffs between them.
+#[derive(Debug, Clone, Copy)]
+pub struct MtpExecutionStreams<'a> {
+    target: &'a Stream,
+    draft: &'a Stream,
+}
+
+impl<'a> MtpExecutionStreams<'a> {
+    /// Creates an execution assignment with explicit target and draft streams.
+    pub const fn new(target: &'a Stream, draft: &'a Stream) -> Self {
+        Self { target, draft }
+    }
+
+    /// Creates the legacy assignment in which all MTP work uses one stream.
+    pub const fn single(stream: &'a Stream) -> Self {
+        Self {
+            target: stream,
+            draft: stream,
+        }
+    }
+
+    /// Returns the stream used for target prefill and verification.
+    pub const fn target(self) -> &'a Stream {
+        self.target
+    }
+
+    /// Returns the stream used for proposal generation.
+    pub const fn draft(self) -> &'a Stream {
+        self.draft
+    }
+
+    /// Returns whether target and draft work use different streams.
+    pub fn is_split(self) -> bool {
+        self.target != self.draft
+    }
+}
+
 /// Per-lane target caches for independently progressing MTP text batches.
 pub struct MtpCache {
     pub(crate) lanes: Vec<ModelCache>,
@@ -251,6 +293,20 @@ pub trait MtpBackend {
         stream: &Stream,
     ) -> Result<Self::DraftState, Exception>;
 
+    /// Starts one draft round with explicit target and draft streams.
+    ///
+    /// Existing backends may rely on the default draft-stream-only behavior.
+    /// Backends that must transfer committed target state should override this
+    /// method.
+    fn begin_draft_with_streams(
+        &mut self,
+        state: &Self::TargetState,
+        last_token: u32,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Self::DraftState, Exception> {
+        self.begin_draft(state, last_token, streams.draft())
+    }
+
     /// Returns raw next-token logits and advances private draft state.
     fn draft_logits(
         &mut self,
@@ -284,6 +340,28 @@ pub trait MtpBackend {
         verified_inputs: usize,
         stream: &Stream,
     ) -> Result<MtpCommit<Self::TargetState>, Exception>;
+
+    /// Commits verification with explicit target and draft streams.
+    ///
+    /// The default preserves the original target-stream commit behavior.
+    fn commit_verification_with_streams(
+        &mut self,
+        output: Self::Verification,
+        draft_state: Self::DraftState,
+        cache: &mut Self::Cache,
+        checkpoint: Self::CacheCheckpoint,
+        verified_inputs: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        self.commit_verification(
+            output,
+            draft_state,
+            cache,
+            checkpoint,
+            verified_inputs,
+            streams.target(),
+        )
+    }
 }
 
 /// Runs one batch-one speculative sequence using an architecture backend.
@@ -300,14 +378,39 @@ where
     B: MtpBackend,
     S: SpeculativeSampler,
 {
-    generate_with_callback(
+    generate_with_streams(
         backend,
         cache,
         input,
         config,
         prng_key,
         sampler,
-        stream,
+        MtpExecutionStreams::single(stream),
+    )
+}
+
+/// Runs one batch-one speculative sequence with explicit target/draft streams.
+pub fn generate_with_streams<B, S>(
+    backend: &mut B,
+    cache: &mut B::Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &mut S,
+    streams: MtpExecutionStreams<'_>,
+) -> Result<(Vec<u32>, MtpStats), Exception>
+where
+    B: MtpBackend,
+    S: SpeculativeSampler,
+{
+    generate_with_streams_and_callback(
+        backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        streams,
         |_| Ok(()),
     )
 }
@@ -327,6 +430,36 @@ pub fn generate_with_callback<B, S, F>(
     prng_key: Option<Array>,
     sampler: &mut S,
     stream: &Stream,
+    on_token: F,
+) -> Result<(Vec<u32>, MtpStats), Exception>
+where
+    B: MtpBackend,
+    S: SpeculativeSampler,
+    F: FnMut(u32) -> Result<(), Exception>,
+{
+    generate_with_streams_and_callback(
+        backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        MtpExecutionStreams::single(stream),
+        on_token,
+    )
+}
+
+/// Runs one batch-one speculative sequence with explicit target/draft streams
+/// and reports each committed token.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_streams_and_callback<B, S, F>(
+    backend: &mut B,
+    cache: &mut B::Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &mut S,
+    streams: MtpExecutionStreams<'_>,
     mut on_token: F,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
@@ -334,6 +467,8 @@ where
     S: SpeculativeSampler,
     F: FnMut(u32) -> Result<(), Exception>,
 {
+    let target_stream = streams.target();
+    let draft_stream = streams.draft();
     let started = Instant::now();
     let mut stats = MtpStats::default();
     if config.max_tokens == 0 {
@@ -360,18 +495,19 @@ where
     }
 
     let mut prng_state = prng_key.map(RandomState::from_key);
-    let prefill = backend.prefill(input, cache, stream)?;
+    let prefill = backend.prefill(input, cache, target_stream)?;
     stats.target_tokens += prefill.evaluated_tokens;
-    let first_logits = sampler.process_logits(&prefill.logits, config.temperature, &[], stream)?;
+    let first_logits =
+        sampler.process_logits(&prefill.logits, config.temperature, &[], target_stream)?;
     let first = sampler.sample_processed(
         &first_logits,
         config.temperature,
         prng_state.as_mut(),
-        stream,
+        target_stream,
     )?;
     eval([&first])?;
-    let first = first.item::<u32>(stream);
-    sampler.commit_token(&first_logits, first, stream)?;
+    let first = first.item::<u32>(target_stream);
+    sampler.commit_token(&first_logits, first, target_stream)?;
     let mut output = vec![first];
     stats.emitted_tokens = 1;
     on_token(first)?;
@@ -390,23 +526,29 @@ where
         if proposal_count == 0 {
             break;
         }
-        let mut draft_state = backend.begin_draft(&target_state, last, stream)?;
+        if streams.is_split() {
+            if let Some(state) = prng_state.as_mut() {
+                migrate_random_state(state, target_stream, draft_stream)?;
+            }
+        }
+        let mut draft_state = backend.begin_draft_with_streams(&target_state, last, streams)?;
         let mut proposed = Vec::with_capacity(proposal_count);
         let mut draft_logits = Vec::with_capacity(proposal_count);
         for _ in 0..proposal_count {
             let previous = proposed.last().copied().unwrap_or(last);
-            let raw = backend.draft_logits(&mut draft_state, previous, stream)?;
+            let raw = backend.draft_logits(&mut draft_state, previous, draft_stream)?;
             let mut history = output.clone();
             history.extend(proposed.iter().copied());
-            let processed = sampler.process_logits(&raw, config.temperature, &history, stream)?;
+            let processed =
+                sampler.process_logits(&raw, config.temperature, &history, draft_stream)?;
             let token = sampler.sample_processed(
                 &processed,
                 config.temperature,
                 prng_state.as_mut(),
-                stream,
+                draft_stream,
             )?;
             eval([&token])?;
-            let token = token.item::<u32>(stream);
+            let token = token.item::<u32>(draft_stream);
             proposed.push(token);
             draft_logits.push(processed);
             if config.eos_token_ids.contains(&token) {
@@ -418,44 +560,66 @@ where
         verify_ids.push(last);
         verify_ids.extend(proposed.iter().copied());
         let verify_input = Array::from_slice(&verify_ids, &[1, verify_ids.len() as i32]);
+        let verify_input = if streams.is_split() {
+            draft_stream.synchronize()?;
+            verify_input.copy(target_stream)?
+        } else {
+            verify_input
+        };
         let checkpoint = B::checkpoint(cache);
-        let verification = backend.verify(&verify_input, cache, stream)?;
+        let verification = backend.verify(&verify_input, cache, target_stream)?;
         let target_raw = B::verification_logits(&verification);
         stats.target_tokens += verify_ids.len();
         stats.draft_tokens += proposed.len();
+        let draft_logits = if config.temperature != 0.0 && streams.is_split() {
+            eval(draft_logits.iter())?;
+            draft_stream.synchronize()?;
+            draft_logits
+                .iter()
+                .map(|logits| logits.copy(target_stream))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            draft_logits
+        };
+        if streams.is_split() {
+            if let Some(state) = prng_state.as_mut() {
+                migrate_random_state(state, draft_stream, target_stream)?;
+            }
+        }
 
         let mut accepted = 0usize;
         let mut replacement = None;
         for (index, (&token, draft)) in proposed.iter().zip(&draft_logits).enumerate() {
-            let raw = target_raw.try_index_device((.., index as i32, ..), stream)?;
+            let raw = target_raw.try_index_device((.., index as i32, ..), target_stream)?;
             let mut history = output.clone();
             history.extend(proposed[..index].iter().copied());
-            let target = sampler.process_logits(&raw, config.temperature, &history, stream)?;
+            let target =
+                sampler.process_logits(&raw, config.temperature, &history, target_stream)?;
             if config.temperature == 0.0 {
                 let chosen = sampler
-                    .sample_processed(&target, 0.0, None, stream)?
-                    .item::<u32>(stream);
+                    .sample_processed(&target, 0.0, None, target_stream)?
+                    .item::<u32>(target_stream);
                 if chosen == token {
-                    sampler.commit_token(&target, token, stream)?;
+                    sampler.commit_token(&target, token, target_stream)?;
                     accepted += 1;
                     continue;
                 }
-                sampler.commit_token(&target, chosen, stream)?;
+                sampler.commit_token(&target, chosen, target_stream)?;
                 replacement = Some(chosen);
                 break;
             }
 
-            let p = probabilities(&target, stream)?;
-            let q = probabilities(draft, stream)?;
-            let p_token = probability_at(&p, token, stream)?;
-            let q_token = probability_at(&q, token, stream)?;
+            let p = probabilities(&target, target_stream)?;
+            let q = probabilities(draft, target_stream)?;
+            let p_token = probability_at(&p, token, target_stream)?;
+            let q_token = probability_at(&q, token, target_stream)?;
             let acceptance = if q_token <= 0.0 {
                 1.0
             } else {
                 (p_token / q_token).min(1.0)
             };
-            if uniform(prng_state.as_mut(), stream)? <= acceptance {
-                sampler.commit_token(&target, token, stream)?;
+            if uniform(prng_state.as_mut(), target_stream)? <= acceptance {
+                sampler.commit_token(&target, token, target_stream)?;
                 accepted += 1;
                 continue;
             }
@@ -466,9 +630,9 @@ where
                 sampler,
                 config.temperature,
                 prng_state.as_mut(),
-                stream,
+                target_stream,
             )?;
-            sampler.commit_token(&target, chosen, stream)?;
+            sampler.commit_token(&target, chosen, target_stream)?;
             replacement = Some(chosen);
             break;
         }
@@ -479,14 +643,20 @@ where
                 .last()
                 .is_some_and(|token| config.eos_token_ids.contains(token))
         {
-            let raw = target_raw.try_index_device((.., accepted as i32, ..), stream)?;
+            let raw = target_raw.try_index_device((.., accepted as i32, ..), target_stream)?;
             let mut history = output.clone();
             history.extend(proposed.iter().copied());
-            let target = sampler.process_logits(&raw, config.temperature, &history, stream)?;
+            let target =
+                sampler.process_logits(&raw, config.temperature, &history, target_stream)?;
             let chosen = sampler
-                .sample_processed(&target, config.temperature, prng_state.as_mut(), stream)?
-                .item::<u32>(stream);
-            sampler.commit_token(&target, chosen, stream)?;
+                .sample_processed(
+                    &target,
+                    config.temperature,
+                    prng_state.as_mut(),
+                    target_stream,
+                )?
+                .item::<u32>(target_stream);
+            sampler.commit_token(&target, chosen, target_stream)?;
             replacement = Some(chosen);
         }
 
@@ -494,13 +664,13 @@ where
         stats.accept_lens.push(accepted);
         stats.rounds += 1;
         let verified_inputs = 1 + accepted;
-        let commit = backend.commit_verification(
+        let commit = backend.commit_verification_with_streams(
             verification,
             draft_state,
             cache,
             checkpoint,
             verified_inputs,
-            stream,
+            streams,
         )?;
         target_state = commit.state;
         stats.target_tokens += commit.replayed_tokens;
@@ -528,6 +698,23 @@ where
 
     stats.elapsed = started.elapsed();
     Ok((output, stats))
+}
+
+fn migrate_random_state(
+    state: &mut RandomState,
+    source: &Stream,
+    destination: &Stream,
+) -> Result<(), Exception> {
+    if source == destination {
+        return Ok(());
+    }
+    eval([state.as_array()])?;
+    source.synchronize()?;
+    let copied = state.as_array().copy(destination)?;
+    eval([&copied])?;
+    destination.synchronize()?;
+    *state.as_array_mut() = copied;
+    Ok(())
 }
 
 fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
@@ -630,6 +817,15 @@ mod tests {
     struct ScriptedBackend {
         reject_first: bool,
         accept_second: bool,
+        routes: Vec<(&'static str, DeviceType)>,
+    }
+
+    impl ScriptedBackend {
+        fn record(&mut self, operation: &'static str, stream: &Stream) -> Result<(), Exception> {
+            self.routes
+                .push((operation, stream.get_device()?.get_type()?));
+            Ok(())
+        }
     }
 
     impl MtpBackend for ScriptedBackend {
@@ -647,8 +843,9 @@ mod tests {
             &mut self,
             _input: ModelInput<'_>,
             cache: &mut Self::Cache,
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
+            self.record("prefill", stream)?;
             *cache = 1;
             Ok(MtpPrefill {
                 logits: Array::from_slice(&[0.0f32, 10.0, 0.0], &[1, 3]),
@@ -661,8 +858,20 @@ mod tests {
             &mut self,
             _state: &Self::TargetState,
             _last_token: u32,
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<Self::DraftState, Exception> {
+            self.record("begin_draft", stream)?;
+            Ok(0)
+        }
+
+        fn begin_draft_with_streams(
+            &mut self,
+            _state: &Self::TargetState,
+            _last_token: u32,
+            streams: MtpExecutionStreams<'_>,
+        ) -> Result<Self::DraftState, Exception> {
+            self.record("begin_target", streams.target())?;
+            self.record("begin_draft", streams.draft())?;
             Ok(0)
         }
 
@@ -670,8 +879,9 @@ mod tests {
             &mut self,
             state: &mut Self::DraftState,
             _last_token: u32,
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<Array, Exception> {
+            self.record("draft", stream)?;
             let logits = if *state == 0 {
                 Array::from_slice(&[0.0f32, 0.0, 10.0], &[1, 1, 3])
             } else {
@@ -689,8 +899,9 @@ mod tests {
             &mut self,
             input_tokens: &Array,
             cache: &mut Self::Cache,
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<Self::Verification, Exception> {
+            self.record("verify", stream)?;
             *cache += input_tokens.dim(1) as usize;
             let first = if self.reject_first {
                 [0.0f32, 10.0, 0.0]
@@ -721,8 +932,27 @@ mod tests {
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            self.record("commit_target", stream)?;
+            *cache = checkpoint + verified_inputs;
+            Ok(MtpCommit {
+                state: (),
+                replayed_tokens: 0,
+            })
+        }
+
+        fn commit_verification_with_streams(
+            &mut self,
+            _output: Self::Verification,
+            _draft_state: Self::DraftState,
+            cache: &mut Self::Cache,
+            checkpoint: Self::CacheCheckpoint,
+            verified_inputs: usize,
+            streams: MtpExecutionStreams<'_>,
+        ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            self.record("commit_target", streams.target())?;
+            self.record("commit_draft", streams.draft())?;
             *cache = checkpoint + verified_inputs;
             Ok(MtpCommit {
                 state: (),
@@ -751,6 +981,7 @@ mod tests {
             &mut ScriptedBackend {
                 reject_first: false,
                 accept_second: false,
+                routes: Vec::new(),
             },
             &mut cache,
             input,
@@ -770,6 +1001,91 @@ mod tests {
         assert_eq!(stats.accept_lens, vec![1]);
         assert_eq!(stats.accepted_tokens, 1);
         assert_eq!(cache, 3);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn split_stream_engine_routes_draft_and_target_work() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: 3,
+            max_draft_tokens: 2,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut backend = ScriptedBackend {
+            reject_first: false,
+            accept_second: false,
+            routes: Vec::new(),
+        };
+        let mut cache = 0;
+
+        let (tokens, _) = generate_with_streams(
+            &mut backend,
+            &mut cache,
+            input,
+            &config,
+            None,
+            &mut DefaultSampler,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+        )
+        .unwrap();
+
+        assert_eq!(tokens, vec![1, 2, 1]);
+        for (operation, device) in backend.routes {
+            let expected = if operation == "begin_draft"
+                || operation == "draft"
+                || operation == "commit_draft"
+            {
+                DeviceType::Cpu
+            } else {
+                DeviceType::Gpu
+            };
+            assert_eq!(device, expected, "{operation}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn split_stream_engine_preserves_stochastic_acceptance() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let input = ModelInput::new(&parts);
+        let config = MtpConfig {
+            max_tokens: 4,
+            max_draft_tokens: 4,
+            temperature: 1.0,
+            eos_token_ids: Vec::new(),
+        };
+        let mut backend = ScriptedBackend {
+            reject_first: false,
+            accept_second: true,
+            routes: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut sampler = MirostatV2Sampler::default();
+        let key = safemlx::random::key(7).unwrap();
+
+        let (tokens, stats) = generate_with_streams(
+            &mut backend,
+            &mut cache,
+            input,
+            &config,
+            Some(key),
+            &mut sampler,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+        )
+        .unwrap();
+
+        assert_eq!(tokens, vec![1, 2, 0, 0]);
+        assert_eq!(stats.accepted_tokens, 2);
+        assert_eq!(sampler.generated_tokens(), tokens);
     }
 
     #[test]
@@ -794,6 +1110,7 @@ mod tests {
             &mut ScriptedBackend {
                 reject_first: false,
                 accept_second: true,
+                routes: Vec::new(),
             },
             &mut cache,
             input,
@@ -833,6 +1150,7 @@ mod tests {
             &mut ScriptedBackend {
                 reject_first: true,
                 accept_second: false,
+                routes: Vec::new(),
             },
             &mut cache,
             input,
