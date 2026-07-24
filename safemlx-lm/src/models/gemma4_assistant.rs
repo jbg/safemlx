@@ -1,6 +1,6 @@
 //! Gemma 4 assistant draft-model support for multi-token prediction.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
@@ -245,7 +245,7 @@ pub struct Gemma4AssistantDraftModel {
 /// discard the losing branch without copying or mutating model parameters.
 #[derive(Debug, Clone)]
 pub(crate) struct Gemma4AssistantDraftState {
-    shared_kv: HashMap<LayerType, (Array, Array)>,
+    shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
     kv_offset: i32,
     hidden: Array,
 }
@@ -321,7 +321,7 @@ impl Gemma4AssistantDraftModel {
     /// Begins one generalized speculative round from committed target state.
     pub(crate) fn begin_round(
         &self,
-        shared_kv: HashMap<LayerType, (Array, Array)>,
+        shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
         kv_offset: i32,
         hidden: &Array,
     ) -> Gemma4AssistantDraftState {
@@ -887,6 +887,8 @@ fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use std::{
         collections::HashMap,
         time::{SystemTime, UNIX_EPOCH},
@@ -921,11 +923,12 @@ mod tests {
     #[test]
     fn draft_state_forks_without_shared_mutable_progress() {
         let original = super::Gemma4AssistantDraftState {
-            shared_kv: HashMap::new(),
+            shared_kv: Arc::new(HashMap::new()),
             kv_offset: 7,
             hidden: Array::from_slice(&[1.0f32], &[1, 1, 1]),
         };
         let mut fork = original.clone();
+        assert!(Arc::ptr_eq(&original.shared_kv, &fork.shared_kv));
         fork.kv_offset += 1;
         fork.hidden = Array::from_slice(&[2.0f32], &[1, 1, 1]);
 

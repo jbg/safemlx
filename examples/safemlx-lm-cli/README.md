@@ -80,11 +80,25 @@ cargo run --release -p safemlx-lm-cli -- \
 
 `--mtp-device gpu` is the default. `--mtp-device cpu` keeps target prefill and
 verification on the GPU while loading and executing the external assistant on
-the CPU. Target state and stochastic acceptance data cross devices through
-explicit, conservatively synchronized copies. This is correctness-first
-heterogeneous execution; it does not yet overlap drafting and verification for
-one request. The option currently requires `--draft-model` and is not available
-for embedded Qwen MTP.
+the CPU. After submitting a lazy target-verification graph, the MTP scheduler
+continues one block ahead on the CPU under the assumption that every proposal
+will be accepted. It resolves the GPU result only after that eligible CPU work
+has been submitted. A fully accepted block reuses the continuation; rejection
+or EOS discards it without changing committed cache, sampler, PRNG, output, or
+statistics state. The default retains at most one target transaction and one
+lookahead block.
+
+Target acceptance and draft sampling use disjoint deterministic PRNG
+substreams. The pipelined path does not emit the conventional target bonus
+after an all-accepted block, because the optimistic continuation is rooted at
+the last proposal rather than an unknown bonus token. This remains lossless;
+the next block is verified normally.
+
+Same-request lookahead currently requires an external Gemma assistant and a
+history-only draft processor. Mirostat V2 still uses scheduled, lossless MTP
+but waits for target resolution because its adaptive state depends on committed
+target probabilities. Embedded Qwen uses the scheduler without optimistic
+lookahead. `--mtp-device cpu` requires `--draft-model`.
 
 The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published
@@ -105,7 +119,9 @@ cargo run --release -p safemlx-lm-cli -- \
 
 Stochastic MTP uses lossless probability-ratio acceptance and supports the
 same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
-generation. Under `--verbose`, the CLI reports proposal and acceptance counts.
+generation. Under `--verbose`, the CLI reports proposal and acceptance counts
+together with optimistic drafted/reused/discarded blocks and cross-request
+draft opportunities.
 
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints with native MTP weights use
 those embedded weights automatically; no `--draft-model` is needed. Their

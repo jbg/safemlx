@@ -601,13 +601,38 @@ Gemma assistant GGUF files may embed their JSON config in the
 `safemlx.mtp.config` metadata string or provide a sibling `config.json`.
 External Gemma assistants may execute on a separate CPU stream through
 `MtpExecutionStreams`; target prefill and verification remain on the target
-stream. The runtime takes a draft-device snapshot of the target token
-embedding, copies committed target hidden/shared-KV state at each round
-boundary, and synchronizes the streams conservatively. Mutable assistant
-round state is cloneable and separate from model parameters so future
-optimistic lookahead can fork and discard draft branches. This mode establishes
-correct heterogeneous placement but does not yet overlap one request's draft
-and verification phases.
+stream. `MtpScheduler` is the canonical engine: requests move through explicit
+prefill, draft, verification-submission, in-flight lookahead, resolution, and
+terminal phases. Verification submission leaves the lazy GPU graph unresolved.
+The scheduler then drafts one optimistic continuation block on the CPU, or
+gives a round-robin turn to another ready request, before reading target
+results. `MtpSchedulerOptions` bounds retained verifications and branches; both
+default to one.
+
+An optimistic Gemma branch shares immutable target shared-KV maps and MLX array
+handles while owning its small token delta, exact processed draft
+distributions, assistant progress, and draft PRNG snapshot. Full acceptance
+promotes that branch without recomputation; rejection, EOS, and cancellation
+drop it and commit only the verified prefix. Target acceptance and draft
+sampling use deterministic disjoint per-request PRNG substreams, so rejected
+lookahead cannot advance canonical target randomness. The pipelined path omits
+the usual all-accepted target bonus token: the next optimistic block is rooted
+at the last accepted proposal, avoiding reuse under a mismatched bonus while
+preserving lossless speculative decoding.
+
+`generate_mtp_text_batch_with_cache_and_streams` submits every independent lane
+to the same starvation-free scheduler and returns results in input order.
+Single-request APIs are one-request scheduler wrappers. `MtpStats` reports
+optimistically drafted, reused, and discarded tokens/blocks plus scheduler
+turns and cross-request draft opportunities; `MtpBatchOutput::scheduler`
+reports aggregate turns and peak retained transactions.
+
+Optimistic continuation currently requires an external Gemma assistant,
+distinct target/draft streams, and a sampler whose draft processing depends
+only on explicit history. Mirostat V2 remains lossless and reproducible but
+does not look ahead because its next truncation depends on target-committed
+adaptive state. Embedded Qwen uses the same request scheduler and independent
+lane semantics without same-request lookahead.
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
 head through `generate_embedded_mtp_input`; resident and bounded-layer loading
 are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text

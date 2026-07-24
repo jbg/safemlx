@@ -1,6 +1,6 @@
 //! Gemma 4 adapter for the architecture-independent MTP engine.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Stream};
 
@@ -18,7 +18,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct Gemma4TargetState {
     hidden: Array,
-    shared_kv: HashMap<LayerType, (Array, Array)>,
+    shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
     cache_len: usize,
 }
 
@@ -144,7 +144,7 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
         }
         Ok(Gemma4TargetState {
             hidden,
-            shared_kv,
+            shared_kv: Arc::new(shared_kv),
             cache_len,
         })
     }
@@ -185,7 +185,7 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
         streams.draft().synchronize()?;
         Ok(Gemma4TargetState {
             hidden,
-            shared_kv,
+            shared_kv: Arc::new(shared_kv),
             cache_len: state.cache_len,
         })
     }
@@ -200,6 +200,10 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
 
     fn max_draft_tokens(&self) -> usize {
         self.assistant.block_size().saturating_sub(1)
+    }
+
+    fn supports_optimistic_lookahead(&self) -> bool {
+        true
     }
 
     fn prefill(
@@ -378,7 +382,7 @@ pub(crate) fn generate_with_streams_and_callback<T, S, F>(
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
 where
     T: Gemma4MtpTarget,
-    S: SpeculativeSampler,
+    S: SpeculativeSampler + Clone,
     F: FnMut(u32) -> Result<(), Exception>,
 {
     let mut backend = Gemma4MtpBackend::new(target, assistant);
@@ -416,7 +420,7 @@ mod tests {
             .unwrap();
         let state = Gemma4TargetState {
             hidden,
-            shared_kv: HashMap::from([(LayerType::FullAttention, (keys, values))]),
+            shared_kv: Arc::new(HashMap::from([(LayerType::FullAttention, (keys, values))])),
             cache_len: 9,
         };
 

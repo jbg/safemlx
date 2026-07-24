@@ -19,6 +19,16 @@ use crate::{
 /// and history commitment.  A speculative decoder can therefore inspect the
 /// exact target and draft distributions without recording rejected tokens.
 pub trait SpeculativeSampler {
+    /// Returns whether processing draft logits depends only on the supplied
+    /// history and immutable sampler configuration.
+    ///
+    /// Optimistic MTP lookahead runs before the current target block has been
+    /// committed. Stateful processors whose next draft distribution depends on
+    /// target-side commit data must keep the default `false`.
+    fn supports_optimistic_lookahead(&self) -> bool {
+        false
+    }
+
     /// Applies penalties, filters, and temperature using the supplied logical
     /// token history, returning canonical-vocabulary logits.
     fn process_logits(
@@ -327,6 +337,10 @@ impl<S: Clone> ConstrainedSampler<S> {
 }
 
 impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
+    fn supports_optimistic_lookahead(&self) -> bool {
+        self.policy.supports_optimistic_lookahead()
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,
@@ -445,6 +459,10 @@ fn constraint_error(error: String) -> Exception {
 pub struct DefaultSampler;
 
 impl SpeculativeSampler for DefaultSampler {
+    fn supports_optimistic_lookahead(&self) -> bool {
+        true
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,
@@ -974,6 +992,10 @@ impl GenerationSampler {
 }
 
 impl SpeculativeSampler for GenerationSampler {
+    fn supports_optimistic_lookahead(&self) -> bool {
+        true
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,

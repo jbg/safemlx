@@ -47,7 +47,7 @@ use crate::{
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
     mtp::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
-        MtpExecutionStreams, MtpStats,
+        MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpStats,
     },
 };
 
@@ -610,7 +610,7 @@ impl Model {
 
     /// Generates with MTP using a caller-provided lossless sampling policy.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler>(
+    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
         cache: &mut ModelCache,
@@ -645,7 +645,7 @@ impl Model {
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         let assistant = drafter.gemma4_mut();
@@ -691,7 +691,7 @@ impl Model {
 
     /// Generates with embedded MTP weights and a caller-provided sampler.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -723,7 +723,7 @@ impl Model {
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         match (self, cache) {
@@ -1937,6 +1937,125 @@ pub struct LoadedModel {
     constraint_compiler: Result<ConstraintCompiler, String>,
 }
 
+fn run_external_mtp_batch<'a, B, S>(
+    backend: &'a mut B,
+    lanes: &'a mut [ModelCache],
+    prompt_tokens: &Array,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &S,
+    streams: MtpExecutionStreams<'a>,
+) -> Result<MtpBatchOutput, Exception>
+where
+    B: crate::mtp::MtpBackend<Cache = gemma4::Cache>,
+    S: SpeculativeSampler + Clone + 'a,
+{
+    let mut batch_prng = prng_key.map(RandomState::from_key);
+    let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
+    for (lane, lane_cache) in lanes.iter_mut().enumerate() {
+        let ModelCache::Gemma4(lane_cache) = lane_cache else {
+            return Err(Exception::custom(format!(
+                "scheduled Gemma 4 MTP requires Gemma 4 cache lane {lane}"
+            )));
+        };
+        let row = prompt_tokens.try_index_device((lane as i32, NewAxis, ..), streams.target())?;
+        let lane_key = batch_prng
+            .as_mut()
+            .map(|state| state.next_key(streams.target()))
+            .transpose()?;
+        let parts = [input::InputPart::text_token_ids(&row)];
+        scheduler.submit(
+            lane_cache,
+            input::ModelInput::new(&parts),
+            config.clone(),
+            lane_key,
+            sampler.clone(),
+            |_| Ok(()),
+        )?;
+    }
+    scheduler.run()?;
+    let output = scheduler.finish()?;
+    let mut token_ids = Vec::with_capacity(output.requests.len());
+    let mut stats = Vec::with_capacity(output.requests.len());
+    for request in output.requests {
+        token_ids.push(request.token_ids);
+        stats.push(request.stats);
+    }
+    Ok(MtpBatchOutput {
+        token_ids,
+        stats,
+        scheduler: output.scheduler,
+    })
+}
+
+fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5_moe::Cache> {
+    match cache {
+        ModelCache::Qwen3Next(cache) => Some(cache),
+        _ => None,
+    }
+}
+
+fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5_moe::Cache> {
+    match cache {
+        ModelCache::Qwen35Moe(cache) => Some(cache),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_embedded_mtp_batch<'a, B, S>(
+    backend: &'a mut B,
+    lanes: &'a mut [ModelCache],
+    cache_for_lane: fn(&mut ModelCache) -> Option<&mut qwen3_5_moe::Cache>,
+    prompt_tokens: &Array,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &S,
+    stream: &'a Stream,
+) -> Result<MtpBatchOutput, Exception>
+where
+    B: crate::mtp::MtpBackend<Cache = qwen3_5_moe::Cache>,
+    S: SpeculativeSampler + Clone + 'a,
+{
+    let streams = MtpExecutionStreams::single(stream);
+    let mut batch_prng = prng_key.map(RandomState::from_key);
+    let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
+    for (lane, lane_cache) in lanes.iter_mut().enumerate() {
+        let lane_cache = cache_for_lane(lane_cache).ok_or_else(|| {
+            Exception::custom(format!(
+                "scheduled embedded MTP cache type mismatch at lane {lane}"
+            ))
+        })?;
+        let row = prompt_tokens.try_index_device((lane as i32, NewAxis, ..), stream)?;
+        let lane_key = batch_prng
+            .as_mut()
+            .map(|state| state.next_key(stream))
+            .transpose()?;
+        let parts = [input::InputPart::text_token_ids(&row)];
+        scheduler.submit(
+            lane_cache,
+            input::ModelInput::new(&parts),
+            config.clone(),
+            lane_key,
+            sampler.clone(),
+            |_| Ok(()),
+        )?;
+    }
+    scheduler.run()?;
+    let output = scheduler.finish()?;
+    let mut token_ids = Vec::with_capacity(output.requests.len());
+    let mut stats = Vec::with_capacity(output.requests.len());
+    for request in output.requests {
+        token_ids.push(request.token_ids);
+        stats.push(request.stats);
+    }
+    Ok(MtpBatchOutput {
+        token_ids,
+        stats,
+        scheduler: output.scheduler,
+    })
+}
+
 impl LoadedModel {
     /// Creates an independent stateful decoder for streaming generated tokens.
     pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
@@ -2003,7 +2122,7 @@ impl LoadedModel {
 
     /// Generates through MTP with a caller-provided speculative sampling policy.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler>(
+    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
         cache: &mut ModelCache,
@@ -2027,7 +2146,7 @@ impl LoadedModel {
     /// Generates through MTP with a caller-provided sampler and separate
     /// target/draft streams.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_mtp_input_with_sampler_and_streams<S: SpeculativeSampler>(
+    pub fn generate_mtp_input_with_sampler_and_streams<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
         cache: &mut ModelCache,
@@ -2069,7 +2188,7 @@ impl LoadedModel {
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         let mut config = config.clone();
@@ -2096,7 +2215,7 @@ impl LoadedModel {
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         self.generate_mtp_input_with_sampler_callback_and_streams(
@@ -2132,7 +2251,7 @@ impl LoadedModel {
 
     /// Generates through embedded MTP weights with a caller-provided sampler.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -2163,7 +2282,7 @@ impl LoadedModel {
         on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         let mut config = config.clone();
@@ -2218,6 +2337,33 @@ impl LoadedModel {
         sampler: &S,
         stream: &Stream,
     ) -> Result<MtpBatchOutput, Exception> {
+        self.generate_mtp_text_batch_with_cache_and_streams(
+            drafter,
+            cache,
+            prompt_tokens,
+            config,
+            prng_key,
+            sampler,
+            MtpExecutionStreams::single(stream),
+        )
+    }
+
+    /// Generates a fair scheduled text batch with explicit target/draft streams.
+    ///
+    /// All lanes are submitted before decoding begins. With split GPU-target
+    /// and CPU-draft streams, a lane drafts optimistically or another ready
+    /// lane drafts before the scheduler resolves an in-flight verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_text_batch_with_cache_and_streams<S: SpeculativeSampler + Clone>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut MtpCache,
+        prompt_tokens: &Array,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &S,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<MtpBatchOutput, Exception> {
         if prompt_tokens.ndim() != 2 || prompt_tokens.dim(1) == 0 {
             return Err(Exception::custom(format!(
                 "MTP text batch must be shaped [batch, nonzero sequence], got {:?}",
@@ -2236,30 +2382,44 @@ impl LoadedModel {
                 "random operations require an explicit PRNG key",
             ));
         }
-        let mut batch_prng = prng_key.map(RandomState::from_key);
-        let mut output = MtpBatchOutput::default();
-        for lane in 0..prompt_tokens.dim(0) {
-            let row = prompt_tokens.try_index_device((lane, NewAxis, ..), stream)?;
-            let lane_key = batch_prng
-                .as_mut()
-                .map(|state| state.next_key(stream))
-                .transpose()?;
-            let parts = [input::InputPart::text_token_ids(&row)];
-            let input = input::ModelInput::new(&parts);
-            let mut lane_sampler = sampler.clone();
-            let (tokens, stats) = self.generate_mtp_input_with_sampler(
-                drafter,
-                &mut cache.lanes[lane as usize],
-                input,
-                config,
-                lane_key,
-                &mut lane_sampler,
-                stream,
-            )?;
-            output.token_ids.push(tokens);
-            output.stats.push(stats);
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        Ok(output)
+        let assistant = drafter.gemma4_mut();
+        match &mut self.model {
+            Model::Gemma4(target) => {
+                validate_gemma4_drafter(&target.args, assistant)?;
+                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                run_external_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    streams,
+                )
+            }
+            Model::Gemma4Layerwise(target) => {
+                validate_gemma4_drafter(target.args(), assistant)?;
+                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                run_external_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    streams,
+                )
+            }
+            model => Err(Exception::custom(format!(
+                "scheduled external MTP batch is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
     }
 
     /// Generates an independently accepting text batch with embedded MTP weights.
@@ -2316,29 +2476,69 @@ impl LoadedModel {
                 "random operations require an explicit PRNG key",
             ));
         }
-        let mut batch_prng = prng_key.map(RandomState::from_key);
-        let mut output = MtpBatchOutput::default();
-        for lane in 0..prompt_tokens.dim(0) {
-            let row = prompt_tokens.try_index_device((lane, NewAxis, ..), stream)?;
-            let lane_key = batch_prng
-                .as_mut()
-                .map(|state| state.next_key(stream))
-                .transpose()?;
-            let parts = [input::InputPart::text_token_ids(&row)];
-            let input = input::ModelInput::new(&parts);
-            let mut lane_sampler = sampler.clone();
-            let (tokens, stats) = self.generate_embedded_mtp_input_with_sampler(
-                &mut cache.lanes[lane as usize],
-                input,
-                config,
-                lane_key,
-                &mut lane_sampler,
-                stream,
-            )?;
-            output.token_ids.push(tokens);
-            output.stats.push(stats);
+        let mut config = config.clone();
+        if config.eos_token_ids.is_empty() {
+            config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        Ok(output)
+        match &mut self.model {
+            Model::Qwen3Next(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    qwen_next_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            Model::Qwen35Moe(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    qwen35_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            Model::Qwen3NextLayerwise(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    qwen_next_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            Model::Qwen35MoeLayerwise(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    qwen35_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            model => Err(Exception::custom(format!(
+                "scheduled embedded MTP batch is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
     }
 
     /// Returns residency telemetry when bounded layer execution was selected.

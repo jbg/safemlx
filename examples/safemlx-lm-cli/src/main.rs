@@ -83,6 +83,7 @@ impl From<ExpertCacheEviction> for CacheEvictionPolicy {
     }
 }
 
+#[derive(Clone)]
 enum CliSampler {
     Greedy(DefaultSampler),
     Configured(GenerationSampler),
@@ -106,6 +107,14 @@ impl Sampler for CliSampler {
 }
 
 impl SpeculativeSampler for CliSampler {
+    fn supports_optimistic_lookahead(&self) -> bool {
+        match self {
+            Self::Greedy(sampler) => sampler.supports_optimistic_lookahead(),
+            Self::Configured(sampler) => sampler.supports_optimistic_lookahead(),
+            Self::MirostatV2(sampler) => sampler.supports_optimistic_lookahead(),
+        }
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,
@@ -734,11 +743,15 @@ fn main() -> Result<()> {
         eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
         if let Some(stats) = &mtp_stats {
             eprintln!(
-                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}",
+                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_reused_optimistic_blocks: {}, mtp_discarded_optimistic_blocks: {}, mtp_cross_request_draft_opportunities: {}",
                 stats.rounds,
                 stats.draft_tokens,
                 stats.accepted_tokens,
                 stats.accept_rate(),
+                stats.optimistic_draft_blocks,
+                stats.reused_optimistic_blocks,
+                stats.discarded_optimistic_blocks,
+                stats.cross_request_draft_opportunities,
             );
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
         }

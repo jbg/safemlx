@@ -2064,6 +2064,31 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
+    fn cache_checkpoint_clone_shares_kv_array_handles() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = ConcatKeyValueCache::new_with_step(8);
+        let keys = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 1, 2]);
+        cache.update_and_fetch(keys.clone(), keys, stream).unwrap();
+        let checkpoint = cache.clone();
+        let cache_arrays = cache.arrays().collect::<Vec<_>>();
+        let checkpoint_arrays = checkpoint.arrays().collect::<Vec<_>>();
+
+        assert_eq!(cache_arrays.len(), 2);
+        assert_eq!(checkpoint_arrays.len(), 2);
+        for (current, saved) in cache_arrays.into_iter().zip(checkpoint_arrays) {
+            eval([current, saved]).unwrap();
+            let current = current.evaluated().unwrap();
+            let saved = saved.evaluated().unwrap();
+            assert_eq!(
+                current.as_slice::<f32>().as_ptr(),
+                saved.as_slice::<f32>().as_ptr()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
     fn chunked_cache_grows_by_steps_and_preserves_sliding_values() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();

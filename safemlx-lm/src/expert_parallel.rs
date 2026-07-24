@@ -1137,13 +1137,18 @@ struct ExpertParallelQwenMtpTarget<'a> {
     group: &'a Group,
 }
 
+#[derive(Clone)]
 struct ExpertParallelSpeculativeSampler<'a, S> {
-    sampler: &'a mut S,
+    sampler: S,
     sampling_rank: usize,
     group: &'a Group,
 }
 
 impl<S: SpeculativeSampler> SpeculativeSampler for ExpertParallelSpeculativeSampler<'_, S> {
+    fn supports_optimistic_lookahead(&self) -> bool {
+        false
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,
@@ -2229,7 +2234,7 @@ impl ExpertParallelModel {
 
     /// Generates through embedded Qwen MTP with a caller-provided sampler.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler>(
+    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ExpertParallelCache,
         input: runtime_input::ModelInput<'_>,
@@ -2269,7 +2274,7 @@ impl ExpertParallelModel {
         mut on_token: F,
     ) -> Result<(Vec<u32>, MtpStats), Exception>
     where
-        S: SpeculativeSampler,
+        S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
         self.validate_group(group)
@@ -2298,13 +2303,13 @@ impl ExpertParallelModel {
             ));
         };
         let mut synchronized_sampler = ExpertParallelSpeculativeSampler {
-            sampler,
+            sampler: sampler.clone(),
             sampling_rank,
             group,
         };
         let emit_callbacks = group.rank() == sampling_rank;
         let mut target = ExpertParallelQwenMtpTarget { model: self, group };
-        crate::qwen_mtp::generate_with_callback(
+        let result = crate::qwen_mtp::generate_with_callback(
             &mut target,
             cache,
             input,
@@ -2319,7 +2324,9 @@ impl ExpertParallelModel {
                     Ok(())
                 }
             },
-        )
+        );
+        *sampler = synchronized_sampler.sampler;
+        result
     }
 
     /// Samples on one rank and synchronizes only token ids and stop state.
