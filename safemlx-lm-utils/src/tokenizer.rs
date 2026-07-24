@@ -66,7 +66,7 @@
 // """
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::read_to_string,
     ops::{Deref, DerefMut},
     path::Path,
@@ -78,6 +78,87 @@ use serde::Serialize;
 use tokenizers::Encoding;
 
 use crate::error::Error;
+
+const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
+const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
+
+/// A single chat template or a Hugging Face named-template collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChatTemplate {
+    Single(String),
+    Named(BTreeMap<String, String>),
+}
+
+impl From<String> for ModelChatTemplate {
+    fn from(template: String) -> Self {
+        Self::Single(template)
+    }
+}
+
+impl From<&str> for ModelChatTemplate {
+    fn from(template: &str) -> Self {
+        Self::Single(template.to_owned())
+    }
+}
+
+/// Stable identity of the template selected from a checkpoint's template metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChatTemplateIdentity {
+    Single,
+    Named(String),
+}
+
+/// A selected Jinja template together with its stable checkpoint-local identity.
+#[derive(Debug, Clone)]
+pub struct SelectedChatTemplate<'a> {
+    template: &'a str,
+    identity: ChatTemplateIdentity,
+}
+
+impl SelectedChatTemplate<'_> {
+    pub fn template(&self) -> &str {
+        self.template
+    }
+
+    pub fn identity(&self) -> &ChatTemplateIdentity {
+        &self.identity
+    }
+}
+
+impl ModelChatTemplate {
+    /// Selects `tool_use` for a non-empty tool list when present, and `default`
+    /// otherwise. Single templates are always selected unchanged.
+    pub fn select(
+        &self,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<SelectedChatTemplate<'_>, Error> {
+        match self {
+            Self::Single(template) => Ok(SelectedChatTemplate {
+                template,
+                identity: ChatTemplateIdentity::Single,
+            }),
+            Self::Named(templates) => {
+                let selected_name = if tools.is_some_and(|tools| !tools.is_empty())
+                    && templates.contains_key(TOOL_USE_CHAT_TEMPLATE_NAME)
+                {
+                    TOOL_USE_CHAT_TEMPLATE_NAME
+                } else {
+                    DEFAULT_CHAT_TEMPLATE_NAME
+                };
+                let template =
+                    templates
+                        .get(selected_name)
+                        .ok_or_else(|| Error::AmbiguousChatTemplate {
+                            available: templates.keys().cloned().collect(),
+                        })?;
+                Ok(SelectedChatTemplate {
+                    template,
+                    identity: ChatTemplateIdentity::Named(selected_name.to_owned()),
+                })
+            }
+        }
+    }
+}
 
 /// Wrapper around [`tokenizers::Tokenizer`] and [`minijinja::Environment`]
 /// providing more utilities.
@@ -127,7 +208,7 @@ impl Tokenizer {
 
     pub fn apply_chat_template<'a, I, R, T>(
         &'a mut self,
-        model_template: String,
+        model_template: impl Into<ModelChatTemplate>,
         args: ApplyChatTemplateArgs<'a, I, R, T>,
     ) -> Result<Vec<String>, Error>
     where
@@ -137,7 +218,7 @@ impl Tokenizer {
     {
         apply_chat_template_with_default_kwargs(
             &mut self.env,
-            model_template,
+            model_template.into(),
             args,
             Some(&self.template_kwargs),
         )
@@ -145,7 +226,7 @@ impl Tokenizer {
 
     pub fn apply_chat_template_and_encode<'a, I, R, T>(
         &mut self,
-        model_template: String,
+        model_template: impl Into<ModelChatTemplate>,
         args: ApplyChatTemplateArgs<'a, I, R, T>,
     ) -> Result<Vec<Encoding>, Error>
     where
@@ -161,7 +242,7 @@ impl Tokenizer {
 
         let rendered_chats = apply_chat_template_with_default_kwargs(
             env,
-            model_template,
+            model_template.into(),
             args,
             Some(template_kwargs),
         )?;
@@ -172,7 +253,7 @@ impl Tokenizer {
 
     pub fn apply_chat_template_json<'a, I>(
         &mut self,
-        model_template: String,
+        model_template: impl Into<ModelChatTemplate>,
         conversations: I,
         tools: Option<&'a [serde_json::Value]>,
         model_id: &'a str,
@@ -184,7 +265,7 @@ impl Tokenizer {
     {
         apply_chat_template_json_with_default_kwargs(
             &mut self.env,
-            model_template,
+            model_template.into(),
             conversations,
             tools,
             model_id,
@@ -296,22 +377,83 @@ where
     pub template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
-pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
-    serde_json::from_str::<serde_json::Value>(content)
-        .map(|value| {
-            value
-                .get("chat_template")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
-        .map_err(Into::into)
+pub fn load_model_chat_template_from_str(
+    content: &str,
+) -> std::io::Result<Option<ModelChatTemplate>> {
+    let config =
+        serde_json::from_str::<serde_json::Value>(content).map_err(std::io::Error::from)?;
+    let Some(value) = config.get("chat_template") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(template) = value.as_str() {
+        return Ok(Some(ModelChatTemplate::Single(template.to_owned())));
+    }
+    let Some(entries) = value.as_array() else {
+        return Err(invalid_chat_template(
+            "expected a string or an array of named template entries".into(),
+        ));
+    };
+    if entries.is_empty() {
+        return Err(invalid_chat_template(
+            "named template collection must not be empty".into(),
+        ));
+    }
+
+    let mut templates = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            return Err(invalid_chat_template(format!(
+                "entry {index} must be an object with string fields \"name\" and \"template\""
+            )));
+        };
+        if entry.len() != 2 || !entry.contains_key("name") || !entry.contains_key("template") {
+            return Err(invalid_chat_template(format!(
+                "entry {index} must contain exactly the fields \"name\" and \"template\""
+            )));
+        }
+        let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
+            return Err(invalid_chat_template(format!(
+                "entry {index} field \"name\" must be a string"
+            )));
+        };
+        if name.is_empty() {
+            return Err(invalid_chat_template(format!(
+                "entry {index} field \"name\" must not be empty"
+            )));
+        }
+        let Some(template) = entry.get("template").and_then(serde_json::Value::as_str) else {
+            return Err(invalid_chat_template(format!(
+                "entry {index} field \"template\" must be a string"
+            )));
+        };
+        if templates
+            .insert(name.to_owned(), template.to_owned())
+            .is_some()
+        {
+            return Err(invalid_chat_template(format!(
+                "duplicate named template {name:?}"
+            )));
+        }
+    }
+
+    Ok(Some(ModelChatTemplate::Named(templates)))
 }
 
 pub fn load_model_chat_template_from_file(
     file: impl AsRef<Path>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<ModelChatTemplate>> {
     let content = read_to_string(file)?;
     load_model_chat_template_from_str(&content)
+}
+
+fn invalid_chat_template(message: String) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        Error::InvalidChatTemplate(message),
+    )
 }
 
 /// Returns undeclared top-level variables referenced by a chat template.
@@ -536,7 +678,7 @@ const STANDARD_CHAT_TEMPLATE_VARIABLES: &[&str] = &[
 
 pub fn apply_chat_template_json<'a, I>(
     env: &mut Environment<'static>,
-    model_template: String,
+    model_template: impl Into<ModelChatTemplate>,
     conversations: I,
     tools: Option<&'a [serde_json::Value]>,
     model_id: &'a str,
@@ -548,7 +690,7 @@ where
 {
     apply_chat_template_json_with_default_kwargs(
         env,
-        model_template,
+        model_template.into(),
         conversations,
         tools,
         model_id,
@@ -560,7 +702,7 @@ where
 
 fn apply_chat_template_json_with_default_kwargs<'a, I>(
     env: &mut Environment<'static>,
-    model_template: String,
+    model_template: ModelChatTemplate,
     conversations: I,
     tools: Option<&'a [serde_json::Value]>,
     model_id: &'a str,
@@ -597,7 +739,7 @@ where
 
 pub fn apply_chat_template<'a, I, R, T>(
     env: &mut Environment<'static>,
-    model_template: String,
+    model_template: impl Into<ModelChatTemplate>,
     args: ApplyChatTemplateArgs<'a, I, R, T>,
 ) -> Result<Vec<String>, Error>
 where
@@ -605,12 +747,12 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
-    apply_chat_template_with_default_kwargs(env, model_template, args, None)
+    apply_chat_template_with_default_kwargs(env, model_template.into(), args, None)
 }
 
 fn apply_chat_template_with_default_kwargs<'a, I, R, T>(
     env: &mut Environment<'static>,
-    model_template: String,
+    model_template: ModelChatTemplate,
     args: ApplyChatTemplateArgs<'a, I, R, T>,
     default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
@@ -632,17 +774,29 @@ where
 
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
     let continue_final_message = continue_final_message.unwrap_or(false);
+    let selected = model_template.select(tools)?;
 
     let template = match chat_template_id {
         Some(chat_template_id) => env.get_template(chat_template_id)?,
-        None => match env.get_template(model_id) {
-            Ok(template) => template,
-            Err(_) => {
-                env.add_template_owned(model_id.to_owned(), model_template)?;
-                env.get_template(model_id)
-                    .expect("Newly added template must be present")
+        None => {
+            let selected_template_id = match selected.identity() {
+                ChatTemplateIdentity::Single => model_id.to_owned(),
+                ChatTemplateIdentity::Named(name) => {
+                    format!("{model_id}::chat_template::{name}")
+                }
+            };
+            match env.get_template(&selected_template_id) {
+                Ok(template) => template,
+                Err(_) => {
+                    env.add_template_owned(
+                        selected_template_id.clone(),
+                        selected.template().to_owned(),
+                    )?;
+                    env.get_template(&selected_template_id)
+                        .expect("Newly added template must be present")
+                }
             }
-        },
+        }
     };
 
     // TODO: allow return_generation_indices
@@ -765,7 +919,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::tokenizer::{
-        apply_chat_template, load_model_chat_template_from_file, ApplyChatTemplateArgs,
+        apply_chat_template, apply_chat_template_json, load_model_chat_template_from_file,
+        load_model_chat_template_from_str, ApplyChatTemplateArgs, ChatTemplateIdentity,
         Conversation, Role,
     };
 
@@ -783,14 +938,191 @@ mod tests {
     fn test_load_chat_template_from_file() {
         let file = fixtures_dir().join("tokenizer_config.json");
         let chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        assert!(!chat_template.is_empty());
+        assert!(!chat_template.select(None).unwrap().template().is_empty());
+    }
+
+    #[test]
+    fn single_chat_template_remains_compatible() {
+        let templates = load_model_chat_template_from_str(r#"{"chat_template":"single-template"}"#)
+            .unwrap()
+            .unwrap();
+        let selected = templates.select(None).unwrap();
+        assert_eq!(selected.template(), "single-template");
+        assert_eq!(selected.identity(), &ChatTemplateIdentity::Single);
+
+        let selected_with_tools = templates.select(Some(&[serde_json::json!({})])).unwrap();
+        assert_eq!(selected_with_tools.template(), "single-template");
+        assert_eq!(
+            selected_with_tools.identity(),
+            &ChatTemplateIdentity::Single
+        );
+    }
+
+    #[test]
+    fn named_chat_templates_select_default_or_tool_use() {
+        let templates = load_model_chat_template_from_str(
+            r#"{
+                "chat_template": [
+                    {"name": "tool_use", "template": "tools-template"},
+                    {"name": "default", "template": "default-template"}
+                ]
+            }"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let selected = templates.select(None).unwrap();
+        assert_eq!(selected.template(), "default-template");
+        assert_eq!(
+            selected.identity(),
+            &ChatTemplateIdentity::Named("default".into())
+        );
+
+        let selected = templates.select(Some(&[])).unwrap();
+        assert_eq!(selected.template(), "default-template");
+        assert_eq!(
+            selected.identity(),
+            &ChatTemplateIdentity::Named("default".into())
+        );
+
+        let tools = [serde_json::json!({"type": "function"})];
+        let selected = templates.select(Some(&tools)).unwrap();
+        assert_eq!(selected.template(), "tools-template");
+        assert_eq!(
+            selected.identity(),
+            &ChatTemplateIdentity::Named("tool_use".into())
+        );
+
+        let default_only = load_model_chat_template_from_str(
+            r#"{"chat_template":[{"name":"default","template":"default-only"}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let selected = default_only.select(Some(&tools)).unwrap();
+        assert_eq!(selected.template(), "default-only");
+        assert_eq!(
+            selected.identity(),
+            &ChatTemplateIdentity::Named("default".into())
+        );
+    }
+
+    #[test]
+    fn named_chat_template_selection_reports_missing_default_deterministically() {
+        let templates = load_model_chat_template_from_str(
+            r#"{"chat_template":[
+                {"name":"rag","template":"rag-template"},
+                {"name":"chat","template":"chat-template"}
+            ]}"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            templates.select(None).unwrap_err().to_string(),
+            r#"chat_template collection has no default template; available templates: ["chat", "rag"]"#
+        );
+    }
+
+    #[test]
+    fn named_chat_template_collection_rejects_malformed_and_duplicate_entries() {
+        let cases = [
+            (
+                r#"{"chat_template":{}}"#,
+                "invalid chat_template: expected a string or an array of named template entries",
+            ),
+            (
+                r#"{"chat_template":[]}"#,
+                "invalid chat_template: named template collection must not be empty",
+            ),
+            (
+                r#"{"chat_template":["default"]}"#,
+                "invalid chat_template: entry 0 must be an object with string fields \"name\" and \"template\"",
+            ),
+            (
+                r#"{"chat_template":[{"template":"x"}]}"#,
+                "invalid chat_template: entry 0 must contain exactly the fields \"name\" and \"template\"",
+            ),
+            (
+                r#"{"chat_template":[{"name":"default","template":1}]}"#,
+                "invalid chat_template: entry 0 field \"template\" must be a string",
+            ),
+            (
+                r#"{"chat_template":[{"name":"default","template":"a"},{"name":"default","template":"b"}]}"#,
+                "invalid chat_template: duplicate named template \"default\"",
+            ),
+        ];
+
+        for (config, expected) in cases {
+            assert_eq!(
+                load_model_chat_template_from_str(config)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn apply_chat_template_apis_share_named_template_selection() {
+        let templates = load_model_chat_template_from_str(
+            r#"{
+                "chat_template": [
+                    {"name": "default", "template": "default"},
+                    {"name": "tool_use", "template": "tool_use"}
+                ]
+            }"#,
+        )
+        .unwrap()
+        .unwrap();
+        let mut env = Environment::new();
+        let conversations = [vec![Conversation {
+            role: Role::User,
+            content: "hello",
+        }]
+        .into()];
+
+        let rendered = apply_chat_template(
+            &mut env,
+            templates.clone(),
+            ApplyChatTemplateArgs {
+                conversations,
+                tools: Some(&[]),
+                documents: None,
+                model_id: "selection-test",
+                chat_template_id: None,
+                add_generation_prompt: None,
+                continue_final_message: None,
+                template_kwargs: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered, vec!["default"]);
+
+        let tools = [serde_json::json!({"type": "function"})];
+        let rendered = apply_chat_template_json(
+            &mut env,
+            templates,
+            [vec![
+                serde_json::json!({"role": "user", "content": "hello"}),
+            ]],
+            Some(&tools),
+            "selection-test",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rendered, vec!["tool_use"]);
     }
 
     #[test]
     fn test_apply_chat_template() {
         let file = fixtures_dir().join("tokenizer_config.json");
         let model_chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        assert!(!model_chat_template.is_empty());
+        assert!(!model_chat_template
+            .select(None)
+            .unwrap()
+            .template()
+            .is_empty());
 
         let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
         let conversations = vec![Conversation {
@@ -915,7 +1247,11 @@ mod tests {
     fn test_qwen_fixture_reports_enable_thinking_kwarg() {
         let file = fixtures_dir().join("tokenizer_config.json");
         let chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        let kwargs = super::chat_template_kwargs(&chat_template, "qwen-fixture").unwrap();
+        let kwargs = super::chat_template_kwargs(
+            chat_template.select(None).unwrap().template(),
+            "qwen-fixture",
+        )
+        .unwrap();
         assert!(kwargs.contains("enable_thinking"), "{kwargs:?}");
     }
 
@@ -937,7 +1273,11 @@ mod tests {
         let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
             .unwrap()
             .unwrap();
-        assert!(!model_chat_template.is_empty());
+        assert!(!model_chat_template
+            .select(None)
+            .unwrap()
+            .template()
+            .is_empty());
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
@@ -973,7 +1313,11 @@ mod tests {
         let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
             .unwrap()
             .unwrap();
-        assert!(!model_chat_template.is_empty());
+        assert!(!model_chat_template
+            .select(None)
+            .unwrap()
+            .template()
+            .is_empty());
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],

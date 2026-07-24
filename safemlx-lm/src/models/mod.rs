@@ -16,7 +16,8 @@ use safemlx::{
 };
 use safemlx_lm_utils::tokenizer::{
     chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
-    ApplyChatTemplateArgs, Chat, Tokenizer as ChatTokenizer,
+    ApplyChatTemplateArgs, Chat, ChatTemplateIdentity, ModelChatTemplate,
+    Tokenizer as ChatTokenizer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1697,7 +1698,7 @@ pub struct LoadedModel {
     #[cfg(feature = "media-processing")]
     processor: Option<ModelProcessor>,
     tokenizer: ChatTokenizer,
-    chat_template: Option<String>,
+    chat_template: Option<ModelChatTemplate>,
     model_id: String,
     eos_token_ids: Vec<u32>,
 }
@@ -2152,6 +2153,23 @@ impl LoadedModel {
         self.chat_template.is_some()
     }
 
+    /// Returns the stable identity of the template that would be selected for
+    /// the supplied tools.
+    pub fn selected_chat_template_identity(
+        &self,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Option<ChatTemplateIdentity>, Error> {
+        self.chat_template
+            .as_ref()
+            .map(|templates| {
+                templates
+                    .select(tools)
+                    .map(|selected| selected.identity().clone())
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Returns whether this model directory includes a supported media processor.
     #[cfg(feature = "media-processing")]
     pub fn has_processor(&self) -> bool {
@@ -2185,10 +2203,13 @@ impl LoadedModel {
         let Some(template) = &self.chat_template else {
             return Ok(Vec::new());
         };
-        Ok(inspect_chat_template_kwargs(template, &self.model_id)?
-            .into_iter()
-            .filter(|name| !self.tokenizer.template_kwargs().contains_key(name))
-            .collect())
+        let selected = template.select(None)?;
+        Ok(
+            inspect_chat_template_kwargs(selected.template(), &self.model_id)?
+                .into_iter()
+                .filter(|name| !self.tokenizer.template_kwargs().contains_key(name))
+                .collect(),
+        )
     }
 
     /// Applies the loaded chat template to structured conversations.
@@ -2447,7 +2468,7 @@ fn final_token_logits(logits: &Array, stream: &Stream) -> Result<Array, Exceptio
 struct LoadedGgufModel {
     model: Model,
     eos_token_ids: Vec<u32>,
-    chat_template: Option<String>,
+    chat_template: Option<ModelChatTemplate>,
     tokenizer: Option<GgufTokenizer>,
 }
 
@@ -2474,7 +2495,9 @@ fn load_gguf_model_data(
         }
     };
     let chat_template = match metadata.get("tokenizer.chat_template") {
-        Some(GgufMetadataValue::String(template)) => Some(template.clone()),
+        Some(GgufMetadataValue::String(template)) => {
+            Some(ModelChatTemplate::Single(template.clone()))
+        }
         Some(_) => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF metadata key \"tokenizer.chat_template\" has the wrong type".into(),
@@ -3247,7 +3270,9 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
         let metadata = GgufMetadata::from_file(submitted_path)?;
         let sidecar_dir = gguf_sidecar_dir(submitted_path);
         let template = match metadata.get("tokenizer.chat_template") {
-            Some(GgufMetadataValue::String(template)) => Some(template.clone()),
+            Some(GgufMetadataValue::String(template)) => {
+                Some(ModelChatTemplate::Single(template.clone()))
+            }
             Some(_) => {
                 return Err(Error::GgufTokenizer(
                     "tokenizer.chat_template must be a string".into(),
@@ -3272,10 +3297,13 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
     let Some(template) = template else {
         return Ok(Vec::new());
     };
-    Ok(inspect_chat_template_kwargs(&template, &model_id)?
-        .into_iter()
-        .filter(|name| !tokenizer_template_kwargs.contains_key(name))
-        .collect())
+    let selected = template.select(None)?;
+    Ok(
+        inspect_chat_template_kwargs(selected.template(), &model_id)?
+            .into_iter()
+            .filter(|name| !tokenizer_template_kwargs.contains_key(name))
+            .collect(),
+    )
 }
 
 fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
@@ -3340,7 +3368,7 @@ fn effective_model_type(metadata: &ModelMetadata) -> String {
     }
 }
 
-fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
+fn load_chat_template(model_dir: &Path) -> Result<Option<ModelChatTemplate>, Error> {
     let config_path = model_dir.join("tokenizer_config.json");
     if config_path.exists() {
         if let Some(template) = load_model_chat_template_from_file(config_path)? {
@@ -3350,7 +3378,9 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
 
     let jinja_path = model_dir.join("chat_template.jinja");
     if jinja_path.exists() {
-        return Ok(Some(std::fs::read_to_string(jinja_path)?));
+        return Ok(Some(ModelChatTemplate::Single(std::fs::read_to_string(
+            jinja_path,
+        )?)));
     }
 
     if !model_dir.join("config.json").exists() {
@@ -3366,7 +3396,9 @@ fn load_chat_template(model_dir: &Path) -> Result<Option<String>, Error> {
             )
         })
     {
-        return Ok(Some(GEMMA4_TEXT_TEMPLATE.to_string()));
+        return Ok(Some(ModelChatTemplate::Single(
+            GEMMA4_TEXT_TEMPLATE.to_string(),
+        )));
     }
 
     Ok(None)
@@ -3415,8 +3447,10 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
     use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
+    use safemlx_lm_utils::tokenizer::{ChatTemplateIdentity, ModelChatTemplate};
     use serde_json::json;
     use std::{
+        collections::BTreeMap,
         fs,
         process::Command,
         sync::atomic::{AtomicUsize, Ordering},
@@ -4065,7 +4099,44 @@ mod tests {
         .unwrap();
 
         let template = load_chat_template(&dir).unwrap().unwrap();
-        assert_eq!(template, "hello {{ messages[0].role }}");
+        assert_eq!(
+            template.select(None).unwrap().template(),
+            "hello {{ messages[0].role }}"
+        );
+        assert!(matches!(template, ModelChatTemplate::Single(_)));
+    }
+
+    #[test]
+    fn gguf_sidecar_loads_named_chat_templates() {
+        let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+        let gguf_path = dir.join("model.gguf");
+        let file = fs::File::create(&gguf_path).unwrap();
+        safemlx_gguf::Writer::default()
+            .write(file, &BTreeMap::new(), &[])
+            .unwrap();
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{
+              "chat_template": [
+                {"name": "default", "template": "{{ default_kw }}"},
+                {"name": "tool_use", "template": "{{ tool_kw }}"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chat_template_kwargs(&gguf_path).unwrap(),
+            vec!["default_kw"]
+        );
+        let templates = load_chat_template(&dir).unwrap().unwrap();
+        let tools = [json!({"type": "function"})];
+        let selected = templates.select(Some(&tools)).unwrap();
+        assert_eq!(selected.template(), "{{ tool_kw }}");
+        assert_eq!(
+            selected.identity(),
+            &ChatTemplateIdentity::Named("tool_use".into())
+        );
     }
 
     #[test]
@@ -4148,7 +4219,11 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
         assert_eq!(rendered, expected["rendered"].as_str().unwrap());
         let expected_ids: Vec<Vec<u32>> = serde_json::from_value(expected["ids"].clone()).unwrap();
         assert_eq!(local_prompt_ids, expected_ids);
-        assert!(template.contains("<|im_start|>assistant"));
+        assert!(template
+            .select(None)
+            .unwrap()
+            .template()
+            .contains("<|im_start|>assistant"));
     }
 
     #[test]

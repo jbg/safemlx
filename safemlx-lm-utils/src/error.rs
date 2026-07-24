@@ -1,5 +1,13 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid chat_template: {0}")]
+    InvalidChatTemplate(String),
+
+    #[error(
+        "chat_template collection has no default template; available templates: {available:?}"
+    )]
+    AmbiguousChatTemplate { available: Vec<String> },
+
     #[error(transparent)]
     RenderTemplate(#[from] minijinja::Error),
 
