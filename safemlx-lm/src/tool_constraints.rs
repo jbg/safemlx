@@ -1,5 +1,7 @@
 //! Private constrained-decoding implementation for native tool plans.
 
+#![allow(dead_code)]
+
 use std::{
     collections::{BTreeSet, HashSet},
     num::NonZeroUsize,
@@ -7,7 +9,6 @@ use std::{
 };
 
 use llguidance::{
-    api::TopLevelGrammar,
     toktrie::{SimpleVob, TokEnv, TokenId},
     Matcher, ParserFactory,
 };
@@ -16,14 +17,12 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
-use crate::chat::{GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan};
+use crate::{
+    chat::{GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
+    format_dialect::{DialectParameters, FormatDialect},
+};
 
 const MAX_SCHEMA_DEPTH: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolDialect {
-    Synthetic,
-}
 
 /// Tokenizer-wide llguidance data. A `LoadedModel` constructs exactly one and
 /// every request grammar shares it.
@@ -83,21 +82,25 @@ impl ConstraintCompiler {
 
     pub(crate) fn compile_tool_plan(
         &self,
-        dialect: ToolDialect,
+        dialect: &'static dyn FormatDialect,
+        parameters: DialectParameters,
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
     ) -> Result<ToolRuntimePlan, String> {
-        let schema = match dialect {
-            ToolDialect::Synthetic => {
-                synthetic_tool_schema(tools, tool_choice, parallel_tool_calls)?
-            }
-        };
-        let fingerprint: [u8; 32] =
-            Sha256::digest(serde_json::to_vec(&schema).expect("JSON values serialize")).into();
+        let configuration = dialect.constraint_configuration(
+            parameters,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+        )?;
+        let fingerprint: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(&configuration.grammar).expect("grammar configuration serializes"),
+        )
+        .into();
         let parser = self
             .factory
-            .create_parser(TopLevelGrammar::from_json_schema(schema))
+            .create_parser(configuration.grammar)
             .map_err(|error| format!("failed to compile tool grammar: {error}"))?;
         let mut matcher = Matcher::new(Ok(parser));
         if let Some(error) = matcher.get_error() {
@@ -110,10 +113,14 @@ impl ConstraintCompiler {
                 warnings.join("; ")
             ));
         }
-        Ok(ToolRuntimePlan::from_constraint(GenerationConstraint::new(
-            fingerprint,
-            ConstraintBlueprint { matcher },
-        )))
+        Ok(ToolRuntimePlan::from_constraint(
+            GenerationConstraint::new(fingerprint, ConstraintBlueprint { matcher }),
+            if tool_choice == ToolChoice::Auto {
+                dialect.auto_activation_trigger(parameters)?
+            } else {
+                None
+            },
+        ))
     }
 }
 
@@ -184,12 +191,11 @@ struct ToolDefinition {
     parameters: Value,
 }
 
-fn synthetic_tool_schema(
-    tools: &[Value],
+pub(crate) fn tool_call_bounds(
     tool_choice: ToolChoice,
     parallel_tool_calls: ParallelToolCallPolicy,
-) -> Result<Value, String> {
-    let tools = parse_tools(tools)?;
+    tools: &[Value],
+) -> Result<(usize, Option<usize>), String> {
     if tool_choice == ToolChoice::Required && tools.is_empty() {
         return Err("tool_choice is required but no tools were supplied".into());
     }
@@ -214,7 +220,15 @@ fn synthetic_tool_schema(
     if max_calls.is_some_and(|maximum| maximum < min_calls) {
         return Err("parallel tool-call limit cannot satisfy tool_choice".into());
     }
+    Ok((min_calls, max_calls))
+}
 
+pub(crate) fn tool_call_schema(
+    tools: &[Value],
+    name_field: &str,
+    arguments_field: &str,
+) -> Result<Value, String> {
+    let tools = parse_tools(tools)?;
     let item_schema = if tools.is_empty() {
         json!({"type": "null"})
     } else {
@@ -224,10 +238,10 @@ fn synthetic_tool_schema(
                 json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "enum": [tool.name]},
-                        "arguments": tool.parameters,
+                        name_field: {"type": "string", "enum": [tool.name]},
+                        arguments_field: tool.parameters,
                     },
-                    "required": ["name", "arguments"],
+                    "required": [name_field, arguments_field],
                     "additionalProperties": false,
                 })
             })
@@ -239,21 +253,7 @@ fn synthetic_tool_schema(
         }
     };
 
-    let mut calls = Map::from_iter([
-        ("type".into(), json!("array")),
-        ("items".into(), item_schema),
-        ("minItems".into(), json!(min_calls)),
-    ]);
-    if let Some(max_calls) = max_calls {
-        calls.insert("maxItems".into(), json!(max_calls));
-    }
-
-    Ok(json!({
-        "type": "object",
-        "properties": {"calls": Value::Object(calls)},
-        "required": ["calls"],
-        "additionalProperties": false,
-    }))
+    Ok(item_schema)
 }
 
 fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
@@ -677,7 +677,35 @@ mod tests {
     use llguidance::toktrie::TokenId;
     use serde_json::json;
 
-    use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice, ToolDialect};
+    use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice};
+    use crate::format_dialect::{
+        DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
+        GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
+    };
+
+    const SYNTHETIC_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: r#"{"calls":"#,
+            suffix: "}",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonList,
+        name_field: "name",
+        arguments_field: "arguments",
+        reasoning_channel: None,
+        text_channel: None,
+        call_separator: ",",
+        parallel_layout: ParallelCallLayout::SingleEnvelope,
+        auto_activation_trigger: Some(r#"{"calls":"#),
+        required_structural_token_ids: &[],
+        stop_sequences: &[],
+    };
+
+    const SYNTHETIC_PARAMETERS: DialectParameters = DialectParameters::Declarative(&SYNTHETIC_SPEC);
 
     fn compiler() -> ConstraintCompiler {
         ConstraintCompiler::synthetic_for_tests()
@@ -706,7 +734,8 @@ mod tests {
         let compiler = compiler();
         let plan = compiler
             .compile_tool_plan(
-                ToolDialect::Synthetic,
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
                 &[
                     tool(
                         "lookup",
@@ -767,7 +796,8 @@ mod tests {
         let compiler = compiler();
         let plan = compiler
             .compile_tool_plan(
-                ToolDialect::Synthetic,
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
                 &[tool(
                     "batch",
                     json!({
@@ -847,7 +877,8 @@ mod tests {
         for tool in invalid {
             let error = compiler
                 .compile_tool_plan(
-                    ToolDialect::Synthetic,
+                    &DECLARATIVE_DIALECT,
+                    SYNTHETIC_PARAMETERS,
                     &[tool],
                     ToolChoice::Required,
                     ParallelToolCallPolicy::Disabled,
@@ -871,7 +902,8 @@ mod tests {
         )];
         let single = compiler
             .compile_tool_plan(
-                ToolDialect::Synthetic,
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
                 &tools,
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
@@ -879,7 +911,8 @@ mod tests {
             .unwrap();
         let parallel = compiler
             .compile_tool_plan(
-                ToolDialect::Synthetic,
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
                 &tools,
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Enabled {
@@ -906,7 +939,8 @@ mod tests {
         let compiler = compiler();
         let plan = compiler
             .compile_tool_plan(
-                ToolDialect::Synthetic,
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
                 &[tool(
                     "ping",
                     json!({"type": "object", "properties": {}, "additionalProperties": false}),

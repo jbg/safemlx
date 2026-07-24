@@ -37,6 +37,7 @@ pub mod error;
 pub mod expert_cache;
 /// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
 pub mod expert_parallel;
+mod format_dialect;
 /// Multimodal bounded layer execution for Gemma 4.
 pub mod gemma4;
 mod gemma4_mtp;

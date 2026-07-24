@@ -302,27 +302,27 @@ impl StopMatcher {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PatternKind {
+pub(crate) enum PatternKind {
     Trigger,
     Tag,
     Delimiter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PatternPiece {
+pub(crate) enum PatternPiece {
     Text(String),
     Match { index: usize, kind: PatternKind },
 }
 
 /// Buffers suffixes that could be partial triggers, tags, or delimiters.
 #[derive(Debug)]
-struct PartialPatternBuffer {
+pub(crate) struct PartialPatternBuffer {
     patterns: Vec<(PatternKind, Vec<u8>)>,
     pending: Vec<u8>,
 }
 
 impl PartialPatternBuffer {
-    fn new(patterns: impl IntoIterator<Item = (PatternKind, &'static str)>) -> Self {
+    pub(crate) fn new(patterns: impl IntoIterator<Item = (PatternKind, &'static str)>) -> Self {
         Self {
             patterns: patterns
                 .into_iter()
@@ -333,7 +333,7 @@ impl PartialPatternBuffer {
         }
     }
 
-    fn push(&mut self, text: &str) -> Vec<PatternPiece> {
+    pub(crate) fn push(&mut self, text: &str) -> Vec<PatternPiece> {
         self.pending.extend_from_slice(text.as_bytes());
         let mut pieces = Vec::new();
 
@@ -367,7 +367,7 @@ impl PartialPatternBuffer {
         pieces
     }
 
-    fn finish(&mut self) -> Option<String> {
+    pub(crate) fn finish(&mut self) -> Option<String> {
         if self.pending.is_empty() {
             None
         } else {
@@ -411,14 +411,14 @@ impl PartialPatternBuffer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum JsonFragmentError {
+pub(crate) enum JsonFragmentError {
     MissingContainer,
     TrailingData,
 }
 
 /// Incrementally identifies one complete JSON object or array.
 #[derive(Debug, Default)]
-struct JsonFragmentBuffer {
+pub(crate) struct JsonFragmentBuffer {
     fragment: String,
     depth: usize,
     in_string: bool,
@@ -429,7 +429,7 @@ struct JsonFragmentBuffer {
 
 impl JsonFragmentBuffer {
     /// Appends input and returns `(consumed_bytes, complete)`.
-    fn push(&mut self, input: &str) -> Result<(usize, bool), JsonFragmentError> {
+    pub(crate) fn push(&mut self, input: &str) -> Result<(usize, bool), JsonFragmentError> {
         if self.complete {
             return if input.is_empty() {
                 Ok((0, true))
@@ -487,7 +487,7 @@ impl JsonFragmentBuffer {
         Ok((consumed, self.complete))
     }
 
-    fn fragment(&self) -> &str {
+    pub(crate) fn fragment(&self) -> &str {
         &self.fragment
     }
 
@@ -499,28 +499,36 @@ impl JsonFragmentBuffer {
 /// Sink offered to protocol parsers so semantic state and emitted events stay
 /// synchronized.
 #[derive(Debug, Default)]
-struct SemanticEventSink {
+pub(crate) struct SemanticEventSink {
     events: Vec<SemanticEvent>,
     active_tool_call: Option<InProgressToolCall>,
     next_tool_index: usize,
 }
 
 impl SemanticEventSink {
-    fn reasoning(&mut self, delta: impl Into<String>) {
+    pub(crate) fn events(&self) -> &[SemanticEvent] {
+        &self.events
+    }
+
+    pub(crate) fn reasoning(&mut self, delta: impl Into<String>) {
         let delta = delta.into();
         if !delta.is_empty() {
             self.events.push(SemanticEvent::ReasoningDelta(delta));
         }
     }
 
-    fn text(&mut self, delta: impl Into<String>) {
+    pub(crate) fn text(&mut self, delta: impl Into<String>) {
         let delta = delta.into();
         if !delta.is_empty() {
             self.events.push(SemanticEvent::TextDelta(delta));
         }
     }
 
-    fn start_tool_call(&mut self, id: String, name: String) {
+    pub(crate) fn next_tool_index(&self) -> usize {
+        self.next_tool_index
+    }
+
+    pub(crate) fn start_tool_call(&mut self, id: String, name: String) {
         debug_assert!(self.active_tool_call.is_none());
         let call = InProgressToolCall::new(self.next_tool_index, id, name);
         self.next_tool_index += 1;
@@ -528,7 +536,7 @@ impl SemanticEventSink {
         self.active_tool_call = Some(call);
     }
 
-    fn tool_arguments(&mut self, fragment: &str) {
+    pub(crate) fn tool_arguments(&mut self, fragment: &str) {
         if fragment.is_empty() {
             return;
         }
@@ -540,7 +548,7 @@ impl SemanticEventSink {
         self.events.push(event);
     }
 
-    fn end_tool_call(&mut self) {
+    pub(crate) fn end_tool_call(&mut self) {
         debug_assert!(self.active_tool_call.is_some());
         self.active_tool_call = None;
         self.events.push(SemanticEvent::ToolCallEnd);
@@ -552,7 +560,7 @@ impl SemanticEventSink {
 }
 
 /// Incremental parser contract implemented by an exact format profile.
-trait ProtocolParser {
+pub(crate) trait ProtocolParser {
     type Error;
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;

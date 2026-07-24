@@ -1824,8 +1824,8 @@ fn prepare_chat_from_parts(
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let profile = prepare_format_profile(selected.template());
-    let native_tool_support = match profile.tool_dialect {
-        Some(dialect) => {
+    let native_tool_support = match (profile.dialect, profile.dialect_parameters) {
+        (Some(dialect), Some(parameters)) => {
             let compiler = constraint_compiler
                 .ok_or_else(|| {
                     Error::ToolConstraint(
@@ -1838,6 +1838,7 @@ fn prepare_chat_from_parts(
                 compiler
                     .compile_tool_plan(
                         dialect,
+                        parameters,
                         &request.tools,
                         request.tool_choice,
                         request.parallel_tool_calls,
@@ -1845,7 +1846,7 @@ fn prepare_chat_from_parts(
                     .map_err(Error::ToolConstraint)?,
             )
         }
-        None => NativeToolSupport::Unsupported {
+        _ => NativeToolSupport::Unsupported {
             reason: profile
                 .native_tool_unavailable_reason
                 .clone()
@@ -1862,6 +1863,9 @@ fn prepare_chat_from_parts(
         add_generation_prompt,
         mut extra_template_kwargs,
     } = request;
+    let add_generation_prompt = profile
+        .generation_prompt_behavior
+        .resolve(add_generation_prompt);
 
     if let Some(enable_thinking) = enable_thinking {
         extra_template_kwargs.insert(

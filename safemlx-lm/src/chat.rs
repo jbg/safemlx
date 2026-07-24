@@ -9,7 +9,17 @@ use std::{fmt, num::NonZeroUsize, sync::Arc};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::tool_constraints::{ConstraintBlueprint, ToolDialect};
+#[cfg(test)]
+use crate::format_dialect::{
+    DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope, ParallelCallLayout,
+    DECLARATIVE_DIALECT,
+};
+use crate::{
+    format_dialect::{
+        DialectParameters, FormatDialect, FormatRegistryEntry, GenerationPromptBehavior,
+    },
+    tool_constraints::ConstraintBlueprint,
+};
 
 pub use safemlx_lm_utils::tokenizer::ChatTemplateIdentity;
 
@@ -96,18 +106,28 @@ impl Eq for GenerationConstraint {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRuntimePlan {
     generation_constraint: GenerationConstraint,
+    auto_activation_trigger: Option<String>,
 }
 
 impl ToolRuntimePlan {
-    pub(crate) fn from_constraint(generation_constraint: GenerationConstraint) -> Self {
+    pub(crate) fn from_constraint(
+        generation_constraint: GenerationConstraint,
+        auto_activation_trigger: Option<&str>,
+    ) -> Self {
         Self {
             generation_constraint,
+            auto_activation_trigger: auto_activation_trigger.map(str::to_owned),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn generation_constraint(&self) -> &GenerationConstraint {
         &self.generation_constraint
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
+        self.auto_activation_trigger.as_deref()
     }
 }
 
@@ -192,19 +212,12 @@ impl PreparedChat {
 #[derive(Debug)]
 pub(crate) struct PreparedFormatProfile {
     pub(crate) identity: Option<String>,
-    pub(crate) tool_dialect: Option<ToolDialect>,
+    pub(crate) dialect: Option<&'static dyn FormatDialect>,
+    pub(crate) dialect_parameters: Option<DialectParameters>,
+    pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
     pub(crate) native_tool_unavailable_reason: Option<String>,
     pub(crate) preserved_structural_token_ids: Vec<u32>,
     pub(crate) stop_sequences: Vec<String>,
-}
-
-#[derive(Debug)]
-struct FormatProfile {
-    identity: &'static str,
-    template_signatures: &'static [[u8; 32]],
-    preserved_structural_token_ids: &'static [u32],
-    stop_sequences: &'static [&'static str],
-    tool_dialect: Option<ToolDialect>,
 }
 
 /// Test-only protocol surface used to exercise constrained tool generation
@@ -215,64 +228,125 @@ pub(crate) const SYNTHETIC_TOOL_TEMPLATE: &str = concat!(
     "{% endif %}safemlx synthetic tool template",
 );
 
+#[cfg(test)]
 const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x5e, 0xc6, 0xe8, 0xcc, 0x55, 0x35, 0x8f, 0x00, 0x81, 0xdf, 0x23, 0xf7, 0x16, 0x52, 0x95, 0xc0,
     0x2a, 0x4b, 0xf7, 0x9c, 0x15, 0x33, 0xd6, 0x8d, 0x04, 0x77, 0x90, 0x30, 0x3d, 0xd8, 0x59, 0xf4,
 ];
 
-const FORMAT_PROFILES: &[FormatProfile] = &[FormatProfile {
-    identity: "safemlx.synthetic-tools.v1",
-    template_signatures: &[SYNTHETIC_TOOL_TEMPLATE_SIGNATURE],
-    preserved_structural_token_ids: &[],
+#[cfg(test)]
+const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: r#"{"calls":"#,
+        suffix: "}",
+    },
+    call: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    payload_shape: DeclarativePayloadShape::JsonList,
+    name_field: "name",
+    arguments_field: "arguments",
+    reasoning_channel: None,
+    text_channel: None,
+    call_separator: ",",
+    parallel_layout: ParallelCallLayout::SingleEnvelope,
+    auto_activation_trigger: Some(r#"{"calls":"#),
+    required_structural_token_ids: &[],
     stop_sequences: &[],
-    tool_dialect: Some(ToolDialect::Synthetic),
+};
+
+#[cfg(test)]
+const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[FormatRegistryEntry {
+    identity: "safemlx.synthetic-tools.v1",
+    template_signature: SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+    dialect: &DECLARATIVE_DIALECT,
+    parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
 }];
 
-fn template_signature(template: &str) -> [u8; 32] {
+#[cfg(not(test))]
+const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[];
+
+pub(crate) fn template_signature(template: &str) -> [u8; 32] {
     Sha256::digest(template.as_bytes()).into()
 }
 
-fn matching_profiles<'a>(template: &str, profiles: &'a [FormatProfile]) -> Vec<&'a FormatProfile> {
+fn matching_registry_entries<'a>(
+    template: &str,
+    registry: &'a [FormatRegistryEntry],
+) -> Vec<&'a FormatRegistryEntry> {
     let signature = template_signature(template);
-    profiles
+    registry
         .iter()
-        .filter(|profile| profile.template_signatures.contains(&signature))
+        .filter(|entry| entry.template_signature == signature)
         .collect()
 }
 
-fn prepare_format_profile_with_registry(
+pub(crate) fn prepare_format_profile_with_registry(
     template: &str,
-    profiles: &[FormatProfile],
+    registry: &[FormatRegistryEntry],
 ) -> PreparedFormatProfile {
-    match matching_profiles(template, profiles).as_slice() {
+    match matching_registry_entries(template, registry).as_slice() {
         [] => PreparedFormatProfile {
             identity: None,
-            tool_dialect: None,
+            dialect: None,
+            dialect_parameters: None,
+            generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             native_tool_unavailable_reason: Some(
                 "no registered format profile matches the selected chat template".into(),
             ),
             preserved_structural_token_ids: Vec::new(),
             stop_sequences: Vec::new(),
         },
-        [profile] => PreparedFormatProfile {
-            identity: Some(profile.identity.to_owned()),
-            tool_dialect: profile.tool_dialect,
-            native_tool_unavailable_reason: profile.tool_dialect.is_none().then(|| {
-                format!(
-                    "format profile {:?} does not provide a native tool runtime plan",
-                    profile.identity
-                )
-            }),
-            preserved_structural_token_ids: profile.preserved_structural_token_ids.to_vec(),
-            stop_sequences: profile
-                .stop_sequences
-                .iter()
-                .map(|sequence| (*sequence).to_owned())
-                .collect(),
-        },
+        [entry] => {
+            let generation_prompt_behavior =
+                entry.dialect.generation_prompt_behavior(entry.parameters);
+            let preserved = entry
+                .dialect
+                .preserved_structural_token_ids(entry.parameters);
+            let stops = entry.dialect.stop_sequences(entry.parameters);
+            match (generation_prompt_behavior, preserved, stops) {
+                (Ok(generation_prompt_behavior), Ok(preserved), Ok(stops)) => {
+                    PreparedFormatProfile {
+                        identity: Some(entry.identity.to_owned()),
+                        dialect: Some(entry.dialect),
+                        dialect_parameters: Some(entry.parameters),
+                        generation_prompt_behavior,
+                        native_tool_unavailable_reason: None,
+                        preserved_structural_token_ids: preserved.to_vec(),
+                        stop_sequences: stops
+                            .iter()
+                            .map(|sequence| (*sequence).to_owned())
+                            .collect(),
+                    }
+                }
+                (generation, preserved, stops) => {
+                    let reason = generation
+                        .err()
+                        .or_else(|| preserved.err())
+                        .or_else(|| stops.err())
+                        .expect("one dialect property failed");
+                    PreparedFormatProfile {
+                        identity: Some(entry.identity.to_owned()),
+                        dialect: None,
+                        dialect_parameters: None,
+                        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+                        native_tool_unavailable_reason: Some(format!(
+                            "format profile {:?} is invalid: {reason}",
+                            entry.identity
+                        )),
+                        preserved_structural_token_ids: Vec::new(),
+                        stop_sequences: Vec::new(),
+                    }
+                }
+            }
+        }
         _ => PreparedFormatProfile {
             identity: None,
-            tool_dialect: None,
+            dialect: None,
+            dialect_parameters: None,
+            generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             native_tool_unavailable_reason: Some(
                 "multiple registered format profiles match the selected chat template".into(),
             ),
@@ -283,14 +357,15 @@ fn prepare_format_profile_with_registry(
 }
 
 pub(crate) fn prepare_format_profile(template: &str) -> PreparedFormatProfile {
-    prepare_format_profile_with_registry(template, FORMAT_PROFILES)
+    prepare_format_profile_with_registry(template, FORMAT_REGISTRY)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, template_signature,
-        FormatProfile, ToolDialect, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT, SYNTHETIC_DECLARATIVE_SPEC,
+        SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
 
     #[test]
@@ -298,7 +373,7 @@ mod tests {
         let prepared = prepare_format_profile("unknown template");
 
         assert_eq!(prepared.identity, None);
-        assert_eq!(prepared.tool_dialect, None);
+        assert!(prepared.dialect.is_none());
         assert!(prepared
             .native_tool_unavailable_reason
             .as_deref()
@@ -310,27 +385,24 @@ mod tests {
     #[test]
     fn registry_treats_duplicate_signatures_as_ambiguous() {
         let signature = template_signature("same template");
-        let signatures: &'static [[u8; 32]] = Box::leak(vec![signature].into_boxed_slice());
-        let profiles = [
-            FormatProfile {
+        let registry = [
+            FormatRegistryEntry {
                 identity: "first",
-                template_signatures: signatures,
-                preserved_structural_token_ids: &[],
-                stop_sequences: &[],
-                tool_dialect: Some(ToolDialect::Synthetic),
+                template_signature: signature,
+                dialect: &DECLARATIVE_DIALECT,
+                parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
             },
-            FormatProfile {
+            FormatRegistryEntry {
                 identity: "second",
-                template_signatures: signatures,
-                preserved_structural_token_ids: &[],
-                stop_sequences: &[],
-                tool_dialect: Some(ToolDialect::Synthetic),
+                template_signature: signature,
+                dialect: &DECLARATIVE_DIALECT,
+                parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
             },
         ];
 
-        let prepared = prepare_format_profile_with_registry("same template", &profiles);
+        let prepared = prepare_format_profile_with_registry("same template", &registry);
         assert_eq!(prepared.identity, None);
-        assert_eq!(prepared.tool_dialect, None);
+        assert!(prepared.dialect.is_none());
         assert!(prepared
             .native_tool_unavailable_reason
             .as_deref()
@@ -348,7 +420,8 @@ mod tests {
             prepared.identity.as_deref(),
             Some("safemlx.synthetic-tools.v1")
         );
-        assert_eq!(prepared.tool_dialect, Some(ToolDialect::Synthetic));
+        assert!(prepared.dialect.is_some());
+        assert!(prepared.dialect_parameters.is_some());
         assert_eq!(prepared.native_tool_unavailable_reason, None);
     }
 }
