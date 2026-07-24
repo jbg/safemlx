@@ -348,22 +348,30 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
             });
         }
 
-        *cache = checkpoint;
-        let retained_inputs = output
-            .inputs
-            .try_index_device((.., ..verified_inputs as i32), stream)?;
-        let replayed = self
-            .target
-            .verify_mtp_target(&retained_inputs, cache, stream)?;
+        let retained_len = checkpoint
+            .mtp_len()
+            .checked_add(verified_inputs)
+            .ok_or_else(|| Exception::custom("Gemma 4 MTP retained cache length overflow"))?;
+        let expected_len = checkpoint
+            .mtp_len()
+            .checked_add(input_len)
+            .ok_or_else(|| Exception::custom("Gemma 4 MTP verified cache length overflow"))?;
+        if cache.mtp_len() != expected_len {
+            return Err(Exception::custom(format!(
+                "Gemma 4 MTP verification cache has length {}, expected {expected_len}",
+                cache.mtp_len()
+            )));
+        }
+        cache.truncate_mtp(retained_len, stream)?;
         let state = Self::state_at(
-            &replayed,
+            &output.output,
             verified_inputs.saturating_sub(1) as i32,
             cache.mtp_len(),
             stream,
         )?;
         Ok(MtpCommit {
             state,
-            replayed_tokens: verified_inputs,
+            replayed_tokens: 0,
         })
     }
 }

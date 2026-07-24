@@ -1146,12 +1146,25 @@ where
         request.stats.accepted_tokens += accepted;
         request.stats.accept_lens.push(accepted);
         request.stats.rounds += 1;
+        // The target cache intentionally trails the emitted output by one
+        // token: the next verification processes that token as its leading
+        // input. A rejection replacement or target bonus is not part of the
+        // verification inputs, so retaining `1 + accepted` leaves that emitted
+        // token uncached. When full acceptance emits no bonus, however, the
+        // last accepted proposal itself is the trailing emitted token and must
+        // be excluded from the retained inputs.
+        let verified_inputs = if replacement.is_some() {
+            1 + accepted
+        } else {
+            debug_assert_eq!(accepted, proposed.len());
+            accepted
+        };
         let commit = self.backend.commit_verification_with_streams(
             flight.verification,
             state,
             request.cache,
             flight.checkpoint,
-            1 + accepted,
+            verified_inputs,
             self.streams,
         )?;
         request.stats.target_tokens += commit.replayed_tokens;
@@ -1982,6 +1995,62 @@ mod tests {
         assert_eq!(stats.reused_optimistic_tokens, 2);
         assert_eq!(output.scheduler.peak_optimistic_branches, 1);
         assert_eq!(backend.draft_storage[0], backend.draft_storage[2]);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn promoted_round_leaves_last_emitted_token_out_of_target_cache() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        let id = scheduler
+            .submit(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 5,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                DefaultSampler,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        scheduler.step().unwrap();
+        scheduler.step().unwrap();
+        scheduler.step().unwrap();
+        scheduler.step().unwrap();
+        assert_eq!(
+            scheduler.phase(id),
+            Some(MtpRequestPhase::ReadyToSubmitVerification)
+        );
+        scheduler.cancel(id).unwrap();
+        let output = scheduler.finish().unwrap();
+
+        assert_eq!(output.requests[0].token_ids, vec![1, 2, 0]);
+        // Prefill retained one token. The fully accepted verification evaluated
+        // `[first, proposal_1, proposal_2]`, but proposal_2 is the last emitted
+        // token and must remain outside the cache for the next round.
+        assert_eq!(cache, 3);
     }
 
     #[test]

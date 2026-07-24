@@ -4607,6 +4607,26 @@ impl Cache {
     pub(crate) fn mtp_len(&self) -> usize {
         self.token_ids.len()
     }
+
+    /// Truncates speculative target state to an evaluated token boundary.
+    pub(crate) fn truncate_mtp(&mut self, len: usize, stream: &Stream) -> Result<(), Exception> {
+        if len < self.prefix_len || len > self.token_ids.len() {
+            return Err(Exception::custom(format!(
+                "Gemma 4 MTP cache truncate length {len} is outside {}..{}",
+                self.prefix_len,
+                self.token_ids.len()
+            )));
+        }
+        let len_i32 = i32::try_from(len)
+            .map_err(|_| Exception::custom("Gemma 4 MTP cache length exceeds i32"))?;
+        let mut kv = self.kv.clone();
+        for layer in kv.iter_mut().flatten() {
+            layer.truncate(len_i32, stream)?;
+        }
+        self.token_ids.truncate(len);
+        self.kv = kv;
+        Ok(())
+    }
 }
 
 impl Model {
