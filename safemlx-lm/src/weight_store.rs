@@ -1792,6 +1792,7 @@ fn selected_byte_len(
     Ok(scaled / full_elements)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_range(
     key: &str,
     source: Array,

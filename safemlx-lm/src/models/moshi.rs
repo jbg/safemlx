@@ -1567,7 +1567,7 @@ impl Model {
         audio_samplers: &mut [AS],
         text_temperature: f32,
         audio_temperature: f32,
-        mut prng_state: Option<&mut RandomState>,
+        prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<(Array, Array, Vec<Array>), Exception> {
         self.sample_temporal_output_forced(
@@ -1581,7 +1581,7 @@ impl Model {
             None,
             None,
             None,
-            prng_state.as_deref_mut(),
+            prng_state,
             false,
             stream,
         )

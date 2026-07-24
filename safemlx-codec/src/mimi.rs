@@ -140,8 +140,6 @@ impl Mimi {
                 config.latent_dim,
                 4,
                 2,
-                1,
-                1,
                 false,
                 ConvPadMode::Edge,
                 stream,
@@ -169,7 +167,6 @@ impl Mimi {
     ) -> Result<Self, Error> {
         let mut model = Self::new(Config::v0_1(num_codebooks), stream)?;
         let transformed = load_decoder_safetensors_arrays(path, stream)?
-            .into_iter()
             .map(|result| result.map(|(key, value)| (Rc::<str>::from(key), value)))
             .collect::<Result<HashMap<_, _>, _>>()?;
         let params = model.parameters().flatten();
@@ -500,9 +497,9 @@ impl SeaNetEncoder {
             channels *= 2;
         }
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(1, 64, 7, 1, 1, 1, true, stream)?,
+            init_conv1d: StreamableConv1d::unloaded(1, 64, 7, 1, stream)?,
             layers,
-            final_conv1d: StreamableConv1d::unloaded(1024, 512, 3, 1, 1, 1, true, stream)?,
+            final_conv1d: StreamableConv1d::unloaded(1024, 512, 3, 1, stream)?,
         })
     }
 
@@ -536,9 +533,8 @@ impl SeaNetEncoder {
                 None => return Ok(None),
             };
         }
-        Ok(self
-            .final_conv1d
-            .step(&nn::elu(&x, Some(1.0), stream)?, stream)?)
+        self.final_conv1d
+            .step(&nn::elu(&x, Some(1.0), stream)?, stream)
     }
 }
 
@@ -565,9 +561,6 @@ impl EncoderLayer {
                 out_channels,
                 ratio * 2,
                 ratio,
-                1,
-                1,
-                true,
                 stream,
             )?,
         })
@@ -944,9 +937,9 @@ impl SeaNetDecoder {
             channels = out_channels;
         }
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(512, 1024, 7, 1, 1, 1, true, stream)?,
+            init_conv1d: StreamableConv1d::unloaded(512, 1024, 7, 1, stream)?,
             layers,
-            final_conv1d: StreamableConv1d::unloaded(64, 1, 3, 1, 1, 1, true, stream)?,
+            final_conv1d: StreamableConv1d::unloaded(64, 1, 3, 1, stream)?,
         })
     }
 
@@ -1045,8 +1038,8 @@ impl SeaNetResnetBlock {
     fn unloaded(channels: i32, stream: &Stream) -> Result<Self, Error> {
         Ok(Self {
             block: vec![
-                StreamableConv1d::unloaded(channels, channels / 2, 3, 1, 1, 1, true, stream)?,
-                StreamableConv1d::unloaded(channels / 2, channels, 1, 1, 1, 1, true, stream)?,
+                StreamableConv1d::unloaded(channels, channels / 2, 3, 1, stream)?,
+                StreamableConv1d::unloaded(channels / 2, channels, 1, 1, stream)?,
             ],
         })
     }
@@ -1099,9 +1092,6 @@ impl StreamableConv1d {
         out_channels: i32,
         kernel_size: i32,
         stride: i32,
-        dilation: i32,
-        groups: i32,
-        bias: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         Self::unloaded_with_pad_mode(
@@ -1109,9 +1099,7 @@ impl StreamableConv1d {
             out_channels,
             kernel_size,
             stride,
-            dilation,
-            groups,
-            bias,
+            true,
             ConvPadMode::Constant,
             stream,
         )
@@ -1122,15 +1110,13 @@ impl StreamableConv1d {
         out_channels: i32,
         kernel_size: i32,
         stride: i32,
-        dilation: i32,
-        groups: i32,
         bias: bool,
         pad_mode: ConvPadMode,
         stream: &Stream,
     ) -> Result<Self, Error> {
         Ok(Self {
             weight: Param::<Array>::unloaded(
-                &[out_channels, kernel_size, in_channels / groups],
+                &[out_channels, kernel_size, in_channels],
                 Dtype::Float32,
                 stream,
             )?,
@@ -1140,8 +1126,8 @@ impl StreamableConv1d {
                 Param::new(None)
             },
             stride,
-            dilation,
-            groups,
+            dilation: 1,
+            groups: 1,
             pad_mode,
             state_prev_xs: None,
             left_pad_applied: false,

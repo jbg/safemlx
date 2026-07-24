@@ -404,7 +404,7 @@ pub fn text_padding_frame(batch: i32, stream: &Stream) -> Result<Array, Exceptio
 
 fn repeated_frame(tokens: &[i32; 8], batch: i32, stream: &Stream) -> Result<Array, Exception> {
     broadcast_to(
-        &Array::from_slice(tokens, &[1, AUDIO_TOKENS_PER_STREAM]),
+        Array::from_slice(tokens, &[1, AUDIO_TOKENS_PER_STREAM]),
         &[batch, AUDIO_TOKENS_PER_STREAM],
         stream,
     )

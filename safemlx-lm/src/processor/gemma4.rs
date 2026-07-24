@@ -491,7 +491,7 @@ fn pack_patches(
     patch_size: usize,
     max_patches: usize,
 ) -> Result<(Array, Array), Error> {
-    if image.height() % patch_size != 0 || image.width() % patch_size != 0 {
+    if !image.height().is_multiple_of(patch_size) || !image.width().is_multiple_of(patch_size) {
         return Err(Error::Processor(format!(
             "Gemma 4 image dimensions {}x{} are not divisible by patch size {patch_size}",
             image.height(),

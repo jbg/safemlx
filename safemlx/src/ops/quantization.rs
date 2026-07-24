@@ -533,7 +533,7 @@ mod tests {
         )
         .unwrap();
         let expected = input
-            .matmul(&restored.transpose(stream).unwrap(), stream)
+            .matmul(restored.transpose(stream).unwrap(), stream)
             .unwrap();
         let max_difference = actual
             .subtract(&expected, stream)

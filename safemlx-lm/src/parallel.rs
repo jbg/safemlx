@@ -285,7 +285,7 @@ impl TensorSlice {
             )));
         }
         let dimension = shape[axis];
-        if dimension == 0 || dimension % parts != 0 {
+        if dimension == 0 || !dimension.is_multiple_of(parts) {
             return Err(Error::Parallel(format!(
                 "tensor dimension {dimension} on axis {axis} is not nonzero and divisible by {parts}"
             )));

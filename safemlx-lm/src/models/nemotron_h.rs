@@ -562,6 +562,8 @@ pub struct Experts {
     pub down_proj_biases: Param<Option<Array>>,
 }
 
+type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
+
 impl Experts {
     /// Creates an unloaded dense or affine-quantized expert bank.
     pub fn new(
@@ -589,10 +591,7 @@ impl Experts {
                           in_features: i32,
                           quantization: Option<AffineQuantization>,
                           iquant: Option<WeightQuantization>|
-         -> Result<
-            (Param<Array>, Param<Option<Array>>, Param<Option<Array>>),
-            Exception,
-        > {
+         -> Result<ExpertProjectionParams, Exception> {
             if let Some(iquant) = iquant {
                 let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
                 let (block_values, block_bytes) = ggml_type
@@ -1217,6 +1216,7 @@ impl Mamba2Mixer {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_token(
         &self,
         state: Array,
@@ -1251,6 +1251,7 @@ impl Mamba2Mixer {
         Ok((state, y))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_chunk(
         &self,
         hidden_states: &Array,
@@ -3152,7 +3153,7 @@ mod tests {
         let args = tiny_moe_args();
         let dir = temp_model_dir();
         let weights_path = dir.join("model.safetensors");
-        let arrays = vec![
+        let arrays = [
             (
                 "backbone.layers.1.mixer.gate.weight",
                 Array::zeros::<f32>(&[2, 4], stream).unwrap(),

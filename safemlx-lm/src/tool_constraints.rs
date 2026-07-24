@@ -957,7 +957,7 @@ mod tests {
             state.commit(*byte as TokenId).unwrap();
         }
         let mut fork = state.fork();
-        assert!(state.allowed_tokens().unwrap().len() > 0);
+        assert!(!state.allowed_tokens().unwrap().is_empty());
         for byte in &bytes[split..] {
             state.commit(*byte as TokenId).unwrap();
         }

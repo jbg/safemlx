@@ -346,7 +346,7 @@ impl<R: Read + Seek> Reader<R> {
             }
         };
         let outer_u64 = u64::try_from(outer).map_err(|_| Error::Overflow("outer dimension"))?;
-        if tensor.byte_len % outer_u64 != 0 {
+        if !tensor.byte_len.is_multiple_of(outer_u64) {
             return Err(Error::tensor(
                 &tensor.name,
                 "payload is not divisible by its outer dimension",

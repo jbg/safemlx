@@ -424,7 +424,7 @@ enum DiskTask {
 enum DiskRequest {
     Operation {
         key: DiskOperationKey,
-        task: DiskTask,
+        task: Box<DiskTask>,
         completion: Arc<DiskCompletion>,
     },
     Stop,
@@ -547,10 +547,10 @@ impl Drop for DiskWriteCommit {
         let Ok(mut state) = state.lock() else {
             return;
         };
-        if !state
+        if state
             .host_write_reservations
             .get(&self.key)
-            .is_some_and(|reservation| reservation.reservation_id == self.reservation_id)
+            .is_none_or(|reservation| reservation.reservation_id != self.reservation_id)
         {
             return;
         }
@@ -839,7 +839,7 @@ impl DiskWorker {
                                 continue;
                             }
                             let mut write_commit = None;
-                            let result = catch_unwind(AssertUnwindSafe(|| match task {
+                            let result = catch_unwind(AssertUnwindSafe(|| match *task {
                                 DiskTask::Write {
                                     directory,
                                     id,
@@ -937,10 +937,12 @@ impl DiskWorker {
             .lock()
             .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
         if let Some(completion) = in_flight.get(&key) {
-            if let DiskTask::Write { commit, .. } = &mut task {
-                if let Some(commit) = commit {
-                    commit.armed = false;
-                }
+            if let DiskTask::Write {
+                commit: Some(commit),
+                ..
+            } = &mut task
+            {
+                commit.armed = false;
             }
             return Ok(DiskSubmission {
                 ticket: DiskTicket {
@@ -960,7 +962,7 @@ impl DiskWorker {
         drop(in_flight);
         let request = DiskRequest::Operation {
             key: key.clone(),
-            task,
+            task: Box::new(task),
             completion: Arc::clone(&completion),
         };
         Ok(DiskSubmission {

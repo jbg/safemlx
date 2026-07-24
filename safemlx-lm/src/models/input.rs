@@ -401,9 +401,7 @@ pub fn text_token_ids(input: ModelInput<'_>, stream: &Stream) -> Result<Array, E
 
 /// Converts a slice of token IDs to a batch-1 text input array.
 pub fn token_ids_array(token_ids: &[u32], stream: &Stream) -> Result<Array, Exception> {
-    Array::from(token_ids)
-        .try_index_device(NewAxis, stream)
-        .map_err(Into::into)
+    Array::from(token_ids).try_index_device(NewAxis, stream)
 }
 
 fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {
@@ -414,7 +412,7 @@ fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Ex
         return Ok(parts[0].clone());
     }
     let refs = parts.iter().collect::<Vec<_>>();
-    concatenate_axis(&refs, 1, stream).map_err(Into::into)
+    concatenate_axis(&refs, 1, stream)
 }
 
 fn validate_token_ids(tokens: &Array) -> Result<(), Exception> {

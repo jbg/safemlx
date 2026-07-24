@@ -1131,7 +1131,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
     quantization: Option<WeightQuantization>,
     weights_stream: &Stream,
 ) -> Result<PreparedLlamaGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "llama" | "mistral") {
         return Err(Error::UnsupportedArchitecture(format!(
             "GGUF architecture {architecture:?}; this loader supports llama and mistral"
@@ -1745,7 +1745,7 @@ mod tests {
         assert_eq!(q_proj.inner.weight.value.dtype(), safemlx::Dtype::Uint8);
         assert_eq!(q_proj.inner.weight.value.shape(), &[32, 18]);
         let projected = q_proj
-            .forward(&Array::from_slice(&vec![1.0f32; 32], &[1, 32]), stream)
+            .forward(&Array::from_slice(&[1.0f32; 32], &[1, 32]), stream)
             .unwrap();
         eval([&projected]).unwrap();
         assert_eq!(projected.shape(), &[1, 32]);

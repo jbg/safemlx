@@ -168,6 +168,7 @@ fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exceptio
     profile_arrays(component, &[array])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sliding_window_prefill_attention(
     queries: Array,
     keys: Array,
@@ -894,22 +895,21 @@ where
         } else {
             cache
         };
-        let output = if attention_cache.is_none()
-            && mask.is_some()
-            && L > 1
-            && self.layer_type == LayerType::SlidingAttention
-            && generated_sliding_window.is_some()
-            && keys.shape()[2] == position_offset + L
-            && (position_offset + L
-                <= generated_sliding_window.expect("checked generated sliding window") + 1
-                || L >= 1024)
-        {
+        let generated_sliding_window = generated_sliding_window.filter(|sliding_window| {
+            attention_cache.is_none()
+                && mask.is_some()
+                && L > 1
+                && self.layer_type == LayerType::SlidingAttention
+                && keys.shape()[2] == position_offset + L
+                && (position_offset + L <= *sliding_window + 1 || L >= 1024)
+        });
+        let output = if let Some(generated_sliding_window) = generated_sliding_window {
             sliding_window_prefill_attention(
                 queries,
                 keys,
                 values,
                 self.scale,
-                generated_sliding_window.expect("checked generated sliding window"),
+                generated_sliding_window,
                 position_offset,
                 B,
                 L,
@@ -1059,22 +1059,21 @@ impl Attention {
         } else {
             cache
         };
-        let output = if attention_cache.is_none()
-            && mask.is_some()
-            && seq_len > 1
-            && self.layer_type == LayerType::SlidingAttention
-            && generated_sliding_window.is_some()
-            && keys.shape()[2] == position_offset + seq_len
-            && (position_offset + seq_len
-                <= generated_sliding_window.expect("checked generated sliding window") + 1
-                || seq_len >= 1024)
-        {
+        let generated_sliding_window = generated_sliding_window.filter(|sliding_window| {
+            attention_cache.is_none()
+                && mask.is_some()
+                && seq_len > 1
+                && self.layer_type == LayerType::SlidingAttention
+                && keys.shape()[2] == position_offset + seq_len
+                && (position_offset + seq_len <= *sliding_window + 1 || seq_len >= 1024)
+        });
+        let output = if let Some(generated_sliding_window) = generated_sliding_window {
             sliding_window_prefill_attention(
                 queries,
                 keys,
                 values,
                 self.scale,
-                generated_sliding_window.expect("checked generated sliding window"),
+                generated_sliding_window,
                 position_offset,
                 batch,
                 seq_len,
@@ -3278,7 +3277,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
     quantization: Option<WeightQuantization>,
     weights_stream: &Stream,
 ) -> Result<PreparedGemma4Gguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "gemma4" {
         return Err(Error::UnsupportedArchitecture(format!(
             "GGUF architecture {architecture:?}; this loader supports only gemma4"
@@ -4632,9 +4631,7 @@ pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Ve
 }
 
 fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exception> {
-    Array::from(token_ids)
-        .try_index_device(NewAxis, stream)
-        .map_err(Into::into)
+    Array::from(token_ids).try_index_device(NewAxis, stream)
 }
 
 pub(crate) struct Gemma4AttentionMasks {

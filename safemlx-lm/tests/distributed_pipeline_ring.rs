@@ -533,8 +533,8 @@ fn run_ring_pipeline(dense_stream: bool, deepseek: bool) {
         children: Vec::with_capacity(2),
     };
     let mut reservations = [Some(first_socket), Some(second_socket)];
-    for rank in 0..2 {
-        drop(reservations[rank].take());
+    for (rank, reservation) in reservations.iter_mut().enumerate() {
+        drop(reservation.take());
         let mut command = Command::new(&executable);
         command
             .args(["--exact", "pipeline_ring_worker", "--nocapture"])

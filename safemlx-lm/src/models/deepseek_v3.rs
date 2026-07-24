@@ -1060,6 +1060,7 @@ impl MultiHeadLatentAttention {
         Ok((keys, values))
     }
 
+    #[allow(clippy::unnecessary_unwrap)]
     fn forward_impl(
         &mut self,
         x: &Array,
@@ -1711,6 +1712,7 @@ impl RoutedExperts {
         Ok(bank)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn projection(
         input: &Array,
         weight: &Array,
@@ -2066,9 +2068,9 @@ impl Moe {
 /// Dense or sparse feed-forward layer.
 pub enum FeedForward {
     /// Dense SwiGLU.
-    Dense(Mlp),
+    Dense(Box<Mlp>),
     /// Routed plus shared DeepSeekMoE.
-    Moe(Moe),
+    Moe(Box<Moe>),
 }
 
 impl ModuleParameters for FeedForward {
@@ -2132,14 +2134,14 @@ impl ModuleParameters for FeedForward {
 impl FeedForward {
     fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
         if args.is_moe_layer(layer) {
-            Ok(Self::Moe(Moe::new(args, layer, stream)?))
+            Ok(Self::Moe(Box::new(Moe::new(args, layer, stream)?)))
         } else {
-            Ok(Self::Dense(Mlp::new(
+            Ok(Self::Dense(Box::new(Mlp::new(
                 args,
                 &format!("model.layers.{layer}.mlp"),
                 args.intermediate_size,
                 stream,
-            )?))
+            )?)))
         }
     }
 
@@ -3436,7 +3438,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     quantization: Option<WeightQuantization>,
     weights_stream: &Stream,
 ) -> Result<PreparedDeepSeekGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "deepseek2" {
         return Err(Error::UnsupportedArchitecture(format!(
             "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
@@ -3723,8 +3725,7 @@ fn gguf_optional_bool(
 
 /// Loads the official `tokenizer.json`.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-    Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json"))
-        .map_err(|error| Error::Other(error))
+    Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json")).map_err(Error::Other)
 }
 
 #[cfg(test)]

@@ -2970,7 +2970,7 @@ mod tests {
                 .try_index_device(&Array::from_slice(&[1i32, 0], &[2]), stream)
                 .unwrap();
             let expected = matmul(
-                &grouped_input
+                grouped_input
                     .reshape(&[2, 1, block_values as i32], stream)
                     .unwrap(),
                 selected.swap_axes(-1, -2, stream).unwrap(),
@@ -3021,7 +3021,7 @@ mod tests {
             let repeated_hidden =
                 crate::ops::broadcast_to(&hidden, &[2, block_values as i32], stream).unwrap();
             let gate = matmul(
-                &repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
+                repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
                 selected_gate_up
                     .try_index_device((.., ..intermediate, ..), stream)
                     .unwrap()
@@ -3033,7 +3033,7 @@ mod tests {
             .reshape(&[2, intermediate], stream)
             .unwrap();
             let up = matmul(
-                &repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
+                repeated_hidden.reshape(&[2, 1, -1], stream).unwrap(),
                 selected_gate_up
                     .try_index_device((.., intermediate.., ..), stream)
                     .unwrap()
@@ -3077,7 +3077,7 @@ mod tests {
                 .try_index_device(&ids, stream)
                 .unwrap();
             let projected = matmul(
-                &activated_ref
+                activated_ref
                     .reshape(&[2, 1, intermediate], stream)
                     .unwrap(),
                 selected_down.swap_axes(-1, -2, stream).unwrap(),
@@ -3198,7 +3198,7 @@ mod tests {
             let repeated =
                 crate::ops::broadcast_to(&hidden, &[2, block_values as i32], &stream).unwrap();
             let gate = matmul(
-                &repeated.reshape(&[2, 1, -1], &stream).unwrap(),
+                repeated.reshape(&[2, 1, -1], &stream).unwrap(),
                 selected_gate_up
                     .try_index_device((.., ..intermediate, ..), &stream)
                     .unwrap()
@@ -3210,7 +3210,7 @@ mod tests {
             .reshape(&[2, intermediate], &stream)
             .unwrap();
             let up = matmul(
-                &repeated.reshape(&[2, 1, -1], &stream).unwrap(),
+                repeated.reshape(&[2, 1, -1], &stream).unwrap(),
                 selected_gate_up
                     .try_index_device((.., intermediate.., ..), &stream)
                     .unwrap()
@@ -3254,7 +3254,7 @@ mod tests {
                 .try_index_device(&ids, &stream)
                 .unwrap();
             let projected = matmul(
-                &activated_ref.reshape(&[2, 1, -1], &stream).unwrap(),
+                activated_ref.reshape(&[2, 1, -1], &stream).unwrap(),
                 selected_down.swap_axes(-1, -2, &stream).unwrap(),
                 &stream,
             )
@@ -3465,7 +3465,7 @@ mod tests {
             .try_index_device(&group_ids, &stream)
             .unwrap();
         let expected = matmul(
-            &input.reshape(&[2, 1, 256], &stream).unwrap(),
+            input.reshape(&[2, 1, 256], &stream).unwrap(),
             selected.swap_axes(-1, -2, &stream).unwrap(),
             &stream,
         )
@@ -3765,7 +3765,7 @@ mod tests {
             .try_index_device(&ids, &stream)
             .unwrap();
         let expected = matmul(
-            &input.reshape(&[-1, 1, input_dim], &stream).unwrap(),
+            input.reshape(&[-1, 1, input_dim], &stream).unwrap(),
             selected.swap_axes(-1, -2, &stream).unwrap(),
             &stream,
         )
@@ -3875,7 +3875,7 @@ mod tests {
             .try_index_device(&ids, &stream)
             .unwrap();
         let projected = matmul(
-            &reference_activated
+            reference_activated
                 .reshape(&[-1, 1, intermediate], &stream)
                 .unwrap(),
             selected_down.swap_axes(-1, -2, &stream).unwrap(),
@@ -3945,7 +3945,7 @@ mod tests {
             .try_index_device(&ids, &stream)
             .unwrap();
         let projected = matmul(
-            &activated.reshape(&[-1, 1, intermediate], &stream).unwrap(),
+            activated.reshape(&[-1, 1, intermediate], &stream).unwrap(),
             selected_down.swap_axes(-1, -2, &stream).unwrap(),
             &stream,
         )

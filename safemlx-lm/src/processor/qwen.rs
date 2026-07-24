@@ -446,7 +446,9 @@ fn pack_image_patches(
 ) -> Result<(Array, Array), Error> {
     let grid_h = image.height() / config.patch_size;
     let grid_w = image.width() / config.patch_size;
-    if image.height() % config.patch_size != 0 || image.width() % config.patch_size != 0 {
+    if !image.height().is_multiple_of(config.patch_size)
+        || !image.width().is_multiple_of(config.patch_size)
+    {
         return Err(Error::Processor(format!(
             "processed image {}x{} is not divisible by patch size {}",
             image.width(),
@@ -454,7 +456,7 @@ fn pack_image_patches(
             config.patch_size
         )));
     }
-    if grid_h % config.merge_size != 0 || grid_w % config.merge_size != 0 {
+    if !grid_h.is_multiple_of(config.merge_size) || !grid_w.is_multiple_of(config.merge_size) {
         return Err(Error::Processor(format!(
             "image patch grid {grid_h}x{grid_w} is not divisible by merge size {}",
             config.merge_size
@@ -496,7 +498,7 @@ fn pack_video_patches(
     let first = frames
         .first()
         .ok_or_else(|| Error::Processor("video must contain processed frames".to_string()))?;
-    if frames.len() % config.temporal_patch_size != 0 {
+    if !frames.len().is_multiple_of(config.temporal_patch_size) {
         return Err(Error::Processor(format!(
             "{} processed video frames are not divisible by temporal patch size {}",
             frames.len(),
@@ -523,7 +525,7 @@ fn pack_video_patches(
     let grid_t = frames.len() / config.temporal_patch_size;
     let grid_h = first.height() / config.patch_size;
     let grid_w = first.width() / config.patch_size;
-    if grid_h % config.merge_size != 0 || grid_w % config.merge_size != 0 {
+    if !grid_h.is_multiple_of(config.merge_size) || !grid_w.is_multiple_of(config.merge_size) {
         return Err(Error::Processor(format!(
             "video patch grid {grid_h}x{grid_w} is not divisible by merge size {}",
             config.merge_size

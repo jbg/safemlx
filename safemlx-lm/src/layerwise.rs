@@ -70,9 +70,10 @@ impl Default for LayerwiseLoadOptions {
 }
 
 /// Weight placement choices exposed by architecture-level model loaders.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum WeightResidency {
     /// Construct every module once and keep all parameters on the execution device.
+    #[default]
     FullyResident,
     /// Keep decoder weights on a host stream and execute through a bounded device window.
     LayerwiseHost(LayerwiseLoadOptions),
@@ -1035,12 +1036,6 @@ impl Drop for DenseStreamGroupGuard<'_> {
     }
 }
 
-impl Default for WeightResidency {
-    fn default() -> Self {
-        Self::FullyResident
-    }
-}
-
 /// Inspectable parameter-residency metadata for a layerwise model.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
@@ -1278,6 +1273,7 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
     }
 
     /// Executes one populated unit while inspecting and mutating the complete cache.
+    #[allow(clippy::too_many_arguments)]
     fn forward_layer(
         &mut self,
         group: usize,
@@ -1527,8 +1523,8 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
                                 .retained_context_arrays(&context, group_index, index);
                         eval(
                             std::iter::once(&hidden)
-                                .chain(retained.into_iter())
-                                .chain(retained_context.into_iter()),
+                                .chain(retained)
+                                .chain(retained_context),
                         )?;
                         stream.synchronize()?;
                         hook_result?;
@@ -1872,7 +1868,7 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
         let mut h = self.adapter.embed(inputs, stream)?;
         let context = self.adapter.prepare_forward(&h, mask, cache, stream)?;
 
-        for index in 0..self.metadata.layer_count {
+        for (index, layer_cache) in cache.iter_mut().enumerate().take(self.metadata.layer_count) {
             let id = &self.layer_group.units()[index];
             {
                 let (_host_lease, lease) = if let Some(streamer) = &self.dense_stream {
@@ -1889,7 +1885,7 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
                 };
                 let mut layer = self.adapter.new_layer(index, stream)?;
                 self.adapter.populate_layer(&mut layer, &lease)?;
-                let layer_cache = cache[index]
+                let layer_cache = layer_cache
                     .as_mut()
                     .ok_or(LayerwiseModelError::MissingLayerCache { index })?;
                 h = self.adapter.forward_layer(
@@ -2134,6 +2130,7 @@ where
     Ok(model)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_unit(
     definitions: &mut Vec<OffloadUnit>,
     specs: &mut Vec<OffloadUnitSpec>,

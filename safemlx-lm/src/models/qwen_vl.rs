@@ -637,10 +637,10 @@ impl QwenVisionLayerwiseStatic {
             self.config.hidden_size / self.config.num_heads,
         );
         let reorder = |array: Array| -> Result<Array, Exception> {
-            Ok(array
+            array
                 .reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?
                 .try_index_device((&window_index_array, .., ..), stream)?
-                .reshape(&[seq_len, -1], stream)?)
+                .reshape(&[seq_len, -1], stream)
         };
         Ok((
             hidden,

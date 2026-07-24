@@ -349,12 +349,12 @@ fn run_ring_tensor_parallel(deepseek: bool) {
     let executable = std::env::current_exe().unwrap();
     let mut children = ChildGuard(Vec::with_capacity(2));
     let mut reservations = [Some(first_socket), Some(second_socket)];
-    for rank in 0..2 {
+    for (rank, reservation) in reservations.iter_mut().enumerate() {
         // Release only the address this rank will bind immediately before its
         // process is spawned. Keeping the peer address reserved closes the
         // previous socket-setup race where either port could be stolen between
         // dropping both listeners and launching the workers.
-        drop(reservations[rank].take());
+        drop(reservation.take());
         children.0.push(
             Command::new(&executable)
                 .args(["--exact", "tensor_ring_worker", "--nocapture"])

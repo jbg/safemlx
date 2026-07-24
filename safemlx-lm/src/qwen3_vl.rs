@@ -342,9 +342,9 @@ pub struct Qwen3VlForwardContext {
 /// One temporary unit from either the vision or text group.
 pub enum Qwen3VlLayer {
     /// Vision transformer block.
-    Vision(QwenVisionBlock),
+    Vision(Box<QwenVisionBlock>),
     /// Dense or sparse-MoE Qwen3 decoder block.
-    Text(TransformerBlock),
+    Text(Box<TransformerBlock>),
 }
 
 impl ModuleParameters for Qwen3VlLayer {
@@ -713,15 +713,13 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
 
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
         match group {
-            0 => Ok(Qwen3VlLayer::Vision(QwenVisionBlock::new(
+            0 => Ok(Qwen3VlLayer::Vision(Box::new(QwenVisionBlock::new(
                 &self.args.vision_config,
                 stream,
-            )?)),
-            1 => Ok(Qwen3VlLayer::Text(TransformerBlock::new_for_layer(
-                &self.args.text_config,
-                index as i32,
-                stream,
-            )?)),
+            )?))),
+            1 => Ok(Qwen3VlLayer::Text(Box::new(
+                TransformerBlock::new_for_layer(&self.args.text_config, index as i32, stream)?,
+            ))),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Qwen3-VL has no execution group {group}"
             ))),

@@ -1902,12 +1902,9 @@ mod tests {
         for args in [dense, moe] {
             let mut model = super::Model::new(args, stream).unwrap();
             for (_, parameter) in model.parameters_mut().flatten() {
-                *parameter = safemlx::ops::zeros_dtype(
-                    &parameter.shape().to_vec(),
-                    parameter.dtype(),
-                    stream,
-                )
-                .unwrap();
+                *parameter =
+                    safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), stream)
+                        .unwrap();
             }
             let mut cache = model.new_cache();
             let prompt = safemlx::Array::from_slice(&[1_u32, 2, 3], &[1, 3]);

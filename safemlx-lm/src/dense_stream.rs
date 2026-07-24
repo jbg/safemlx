@@ -632,8 +632,10 @@ mod tests {
 
     #[test]
     fn mutated_public_controls_are_revalidated() {
-        let mut options = DenseDiskStreamLoadOptions::default();
-        options.background_queue_capacity = 0;
+        let options = DenseDiskStreamLoadOptions {
+            background_queue_capacity: 0,
+            ..DenseDiskStreamLoadOptions::default()
+        };
         assert!(matches!(
             options.validate(),
             Err(DenseStreamError::ZeroQueueCapacity)

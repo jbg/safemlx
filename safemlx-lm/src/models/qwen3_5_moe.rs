@@ -835,7 +835,7 @@ impl QwenLinear {
 }
 
 fn default_layer_type(index: usize) -> LayerType {
-    if (index + 1) % 4 == 0 {
+    if (index + 1).is_multiple_of(4) {
         LayerType::FullAttention
     } else {
         LayerType::LinearAttention
@@ -2961,9 +2961,9 @@ impl Module<&Array> for SparseMoeBlock {
 /// Dense or sparse-MoE feed-forward layer stored under the checkpoint-native `mlp` namespace.
 pub enum FeedForward {
     /// Dense SwiGLU MLP.
-    Dense(Mlp),
+    Dense(Box<Mlp>),
     /// Sparse mixture-of-experts block.
-    Moe(SparseMoeBlock),
+    Moe(Box<SparseMoeBlock>),
 }
 
 impl FeedForward {
@@ -2974,14 +2974,14 @@ impl FeedForward {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         if args.is_moe() {
-            Ok(Self::Moe(SparseMoeBlock::new_with_format(
+            Ok(Self::Moe(Box::new(SparseMoeBlock::new_with_format(
                 args,
                 &format!("{prefix}.mlp"),
                 format,
                 stream,
-            )?))
+            )?)))
         } else {
-            Ok(Self::Dense(Mlp::new(
+            Ok(Self::Dense(Box::new(Mlp::new(
                 args.hidden_size,
                 args.intermediate_size,
                 false,
@@ -2989,7 +2989,7 @@ impl FeedForward {
                 Some(&format!("{prefix}.mlp")),
                 format,
                 stream,
-            )?))
+            )?)))
         }
     }
 
@@ -4995,6 +4995,8 @@ enum Qwen35Variant {
     Qwen3Next,
 }
 
+type ParsedQwen35Config = (ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>);
+
 impl Qwen35Variant {
     fn text_model_type(self) -> &'static str {
         match self {
@@ -5005,9 +5007,7 @@ impl Qwen35Variant {
     }
 }
 
-fn parse_qwen3_5_config_value(
-    value: Value,
-) -> Result<(ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>), Error> {
+fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Config, Error> {
     let mut config: TopLevelConfig = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Qwen3.5 config: {error}"))
     })?;
@@ -5091,7 +5091,7 @@ fn parse_qwen3_5_config_value(
         }
         args.layer_types = (0..args.num_hidden_layers)
             .map(|idx| {
-                if (idx as usize + 1) % interval == 0 {
+                if (idx as usize + 1).is_multiple_of(interval) {
                     LayerType::FullAttention
                 } else {
                     LayerType::LinearAttention
@@ -5110,7 +5110,7 @@ fn parse_qwen3_5_config_value(
 /// Reads and normalizes dense or MoE Qwen3.5 model arguments from `config.json`.
 pub fn get_qwen3_5_moe_model_args(
     model_dir: impl AsRef<Path>,
-) -> Result<(ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>), Error> {
+) -> Result<ParsedQwen35Config, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
     let value = serde_json::from_reader(file)?;
     parse_qwen3_5_config_value(value)
@@ -5967,8 +5967,7 @@ mod tests {
             name: name.into(),
             dimensions: shape.iter().rev().copied().collect(),
             ty: GgmlType::F32,
-            data: std::iter::repeat(value.to_le_bytes())
-                .take(elements)
+            data: std::iter::repeat_n(value.to_le_bytes(), elements)
                 .flatten()
                 .collect(),
         }
@@ -6716,7 +6715,7 @@ mod tests {
             assert_eq!(decode.shape(), &[1, 256]);
             assert!(decode
                 .all_close(
-                    &Array::zeros::<f32>(&[1, 256], gpu.stream()).unwrap(),
+                    Array::zeros::<f32>(&[1, 256], gpu.stream()).unwrap(),
                     1e-3,
                     1e-3,
                     None,

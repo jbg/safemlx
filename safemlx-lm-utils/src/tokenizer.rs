@@ -168,6 +168,11 @@ pub struct Tokenizer {
     template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
+struct TemplateKwargs<'defaults, 'overrides> {
+    defaults: Option<&'defaults serde_json::Map<String, serde_json::Value>>,
+    overrides: Option<&'overrides serde_json::Map<String, serde_json::Value>>,
+}
+
 impl FromStr for Tokenizer {
     type Err = tokenizers::Error;
 
@@ -270,8 +275,10 @@ impl Tokenizer {
             tools,
             model_id,
             add_generation_prompt,
-            Some(&self.template_kwargs),
-            template_kwargs,
+            TemplateKwargs {
+                defaults: Some(&self.template_kwargs),
+                overrides: template_kwargs,
+            },
         )
     }
 }
@@ -695,20 +702,21 @@ where
         tools,
         model_id,
         add_generation_prompt,
-        None,
-        template_kwargs,
+        TemplateKwargs {
+            defaults: None,
+            overrides: template_kwargs,
+        },
     )
 }
 
-fn apply_chat_template_json_with_default_kwargs<'a, I>(
+fn apply_chat_template_json_with_default_kwargs<'a, 'defaults, I>(
     env: &mut Environment<'static>,
     model_template: ModelChatTemplate,
     conversations: I,
     tools: Option<&'a [serde_json::Value]>,
     model_id: &'a str,
     add_generation_prompt: bool,
-    default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    template_kwargs: TemplateKwargs<'defaults, 'a>,
 ) -> Result<Vec<String>, Error>
 where
     I: IntoIterator<Item = Vec<serde_json::Value>>,
@@ -731,9 +739,9 @@ where
             chat_template_id: None,
             add_generation_prompt: Some(add_generation_prompt),
             continue_final_message: None,
-            template_kwargs,
+            template_kwargs: template_kwargs.overrides,
         },
-        default_template_kwargs,
+        template_kwargs.defaults,
     )
 }
 
@@ -801,28 +809,29 @@ where
 
     // TODO: allow return_generation_indices
 
-    render_jinja_tempalte(
+    render_jinja_template(
         template,
         conversations,
         tools,
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
-        default_template_kwargs,
-        template_kwargs,
+        TemplateKwargs {
+            defaults: default_template_kwargs,
+            overrides: template_kwargs,
+        },
     )
 }
 
 // TODO: render with assistant indices
-fn render_jinja_tempalte<'a, R, T>(
+fn render_jinja_template<'a, 'defaults, R, T>(
     template: Template,
     conversations: impl IntoIterator<Item = Chat<'a, R, T>>,
     tools: Option<&'a [serde_json::Value]>,
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
-    default_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    template_kwargs: TemplateKwargs<'defaults, 'a>,
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
@@ -863,10 +872,10 @@ where
             "add_generation_prompt".to_string(),
             serde_json::Value::Bool(add_generation_prompt),
         );
-        if let Some(default_template_kwargs) = default_template_kwargs {
+        if let Some(default_template_kwargs) = template_kwargs.defaults {
             context.extend(default_template_kwargs.clone());
         }
-        if let Some(template_kwargs) = template_kwargs {
+        if let Some(template_kwargs) = template_kwargs.overrides {
             context.extend(template_kwargs.clone());
         }
 

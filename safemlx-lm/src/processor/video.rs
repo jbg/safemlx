@@ -126,7 +126,8 @@ pub fn temporal_group_timestamps(
             "video source FPS must be finite and positive, got {source_fps}"
         )));
     }
-    if temporal_factor == 0 || indices.is_empty() || indices.len() % temporal_factor != 0 {
+    if temporal_factor == 0 || indices.is_empty() || !indices.len().is_multiple_of(temporal_factor)
+    {
         return Err(Error::Processor(format!(
             "{} frame indices cannot be grouped by temporal factor {temporal_factor}",
             indices.len()

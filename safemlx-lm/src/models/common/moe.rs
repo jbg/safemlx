@@ -50,6 +50,7 @@ pub fn affine_grouped_linear(
 }
 
 /// Applies an affine packed grouped projection in either matrix direction.
+#[allow(clippy::too_many_arguments)]
 pub fn affine_grouped_linear_with_transpose(
     input: &Array,
     weight: &Array,

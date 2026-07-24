@@ -134,7 +134,7 @@ impl MoshiLayerwiseModel {
         audio_samplers: &mut [AS],
         text_temperature: f32,
         audio_temperature: f32,
-        mut prng_state: Option<&mut RandomState>,
+        prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<SampleStepOutput, Exception> {
         self.sample_step_forced(
@@ -148,7 +148,7 @@ impl MoshiLayerwiseModel {
             None,
             None,
             None,
-            prng_state.as_deref_mut(),
+            prng_state,
             stream,
         )
     }
@@ -227,7 +227,7 @@ impl MoshiLayerwiseModel {
                             .forced_audio_codebooks
                             .as_ref()
                             .filter(|mask| mask[index])
-                            .and_then(|_| context.forced_audio_tokens.as_ref())
+                            .and(context.forced_audio_tokens.as_ref())
                             .map(|tokens| tokens.try_index_device((.., index as i32), stream))
                             .transpose()?;
                         let next = match forced {
@@ -893,8 +893,8 @@ impl MoshiForwardContext {
 
 /// One temporary temporal layer or one complete depth-codebook slice.
 pub(crate) enum MoshiExecutionUnit {
-    Temporal(MoshiTransformerLayer),
-    Depth(DepFormerSlice),
+    Temporal(Box<MoshiTransformerLayer>),
+    Depth(Box<DepFormerSlice>),
 }
 
 impl ModuleParameters for MoshiExecutionUnit {
@@ -1110,12 +1110,12 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
 
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
         match group {
-            0 => Ok(MoshiExecutionUnit::Temporal(
+            0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
                 MoshiTransformerLayer::new_temporal(&self.args, stream)?,
-            )),
-            1 => Ok(MoshiExecutionUnit::Depth(DepFormerSlice::new_for_index(
-                &self.args, index, stream,
-            )?)),
+            ))),
+            1 => Ok(MoshiExecutionUnit::Depth(Box::new(
+                DepFormerSlice::new_for_index(&self.args, index, stream)?,
+            ))),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Moshi has no execution group {group}"
             ))),

@@ -1246,8 +1246,7 @@ mod tests {
                 "original_max_position_embeddings": 4096,
                 "beta_fast": 32.0, "beta_slow": 1.0
             },
-            "layer_types": std::iter::repeat(["sliding_attention", "full_attention"])
-                .take(12).flatten().collect::<Vec<_>>(),
+            "layer_types": std::iter::repeat_n(["sliding_attention", "full_attention"], 12).flatten().collect::<Vec<_>>(),
             "quantization_config": {"quant_method": "mxfp4"}
         });
         let args: ModelArgs = serde_json::from_value(value).unwrap();

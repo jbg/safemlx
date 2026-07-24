@@ -1105,6 +1105,7 @@ fn pipeline_load_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pipeline_dense_layers<L, F, B>(
     model_dir: &Path,
     range: Range<usize>,
@@ -2591,8 +2592,7 @@ mod tests {
             stream,
             cpu.stream(),
         )
-        .err()
-        .expect("strict pipeline loading must reject an unrelated checkpoint tensor");
+        .expect_err("strict pipeline loading must reject an unrelated checkpoint tensor");
         assert!(matches!(
             strict_error,
             Error::StrictLoadValidation { missing, unused }
@@ -2767,8 +2767,7 @@ mod tests {
             stream,
             cpu.stream(),
         )
-        .err()
-        .expect("an undersized local host budget must fail");
+        .expect_err("an undersized local host budget must fail");
         assert!(matches!(
             host_error,
             Error::Parallel(message)
@@ -2786,8 +2785,7 @@ mod tests {
             stream,
             cpu.stream(),
         )
-        .err()
-        .expect("an undersized local device budget must fail");
+        .expect_err("an undersized local device budget must fail");
         assert!(matches!(
             device_error,
             Error::Parallel(message)

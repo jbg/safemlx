@@ -762,6 +762,7 @@ where
 }
 
 /// Strict-loads a model directory while streaming and packing split ReLU2 experts.
+#[allow(clippy::too_many_arguments)]
 pub fn load_safetensors_dir_strict_with_split_relu2_experts<M, F>(
     model: &mut M,
     model_dir: impl AsRef<Path>,

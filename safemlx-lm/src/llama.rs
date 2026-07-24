@@ -166,8 +166,8 @@ impl LlamaCache {
 }
 
 enum LlamaExecution {
-    FullyResident(resident::ResidentModel),
-    LayerwiseHost(LayerwiseModel<LlamaLayerwiseAdapter>),
+    FullyResident(Box<resident::ResidentModel>),
+    LayerwiseHost(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
 }
 
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
@@ -503,32 +503,32 @@ pub fn load_llama_model(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let execution = match options.weight_residency {
-        WeightResidency::FullyResident => LlamaExecution::FullyResident(
+        WeightResidency::FullyResident => LlamaExecution::FullyResident(Box::new(
             resident::load_resident_llama_model(model_dir, stream, weights_stream)?,
-        ),
+        )),
         WeightResidency::LayerwiseHost(options) => {
             let model_dir = model_dir.as_ref();
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(load_layerwise_model(
+            LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(
                 model_dir,
                 adapter,
                 options,
                 stream,
                 weights_stream,
-            )?)
+            )?))
         }
         WeightResidency::DenseDiskStream(options) => {
             let model_dir = model_dir.as_ref();
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(load_layerwise_model(
+            LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(
                 model_dir,
                 adapter,
                 options,
                 stream,
                 weights_stream,
-            )?)
+            )?))
         }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
@@ -558,12 +558,12 @@ pub(crate) fn load_llama_gguf_model(
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => LlamaExecution::LayerwiseHost(
+        WeightResidency::LayerwiseHost(options) => LlamaExecution::LayerwiseHost(Box::new(
             load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
-        ),
-        WeightResidency::DenseDiskStream(options) => LlamaExecution::LayerwiseHost(
+        )),
+        WeightResidency::DenseDiskStream(options) => LlamaExecution::LayerwiseHost(Box::new(
             load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
-        ),
+        )),
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
             return Err(Error::UnsupportedArchitecture(
